@@ -1159,9 +1159,23 @@ class WindowsEmulator(BinaryEmulator):
                 for page_base in range(aligned_addr, aligned_end, self.page_size):
                     page_perms[page_base] = page_perms.get(page_base, 0) | sect.perms
 
-            for page_base, perms in page_perms.items():
+            # Coalesce consecutive pages that ended up with identical permissions and
+            # protect each run with a single mem_protect call. Calling mem_protect once
+            # per page is prohibitively slow on large sections: a section with a big
+            # virtual_size (e.g. 32 MB of zero-filled .data) is ~8000 pages, and
+            # unicorn's mem_protect cost grows with the size of the mapped address
+            # space, so the image load appears to hang.
+            runs = []
+            for page_base in sorted(page_perms):
+                perms = page_perms[page_base]
+                if runs and runs[-1][1] == page_base and runs[-1][2] == perms:
+                    runs[-1][1] = page_base + self.page_size
+                else:
+                    runs.append([page_base, page_base + self.page_size, perms])
+
+            for start, end, perms in runs:
                 try:
-                    self.mem_protect(page_base, self.page_size, perms)
+                    self.mem_protect(start, end - start, perms)
                 except Exception:
                     pass
 
