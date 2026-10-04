@@ -288,12 +288,14 @@ class MemoryManager:
         """
         Retrieve a valid address range that can satisfy the requested size.
         Optionally, a base address can be specified to test if it can be used
+
+        Implementation note: the search works on *intervals* (mapped regions and
+        reservations) instead of materialising the set of every mapped page.
+        Building that page set is O(total mapped pages); guests can reserve huge
+        regions (tens of GB -> millions of pages), which made a single call take
+        minutes and showed up as a hang (e.g. a sample that VirtualAlloc-reserves
+        32 GB and then faults page by page inside that range).
         """
-
-        def get_runs(i):
-            for k, g in groupby(enumerate(i), lambda ix: ix[0] - (ix[1] >> 12)):
-                yield tuple(map(itemgetter(1), g))
-
         page_size = self.page_size
 
         # mem_map needs to be page aligned
@@ -309,24 +311,26 @@ class MemoryManager:
         elif total % page_size:
             total += page_size - (total % page_size)
 
-        curr: list[int] = []
+        # Occupied intervals: mapped regions plus reserved ranges. Starts are
+        # aligned down to a page so a partially used page counts as occupied.
+        occupied = []
         for m in self.get_mem_regions():
-            curr += range(m[0], m[1], page_size)
-
-        # Add reserved memory so we don't accidentally allocate it
+            o_start = int(m[0]) & ~(page_size - 1)
+            o_end = int(m[1])
+            if o_end > o_start:
+                occupied.append((o_start, o_end))
         for res in self.mem_reserves:
-            curr += range(res.base, (res.base + res.size), page_size)
-
-        curr = sorted(set(curr))
+            o_start = int(res.base) & ~(page_size - 1)
+            o_end = int(res.base) + int(res.size)
+            if o_end > o_start:
+                occupied.append((o_start, o_end))
+        occupied.sort()
 
         attempts = 9999
         while attempts:
-            req = set(range(base, base + total, page_size))
-
-            diffs = sorted(req.difference(curr))
-
-            if len(diffs) == len(req):
-                break
+            end = base + total
+            if not any(o_start < end and base < o_end for o_start, o_end in occupied):
+                return (base, total)
 
             if not attempts % 10:
                 base += page_size * 1000
@@ -334,9 +338,4 @@ class MemoryManager:
                 base += total
             attempts -= 1
 
-        if attempts == 0:
-            raise Exception("Failed to allocate emulator memory")
-
-        a = [r for r in get_runs(diffs)][0]
-
-        return (min(a), total)
+        raise Exception("Failed to allocate emulator memory")
