@@ -595,7 +595,14 @@ class Win32Emulator(WindowsEmulator):
                 proc_mod = p
                 break
 
-        if proc_mod:
+        # Only synthesize the configured host-process decoy when no module has
+        # been loaded yet (same guard as 1.5.11's ``not self.user_modules``).
+        # When a real sample image is already registered, preloading the decoy
+        # adds a bogus module to the module list and shifts every later module by
+        # one slot; samples that pick modules by index (common in packed
+        # binaries that resolve APIs by walking the module list) then read the
+        # wrong module. See regression ② in documents/speakeasy/.
+        if proc_mod and not self.modules:
             all_user_mods = [proc_mod] + list(self.config.modules.user_modules)
         else:
             all_user_mods = list(self.config.modules.user_modules)
