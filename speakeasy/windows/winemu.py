@@ -2101,7 +2101,15 @@ class WindowsEmulator(BinaryEmulator):
 
     def _handle_prot_write(self, emu, address, size, value):
         fakeout = address & 0xFFFFFFFFFFFFF000
-        self.mem_map(self.page_size, base=fakeout)
+        # The page is typically already mapped (this handler fires on a write to
+        # a read-only page); mapping it again cannot succeed and used to rely on
+        # the page-set implementation accidentally finding a "free" candidate.
+        # The run ends below anyway, so a failure here must not abort the error
+        # path (it used to surface as "Failed to allocate emulator memory").
+        try:
+            self.mem_map(self.page_size, base=fakeout)
+        except Exception:
+            pass
 
         error = self.get_error_info("invalid_protect_write", address, access_type="write")
         self.curr_run.error = error  # type: ignore[union-attr]
