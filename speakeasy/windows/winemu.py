@@ -1512,6 +1512,14 @@ class WindowsEmulator(BinaryEmulator):
         """
         if address == self.return_hook or address == self.exit_hook:
             self._unset_emu_hooks()
+            # Complete the run here instead of relying on the transient code
+            # hook to see addr == return_hook: ``_unset_emu_hooks()`` re-maps
+            # the sentinel range, and under unicorn 2.x a code hook installed
+            # while that range was unmapped does not fire once it is mapped.
+            # The run would otherwise keep executing the zero-filled sentinel
+            # page, recording a spurious invalid_read (and corrupting state).
+            # The transient code hook does exactly this in 1.5.11.
+            self.on_run_complete()
             return True
 
         if not self.curr_mod:
