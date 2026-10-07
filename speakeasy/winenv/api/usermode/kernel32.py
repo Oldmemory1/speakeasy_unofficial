@@ -2012,7 +2012,21 @@ class Kernel32(api.ApiHandler):
                     entry = next(filter(lambda entry: entry.name == proc, mod.get_exports()), None)
                     if entry:
                         rv = emu.get_proc(mname, proc)
-                    elif emu.config.modules.functions_always_exist or emu.has_api_signature(mname, proc):
+                    # fixF: relax the export-table gate for *dynamically loaded*
+                    # modules (anything that is not the primary image). Those are
+                    # the system DLLs speakeasy simulates itself (kernel32,
+                    # msvcrt, user32, ...) and their export table comes from the
+                    # emulator's internal database, which is incomplete -- e.g.
+                    # msvcrt!_CIfmod is missing. Returning 0 there makes packer
+                    # stubs treat the import as unresolved and call ExitProcess,
+                    # so the unpacked code never runs (400-sample check: 66
+                    # samples hit such a zero). The primary image keeps the
+                    # strict behaviour because its exports are read from the
+                    # real file, matching Windows semantics. 1.5.11 had no such
+                    # gate for loaded modules; this restores that behaviour.
+                    elif (emu.config.modules.functions_always_exist
+                          or emu.has_api_signature(mname, proc)
+                          or not getattr(mod, "is_exe", lambda: True)()):
                         rv = emu.get_proc(mname, proc)
                     break
 
