@@ -2525,7 +2525,15 @@ class WindowsEmulator(BinaryEmulator):
             return existing.base
 
         if not self.config.modules.modules_always_exist:
-            return 0
+            # fixG: allow on-demand synthesis when the engine actually knows this
+            # module (kernel32/user32/msvcrt/... and also mpr/comdlg32/atl/...).
+            # On a real Windows host these system DLLs exist, so failing
+            # LoadLibrary here is a false negative: packers treat the 0 as
+            # "hostile/incomplete environment", call GetProcAddress(NULL, ...)
+            # and exit before unpacking (measured: 129 of 543 zero-buffer
+            # samples, 91 of them asking for MPR.dll).
+            if self.api is None or self.api.load_api_handler(lib) is None:
+                return 0
 
         mod = self.load_module_by_name(lib)
 
@@ -2550,34 +2558,66 @@ class WindowsEmulator(BinaryEmulator):
 
         native_path = self.get_native_module_path(mod_name=name)
 
-        loader: PeLoader | ApiModuleLoader | DecoyLoader
-        if native_path:
-            loader = PeLoader(path=native_path, base_override=base, emu_path=emu_path)
-        else:
-            handler = self.api.load_api_handler(name) if self.api else None
-            if handler:
-                if name == "ntdll":
-                    nt_handler = self.api.load_api_handler("ntoskrnl") if self.api else None
-                    if nt_handler:
-                        handler._nt_handler = nt_handler
-                loader = ApiModuleLoader(
-                    name=name,
-                    api=handler,
-                    arch=self.get_arch(),
-                    base=base,
-                    emu_path=emu_path,
-                )
+        def _make_image(load_base):
+            """Build the module image at ``load_base`` (loader selection kept as-is)."""
+            loader: PeLoader | ApiModuleLoader | DecoyLoader
+            if native_path:
+                loader = PeLoader(path=native_path, base_override=load_base, emu_path=emu_path)
             else:
-                fallback_path = self.get_native_module_path(mod_name="default_exe")
-                if fallback_path:
-                    loader = PeLoader(path=fallback_path, base_override=base, emu_path=emu_path)
+                handler = self.api.load_api_handler(name) if self.api else None
+                if handler:
+                    if name == "ntdll":
+                        nt_handler = self.api.load_api_handler("ntoskrnl") if self.api else None
+                        if nt_handler:
+                            handler._nt_handler = nt_handler
+                    loader = ApiModuleLoader(
+                        name=name,
+                        api=handler,
+                        arch=self.get_arch(),
+                        base=load_base,
+                        emu_path=emu_path,
+                    )
                 else:
-                    loader = DecoyLoader(name=name, base=base, emu_path=emu_path, image_size=0x1000)
+                    fallback_path = self.get_native_module_path(mod_name="default_exe")
+                    if fallback_path:
+                        loader = PeLoader(path=fallback_path, base_override=load_base, emu_path=emu_path)
+                    else:
+                        loader = DecoyLoader(name=name, base=load_base, emu_path=emu_path, image_size=0x1000)
 
-        image = loader.make_image()
-        image.name = name
-        image.module_type = _module_type_from_path(emu_path)
+            image = loader.make_image()
+            image.name = name
+            image.module_type = _module_type_from_path(emu_path)
+            return image
+
+        image = _make_image(base)
+
+        # fixG: the default module base (0x6F000000) is also where the module
+        # group puts kernelbase, so every *new* synthesized module used to land
+        # on an address that is already taken. mem_map() then cannot honour the
+        # request and the following mem_write() raises UcError, which surfaced as
+        # "LoadLibrary returned 0" (and the sample exiting). Rebuild the image at
+        # a free base instead of failing the load.
+        if self._module_image_conflicts(image):
+            span = self._module_image_span(image)
+            free_base, _ = self.get_valid_ranges(span)
+            image = _make_image(free_base)
+
         return self.load_image(image)
+
+    def _module_image_conflicts(self, image):
+        """fixG: True when any region of a module image lands on mapped memory."""
+        for region in image.regions:
+            end = region.base + len(region.data)
+            if self.get_address_map(region.base) or self.get_address_map(max(region.base, end - 1)):
+                return True
+        return False
+
+    @staticmethod
+    def _module_image_span(image):
+        """fixG: page-aligned span covering all regions of a module image."""
+        low = min(r.base for r in image.regions)
+        high = max(r.base + len(r.data) for r in image.regions)
+        return max(high - low, image.image_size)
 
     # This will create a module from a file inside Speakeasy's
     # object manager. file_path is expected to point to a valid PE
