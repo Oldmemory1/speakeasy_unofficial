@@ -159,7 +159,16 @@ def normalize_dll_name(name):
     ret = name
 
     # Funnel CRTs into a single handler
-    if name.lower().startswith(("api-ms-win-crt", "vcruntime", "ucrtbased", "ucrtbase", "msvcr", "msvcp")):
+    # fixI: crtdll 是 VC4/5 时代的 CRT（= 老 MSVCRT），原先不在折叠表里，
+    # 于是 crtdll._XcptFilter / _initterm / malloc / memset ... 全部落到
+    # "无 handler" 分支（fixH 之前是 argc=0 的空操作；fixH 之后因为签名库里
+    # 也没有 CRT 内部函数，仍然拿不到参数与返回值）。
+    # 语料实测：1204 个样本里 46 个的导入表里有 crtdll，共 705 个导入函数，
+    # 其中 17+ 个 msvcrt 已经实现（_XcptFilter / _exit / _initterm / malloc /
+    # memset / free / operator new / ...）。
+    if name.lower().startswith(
+        ("api-ms-win-crt", "vcruntime", "ucrtbased", "ucrtbase", "msvcr", "msvcp", "crtdll")
+    ):
         ret = "msvcrt"
 
     # Redirect windows sockets 1.0 to windows sockets 2.0
