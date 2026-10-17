@@ -1005,6 +1005,29 @@ class Kernel32(api.ApiHandler):
         mm = emu.get_address_map(lpAddress)
         if mm and mm.tag and mm.tag.startswith(tag_prefix):
             buf = lpAddress
+            # fixK: MEM_COMMIT 覆盖一个**已提交**的区间时，Windows 仍会把
+            # flProtect 应用到 [lpAddress, lpAddress+dwSize)。旧实现只返回基址、
+            # 完全不改权限，于是"先 VirtualAlloc(1MB, PAGE_NOACCESS) 再
+            # VirtualAlloc(range, MEM_COMMIT, PAGE_READWRITE)"这种常见写法里，
+            # 目标区间仍是 NOACCESS，样本一写就触发 invalid_protect_write，
+            # run 直接结束（实测：12 个 wabot 样本全部死在 0x53ffc 的
+            # `mov dword ptr [eax], ecx`，而该地址就在它刚 commit 的 16KB 内）。
+            if dwSize and flProtect:
+                addr = lpAddress & 0xFFFFFFFFFFFFF000
+                size = dwSize & 0xFFFFFFFFFFFFF000
+                if dwSize & 0xFFF:
+                    size += 0x1000
+                end = min(addr + size, mm.base + mm.size)
+                size = max(end - addr, 0)
+                if size:
+                    try:
+                        new_perms = self.win_perms_to_emu_perms(flProtect)
+                        emu.mem_protect(addr, size, new_perms)
+                        mm.prot = new_perms
+                        mm.flags = flProtect
+                    except Exception:
+                        # 权限更新失败不应中断 API（样本后续自会触发访问违例）
+                        pass
         else:
             if dwSize:
                 if lpAddress:
@@ -2674,25 +2697,31 @@ class Kernel32(api.ApiHandler):
         """
         LPCH GetEnvironmentStrings();
         """
-        ctx = ctx or {}
+        # fixJ：这个 API 没有 A/W 后缀，旧实现调用 get_char_width(ctx) 会直接抛
+        # ApiEmuError（"Failed to get character width from function"）。
+        # 异常被全局 API hook 吞掉后返回 None，样本拿到 NULL 环境块 →
+        # 解引用空指针 → 访问违例 → ExitProcess(0xC0000005)。
+        # 实测：4 个 sfone 样本（0011b6ad4…/01994fec…/07fc6ede…/0d32453b…）
+        # 都在 GetEnvironmentStrings 之后崩溃，模拟只跑到 28 次调用。
+        # 另外旧实现把环境块拼成 "K V K V "（空格分隔、无 NUL），
+        # 不符合 Windows 的 "K=V\0K=V\0\0" 格式，这里一并修正。
+        return self._environment_block(emu, wide=False)
 
-        out = ""
-        fn = ctx["func_name"]
-        cw = self.get_char_width(ctx)
-        for k, v in emu.get_env().items():
-            out += f"{k} {v} "
+    @apihook("GetEnvironmentStringsW", argc=0)
+    def GetEnvironmentStringsW(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        LPWCH GetEnvironmentStringsW();
+        """
+        return self._environment_block(emu, wide=True)
 
-        out = out.strip()
-
-        env_ptr = self.mem_alloc((len(out) + 1) * cw, tag=f"api.environment.{fn}")
-
-        if cw == 2:
-            ev = out.encode("utf-16le")
-        elif cw == 1:
-            ev = out.encode("utf-8")
-
-        self.mem_write(env_ptr, ev)
-
+    def _environment_block(self, emu, wide: bool):
+        """构造 Windows 环境块：每个条目 ``K=V\\0``，末尾再补一个 ``\\0``（双 NUL 结尾）。"""
+        enc = "utf-16le" if wide else "utf-8"
+        terminator = b"\0\0" if wide else b"\0"
+        parts = [f"{k}={v}\0".encode(enc) for k, v in (emu.get_env() or {}).items()]
+        block = b"".join(parts) + terminator
+        env_ptr = self.mem_alloc(len(block), tag="api.environment")
+        self.mem_write(env_ptr, block)
         return env_ptr
 
     @apihook("FreeEnvironmentStrings", argc=1)
