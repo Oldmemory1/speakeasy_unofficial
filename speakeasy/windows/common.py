@@ -349,14 +349,20 @@ class _PeParser(pefile.PE):
         if not self.mapped_image:
             raise ValueError("PE image has not been mapped yet")
 
+        # fixP：旧实现对**每一个 import** 都复制一整张镜像
+        # （`tmp = bytearray(self.mapped_image)` → `self.mapped_image = bytes(tmp)`），
+        # 复杂度 O(导入数 × SizeOfImage)。大镜像样本因此加载极慢：
+        # 实测 04e004f9173e（SizeOfImage 214 MB、584 个导入）加载要 320 s，
+        # 04e004f9 这类样本在 1204 批里表现为"启动超时/0 调用"。
+        # 改成只建一次 bytearray、循环结束后统一写回 —— 语义完全等价。
+        tmp = bytearray(self.mapped_image)
         for addr, imp in self.imports.items():
-            tmp = bytearray(self.mapped_image)
             offset = addr - self.base
             tmp[offset : offset + self.ptr_size] = self.imp_id.to_bytes(self.ptr_size, "little")
-            self.mapped_image = bytes(tmp)
 
             self.import_table.update({self.imp_id: imp})
             self.imp_id += self.imp_step
+        self.mapped_image = bytes(tmp)
 
     def get_export_by_name(self, name):
         for exp in self.get_exports():
