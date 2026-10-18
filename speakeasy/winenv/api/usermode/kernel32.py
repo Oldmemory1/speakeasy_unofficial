@@ -6930,3 +6930,48 @@ class Kernel32(api.ApiHandler):
         """
         # Return a fake ATOM value. ATOMs are 16-bit identifiers.
         return 0x1234
+
+    # ── fixO：运行时高频但缺失的 kernel32 API ─────────────────────────
+    # 扫描 191 个已跑样本的运行轨迹：这些 API 被真实调用却没有 handler，
+    # 走签名兜底后返回值不可信（例如 GetConsoleOutputCP 返回 u32=0）。
+
+    @apihook("GetConsoleOutputCP", argc=0)
+    def GetConsoleOutputCP(self, emu, argv, ctx: api.ApiContext = None):
+        """UINT GetConsoleOutputCP();"""
+        return 437  # 美式英语代码页
+
+    @apihook("TryAcquireSRWLockExclusive", argc=1)
+    def TryAcquireSRWLockExclusive(self, emu, argv, ctx: api.ApiContext = None):
+        """BOOLEAN TryAcquireSRWLockExclusive(PSRWLOCK SRWLock);"""
+        return 1
+
+    @apihook("WriteConsoleA", argc=5)
+    def WriteConsoleA(self, emu, argv, ctx: api.ApiContext = None):
+        """BOOL WriteConsoleA(HANDLE, const VOID*, DWORD, LPDWORD, LPVOID);"""
+        buf, n_chars, p_written = argv[1], argv[2], argv[3]
+        if p_written:
+            self.mem_write(p_written, int(n_chars or 0).to_bytes(4, "little"))
+        argv[1] = buf
+        return 1
+
+    @apihook("WriteConsoleW", argc=5)
+    def WriteConsoleW(self, emu, argv, ctx: api.ApiContext = None):
+        """BOOL WriteConsoleW(HANDLE, const VOID*, DWORD, LPDWORD, LPVOID);"""
+        buf, n_chars, p_written = argv[1], argv[2], argv[3]
+        if p_written:
+            self.mem_write(p_written, int(n_chars or 0).to_bytes(4, "little"))
+        argv[1] = buf
+        return 1
+
+    @apihook("WritePrivateProfileStringA", argc=4)
+    def WritePrivateProfileStringA(self, emu, argv, ctx: api.ApiContext = None):
+        """BOOL WritePrivateProfileStringA(LPCSTR, LPCSTR, LPCSTR, LPCSTR);
+
+        语料里只有 13 个样本调用、每次 1 次；这里只回成功（不落盘）。
+        """
+        return 1
+
+    @apihook("WritePrivateProfileStringW", argc=4)
+    def WritePrivateProfileStringW(self, emu, argv, ctx: api.ApiContext = None):
+        """BOOL WritePrivateProfileStringW(LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR);"""
+        return 1

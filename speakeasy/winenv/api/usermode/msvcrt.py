@@ -2111,3 +2111,69 @@ class Msvcrt(api.ApiHandler):
             return SIG_IGN
         else:
             return SIG_ERR
+
+    # ── fixO：CRT 运行时缺口 ────────────────────────────────────────────
+    # 运行时扫描（191 个已跑样本）显示这些函数被真实调用但引擎没有 handler，
+    # 于是走签名兜底（指针型返回 0 → 调用方解引用崩溃；`abort`/`_amsg_exit`
+    # 不终止 → 样本在原地空转，实测 `_amsg_exit` 单样本被调用 21 853 次）。
+
+    @apihook("abort", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def abort(self, emu, argv, ctx: api.ApiContext = None):
+        """void abort(void);"""
+        self.exit_process()
+
+    @apihook("_amsg_exit", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _amsg_exit(self, emu, argv, ctx: api.ApiContext = None):
+        """void _amsg_exit(int rterrnum);"""
+        self.exit_process()
+
+    @apihook("atexit", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def atexit(self, emu, argv, ctx: api.ApiContext = None):
+        """int atexit(void (__cdecl *func)(void));"""
+        return 0
+
+    @apihook("setvbuf", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def setvbuf(self, emu, argv, ctx: api.ApiContext = None):
+        """int setvbuf(FILE *stream, char *buffer, int mode, size_t size);"""
+        return 0
+
+    @apihook("__iob_func", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __iob_func(self, emu, argv, ctx: api.ApiContext = None):
+        """FILE *__iob_func(void); —— 返回一段可写的伪 stdio 数组（3 个 FILE）。"""
+        ptr = self.mem_alloc(3 * 0x40, tag="api.msvcrt.iob")
+        return ptr
+
+    @apihook("__p__environ", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p__environ(self, emu, argv, ctx: api.ApiContext = None):
+        """char ***__p__environ(void);"""
+        return self._get_initial_narrow_environment(emu, [], None)
+
+    @apihook("getenv", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def getenv(self, emu, argv, ctx: api.ApiContext = None):
+        """char *getenv(const char *varname);"""
+        (name_ptr,) = argv
+        if not name_ptr:
+            return 0
+        try:
+            name = self.read_mem_string(name_ptr, 1)
+        except Exception:
+            return 0
+        env = emu.get_env() or {}
+        val = env.get(name.lower())
+        if val is None:
+            return 0
+        ptr = self.mem_alloc(len(str(val)) + 1, tag="api.msvcrt.getenv")
+        self.mem_write(ptr, (str(val) + "\x00").encode("utf-8"))
+        return ptr
+
+    @apihook("setlocale", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def setlocale(self, emu, argv, ctx: api.ApiContext = None):
+        """char *setlocale(int category, const char *locale);"""
+        ptr = self.mem_alloc(2, tag="api.msvcrt.setlocale")
+        self.mem_write(ptr, b"C\x00")
+        return ptr
+
+    @apihook("_ismbblead", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _ismbblead(self, emu, argv, ctx: api.ApiContext = None):
+        """int _ismbblead(unsigned int c); —— "C" locale 下恒为 0。"""
+        return 0

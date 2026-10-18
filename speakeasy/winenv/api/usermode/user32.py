@@ -1557,6 +1557,11 @@ class User32(api.ApiHandler):
         # We return success without writing anything unless needed.
         return 1
 
+    @apihook("SystemParametersInfoW", argc=4)
+    def SystemParametersInfoW(self, emu, argv, ctx: api.ApiContext = None):
+        """BOOL SystemParametersInfoW(UINT, UINT, PVOID, UINT);（fixO：W 变体）"""
+        return 1
+
     @apihook("GetKeyboardLayout", argc=1)
     def GetKeyboardLayout(self, emu, argv, ctx: api.ApiContext = None):
         """
