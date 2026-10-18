@@ -178,6 +178,14 @@ def normalize_dll_name(name):
     elif name.lower().startswith("api-ms-win-core"):
         ret = "kernel32"
 
+    # fixN：API set 前向 —— 语料里出现过的 8 个未折叠名字里，只有 security-*
+    # 在 advapi32 有对应实现（AllocateAndInitializeSid / GetTokenInformation /
+    # EqualSid / FreeSid / CheckTokenMembership）。其余（eventing / power-base /
+    # devices-config / shcore-taskpool）目标模块暂无 handler，折叠与否都不影响
+    # 解析结果，故不引入"看似映射、实则无实现"的噪声。
+    elif name.lower().startswith("api-ms-win-security"):
+        ret = "advapi32"
+
     return ret
 
 
