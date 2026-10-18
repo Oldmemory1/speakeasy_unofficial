@@ -1984,10 +1984,20 @@ class WindowsEmulator(BinaryEmulator):
                 self.enable_code_hook()
 
         else:
-            # Unsupported API: no speakeasy handler exists, so argc/call_conv
-            # must come from the hook itself. Only the last registered hook
-            # (FIFO-consistent: last = highest priority return value) is called
-            # because hooks may disagree on argc/call_conv.
+            # Unsupported API: no speakeasy handler exists. Only the last
+            # registered hook (FIFO-consistent: last = highest priority return
+            # value) is called because hooks may disagree on argc/call_conv.
+            #
+            # fixH: prefer the *declared signature* over the hook's own
+            # argc/call_conv. A wildcard hook (module="*", api_name="*", the
+            # shape the dynamic pipeline registers) carries argc=0/STDCALL, so
+            # taking argc from the hook silently disabled both
+            # emulate_api_from_signature() and the argument cleanup for every
+            # import without a built-in handler: the hook saw `args: []`,
+            # `ret: None` reached the sample, the callee's side effects never
+            # happened and do_call_return(0, ...) never popped the arguments.
+            sig = self.lookup_api_signature(dll, name)
+            ptr_size = self.get_ptr_size()
             hooks = self.get_api_hooks(dll, name)
             if hooks:
                 if len(hooks) > 1:
@@ -2000,22 +2010,48 @@ class WindowsEmulator(BinaryEmulator):
                 hook = hooks[-1]
                 imp_api = f"{dll}.{name}"
 
-                if hook.call_conv is None:
-                    hook.call_conv = _arch.CALL_CONV_STDCALL
+                if sig is not None:
+                    # The signature knows the real argc/call_conv.
+                    conv = (
+                        _arch.CALL_CONV_CDECL
+                        if sig.conv == sigdb.CONV_CDECL
+                        else _arch.CALL_CONV_STDCALL
+                    )
+                    argc = sig.slot_count(ptr_size)
+                else:
+                    if hook.call_conv is None:
+                        hook.call_conv = _arch.CALL_CONV_STDCALL
+                    conv = hook.call_conv
+                    argc = hook.argc
 
-                argv = self.get_func_argv(hook.call_conv, hook.argc)
-                self.hammer.handle_import_func(imp_api, hook.call_conv, hook.argc)
-                rv = hook.cb(self, imp_api, None, argv)
+                argv = self.get_func_argv(conv, argc)
+                self.hammer.handle_import_func(imp_api, conv, argc)
+
+                orig = None
+                if sig is not None:
+                    # Default implementation for the hook == what the engine
+                    # would have done on its own: zero-fill the out parameters
+                    # and return a type-appropriate "success" value.
+                    values = sig.values_from_slots(argv, ptr_size)
+                    self._zero_fill_out_params(sig, values, ptr_size)
+                    if sig.set_last_error:
+                        set_last_error = getattr(self, "set_last_error", None)
+                        if set_last_error:
+                            set_last_error(0)
+
+                    def orig(args, _sig=sig):
+                        return self._default_return_for_signature(_sig)
+
+                rv = hook.cb(self, imp_api, orig, argv)
                 ret = self.get_ret_address()
                 self.log_api(call_pc, imp_api, rv, argv)
-                self.do_call_return(hook.argc, ret, rv, conv=hook.call_conv)
+                self.do_call_return(argc, ret, rv, conv=conv)
                 if not self.run_complete:
                     self.enable_code_hook()
                 return
 
             # No handler and no user hook: fall back to the declared signature
             # so the call is at least traced and cleaned up correctly.
-            sig = self.lookup_api_signature(dll, name)
             if sig is not None:
                 self.emulate_api_from_signature(dll, name, sig, call_pc)
             elif self.config.modules.functions_always_exist:
