@@ -432,14 +432,7 @@ class User32(api.ApiHandler):
             # self.logger.info("unable to find resource string id %04X" % uID)
             return 0
 
-        if cw == 2:
-            encoded = s.encode("utf-16le")
-        elif cw == 1:
-            encoded = s.encode("utf-8")
-
-        size = int(len(encoded) / cw)
-
-        if size == 0:
+        if not s:
             # self.logger.debug("resource id %04X not found" % uID)
             return 0
 
@@ -447,16 +440,15 @@ class User32(api.ApiHandler):
             # Returning a pointer to the resource string is not supported without raw access
             return 0
 
-        if len(encoded) > ccBufferMax:
-            encoded = encoded[: ccBufferMax * cw]
+        # fixL：Windows 语义 —— 最多复制 cchBufferMax-1 个字符，末尾补 NUL；
+        # 返回值是**字符数**（不含 NUL），旧实现返回的是字节数（宽字符时是 2×）。
+        if len(s) >= ccBufferMax:
+            s = s[: max(ccBufferMax - 1, 0)]
 
-        emu.mem_write(lpBuffer, encoded)
-        if cw == 1:
-            argv[2] = s
-        else:
-            argv[2] = s
-
-        return len(encoded)
+        encoded = s.encode("utf-16le" if cw == 2 else "utf-8")
+        emu.mem_write(lpBuffer, encoded + b"\x00" * cw)
+        argv[2] = s
+        return len(s)
 
     @apihook("GetCursorPos", argc=1)
     def GetCursorPos(self, emu, argv, ctx: api.ApiContext = None):

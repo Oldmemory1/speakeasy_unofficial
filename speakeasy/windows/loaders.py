@@ -297,12 +297,17 @@ class PeLoader:
 
                     # Handle string table specifically for LoadString
                     if type_id == 6:  # RT_STRING
-                        if hasattr(resource_id, "directory"):
-                            for str_entry in resource_id.directory.entries:
-                                directory = getattr(str_entry, "directory", None)
-                                if hasattr(directory, "strings"):
-                                    for s_id, s_val in directory.strings.items():
-                                        pe_metadata.string_table[s_id] = s_val
+                        # fixL：pefile 把字符串表直接挂在 resource_id.directory.strings 上
+                        # （dict: 绝对字符串 ID → 文本）。旧实现又往下迭代了一层
+                        # （str_entry.directory.strings），那一层根本不存在 →
+                        # string_table 永远是空的 → user32.LoadString 对任何 ID 都返回 0。
+                        # 实测：698 次 LoadStringA/W 调用 100% 返回 0；样本 096bbaee5b75
+                        # 请求的 103/109 明明就在资源里。
+                        directory = getattr(resource_id, "directory", None)
+                        strings = getattr(directory, "strings", None)
+                        if isinstance(strings, dict):
+                            for s_id, s_val in strings.items():
+                                pe_metadata.string_table[s_id] = s_val
 
                     # Regular resource entry
                     if hasattr(resource_id, "directory"):
