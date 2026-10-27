@@ -979,8 +979,27 @@ class BinaryEmulator(MemoryManager, ABC):
             run = self.get_current_run()
             profiler.record_dyn_code_event(run, mm.tag, mm.base, mm.size)
 
-        for h in self.hooks.get(common.HOOK_DYN_CODE, []):
-            h.cb(mm)
+        # The legacy callback only receives the containing mapping. Preserve
+        # the exact triggering address transiently so callers can calculate a
+        # correct entry offset for mappings that are larger than one page.
+        missing = object()
+        previous = getattr(mm, "execution_address", missing)
+        previous_caller = getattr(mm, "execution_caller_address", missing)
+        caller_address = getattr(self, "_dyn_code_caller_pc", None)
+        mm.execution_address = addr
+        mm.execution_caller_address = caller_address
+        try:
+            for h in self.hooks.get(common.HOOK_DYN_CODE, []):
+                h.cb(mm)
+        finally:
+            if previous is missing:
+                del mm.execution_address
+            else:
+                mm.execution_address = previous
+            if previous_caller is missing:
+                del mm.execution_caller_address
+            else:
+                mm.execution_caller_address = previous_caller
 
     def _set_dyn_code_hook(self, addr, size):
         """

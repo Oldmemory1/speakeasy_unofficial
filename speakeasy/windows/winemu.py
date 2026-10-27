@@ -134,6 +134,7 @@ class WindowsEmulator(BinaryEmulator):
         self.run_complete: bool = False
         self.emu_complete: bool = False
         self.instruction_budget_exhausted: bool = False
+        self._dyn_code_caller_pc: int | None = None
         self.global_data: dict[str, Any] = {}
         self.processes: list[Any] = []
         # Child processes created by calls to CreateProcess
@@ -2485,6 +2486,11 @@ class WindowsEmulator(BinaryEmulator):
                 self.handle_import_func(mod_name, fn)
                 return True
 
+            self._dyn_code_caller_pc = (
+                self.prev_pc
+                if self.prev_pc and self.prev_pc != addr
+                else None
+            )
             self.prev_pc = addr
             self.curr_run.instr_cnt += 1  # type: ignore[union-attr]
 
