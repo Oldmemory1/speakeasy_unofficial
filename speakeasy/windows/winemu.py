@@ -133,6 +133,7 @@ class WindowsEmulator(BinaryEmulator):
 
         self.run_complete: bool = False
         self.emu_complete: bool = False
+        self.instruction_budget_exhausted: bool = False
         self.global_data: dict[str, Any] = {}
         self.processes: list[Any] = []
         # Child processes created by calls to CreateProcess
@@ -631,6 +632,19 @@ class WindowsEmulator(BinaryEmulator):
                 should_execute = debugger is None or debugger.begin_run(debug_action)
                 if should_execute:
                     self.emu_eng.start(resume_addr, timeout=timeout, count=instruction_count)  # type: ignore[union-attr]
+                if (
+                    debugger is None
+                    and should_execute
+                    and self.config.max_instructions != -1
+                    and self.curr_run is not None
+                    and self.curr_run.error is None
+                    and not self.run_queue
+                    and self.get_pc() not in (self.return_hook, self.exit_hook)
+                ):
+                    # Unicorn's instruction-count stop is not otherwise
+                    # distinguishable from a normal run returning to the
+                    # emulator after the Run object has been completed.
+                    self.instruction_budget_exhausted = True
                 if debugger is not None:
                     stop_reason = debugger.finish_run(debug_action)
                     if stop_reason is not None:
@@ -1968,7 +1982,7 @@ class WindowsEmulator(BinaryEmulator):
             mm = self.get_address_map(ret)
 
             # Is this function being called from a dynamcially allocated memory segment?
-            if mm and "virtualalloc" in mm.tag.lower():
+            if mm and "virtualalloc" in (mm.tag or "").lower():
                 self._fire_dyn_code_hooks(ret)
 
             # Log the API args and return value
@@ -2448,6 +2462,7 @@ class WindowsEmulator(BinaryEmulator):
         """
         try:
             if self.config.max_instructions != -1 and self.curr_run.instr_cnt >= self.config.max_instructions:  # type: ignore[union-attr]
+                self.instruction_budget_exhausted = True
                 self.on_run_complete()
                 return False
 
