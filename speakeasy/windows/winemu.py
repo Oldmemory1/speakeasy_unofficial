@@ -2604,7 +2604,8 @@ class WindowsEmulator(BinaryEmulator):
         if existing:
             return existing.base
 
-        if not self.config.modules.modules_always_exist:
+        native_path = self.get_native_module_path(mod_name=lib)
+        if not self.config.modules.modules_always_exist and not native_path:
             # fixG: allow on-demand synthesis when the engine actually knows this
             # module (kernel32/user32/msvcrt/... and also mpr/comdlg32/atl/...).
             # On a real Windows host these system DLLs exist, so failing
@@ -2618,7 +2619,7 @@ class WindowsEmulator(BinaryEmulator):
         mod = self.load_module_by_name(lib)
 
         proc = self.get_current_process()
-        if self.get_address_map(proc.peb_ldr_data.address):
+        if proc and self.get_address_map(proc.peb_ldr_data.address):
             proc.add_module_to_peb(mod)
 
         return mod.base
