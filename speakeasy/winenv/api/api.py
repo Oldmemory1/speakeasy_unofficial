@@ -1,6 +1,7 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import logging
+from typing import Any
 
 import speakeasy.windows.common as winemu
 import speakeasy.winenv.arch as _arch
@@ -12,7 +13,7 @@ from speakeasy.struct import EmuStruct
 
 logger = logging.getLogger(__name__)
 
-ApiContext = dict[str, str] | None
+ApiContext = dict[str, Any] | None
 
 
 class ApiHandler:

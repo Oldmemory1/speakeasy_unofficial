@@ -1,5 +1,6 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+import logging
 from typing import Any
 
 import speakeasy.windows.sessman as sessman
@@ -8,6 +9,8 @@ import speakeasy.winenv.defs.windows.user32 as windefs
 import speakeasy.winenv.defs.windows.windef as windef
 
 from .. import api
+
+logger = logging.getLogger(__name__)
 
 IDCANCEL = 2
 
@@ -23,6 +26,316 @@ IDI_WARNING = 32515
 IDI_WINLOGO = 32517
 
 UOI_FLAGS = 1
+
+# GetSystemMetrics selectors. Values follow WinUser.h.
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
+SM_CXVSCROLL = 2
+SM_CYHSCROLL = 3
+SM_CYCAPTION = 4
+SM_CXBORDER = 5
+SM_CYBORDER = 6
+SM_CXDLGFRAME = 7
+SM_CYDLGFRAME = 8
+SM_CYVTHUMB = 9
+SM_CXHTHUMB = 10
+SM_CXICON = 11
+SM_CYICON = 12
+SM_CXCURSOR = 13
+SM_CYCURSOR = 14
+SM_CYMENU = 15
+SM_CXFULLSCREEN = 16
+SM_CYFULLSCREEN = 17
+SM_CYKANJIWINDOW = 18
+SM_MOUSEPRESENT = 19
+SM_CYVSCROLL = 20
+SM_CXHSCROLL = 21
+SM_DEBUG = 22
+SM_SWAPBUTTON = 23
+SM_CXMIN = 28
+SM_CYMIN = 29
+SM_CXSIZE = 30
+SM_CYSIZE = 31
+SM_CXFRAME = 32
+SM_CYFRAME = 33
+SM_CXMINTRACK = 34
+SM_CYMINTRACK = 35
+SM_CXDOUBLECLK = 36
+SM_CYDOUBLECLK = 37
+SM_CXICONSPACING = 38
+SM_CYICONSPACING = 39
+SM_MENUDROPALIGNMENT = 40
+SM_PENWINDOWS = 41
+SM_DBCSENABLED = 42
+SM_CMOUSEBUTTONS = 43
+SM_SECURE = 44
+SM_CXEDGE = 45
+SM_CYEDGE = 46
+SM_CXMINSPACING = 47
+SM_CYMINSPACING = 48
+SM_CXSMICON = 49
+SM_CYSMICON = 50
+SM_CYSMCAPTION = 51
+SM_CXSMSIZE = 52
+SM_CYSMSIZE = 53
+SM_CXMENUSIZE = 54
+SM_CYMENUSIZE = 55
+SM_ARRANGE = 56
+SM_CXMINIMIZED = 57
+SM_CYMINIMIZED = 58
+SM_CXMAXTRACK = 59
+SM_CYMAXTRACK = 60
+SM_CXMAXIMIZED = 61
+SM_CYMAXIMIZED = 62
+SM_NETWORK = 63
+SM_CLEANBOOT = 67
+SM_CXDRAG = 68
+SM_CYDRAG = 69
+SM_SHOWSOUNDS = 70
+SM_CXMENUCHECK = 71
+SM_CYMENUCHECK = 72
+SM_SLOWMACHINE = 73
+SM_MIDEASTENABLED = 74
+SM_MOUSEWHEELPRESENT = 75
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+SM_CMONITORS = 80
+SM_SAMEDISPLAYFORMAT = 81
+SM_IMMENABLED = 82
+SM_CXFOCUSBORDER = 83
+SM_CYFOCUSBORDER = 84
+SM_TABLETPC = 86
+SM_MEDIACENTER = 87
+SM_STARTER = 88
+SM_SERVERR2 = 89
+SM_MOUSEHORIZONTALWHEELPRESENT = 91
+SM_CXPADDEDBORDER = 92
+SM_DIGITIZER = 94
+SM_MAXIMUMTOUCHES = 95
+SM_SHUTTINGDOWN = 8192
+SM_REMOTECONTROL = 8193
+SM_CONVERTIBLESLATEMODE = 8195
+SM_SYSTEMDOCKED = 8196
+SM_REMOTESESSION = 4096
+
+SYSTEM_METRIC_NAMES = {
+    SM_CXSCREEN: "SM_CXSCREEN",
+    SM_CYSCREEN: "SM_CYSCREEN",
+    SM_CXVSCROLL: "SM_CXVSCROLL",
+    SM_CYHSCROLL: "SM_CYHSCROLL",
+    SM_CYCAPTION: "SM_CYCAPTION",
+    SM_CXBORDER: "SM_CXBORDER",
+    SM_CYBORDER: "SM_CYBORDER",
+    SM_CXDLGFRAME: "SM_CXFIXEDFRAME",
+    SM_CYDLGFRAME: "SM_CYFIXEDFRAME",
+    SM_CYVTHUMB: "SM_CYVTHUMB",
+    SM_CXHTHUMB: "SM_CXHTHUMB",
+    SM_CXICON: "SM_CXICON",
+    SM_CYICON: "SM_CYICON",
+    SM_CXCURSOR: "SM_CXCURSOR",
+    SM_CYCURSOR: "SM_CYCURSOR",
+    SM_CYMENU: "SM_CYMENU",
+    SM_CXFULLSCREEN: "SM_CXFULLSCREEN",
+    SM_CYFULLSCREEN: "SM_CYFULLSCREEN",
+    SM_CYKANJIWINDOW: "SM_CYKANJIWINDOW",
+    SM_MOUSEPRESENT: "SM_MOUSEPRESENT",
+    SM_CYVSCROLL: "SM_CYVSCROLL",
+    SM_CXHSCROLL: "SM_CXHSCROLL",
+    SM_DEBUG: "SM_DEBUG",
+    SM_SWAPBUTTON: "SM_SWAPBUTTON",
+    SM_CXMIN: "SM_CXMIN",
+    SM_CYMIN: "SM_CYMIN",
+    SM_CXSIZE: "SM_CXSIZE",
+    SM_CYSIZE: "SM_CYSIZE",
+    SM_CXFRAME: "SM_CXSIZEFRAME",
+    SM_CYFRAME: "SM_CYSIZEFRAME",
+    SM_CXMINTRACK: "SM_CXMINTRACK",
+    SM_CYMINTRACK: "SM_CYMINTRACK",
+    SM_CXDOUBLECLK: "SM_CXDOUBLECLK",
+    SM_CYDOUBLECLK: "SM_CYDOUBLECLK",
+    SM_CXICONSPACING: "SM_CXICONSPACING",
+    SM_CYICONSPACING: "SM_CYICONSPACING",
+    SM_MENUDROPALIGNMENT: "SM_MENUDROPALIGNMENT",
+    SM_PENWINDOWS: "SM_PENWINDOWS",
+    SM_DBCSENABLED: "SM_DBCSENABLED",
+    SM_CMOUSEBUTTONS: "SM_CMOUSEBUTTONS",
+    SM_SECURE: "SM_SECURE",
+    SM_CXEDGE: "SM_CXEDGE",
+    SM_CYEDGE: "SM_CYEDGE",
+    SM_CXMINSPACING: "SM_CXMINSPACING",
+    SM_CYMINSPACING: "SM_CYMINSPACING",
+    SM_CXSMICON: "SM_CXSMICON",
+    SM_CYSMICON: "SM_CYSMICON",
+    SM_CYSMCAPTION: "SM_CYSMCAPTION",
+    SM_CXSMSIZE: "SM_CXSMSIZE",
+    SM_CYSMSIZE: "SM_CYSMSIZE",
+    SM_CXMENUSIZE: "SM_CXMENUSIZE",
+    SM_CYMENUSIZE: "SM_CYMENUSIZE",
+    SM_ARRANGE: "SM_ARRANGE",
+    SM_CXMINIMIZED: "SM_CXMINIMIZED",
+    SM_CYMINIMIZED: "SM_CYMINIMIZED",
+    SM_CXMAXTRACK: "SM_CXMAXTRACK",
+    SM_CYMAXTRACK: "SM_CYMAXTRACK",
+    SM_CXMAXIMIZED: "SM_CXMAXIMIZED",
+    SM_CYMAXIMIZED: "SM_CYMAXIMIZED",
+    SM_NETWORK: "SM_NETWORK",
+    SM_CLEANBOOT: "SM_CLEANBOOT",
+    SM_CXDRAG: "SM_CXDRAG",
+    SM_CYDRAG: "SM_CYDRAG",
+    SM_SHOWSOUNDS: "SM_SHOWSOUNDS",
+    SM_CXMENUCHECK: "SM_CXMENUCHECK",
+    SM_CYMENUCHECK: "SM_CYMENUCHECK",
+    SM_SLOWMACHINE: "SM_SLOWMACHINE",
+    SM_MIDEASTENABLED: "SM_MIDEASTENABLED",
+    SM_MOUSEWHEELPRESENT: "SM_MOUSEWHEELPRESENT",
+    SM_XVIRTUALSCREEN: "SM_XVIRTUALSCREEN",
+    SM_YVIRTUALSCREEN: "SM_YVIRTUALSCREEN",
+    SM_CXVIRTUALSCREEN: "SM_CXVIRTUALSCREEN",
+    SM_CYVIRTUALSCREEN: "SM_CYVIRTUALSCREEN",
+    SM_CMONITORS: "SM_CMONITORS",
+    SM_SAMEDISPLAYFORMAT: "SM_SAMEDISPLAYFORMAT",
+    SM_IMMENABLED: "SM_IMMENABLED",
+    SM_CXFOCUSBORDER: "SM_CXFOCUSBORDER",
+    SM_CYFOCUSBORDER: "SM_CYFOCUSBORDER",
+    SM_TABLETPC: "SM_TABLETPC",
+    SM_MEDIACENTER: "SM_MEDIACENTER",
+    SM_STARTER: "SM_STARTER",
+    SM_SERVERR2: "SM_SERVERR2",
+    SM_MOUSEHORIZONTALWHEELPRESENT: "SM_MOUSEHORIZONTALWHEELPRESENT",
+    SM_CXPADDEDBORDER: "SM_CXPADDEDBORDER",
+    SM_DIGITIZER: "SM_DIGITIZER",
+    SM_MAXIMUMTOUCHES: "SM_MAXIMUMTOUCHES",
+    SM_SHUTTINGDOWN: "SM_SHUTTINGDOWN",
+    SM_REMOTECONTROL: "SM_REMOTECONTROL",
+    SM_CONVERTIBLESLATEMODE: "SM_CONVERTIBLESLATEMODE",
+    SM_SYSTEMDOCKED: "SM_SYSTEMDOCKED",
+    SM_REMOTESESSION: "SM_REMOTESESSION",
+}
+
+
+def _ui_metric(ui: Any, name: str, default: int) -> int:
+    if isinstance(ui, dict):
+        value = ui.get(name, default)
+    else:
+        value = getattr(ui, name, default)
+    return int(value)
+
+
+def resolve_system_metric(n_index: int, ui: Any = None) -> tuple[int, str | None, bool]:
+    """Resolve a GetSystemMetrics selector to a profile-backed Windows value."""
+    width = max(1, _ui_metric(ui, "screen_width", 1024))
+    height = max(1, _ui_metric(ui, "screen_height", 768))
+    monitor_count = max(1, _ui_metric(ui, "monitor_count", 1))
+    mouse_present = _ui_metric(ui, "mouse_present", 1)
+    mouse_buttons = _ui_metric(ui, "mouse_buttons", 3)
+    mouse_wheel_present = _ui_metric(ui, "mouse_wheel_present", 1)
+    horizontal_wheel_present = _ui_metric(ui, "horizontal_wheel_present", 1)
+    clean_boot = _ui_metric(ui, "clean_boot", 0)
+    remote_session = _ui_metric(ui, "remote_session", 0)
+    remote_control = _ui_metric(ui, "remote_control", 0)
+    swap_buttons = _ui_metric(ui, "swap_buttons", 0)
+    secure = _ui_metric(ui, "secure", 0)
+
+    values = {
+        SM_CXSCREEN: width,
+        SM_CYSCREEN: height,
+        SM_CXVSCROLL: 17,
+        SM_CYHSCROLL: 17,
+        SM_CYCAPTION: 23,
+        SM_CXBORDER: 1,
+        SM_CYBORDER: 1,
+        SM_CXDLGFRAME: 3,
+        SM_CYDLGFRAME: 3,
+        SM_CYVTHUMB: 17,
+        SM_CXHTHUMB: 17,
+        SM_CXICON: 32,
+        SM_CYICON: 32,
+        SM_CXCURSOR: 32,
+        SM_CYCURSOR: 32,
+        SM_CYMENU: 19,
+        SM_CXFULLSCREEN: width,
+        SM_CYFULLSCREEN: height,
+        SM_CYKANJIWINDOW: 0,
+        SM_MOUSEPRESENT: mouse_present,
+        SM_CYVSCROLL: 17,
+        SM_CXHSCROLL: 17,
+        SM_DEBUG: 0,
+        SM_SWAPBUTTON: swap_buttons,
+        SM_CXMIN: 112,
+        SM_CYMIN: 27,
+        SM_CXSIZE: 30,
+        SM_CYSIZE: 30,
+        SM_CXFRAME: 8,
+        SM_CYFRAME: 8,
+        SM_CXMINTRACK: 112,
+        SM_CYMINTRACK: 27,
+        SM_CXDOUBLECLK: 4,
+        SM_CYDOUBLECLK: 4,
+        SM_CXICONSPACING: 75,
+        SM_CYICONSPACING: 75,
+        SM_MENUDROPALIGNMENT: 0,
+        SM_PENWINDOWS: 0,
+        SM_DBCSENABLED: 0,
+        SM_CMOUSEBUTTONS: mouse_buttons,
+        SM_SECURE: secure,
+        SM_CXEDGE: 2,
+        SM_CYEDGE: 2,
+        SM_CXMINSPACING: 160,
+        SM_CYMINSPACING: 24,
+        SM_CXSMICON: 16,
+        SM_CYSMICON: 16,
+        SM_CYSMCAPTION: 17,
+        SM_CXSMSIZE: 16,
+        SM_CYSMSIZE: 16,
+        SM_CXMENUSIZE: 20,
+        SM_CYMENUSIZE: 20,
+        SM_ARRANGE: 0,
+        SM_CXMINIMIZED: 160,
+        SM_CYMINIMIZED: 24,
+        SM_CXMAXTRACK: width + 8,
+        SM_CYMAXTRACK: height + 8,
+        SM_CXMAXIMIZED: width,
+        SM_CYMAXIMIZED: height,
+        SM_NETWORK: 1,
+        SM_CLEANBOOT: clean_boot,
+        SM_CXDRAG: 4,
+        SM_CYDRAG: 4,
+        SM_SHOWSOUNDS: 0,
+        SM_CXMENUCHECK: 13,
+        SM_CYMENUCHECK: 13,
+        SM_SLOWMACHINE: 0,
+        SM_MIDEASTENABLED: 0,
+        SM_MOUSEWHEELPRESENT: mouse_wheel_present,
+        SM_XVIRTUALSCREEN: 0,
+        SM_YVIRTUALSCREEN: 0,
+        SM_CXVIRTUALSCREEN: width,
+        SM_CYVIRTUALSCREEN: height,
+        SM_CMONITORS: monitor_count,
+        SM_SAMEDISPLAYFORMAT: 1,
+        SM_IMMENABLED: 1,
+        SM_CXFOCUSBORDER: 1,
+        SM_CYFOCUSBORDER: 1,
+        SM_TABLETPC: 0,
+        SM_MEDIACENTER: 0,
+        SM_STARTER: 0,
+        SM_SERVERR2: 0,
+        SM_MOUSEHORIZONTALWHEELPRESENT: horizontal_wheel_present,
+        SM_CXPADDEDBORDER: 0,
+        SM_DIGITIZER: 0,
+        SM_MAXIMUMTOUCHES: 0,
+        SM_SHUTTINGDOWN: 0,
+        SM_REMOTECONTROL: remote_control,
+        SM_CONVERTIBLESLATEMODE: 0,
+        SM_SYSTEMDOCKED: 1,
+        SM_REMOTESESSION: remote_session,
+    }
+
+    metric_name = SYSTEM_METRIC_NAMES.get(n_index)
+    if metric_name is None:
+        return 0, None, False
+    return values[n_index], metric_name, True
 
 
 class User32(api.ApiHandler):
@@ -498,10 +811,35 @@ class User32(api.ApiHandler):
         );
         """
 
-        (nIndex,) = argv
+        (n_index,) = argv
 
-        rv = 1
-        return rv
+        ui = getattr(getattr(emu, "config", None), "ui", None)
+        value, metric_name, known = resolve_system_metric(n_index, ui)
+
+        if not known:
+            logger.warning("GetSystemMetrics received unknown selector 0x%x; returning 0", n_index)
+
+        if ctx is not None:
+            profile = getattr(ui, "profile", ui.get("profile") if isinstance(ui, dict) else "normal")
+            observation: dict[str, Any] = {
+                "kind": "system_metric",
+                "selector": n_index,
+                "metric": metric_name,
+                "value": value,
+                "known": known,
+                "profile": profile,
+            }
+            if metric_name == "SM_CLEANBOOT":
+                observation["interpretation"] = {
+                    0: "normal_boot",
+                    1: "safe_mode",
+                    2: "safe_mode_with_networking",
+                }.get(value, "invalid_clean_boot_value")
+            elif metric_name == "SM_REMOTESESSION":
+                observation["interpretation"] = "remote_session" if value else "local_session"
+            ctx["_api_observation"] = observation
+
+        return value
 
     @apihook("LoadBitmap", argc=2)
     def LoadBitmap(self, emu, argv, ctx: api.ApiContext = None):

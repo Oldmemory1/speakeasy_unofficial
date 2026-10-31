@@ -1,4 +1,4 @@
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Discriminator, Field
 
@@ -119,6 +119,14 @@ class ApiEvent(Event):
         description=(
             "Formatted return value for the API call, when available.\n\n"
             "Use this to identify failure codes and branch-driving outcomes."
+        ),
+    )
+    observation: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional semantic interpretation of this API result.\n\n"
+            "For environment APIs, may include the selector, resolved value, "
+            "profile, and whether the selector was known."
         ),
     )
 

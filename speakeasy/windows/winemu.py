@@ -1771,7 +1771,15 @@ class WindowsEmulator(BinaryEmulator):
             return f'"{arg}"'  # type: ignore[str-bytes-safe]
         return ""
 
-    def log_api(self, pc: int, imp_api: str, rv: int | None, argv: list[Any], display: list[str] | None = None) -> None:
+    def log_api(
+        self,
+        pc: int,
+        imp_api: str,
+        rv: int | None,
+        argv: list[Any],
+        display: list[str] | None = None,
+        event_context: dict[str, Any] | None = None,
+    ) -> None:
         """
         Log an API call and record it with the profiler. ``display`` optionally
         supplies a pre-rendered string per argument (used when parameter names
@@ -1787,7 +1795,16 @@ class WindowsEmulator(BinaryEmulator):
             tid = self.curr_thread.tid if self.curr_thread else 0
             pid = self.curr_process.id if self.curr_process else 0
             pos = TracePosition(tick=tick, tid=tid, pid=pid, pc=pc)
-            self.profiler.record_api_event(self.curr_run, pos, imp_api, rv, argv, display=display)
+            observation = event_context.get("_api_observation") if event_context else None
+            self.profiler.record_api_event(
+                self.curr_run,
+                pos,
+                imp_api,
+                rv,
+                argv,
+                display=display,
+                observation=observation if isinstance(observation, dict) else None,
+            )
 
     def get_signature_db(self) -> sigdb.SignatureDatabase:
         """
@@ -1989,7 +2006,7 @@ class WindowsEmulator(BinaryEmulator):
                 self._fire_dyn_code_hooks(ret)
 
             # Log the API args and return value
-            self.log_api(call_pc, imp_api, rv, argv)
+            self.log_api(call_pc, imp_api, rv, argv, event_context=default_ctx)
 
             if not self.run_complete and ret == oret and pc == opc:
                 self.do_call_return(argc, ret, rv, conv=conv)

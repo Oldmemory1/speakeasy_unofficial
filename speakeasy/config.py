@@ -5,6 +5,69 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+WINDOWS_UI_PROFILES = {
+    "normal": {
+        "profile": "normal",
+        "clean_boot": 0,
+        "remote_session": 0,
+        "remote_control": 0,
+        "screen_width": 1024,
+        "screen_height": 768,
+        "monitor_count": 1,
+        "mouse_present": 1,
+        "mouse_buttons": 3,
+        "mouse_wheel_present": 1,
+        "horizontal_wheel_present": 1,
+        "swap_buttons": 0,
+        "secure": 0,
+    },
+    "safe_mode": {
+        "profile": "safe_mode",
+        "clean_boot": 1,
+        "remote_session": 0,
+        "remote_control": 0,
+        "screen_width": 1024,
+        "screen_height": 768,
+        "monitor_count": 1,
+        "mouse_present": 1,
+        "mouse_buttons": 3,
+        "mouse_wheel_present": 1,
+        "horizontal_wheel_present": 1,
+        "swap_buttons": 0,
+        "secure": 0,
+    },
+    "remote_session": {
+        "profile": "remote_session",
+        "clean_boot": 0,
+        "remote_session": 1,
+        "remote_control": 0,
+        "screen_width": 1024,
+        "screen_height": 768,
+        "monitor_count": 1,
+        "mouse_present": 1,
+        "mouse_buttons": 3,
+        "mouse_wheel_present": 1,
+        "horizontal_wheel_present": 1,
+        "swap_buttons": 0,
+        "secure": 0,
+    },
+    "custom": {
+        "profile": "custom",
+        "clean_boot": 0,
+        "remote_session": 0,
+        "remote_control": 0,
+        "screen_width": 1024,
+        "screen_height": 768,
+        "monitor_count": 1,
+        "mouse_present": 1,
+        "mouse_buttons": 3,
+        "mouse_wheel_present": 1,
+        "horizontal_wheel_present": 1,
+        "swap_buttons": 0,
+        "secure": 0,
+    },
+}
+
 DEFAULT_CONFIG_DATA = {
     "config_version": 0.2,
     "description": "Default emulation profile to use when not overridden by user",
@@ -32,6 +95,7 @@ DEFAULT_CONFIG_DATA = {
     "domain": "speakeasy_domain",
     "hostname": "speakeasy_host",
     "user": {"name": "speakeasy_user", "is_admin": True, "sid": "S-1-5-21-1111111111-2222222222-3333333333-1001"},
+    "ui": WINDOWS_UI_PROFILES["normal"],
     "api_hammering": {"enabled": False, "threshold": 2000},
     "symlinks": [
         {"name": "\\??\\C:", "target": "\\Device\\HarddiskVolume1"},
@@ -283,6 +347,49 @@ class UserConfig(BaseModel):
     name: str = Field(description="Username exposed to account and profile APIs.")
     is_admin: bool = Field(default=False, description="Expose elevated privileges to admin checks.")
     sid: str | None = Field(default=None, description="Optional explicit SID for the emulated user.")
+
+
+class UiConfig(BaseModel):
+    """System-metric values exposed to user-mode Windows APIs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    profile: Literal["normal", "safe_mode", "remote_session", "custom"] = Field(
+        default="normal",
+        description="Named UI environment profile. Use custom when overriding metric values explicitly.",
+    )
+    clean_boot: int = Field(
+        default=0,
+        ge=0,
+        le=2,
+        description="SM_CLEANBOOT value: 0 normal boot, 1 safe mode, 2 safe mode with networking.",
+    )
+    remote_session: int = Field(
+        default=0,
+        ge=0,
+        le=1,
+        description="SM_REMOTESESSION value: 0 local console session, 1 remote session.",
+    )
+    remote_control: int = Field(
+        default=0,
+        ge=0,
+        le=1,
+        description="SM_REMOTECONTROL value exposed to session-detection code.",
+    )
+    screen_width: int = Field(default=1024, ge=1, description="SM_CXSCREEN value.")
+    screen_height: int = Field(default=768, ge=1, description="SM_CYSCREEN value.")
+    monitor_count: int = Field(default=1, ge=1, description="SM_CMONITORS value.")
+    mouse_present: int = Field(default=1, ge=0, le=1, description="SM_MOUSEPRESENT value.")
+    mouse_buttons: int = Field(default=3, ge=0, description="SM_CMOUSEBUTTONS value.")
+    mouse_wheel_present: int = Field(default=1, ge=0, le=1, description="SM_MOUSEWHEELPRESENT value.")
+    horizontal_wheel_present: int = Field(
+        default=1,
+        ge=0,
+        le=1,
+        description="SM_MOUSEHORIZONTALWHEELPRESENT value.",
+    )
+    swap_buttons: int = Field(default=0, ge=0, le=1, description="SM_SWAPBUTTON value.")
+    secure: int = Field(default=0, ge=0, le=1, description="SM_SECURE value.")
 
 
 class ApiHammeringConfig(BaseModel):
@@ -586,6 +693,10 @@ class SpeakeasyConfig(BaseModel):
         default_factory=lambda: UserConfig.model_validate(_copy_default_value("user")),
         description="Primary emulated user account.",
     )
+    ui: UiConfig = Field(
+        default_factory=lambda: UiConfig.model_validate(_copy_default_value("ui")),
+        description="Selector-aware Windows UI and system-metric environment.",
+    )
     api_hammering: ApiHammeringConfig | None = Field(
         default_factory=lambda: ApiHammeringConfig.model_validate(_copy_default_value("api_hammering")),
         description="API hammering mitigation settings.",
@@ -630,3 +741,13 @@ def get_default_config() -> SpeakeasyConfig:
 
 def get_default_config_dict() -> dict[str, Any]:
     return model_to_dict(get_default_config())
+
+
+def get_windows_ui_profile(name: str) -> dict[str, Any]:
+    """Return a complete, independent Windows UI profile for A/B emulation."""
+    try:
+        profile = WINDOWS_UI_PROFILES[name]
+    except KeyError as err:
+        choices = ", ".join(sorted(WINDOWS_UI_PROFILES))
+        raise ValueError(f"Unknown Windows UI profile {name!r}; expected one of: {choices}") from err
+    return copy.deepcopy(profile)

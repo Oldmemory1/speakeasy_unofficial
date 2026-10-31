@@ -232,6 +232,7 @@ class Profiler:
         ret: int | None,
         argv: list[Any],
         display: list[str] | None = None,
+        observation: dict[str, Any] | None = None,
     ) -> None:
         """
         Log a call to an OS API. This includes arguments, return address, and return value.
@@ -261,6 +262,7 @@ class Profiler:
             api_name=name,
             args=args,
             ret_val=ret_str,
+            observation=observation,
         )
 
         recent_events = [e for e in run.events[-3:] if isinstance(e, ApiEvent)]

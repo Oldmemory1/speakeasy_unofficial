@@ -52,6 +52,34 @@ The example below is JSONC (JSON with comments). Remove comment lines for machin
     "coverage": false
   },
 
+  // Environment values returned by GetSystemMetrics.
+  // Use get_windows_ui_profile("safe_mode") or
+  // get_windows_ui_profile("remote_session") for controlled A/B runs.
+  "ui": {
+    // "normal", "safe_mode", "remote_session", or "custom".
+    "profile": "normal",
+
+    // 0 = normal boot, 1 = safe mode, 2 = safe mode with networking.
+    "clean_boot": 0,
+
+    // Remote-session and remote-control indicators.
+    "remote_session": 0,
+    "remote_control": 0,
+
+    // Desktop geometry and monitor behavior.
+    "screen_width": 1024,
+    "screen_height": 768,
+    "monitor_count": 1,
+
+    // Mouse and secure-desktop indicators.
+    "mouse_present": 1,
+    "mouse_buttons": 3,
+    "mouse_wheel_present": 1,
+    "horizontal_wheel_present": 1,
+    "swap_buttons": 0,
+    "secure": 0
+  },
+
   // If true, frees do not immediately remove memory maps.
   // Useful when you want to inspect post-free data artifacts.
   "keep_memory_on_free": false,
