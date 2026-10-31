@@ -38,7 +38,6 @@ class Urlmon(api.ApiHandler):
         rv = windefs.ERROR_SUCCESS
 
         cw = self.get_char_width(ctx)
-
         if szURL:
             url = self.read_mem_string(szURL, cw)
             argv[1] = url
@@ -70,7 +69,6 @@ class Urlmon(api.ApiHandler):
         pCaller, szURL, szFileName, cchFileName, dwReserved, lpfnCB = argv
         rv = windefs.ERROR_SUCCESS
         cw = self.get_char_width(ctx)
-
         cache_name = "C:\\Windows\\Temp\\urlcache.bin"
 
         if szURL:

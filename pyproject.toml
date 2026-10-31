@@ -7,7 +7,7 @@ name = "speakeasy-emulator"
 dynamic = ["version"]
 description = "Speakeasy malware emulation framework"
 readme = "README.md"
-license = "MIT"
+license = {text = "MIT"}
 authors = [
     {name = "Andrew Davis"}
 ]

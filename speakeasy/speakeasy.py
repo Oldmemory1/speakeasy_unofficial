@@ -17,6 +17,7 @@ from speakeasy.config import SpeakeasyConfig, get_default_config_dict
 from speakeasy.errors import ConfigError, NotSupportedError, SpeakeasyError
 from speakeasy.report import FileManifestEntry, Report
 from speakeasy.volumes import apply_volumes
+from speakeasy.winenv import arch as _arch
 
 logger = logging.getLogger(__name__)
 
@@ -113,8 +114,25 @@ class Speakeasy:
             from speakeasy.windows.common import _PeParser
 
             pe = _PeParser(path=path, data=data)
-            # Get the machine type we only support x86/x64 atm
-            mach = MACHINE_TYPE[pe.FILE_HEADER.Machine].split("_")[-1:][0].lower()
+            # Some packed samples carry Machine=0 while retaining a valid PE32
+            # optional header. In that narrow malformed-header case, use the PE
+            # magic that _PeParser already validates for the runtime emulator.
+            if pe.FILE_HEADER.Machine == 0:
+                if pe.arch == _arch.ARCH_X86:
+                    mach = "i386"
+                elif pe.arch == _arch.ARCH_AMD64:
+                    mach = "amd64"
+                else:
+                    raise SpeakeasyError(
+                        f"Unsupported architecture: 0x{pe.OPTIONAL_HEADER.Magic:x}"
+                    )
+                logger.warning(
+                    "PE Machine field is zero; inferred %s architecture from "
+                    "the optional header",
+                    mach,
+                )
+            else:
+                mach = MACHINE_TYPE[pe.FILE_HEADER.Machine].split("_")[-1:][0].lower()
             if mach not in ("amd64", "i386"):
                 raise SpeakeasyError(f"Unsupported architecture: {mach}")
 

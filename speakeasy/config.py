@@ -63,6 +63,11 @@ DEFAULT_CONFIG_DATA = {
         "files": [
             {
                 "mode": "full_path",
+                "emu_path": "c:\\Windows\\regedit.exe",
+                "path": "$ROOT$/resources/windows_exe/regedit.exe",
+            },
+            {
+                "mode": "full_path",
                 "emu_path": "c:\\programdata\\mydir\\myfile.bin",
                 "byte_fill": {"byte": "0x41", "size": 512},
             },

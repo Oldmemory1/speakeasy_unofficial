@@ -639,6 +639,8 @@ class WindowsEmulator(BinaryEmulator):
                     and self.config.max_instructions != -1
                     and self.curr_run is not None
                     and self.curr_run.error is None
+                    and not self.run_complete
+                    and not self.emu_complete
                     and not self.run_queue
                     and self.get_pc() not in (self.return_hook, self.exit_hook)
                 ):

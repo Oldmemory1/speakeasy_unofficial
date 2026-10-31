@@ -33,7 +33,7 @@ def _build_x86() -> tuple[bytes, dict[str, tuple[int, int]]]:
     """
     call $+5 / pop ebx            ; ebx = blob + 5
     push EXIT_CODE                ; argument for ExitProcess, must survive the stdcall cleanup
-    push MOVEFILE_REPLACE_EXISTING
+    push RESERVED_SECURITY_ATTRIBUTES
     lea eax, [ebx + new] / push eax
     lea eax, [ebx + old] / push eax
     mov eax, <MoveFileExW>        ; patched
