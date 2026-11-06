@@ -250,8 +250,10 @@ class ChildLaunchDispatcher:
             return
         if parent_result.status.lower() in _PARENT_FAILURE_STATUSES:
             self._scheduler.stop(parent_result.termination_reason)
+            self._refresh_from_scheduler()
             return
         self._results.extend(self._scheduler.drain(parent_result))
+        self._refresh_from_scheduler()
 
     def stop(self, reason: str) -> None:
         """Propagate a stop and close parent intake.
@@ -283,6 +285,7 @@ class ChildLaunchDispatcher:
             None.
         """
 
+        self._refresh_from_scheduler()
         records = tuple(self._records)
         return ChildExecutionReportData(
             mode="scheduled" if self._options.enabled else "model_only",
@@ -310,6 +313,39 @@ class ChildLaunchDispatcher:
             records=records,
             results=tuple(self._results),
         )
+
+    def _refresh_from_scheduler(self) -> None:
+        """Merge the scheduler's authoritative record and result snapshot.
+
+        Returns:
+            ``None``.
+
+        Side effects:
+            Replaces matching dispatcher-owned record snapshots with the
+            scheduler's latest immutable state and retains scheduler results.
+            Model-only mode and compatibility fakes that return ``None`` are
+            left unchanged.  No engine object or mutable queue is exposed.
+        """
+
+        if not self._options.enabled or self._scheduler is None:
+            return
+        snapshot = self._scheduler.snapshot()
+        if not isinstance(snapshot, ChildExecutionReportData):
+            return
+
+        records_by_launch_id = {
+            record.request.launch_id: record for record in snapshot.records
+        }
+        self._records = [
+            records_by_launch_id.get(record.request.launch_id, record)
+            for record in self._records
+        ]
+        results_by_launch_id = {
+            result.launch_id: result for result in self._results
+        }
+        for result in snapshot.results:
+            results_by_launch_id[result.launch_id] = result
+        self._results = list(results_by_launch_id.values())
 
     def _ensure_intake_open(self) -> None:
         """Reject submissions after parent intake has closed.

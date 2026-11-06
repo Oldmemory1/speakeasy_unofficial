@@ -101,6 +101,7 @@ from .runtime_loader import (
     EngineChildImageMapper,
     PeChildImageMaterializer,
 )
+from .scheduler import ChildExecutionScheduler
 from .targets import ChildTargetResolver
 
 __all__ = [
@@ -130,6 +131,7 @@ __all__ = [
     "ChildExecutionRequestFactory",
     "ChildExecutionRunner",
     "ChildExecutionRuntimeError",
+    "ChildExecutionScheduler",
     "ChildExecutionState",
     "ChildFailure",
     "ChildFailureKind",

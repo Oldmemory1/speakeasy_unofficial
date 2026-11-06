@@ -11,6 +11,11 @@ import speakeasy.windows.objman as objman
 import speakeasy.winenv.arch as _arch
 from speakeasy.errors import Win32EmuError
 from speakeasy.profiler import Run
+from speakeasy.windows.child_execution import (
+    BudgetUsage,
+    ExecutionBudget,
+    ParentRunOutcome,
+)
 from speakeasy.windows.com import COM
 from speakeasy.windows.loaders import (
     PeLoader,
@@ -334,37 +339,58 @@ class Win32Emulator(WindowsEmulator):
         # Begin emulation of main module
         self.start()
 
-        if emulate_children and self.child_processes:
-            if not self.child_execution.allow_execution:
-                logger.warning(
-                    "Child execution is model-only; %d request(s) were recorded but not run.",
-                    len(self.child_processes),
-                )
-            return
-
-        if not emulate_children or len(self.child_processes) == 0:
-            return
-
-        # Emulate any child processes
-        while len(self.child_processes) > 0:
-            child = self.child_processes.pop(0)
-
-            child.pe = self.load_module(data=child.pe_data)
-            self.prepare_module_for_emulation(child.pe, all_entrypoints)
-
-            self.command_line = child.cmdline
-
-            self.curr_process = child
-            self.curr_process.base = child.pe.base
-            self.curr_thread = child.threads[0]
-
-            self.om.objects.update({self.curr_thread.address: self.curr_thread})  # type: ignore[union-attr]
-
-            # PEB and TEB will be initialized when the next run happens
-
-            self.start()
-
+        if emulate_children:
+            self._drain_child_scheduler()
         return
+
+    def _drain_child_scheduler(self) -> None:
+        """Drain admitted children through the sole production scheduler.
+
+        Returns:
+            ``None``.
+
+        Side effects:
+            Invokes the injected scheduler's public ``drain`` method exactly
+            once. Without a scheduler, no child image is loaded and no child
+            run is queued or started. Legacy ``child_processes`` entries are
+            never drained directly.
+        """
+
+        if self.child_dispatcher is None and self.child_scheduler is None:
+            logger.warning(
+                "Child execution is disabled; no production scheduler is installed."
+            )
+            return
+
+        run_errors = [run.error for run in self.runs if run.error is not None]
+        budget_exhausted = bool(
+            getattr(self, "instruction_budget_exhausted", False)
+        )
+        parent_ok = not run_errors and not budget_exhausted
+        termination_reason = (
+            "normal_exit"
+            if parent_ok
+            else (
+                "max_instructions"
+                if budget_exhausted
+                else "parent_runtime_error"
+            )
+        )
+        parent_result = ParentRunOutcome(
+            status="ok" if parent_ok else "simulation_error",
+            termination_reason=termination_reason,
+            coverage_complete=parent_ok,
+            budget=ExecutionBudget(
+                timeout_seconds=float(self.config.timeout),
+                max_api_count=int(self.config.max_api_count),
+                max_instructions=int(self.config.max_instructions),
+            ),
+            usage=BudgetUsage(),
+        )
+        if self.child_dispatcher is not None:
+            self.child_dispatcher.parent_finished(parent_result)
+        elif self.child_scheduler is not None:
+            self.child_scheduler.drain(parent_result)
 
     def _prepare_child_execution_report(self) -> None:
         """Attach the model-only child request summary to the root report."""

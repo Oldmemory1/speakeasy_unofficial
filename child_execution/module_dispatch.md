@@ -2,8 +2,10 @@
 
 > 日期：2026-11-04
 >
-> 状态：步骤 1-5 的引擎侧模块已实现；真实 scheduler/pipeline 接入和步骤 6
-> 小批实验尚未完成
+> 状态：步骤 1-7 已执行。步骤 1-5 的引擎侧模块已完成；步骤 6 的
+> state-only 小批、目标解析门槛和 R3 审计已完成。生产 scheduler 已实现并
+> 成为 child execution 包内唯一 queue/drain 路径；pipeline 接线仍缺失，
+> 因此真实 child execution 和 depth=2 仍被阻断。
 >
 > 上位设计：
 > [child_execution_capture_develop_manual.md](child_execution_capture_develop_manual.md)
@@ -1005,8 +1007,9 @@ tracker 不得从 API result、Process 是否存在或后续任意 pid 事件反
 - [x] 阶段 4 文件 Ruff、包导出检查和 `py_compile`：通过；
 - [x] 全量测试：`431 passed, 26 skipped, 5 failed`；5 个失败仍是既有缺失
       `tests/capa-testfiles` 资产及既有引擎行为差异，与步骤 4 无关；
-- [ ] 真实 emulator/scheduler 在 `mira` fixture 上的端到端接入；调度器尚未
-      实现，因此本步骤只冻结并验证 loader/context/runner 接口和独立实现；
+- [ ] 真实 emulator/pipeline 在 `mira` fixture 上的端到端接入；生产
+      scheduler 已实现，但尚未完成 pipeline 接线，因此本步骤只冻结并验证
+      loader/context/runner 接口和独立实现；
 - [ ] 真实 child run 的 end-to-end parent metadata/report 验收，留到
       scheduler、report/dynamic adapter 接入后执行。
 
@@ -1041,27 +1044,118 @@ tracker 不得从 API result、Process 是否存在或后续任意 pid 事件反
       `update_child_execution(report)`，也尚未接入 pipeline；
 - [ ] 现有 `note_execution_context` 的 pid 推断尚未切换为权威报告，留到
       pipeline 集成步骤；
-- [ ] 步骤 6 小批实验尚未执行。
+- [x] 步骤 6 state-only 小批和目标门槛实验已执行；结果见
+      [step6_experiments/README.md](step6_experiments/README.md)。
+- [ ] 真实 child execution 仍被缺失的 pipeline 接线以及 target/API 语义
+      门槛阻断；depth=2 未获批准。
 
 ### 步骤 6：小批实验
 
-- `mira` self + depth=1；
-- 完整 dropped EXE；
-- `padodor` unavailable；
-- `systex` 不执行 IE；
-- R3 良性安装器噪声检查；
-- 最后才评估 depth=2。
+- [x] state-only 重跑 12 个样本（4 `mira`、6 `padodor`、2 `systex`）；
+      12/12 父样本 `ok`，child started/emulated 均为 0；
+- [x] `mira` 4 个真实 launch 的 self-target 复核；稳定 resolver 4/4
+      `target_unavailable`，self bytes 门槛失败；
+- [x] `padodor` 6/6 target unavailable，但 6/6 仍返回
+      `success_request`/API 32，失败语义门槛失败；
+- [x] `systex` 2/2 保留完整 URL/target，并且不默认执行 IE；
+- [x] R3 清单为 25 个样本、35 个 finding、23 恶意/2 良性；代表 dropped
+      PE 可被显式 fixture resolver 解析，但生产路径映射仍未接线；
+- [x] child execution 定向测试：`112 passed`；Ruff 通过；
+- [ ] 真实 child E2E：`BLOCKED`，生产 scheduler 已实现，但 pipeline
+      `child_execution` 报告尚未接线；
+- [ ] depth=2：**REJECTED / NOT APPROVED**。
+
+### 步骤 6 后续门槛：接入 `dynamic_stage_new`
+
+以下条件全部满足前，不得在 `dynamic_stage_new` 开放真实 child
+execution，也不得开放 depth=2：
+
+1. [x] 实现生产 scheduler，并让它成为唯一 queue/drain 路径。
+       `ChildExecutionScheduler` 独占 FIFO，`submit()` 只入队，
+       `drain()` 只在 parent 完成后执行；dispatcher 只通过该公共接口
+       提交、停止和读取结果。
+2. pipeline 接入 dispatcher，报告输出完整 `child_execution`。
+3. 修复 `ShellExecute` self target 的最后字符和扩展名解析。
+4. 修复 `WinExec` 在 target unavailable 时的返回值与 pid 语义。
+5. 完成 dropped request path 到 artifact bytes 的权威映射。
+6. 重跑同样的 12 个 state-only 样本，确认父状态无漂移。
+7. 在显式开关下只开启 `mira` depth=1，确认真实
+   `entrypoint_reached`、ownership、独立预算和 parent context 恢复。
+8. `mira` 通过后再跑完整 dropped EXE，并单独复核两个良性安装器。
+9. 最后才评估 depth=2。
+
+接入验收证据见
+[step6_experiments/README.md](step6_experiments/README.md) 和
+[step6_experiments/step6_summary.json](step6_experiments/step6_summary.json)。
+
+### 步骤 7：生产 scheduler 与唯一 queue/drain 路径
+
+- [x] 新增 `scheduler.py` 的具体 `ChildExecutionScheduler`，实现冻结的
+      `ChildSchedulerProtocol`；
+- [x] scheduler 显式注入 `ChildRuntimeLoader`、`ChildContextManager`、
+      `ChildBudgetFactory`、`ChildRunnerProtocol` 和可选 `ChildResultSink`；
+- [x] `submit()` 只接收 admitted、resolved 且已有 Process 对象的请求；
+      只追加不可变 `thread_queued` 记录，不加载、不切换上下文、不执行；
+- [x] child FIFO 只存在于 scheduler；`dispatcher.parent_finished()` 是唯一
+      触发生产 `drain()` 的编排入口；
+- [x] `drain()` 只执行一次，严格 FIFO；重复调用只返回相同结果，不重放；
+- [x] parent 失败、parent budget 改变、显式 stop 或上下文完整性失败时停止
+      尚未开始的 child；
+- [x] 每个 child 的 timeout/API/instruction 限额与 parent 逐项相同，但
+      `BudgetUsage` 实例独立；共享 usage 或隐藏限额会停止该 child 和后续队列；
+- [x] loader/context/runner 的预期异常均转换为 child-local
+      `ChildRunResult`，不覆盖或冒泡为 parent simulation error；
+- [x] scheduler terminal record 使用 `completed/partial/failed`；入口是否到达
+      只由 result 的 `entrypoint_reached` 证明；`thread_queued` 保留为已经发生的
+      队列事实，即使 child 最终失败；
+- [x] `ChildLaunchDispatcher.report()` 合并 scheduler 的权威 terminal records
+      和 results，避免报告永久停留在 `thread_queued`；
+- [x] 公共类、构造器和方法均有类型标注及 Args/Returns/Side effects/Raises
+      docstring；
+- [x] `WindowsEmulator` 增加显式 `set_child_scheduler()` 注入点，默认
+      `None`，不使用环境变量开关；
+- [x] `WindowsEmulator` 增加显式 `set_child_dispatcher()`；API
+      `request_child_process()` 在 dispatcher 安装后统一经 dispatcher
+      resolve/admit/create；
+- [x] `Win32Emulator.run_module(emulate_children=True)` 只调用注入
+      dispatcher 的 `parent_finished()`；没有 dispatcher 时才调用 scheduler；
+- [x] 删除旧 `child_processes.pop(0)` → load/start 的直接执行循环；
+      `child_processes` 仅作为 legacy Process 对象集合保留，不再是执行队列；
+- [x] 没有 scheduler 时 child execution 保持关闭，不加载或执行任何旧
+      child Process；
+- [x] 未修改 kernel32、shell32、profiler、tracker；只增加 Win32 的唯一
+      dispatcher/scheduler 接线；
+- [x] 生产代码没有 `ENV_ENABLE=1`、环境变量开关、monkey patch、动态属性注入、
+      私有字段穿透或跨项目目录操作；
+- [x] `dynamic_stage_new/child-execution-detection/` 内部实现 pipeline bridge、
+      dispatcher 构造适配器和完整 report merge；
+- [x] 顶层 `pipeline.py` 只增加 bridge 安装、parent finish 和
+      `child_execution` 字段；
+- [x] event-first report 和磁盘 JSON 均输出完整 `child_execution`，
+      model-only 模式保留 requests/results 空数组；
+- [x] scheduler 定向测试覆盖 submit/drain/FIFO/stop/预算/失败隔离/dispatcher
+      权威快照、engine 唯一 drain 路径和入口证据独立性；
+- [x] dynamic-stage 全组测试：`175 passed`；
+- [x] child-execution 相关回归：`123 passed`；Ruff、`py_compile` 通过；
+- [x] 全量 Speakeasy 回归：`472 passed, 26 skipped, 5 failed`；5 个失败仍是
+      既有 capa 测试资产缺失和引擎历史行为差异；
+- [ ] 生产 backend 尚未把 API/instruction 预算计数接到实际 child 指令循环；
+- [ ] 当前 pipeline 默认仍为 model-only；真实 enabled scheduler 需要显式
+      `scheduler_factory`，不能在缺少 loader/context/runner adapter 时开启；
+- [x] 真实 `mira` pipeline 烟测已记录 1 个 unavailable `ShellExecute`
+      request，child results 为 0；
+- [ ] 真实 `mira` child E2E 和 dropped EXE 执行仍未获准。
 
 ## 14. 接口验收清单
 
-- [ ] 每个模块都有单一职责和明确依赖方向。
-- [ ] 所有公共接口有类型标注和 docstring。
-- [ ] dispatcher 是唯一状态编排入口。
+- [x] 每个模块都有单一职责和明确依赖方向。
+- [x] 所有公共接口有类型标注和 docstring。
+- [x] dispatcher 是唯一状态编排入口。
 - [ ] API handler 不直接调用 runner/loader。
-- [ ] child budget 三项与 parent 逐项相同。
-- [ ] parent 和 child 使用独立 usage 计数。
+- [x] child budget 三项与 parent 逐项相同。
+- [x] parent 和 child 使用独立 usage 计数。
 - [x] child loader 使用 `primary=False`，不覆盖 root metadata。
-- [ ] scheduler 在 parent 完成前不 drain。
+- [x] scheduler 在 parent 完成前不 drain，且是唯一 child queue/drain 路径。
 - [x] runner 的入口 hook 是 `entrypoint_reached` 唯一证据。
 - [x] child result 有稳定 ownership 并可回溯 run index。
 - [x] dynamic adapter 只消费报告 DTO。

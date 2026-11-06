@@ -1,6 +1,8 @@
 # Speakeasy 受控 child execution 开发手册
 
-> 状态：阶段 1 model-only 已实现，child execution 仍关闭，待全量验收
+> 状态：阶段 1 model-only 已实现；步骤 6 小批实验已执行，child execution
+> 仍关闭。真实 scheduler/pipeline 接入、`mira` self-target 和 `padodor`
+> 失败语义尚未通过，depth=2 未获批准。
 >
 > 日期：2026-11-01；当前工作包更新于 2026-11-04
 >
@@ -735,8 +737,8 @@ engine.run_module(module, emulate_children=True)
 `8 + 6 + 2 + 1 = 17` 的计数口径不同。后续统计必须明确单位是样本数、
 request 数、API 调用数还是机制分类数。
 
-阶段 1 model-only 和步骤 1-5 的引擎侧模块已经实现并提交过检查点；真实
-scheduler/pipeline 接入与 1,229 全量验收尚未完成。当前策略仍只记录
+阶段 1 model-only、步骤 1-5 的引擎侧模块和生产 child scheduler 已经实现；
+pipeline 接入与 1,229 全量验收尚未完成。当前策略仍只记录
 request，不执行 child。后续工作按下列 A-H 工作包推进。
 
 当前 model-only 代码中的 `per_child_timeout_sec`、
@@ -899,6 +901,12 @@ completed、partial、skipped 和 rejected。
 | R3 完整 dropped EXE | source/hash/ownership 完整 |
 | 2 个良性安装器 | parent status 不被 child 噪声覆盖 |
 
+2026-11-06 小批实验结果：state-only 重跑 12 个样本全部 `ok`，但真实
+child execution 仍被生产 scheduler/pipeline 接线阻断。`mira` self-target
+4/4 未解析，`padodor` 6/6 仍表现为虚假成功，因此 depth=2 未获批准。
+完整证据见
+[step6_experiments/README.md](step6_experiments/README.md)。
+
 ### 15.10 依赖关系和阶段顺序
 
 ```text
@@ -1039,10 +1047,17 @@ target resolution 和 launch tracking 修复。
       root metadata。
 - [x] child runner 使用与 parent 等额但独立的 usage 计数，并将预期 child
       错误收口为 child result。
-- [ ] 完成 child scheduler 和真实 emulator 端到端接入。
+- [x] 完成生产 child scheduler：FIFO、parent 完成后 drain、停止传播、
+      独立 usage、child-local failure 和不可变报告快照均通过显式接口测试。
+- [ ] 完成真实 emulator/pipeline 端到端接入。
 - [ ] policy 默认关闭，depth/count 有上限，time/API/instruction 继承 parent。
 - [x] 所有步骤 4 新增协作者通过显式接口注入，生产代码无 monkey patch。
 - [x] parent metadata 不被 model-only child load 覆盖。
 - [x] child run 的 parent/child status 和 error 有独立保护。
 - [ ] detector 接受权威 `launch_id` 和 child result。
-- [ ] 先跑 state-only 回归，再跑 `mira`，最后跑 dropped EXE。
+- [x] 先跑 state-only 回归：12 个样本全部 `ok`，child started/emulated 为 0。
+- [x] 完成 `mira` model-only 门槛复核：4 个真实 launch 均未解析为 self。
+- [ ] 真实 `mira` child execution：被 pipeline 接线阻断。
+- [x] 完成 R3 dropped artifact 清单及两个良性安装器标记。
+- [ ] 真实 dropped EXE child execution：被生产路径映射和 pipeline 接线阻断。
+- [ ] depth=2：未获批准。

