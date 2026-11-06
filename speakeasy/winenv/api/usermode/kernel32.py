@@ -27,6 +27,7 @@ from speakeasy.profiler_events import (
     THREAD_CREATE,
     THREAD_INJECT,
 )
+from speakeasy.windows.child_execution import ChildTargetResolver
 
 from .. import api
 
@@ -153,19 +154,22 @@ class Kernel32(api.ApiHandler):
         return new
 
     def emu_perms_to_win_perms(self, emu_perms):
-        new = 0
-        if emu_perms & common.PERM_MEM_RWX:
-            new = windefs.PAGE_EXECUTE_READWRITE
-        elif emu_perms & common.PERM_MEM_NONE:
-            new = windefs.PAGE_NOACCESS
-        else:
-            if emu_perms & common.PERM_MEM_EXEC:
-                new |= windefs.PAGE_EXECUTE
-            if emu_perms & common.PERM_MEM_READ:  # noqa
-                new |= windefs.PAGE_READONLY
-            if emu_perms & common.PERM_MEM_WRITE:
-                new |= windefs.PAGE_READWRITE
-        return new
+        execute = bool(emu_perms & common.PERM_MEM_EXEC)
+        read = bool(emu_perms & common.PERM_MEM_READ)
+        write = bool(emu_perms & common.PERM_MEM_WRITE)
+
+        if execute:
+            if write:
+                return windefs.PAGE_EXECUTE_READWRITE
+            if read:
+                return windefs.PAGE_EXECUTE_READ
+            return windefs.PAGE_EXECUTE
+        if write:
+            # Windows has no user-mode write-only page protection.
+            return windefs.PAGE_READWRITE
+        if read:
+            return windefs.PAGE_READONLY
+        return windefs.PAGE_NOACCESS
 
     def map_view_access_to_emu_perms(self, desired_access, mapping_protect):
         perms = 0
@@ -410,6 +414,9 @@ class Kernel32(api.ApiHandler):
         hmod = windefs.NULL
 
         cw = self.get_char_width(ctx)
+        if not lib_name or not emu.is_address_valid(lib_name):
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return hmod
         req_lib = self.read_mem_string(lib_name, cw)
         lib = winemu.normalize_dll_name(req_lib)
 
@@ -852,8 +859,12 @@ class Kernel32(api.ApiHandler):
         if lpCmdLine:
             cmd = self.read_mem_string(lpCmdLine, 1)
             argv[0] = cmd
-            app = cmd.split()[0]
-            proc = emu.create_process(path=app, cmdline=cmd)
+            app = ChildTargetResolver.command_target(cmd)
+            proc, _request = emu.request_child_process(
+                source_api="WinExec",
+                path=app,
+                cmdline=cmd,
+            )
             self.record_process_event(proc, PROC_CREATE)
             rv = 32
 
@@ -922,6 +933,7 @@ class Kernel32(api.ApiHandler):
         );
         """
         ctx = ctx or {}
+        ctx["child_execution_source_api"] = "CreateProcessInternal"
         # Args are the same as CreateProcess except for argv[0] and argv[-1]
         _argv = argv[1:-1]
         rv = self.CreateProcess(emu, _argv, ctx)
@@ -948,19 +960,28 @@ class Kernel32(api.ApiHandler):
         cw = self.get_char_width(ctx)
         cmdstr = ""
         appstr = ""
+        cwdstr = ""
         if app:
             appstr = self.read_mem_string(app, cw)
             argv[0] = appstr
         if cmd:
             cmdstr = self.read_mem_string(cmd, cw)
             argv[1] = cmdstr
+        if cd:
+            cwdstr = self.read_mem_string(cd, cw)
+            argv[7] = cwdstr
 
         def_flags = windefs.get_creation_flags(flags)
         if def_flags:
             def_flags = " | ".join(def_flags)
             argv[5] = def_flags
 
-        proc = emu.create_process(path=appstr, cmdline=cmdstr, child=True)
+        proc, _request = emu.request_child_process(
+            source_api=str(ctx.get("child_execution_source_api", "CreateProcess")),
+            path=appstr,
+            cmdline=cmdstr,
+            cwd=cwdstr or None,
+        )
         proc_hnd = self.get_object_handle(proc)
 
         thread = proc.threads[0]
@@ -1229,6 +1250,10 @@ class Kernel32(api.ApiHandler):
             is_remote = True
             proc_obj = self.get_object_from_handle(hProcess)
 
+        if proc_obj in emu.child_processes and not emu.child_execution.allow_execution:
+            emu.set_last_error(windefs.ERROR_ACCESS_DENIED)
+            return 0
+
         proc_path = proc_obj.path
         argv[0] = proc_path
         proc_path = ntpath.basename(proc_path)
@@ -1325,6 +1350,8 @@ class Kernel32(api.ApiHandler):
                     start_addr = context.Eax
 
             if start_addr and proc in emu.child_processes:
+                if not emu.child_execution.allow_execution:
+                    return rv
                 mm = emu.get_address_map(start_addr)
                 if mm:
                     emu.ensure_pe_import_hooks(mm.base)
@@ -1412,12 +1439,21 @@ class Kernel32(api.ApiHandler):
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return rv
 
-        mbi.BaseAddress = mm.base
+        effective_prot = emu.get_address_perms(lpAddress)
+        if effective_prot is None:
+            effective_prot = mm.prot
+        region = emu.get_protection_region(lpAddress)
+        if region is None:
+            region_base, region_size = mm.base, mm.size
+        else:
+            region_base, region_size = region
+
+        mbi.BaseAddress = region_base
         mbi.AllocationBase = mm.base
         mbi.AllocationProtect = self.emu_perms_to_win_perms(mm.prot)
-        mbi.RegionSize = mm.size
+        mbi.RegionSize = region_size
         mbi.State = windefs.MEM_COMMIT
-        mbi.Protect = self.emu_perms_to_win_perms(mm.prot)
+        mbi.Protect = self.emu_perms_to_win_perms(effective_prot)
         mbi.Type = 0
 
         self.mem_write(lpBuffer, mbi.get_bytes())
@@ -1451,9 +1487,12 @@ class Kernel32(api.ApiHandler):
             # VirtualAlloc()
             old_prot = mm.flags
             if not old_prot:
-                # Otherwise, get the perms from the emulator and convert it to
-                # Win32 protection flags
-                old_prot = self.emu_perms_to_win_perms(mm.prot)
+                # Use page-level permissions when the containing map spans
+                # several PE sections with different protections.
+                old_perms = emu.get_address_perms(lpAddress)
+                if old_perms is None:
+                    old_perms = mm.prot
+                old_prot = self.emu_perms_to_win_perms(old_perms)
             # Check for page alignment
             addr = lpAddress & 0xFFFFFFFFFFFFF000
             size = dwSize & 0xFFFFFFFFFFFFF000
@@ -2337,7 +2376,7 @@ class Kernel32(api.ApiHandler):
             mm = emu.get_address_map(lpMem)
             if mm and mm.tag.startswith(tag_prefix):
                 # Copy the existing data
-                data = self.mem_read(lpMem, mm.size)
+                data = self.mem_read(lpMem, min(mm.size, dwBytes))
                 new_buf = self.heap_alloc(dwBytes, heap="HeapReAlloc")
                 self.mem_write(new_buf, data)
 
@@ -2592,6 +2631,8 @@ class Kernel32(api.ApiHandler):
         """
 
         (Addend,) = argv
+        if not Addend or not emu.is_address_valid(Addend):
+            return 0
 
         val = self.mem_read(Addend, 4)
         ival = int.from_bytes(val, "little")
@@ -3427,11 +3468,11 @@ class Kernel32(api.ApiHandler):
         fman = emu.get_file_manager()
         mapping = fman.get_mapping_from_handle(hmap)
         tag_prefix = "api.MapViewOfFile"
+        buf = 0
 
         if mapping:
             f = mapping.backed_file
             full_offset = (offset_high << 32) | offset_low
-            buf = 0
             size = 0
             view_perms = self.map_view_access_to_emu_perms(access, mapping.prot)
             if f:
@@ -4052,8 +4093,13 @@ class Kernel32(api.ApiHandler):
         if f:
             f.seek(lDistanceToMove, dwMoveMethod)
             rv = f.tell()
+            if rv is None:
+                f.get_size()
+                rv = f.tell()
+            if rv is None:
+                rv = 0
             if lpNewFilePointer:
-                self.mem_write(lpNewFilePointer, rv.to_bytes(8, "little"))
+                self.mem_write(lpNewFilePointer, rv.to_bytes(8, "little", signed=rv < 0))
             emu.set_last_error(windefs.ERROR_SUCCESS)
             return True
         return False
@@ -5259,6 +5305,8 @@ class Kernel32(api.ApiHandler):
         if not pe:
             return 0
 
+        if not hResInfo or not emu.is_address_valid(hResInfo):
+            return 0
         res_rva = self.mem_read(hResInfo, 4)
         if res_rva:
             return pe.base + int.from_bytes(res_rva, "little")
@@ -5694,6 +5742,13 @@ class Kernel32(api.ApiHandler):
         );
         """
         pfnAPC, hThread, dwData = argv
+        thread_obj = self.get_object_from_handle(hThread)
+        if (
+            thread_obj is not None
+            and thread_obj.process in emu.child_processes
+            and not emu.child_execution.allow_execution
+        ):
+            return 0
         run_type = f"apc_thread_{hThread:x}"
         self.create_thread(pfnAPC, dwData, 0, thread_type=run_type)
 
@@ -6602,8 +6657,18 @@ class Kernel32(api.ApiHandler):
         lpPathName, lpPrefixString, uUnique, lpTempFileName = argv
 
         cw = self.get_char_width(ctx)
+        if (
+            not lpPathName
+            or not emu.is_address_valid(lpPathName)
+            or not lpTempFileName
+            or not emu.is_address_valid(lpTempFileName)
+        ):
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
         path = self.read_mem_string(lpPathName, cw)
-        prefix = self.read_mem_string(lpPrefixString, cw)
+        prefix = ""
+        if lpPrefixString and emu.is_address_valid(lpPrefixString):
+            prefix = self.read_mem_string(lpPrefixString, cw)
 
         import time
 

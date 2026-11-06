@@ -77,6 +77,8 @@ class OleAut32(api.ApiHandler):
             BSTR bstrString
         );
         """
+        if not argv[0] or not emu.is_address_valid(argv[0]):
+            return
         argv[0] = self.read_wide_string(argv[0])
         return
 

@@ -823,6 +823,7 @@ class Profiler:
             errors=errors,
             strings=strings_report,
             data=report_data or None,
+            child_execution=self.meta.get("child_execution"),
             entry_points=entry_points,
         )
         return report

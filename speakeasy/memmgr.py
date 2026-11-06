@@ -69,6 +69,7 @@ class MemoryManager:
     def __init__(self, *args, **kwargs):
         super().__init__()
         self.maps = []
+        self._page_protections: dict[int, int] = {}
         self.emu_eng: EmuEngine | None = None
         self.mem_reserves = []
         self.block_base = 0
@@ -180,6 +181,7 @@ class MemoryManager:
         """
         Free a block of emulated memory
         """
+        self.clear_page_protections(base, size)
         self.emu_eng.mem_unmap(base, size)  # type: ignore[union-attr]
 
     def mem_write(self, addr, data):
@@ -199,6 +201,71 @@ class MemoryManager:
         Change memory protections
         """
         self.emu_eng.mem_protect(addr, size, perms)  # type: ignore[union-attr]
+        self._set_page_protections(addr, size, perms)
+
+    def _set_page_protections(self, addr, size, perms):
+        """Record effective page protections overlaid on broad memory maps."""
+        if size <= 0:
+            return
+
+        page = addr & ~(self.page_size - 1)
+        end = addr + size
+        while page < end:
+            self._page_protections[page] = perms
+            page += self.page_size
+
+    def clear_page_protections(self, addr, size):
+        """Forget page-protection overrides in an unmapped range."""
+        if size <= 0:
+            return
+
+        page = addr & ~(self.page_size - 1)
+        end = addr + size
+        while page < end:
+            self._page_protections.pop(page, None)
+            page += self.page_size
+
+    def get_address_perms(self, address):
+        """
+        Return the effective permissions for an address.
+
+        Image maps commonly span multiple PE sections. Their initial map-level
+        protection is not enough to answer VirtualQuery after section
+        protections have been applied.
+        """
+        mm = self.get_address_map(address)
+        if not mm:
+            return None
+
+        page = address & ~(self.page_size - 1)
+        return self._page_protections.get(page, mm.prot)
+
+    def get_protection_region(self, address):
+        """
+        Return the page-aligned region with one effective protection.
+        """
+        mm = self.get_address_map(address)
+        if not mm:
+            return None
+
+        page = address & ~(self.page_size - 1)
+        perms = self.get_address_perms(page)
+        map_end = mm.base + mm.size
+
+        start = page
+        while start > mm.base:
+            previous = start - self.page_size
+            if previous < mm.base or self.get_address_perms(previous) != perms:
+                break
+            start = previous
+
+        end = page + self.page_size
+        while end < map_end:
+            if self.get_address_perms(end) != perms:
+                break
+            end += self.page_size
+
+        return start, min(end, map_end) - start
 
     def _mem_unmap_region(self, base, size):
         """

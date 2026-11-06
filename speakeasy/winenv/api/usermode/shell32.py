@@ -69,6 +69,16 @@ class Shell32(api.ApiHandler):
             INT    nShowCmd
         );
         """
+        return self._shell_execute(emu, argv, ctx, source_api="ShellExecute")
+
+    def _shell_execute(
+        self,
+        emu,
+        argv,
+        ctx: api.ApiContext = None,
+        *,
+        source_api: str,
+    ):
         ctx = ctx or {}
 
         hwnd, lpOperation, lpFile, lpParameters, lpDirectory, nShowCmd = argv
@@ -94,7 +104,12 @@ class Shell32(api.ApiHandler):
         if dn and fn:
             fn = f"{dn}\\{fn}"
 
-        proc = emu.create_process(path=fn, cmdline=param)
+        proc, _request = emu.request_child_process(
+            source_api=source_api,
+            path=fn,
+            cmdline=param,
+            cwd=dn or None,
+        )
         self.record_process_event(proc, PROC_CREATE)
 
         return 33
@@ -112,8 +127,11 @@ class Shell32(api.ApiHandler):
         sei = shell32_defs.SHELLEXECUTEINFOA(emu.get_ptr_size())
         sei_struct = self.mem_cast(sei, lpShellExecuteInfo)
 
-        self.ShellExecute(
-            emu, [0, sei_struct.lpVerb, sei_struct.lpFile, sei_struct.lpParameters, sei_struct.lpDirectory, 0], ctx
+        self._shell_execute(
+            emu,
+            [0, sei_struct.lpVerb, sei_struct.lpFile, sei_struct.lpParameters, sei_struct.lpDirectory, 0],
+            ctx,
+            source_api="ShellExecuteEx",
         )
 
         return True
@@ -164,6 +182,8 @@ class Shell32(api.ApiHandler):
         cmdline, argc = argv
 
         cw = self.get_char_width(ctx)
+        if not cmdline or not emu.is_address_valid(cmdline):
+            return 0
         cl = self.read_mem_string(cmdline, cw)
 
         ptrsize = emu.get_ptr_size()
@@ -191,7 +211,7 @@ class Shell32(api.ApiHandler):
 
             strs += len(s)
 
-        if argc:
+        if argc and emu.is_address_valid(argc):
             self.mem_write(argc, nargs.to_bytes(4, "little"))
 
         return buf

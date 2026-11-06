@@ -520,6 +520,81 @@ class MemoryLayout(BaseModel):
     )
 
 
+class ChildExecutionOwnership(BaseModel):
+    """Correlation metadata for one child execution lineage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    launch_id: str = Field(description="Stable engine-generated child launch identifier.")
+    root_sample_sha256: str | None = Field(
+        default=None,
+        description="SHA-256 of the root input, which remains the report's primary sample identity.",
+    )
+    parent_pid: int | None = Field(default=None, description="Emulated process that requested the child.")
+    child_pid: int | None = Field(default=None, description="Emulated child process identifier.")
+    depth: int = Field(default=1, description="One-based child execution depth.")
+
+
+class ChildExecutionRequestReport(BaseModel):
+    """Serializable process-launch request and its model-only resolution state."""
+
+    model_config = ConfigDict(extra="allow")
+
+    launch_id: str = Field(description="Stable engine-generated launch identifier.")
+    source_api: str = Field(description="Process-launch API that produced this request.")
+    parent_pid: int | None = Field(default=None, description="Requesting emulated process.")
+    parent_tid: int | None = Field(default=None, description="Requesting emulated thread.")
+    parent_launch_id: str | None = Field(default=None, description="Parent child launch, if nested.")
+    root_sample_sha256: str | None = Field(default=None, description="Root sample identity.")
+    depth: int = Field(description="One-based child depth.")
+    requested_target: str = Field(description="Target text captured from the API request.")
+    normalized_target: str = Field(description="Normalized emulated target path.")
+    working_directory: str = Field(default="", description="Working directory used for resolution.")
+    command_line: str = Field(default="", description="Complete requested command line.")
+    command_sha256: str = Field(description="SHA-256 of the canonical command line used for duplicate admission.")
+    target_source: str = Field(description="self, dropped_file, fixture, or unavailable.")
+    target_sha256: str | None = Field(default=None, description="SHA-256 of resolved target bytes.")
+    target_size: int = Field(default=0, description="Resolved target byte count.")
+    target_format: str = Field(default="unknown", description="Resolved file format.")
+    target_format_detail: str = Field(default="unknown", description="Detailed target format.")
+    target_arch: str = Field(default="unknown", description="Resolved PE architecture.")
+    target_module_type: str = Field(default="unknown", description="Resolved PE module type.")
+    target_entrypoint_rva: int = Field(default=0, description="Resolved PE entry point RVA.")
+    target_resolved: bool = Field(description="Whether allowed target bytes were found and parsed.")
+    eligible: bool = Field(description="Whether the model-only admission policy accepted the target.")
+    state: str = Field(description="Current model-only request state.")
+    process_object_created: bool = Field(default=False, description="Whether a Process object was created.")
+    created_child_pid: int | None = Field(default=None, description="PID assigned by the created object.")
+    thread_queued: bool = Field(default=False, description="Reserved for stage-two execution scheduling.")
+    entrypoint_reached: bool = Field(default=False, description="Reserved for execution hook evidence.")
+    skip_reason: str | None = Field(default=None, description="Policy or target skip reason.")
+    rejection_reason: str | None = Field(default=None, description="Admission rejection reason.")
+
+
+class ChildExecutionReport(BaseModel):
+    """Stage-one child request summary attached to the root emulation report."""
+
+    model_config = ConfigDict(extra="allow")
+
+    mode: str = Field(default="model_only", description="Child execution integration mode.")
+    policy: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Model-only admission and future execution limits.",
+    )
+    execution_enabled: bool = Field(default=False, description="Whether child entrypoints were executed.")
+    request_count: int = Field(default=0, description="Number of recorded launch requests.")
+    eligible_count: int = Field(default=0, description="Number accepted by model-only admission.")
+    target_resolved_count: int = Field(default=0, description="Number with trusted target bytes.")
+    process_object_created_count: int = Field(default=0, description="Number with Process objects.")
+    thread_queued_count: int = Field(default=0, description="Must remain zero in stage one.")
+    entrypoint_reached_count: int = Field(default=0, description="Must remain zero in stage one.")
+    states: dict[str, int] = Field(default_factory=dict, description="Counts by request state.")
+    requests: list[ChildExecutionRequestReport] = Field(
+        default_factory=list,
+        description="Recorded process-launch requests in deterministic order.",
+    )
+
+
 class EntryPoint(BaseModel):
     """Represents one emulation execution primitive captured as a run.
 
@@ -635,6 +710,10 @@ class EntryPoint(BaseModel):
             "Populate this when memory-layout capture is active for the emulator mode."
         ),
     )
+    ownership: ChildExecutionOwnership | None = Field(
+        default=None,
+        description="Child execution lineage when this run belongs to a controlled child.",
+    )
 
 
 class Report(BaseModel):
@@ -731,6 +810,10 @@ class Report(BaseModel):
             "Deduplicated binary payload store keyed by SHA-256.\n\n"
             "Resolve ``*_ref`` fields in the report against this mapping to recover compressed payload bytes."
         ),
+    )
+    child_execution: ChildExecutionReport | None = Field(
+        default=None,
+        description="Model-only child launch requests and their resolution/admission state.",
     )
     entry_points: list[EntryPoint] = Field(
         default_factory=list,

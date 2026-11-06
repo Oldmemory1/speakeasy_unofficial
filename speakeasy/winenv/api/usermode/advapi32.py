@@ -12,6 +12,7 @@ import speakeasy.winenv.defs.windows.advapi32 as adv32
 import speakeasy.winenv.defs.windows.kernel32 as k32
 import speakeasy.winenv.defs.windows.windows as windefs
 from speakeasy.profiler_events import PROC_CREATE, REG_CREATE, REG_LIST, REG_OPEN, REG_READ, REG_WRITE
+from speakeasy.windows.child_execution import ChildTargetResolver
 
 from .. import api
 
@@ -1470,16 +1471,25 @@ class AdvApi32(api.ApiHandler):
         cw = self.get_char_width(ctx)
         cmdstr = ""
         appstr = ""
+        cwdstr = ""
         if app:
             appstr = self.read_mem_string(app, cw)
             argv[1] = appstr
         if cmd:
             cmdstr = self.read_mem_string(cmd, cw)
             if not appstr:
-                appstr = cmdstr.split(" ")[0]
+                appstr = ChildTargetResolver.command_target(cmdstr)
             argv[2] = cmdstr
+        if cd:
+            cwdstr = self.read_mem_string(cd, cw)
+            argv[8] = cwdstr
 
-        proc = emu.create_process(path=appstr, cmdline=cmdstr)
+        proc, _request = emu.request_child_process(
+            source_api="CreateProcessAsUser",
+            path=appstr,
+            cmdline=cmdstr,
+            cwd=cwdstr or None,
+        )
         proc_hnd = self.get_object_handle(proc)
 
         thread = proc.threads[0]

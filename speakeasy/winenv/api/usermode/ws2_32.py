@@ -14,6 +14,7 @@ from .. import api
 INADDR_NONE = 0xFFFFFFFF
 HOST_NOT_FOUND = 11001
 WSAENOTSOCK = 10038
+WSAEFAULT = 10014
 
 
 class Ws2_32(api.ApiHandler):
@@ -49,6 +50,14 @@ class Ws2_32(api.ApiHandler):
         ver, lpWSAData = argv
 
         wsa = self.wstypes.WSAData(emu.get_ptr_size())
+        struct_size = self.sizeof(wsa)
+        if (
+            not lpWSAData
+            or not emu.is_address_valid(lpWSAData)
+            or not emu.is_address_valid(lpWSAData + struct_size - 1)
+        ):
+            emu.set_last_error(WSAEFAULT)
+            return WSAEFAULT
         data = self.mem_cast(wsa, lpWSAData)
 
         data.wVersion = 0x0101

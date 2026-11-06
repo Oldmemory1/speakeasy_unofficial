@@ -581,7 +581,45 @@ class Ntoskrnl(api.ApiHandler):
         nts = ddk.STATUS_INFO_LENGTH_MISMATCH
         buf_ptr = 0
 
-        if sysclass == ddk.SYSTEM_INFORMATION_CLASS.SystemModuleInformation:
+        if sysclass == ddk.SYSTEM_INFORMATION_CLASS.SystemBasicInformation:
+            ptr_size = emu.get_ptr_size()
+            size = 0x40 if ptr_size == 8 else 0x2C
+            if sysinfo and syslen >= size:
+                info = bytearray(size)
+                dwords = (
+                    0,  # Reserved
+                    156250,  # TimerResolution
+                    0x1000,  # PageSize
+                    0x40000,  # NumberOfPhysicalPages
+                    0,  # LowestPhysicalPageNumber
+                    0x3FFFF,  # HighestPhysicalPageNumber
+                    0x10000,  # AllocationGranularity
+                )
+                for index, value in enumerate(dwords):
+                    offset = index * 4
+                    info[offset : offset + 4] = value.to_bytes(4, "little")
+
+                ptr_offset = 0x20 if ptr_size == 8 else 0x1C
+                max_user_address = 0x00007FFFFFFEFFFF if ptr_size == 8 else 0x7FFEFFFF
+                ptr_values = (0x10000, max_user_address, 1)
+                for index, value in enumerate(ptr_values):
+                    offset = ptr_offset + index * ptr_size
+                    info[offset : offset + ptr_size] = value.to_bytes(ptr_size, "little")
+                info[ptr_offset + 3 * ptr_size] = 1  # NumberOfProcessors
+
+                self.mem_write(sysinfo, bytes(info))
+                nts = ddk.STATUS_SUCCESS
+
+        elif sysclass == ddk.SYSTEM_INFORMATION_CLASS.SystemPerformanceInformation:
+            # The object is fixed-size counters. A correctly sized zero-filled
+            # value lets callers size and consume the result without fabricating
+            # host performance data.
+            size = 0x138
+            if sysinfo and syslen >= size:
+                self.mem_write(sysinfo, bytes(size))
+                nts = ddk.STATUS_SUCCESS
+
+        elif sysclass == ddk.SYSTEM_INFORMATION_CLASS.SystemModuleInformation:
             mods = emu.get_peb_modules()
             mod_count = len(mods)
             size = mod_count * self.sizeof(self.win.SYSTEM_MODULE(emu.get_ptr_size()))
@@ -688,9 +726,13 @@ class Ntoskrnl(api.ApiHandler):
                 nts = ddk.STATUS_SUCCESS
 
         else:
-            raise ApiEmuError(f"Unsupported information class: 0x{sysclass:x}")
+            # Unsupported classes are reported to the caller through NTSTATUS.
+            # A Python exception would abort emulation before normal error
+            # handling can run.
+            nts = ddk.STATUS_INVALID_INFO_CLASS
+            size = 0
 
-        if retlen:
+        if retlen and emu.is_address_valid(retlen):
             self.mem_write(retlen, size.to_bytes(4, "little"))
 
         return nts

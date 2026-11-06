@@ -1454,6 +1454,8 @@ class Msvcrt(api.ApiHandler):
             );
         """
         cstr, c = argv
+        if not cstr or not emu.is_address_valid(cstr):
+            return 0
         cs = self.read_string(cstr)
         hay = cs.encode("utf-8")
         needle = c.to_bytes(1, "little")

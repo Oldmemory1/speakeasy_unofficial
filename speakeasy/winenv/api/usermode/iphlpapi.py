@@ -22,6 +22,12 @@ class Iphlpapi(api.ApiHandler):
 
         self.iphlpapi_types = iphlpapi_types
 
+    @staticmethod
+    def _adapter_value(adapter, name, default=None):
+        if isinstance(adapter, dict):
+            return adapter.get(name, default)
+        return getattr(adapter, name, default)
+
     @apihook("GetAdaptersInfo", argc=2)
     def GetAdaptersInfo(self, emu, argv, ctx: api.ApiContext = None):
         ptr_adapter_info, size_ptr = argv
@@ -39,14 +45,24 @@ class Iphlpapi(api.ApiHandler):
         for index, adapter in enumerate(adapters):
             adapter_info = self.iphlpapi_types.IP_ADAPTER_INFO(emu.get_ptr_size())
 
-            adapter_info.AdapterName = adapter.get("name").encode("utf-8")
-            adapter_info.Description = adapter.get("description").encode("utf-8")
+            name = self._adapter_value(adapter, "name") or ""
+            description = self._adapter_value(adapter, "description") or ""
+            mac_address = self._adapter_value(adapter, "mac_address") or ""
+            adapter_type = self._adapter_value(adapter, "type") or ""
+            ip_address = self._adapter_value(adapter, "ip_address") or ""
+            subnet_mask = self._adapter_value(adapter, "subnet_mask") or ""
+
+            adapter_info.AdapterName = name.encode("utf-8")
+            adapter_info.Description = description.encode("utf-8")
             adapter_info.AddressLength = 6
-            adapter_info.Address = binascii.unhexlify(adapter.get("mac_address").replace("-", ""))
-            adapter_info.Type = iphlpapi_types.get_adapter_type(adapter.get("type"))
-            adapter_info.IpAddressList.IpAddress = adapter.get("ip_address").encode("utf-8")
-            adapter_info.IpAddressList.IpMask = adapter.get("subnet_mask").encode("utf-8")
-            adapter_info.DhcpEnabled = adapter.get("dhcp_enabled")
+            try:
+                adapter_info.Address = binascii.unhexlify(mac_address.replace("-", "").replace(":", ""))
+            except (binascii.Error, ValueError):
+                adapter_info.Address = b"\x00" * 6
+            adapter_info.Type = iphlpapi_types.get_adapter_type(adapter_type)
+            adapter_info.IpAddressList.IpAddress = ip_address.encode("utf-8")
+            adapter_info.IpAddressList.IpMask = subnet_mask.encode("utf-8")
+            adapter_info.DhcpEnabled = bool(self._adapter_value(adapter, "dhcp_enabled", False))
 
             if index < adapter_count - 1:
                 ptr_next = self.mem_alloc(adapter_info.sizeof(), tag="api.struct.IP_ADAPTER_INFO")

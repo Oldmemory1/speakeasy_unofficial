@@ -449,7 +449,10 @@ class ApiHandler:
                         curr_fmt = ""
                         new_fmts.append(s)
                     else:
-                        s = self.read_string(args.pop(0))
+                        string_arg = args.pop(0)
+                        # Rendering a NULL %s argument as empty avoids
+                        # dereferencing address zero and aborting emulation.
+                        s = self.read_string(string_arg) if string_arg else ""
                         new_fmts.append(s)
                 elif c in ("x", "X", "d", "u", "i"):
                     if curr_fmt.startswith("ll"):

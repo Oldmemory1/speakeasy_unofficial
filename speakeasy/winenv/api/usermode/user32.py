@@ -1304,7 +1304,12 @@ class User32(api.ApiHandler):
         hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam = argv
         rv = self.get_handle()
         cw = self.get_char_width(ctx)
-        if lpTemplateName:
+        # lpTemplateName is overloaded: it may be a string pointer or a
+        # MAKEINTRESOURCE identifier whose value is the low-order word.
+        # Treating a small identifier as an address aborts otherwise valid runs.
+        if lpTemplateName and lpTemplateName > 0xFFFF:
+            if not emu.is_address_valid(lpTemplateName):
+                return 0
             tname = self.read_mem_string(lpTemplateName, cw)
             argv[1] = tname
 

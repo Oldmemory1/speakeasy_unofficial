@@ -1,6 +1,7 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import hashlib
+import logging
 import ntpath
 import os
 import shlex
@@ -24,6 +25,8 @@ DLL_PROCESS_DETACH = 0
 DLL_PROCESS_ATTACH = 1
 
 MAX_EXPORTS_TO_EMULATE = 10
+
+logger = logging.getLogger(__name__)
 
 
 class Win32Emulator(WindowsEmulator):
@@ -166,8 +169,11 @@ class Win32Emulator(WindowsEmulator):
             assert path is not None
             with open(path, "rb") as f:
                 data = f.read()
+        self._root_pe_data = bytes(data)
+        self._root_sample_sha256 = hashlib.sha256(data).hexdigest()
 
         emu_path = self._make_emu_path(path, data)
+        self._root_emu_path = emu_path
         self.fileman.add_existing_file(emu_path, data)
 
         self._set_input_metadata(path, data)
@@ -218,6 +224,8 @@ class Win32Emulator(WindowsEmulator):
             "emu_version": self.get_emu_version(),
             "os_run": self.get_osver_string(),
         }
+        if not self._root_sample_sha256:
+            self._root_sample_sha256 = pe.hash
         self.profiler.add_input_metadata(self.input)
 
     def prepare_module_for_emulation(self, module, all_entrypoints, entry_point=None):
@@ -326,6 +334,14 @@ class Win32Emulator(WindowsEmulator):
         # Begin emulation of main module
         self.start()
 
+        if emulate_children and self.child_processes:
+            if not self.child_execution.allow_execution:
+                logger.warning(
+                    "Child execution is model-only; %d request(s) were recorded but not run.",
+                    len(self.child_processes),
+                )
+            return
+
         if not emulate_children or len(self.child_processes) == 0:
             return
 
@@ -349,6 +365,22 @@ class Win32Emulator(WindowsEmulator):
             self.start()
 
         return
+
+    def _prepare_child_execution_report(self) -> None:
+        """Attach the model-only child request summary to the root report."""
+
+        if self.profiler and self.child_execution.requests:
+            meta = dict(self.profiler.meta or {})
+            meta["child_execution"] = self.child_execution.to_report_dict()
+            self.profiler.meta = meta
+
+    def get_report(self):
+        self._prepare_child_execution_report()
+        return super().get_report()
+
+    def get_json_report(self):
+        self._prepare_child_execution_report()
+        return super().get_json_report()
 
     def _init_name(self, path, data=None, filename=None):
         if filename:

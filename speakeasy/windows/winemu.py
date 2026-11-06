@@ -23,6 +23,10 @@ from speakeasy.profiler import MemAccess, Run
 from speakeasy.profiler_events import TracePosition
 from speakeasy.report import ErrorInfo, RegionInfo
 from speakeasy.struct import EmuStruct
+from speakeasy.windows.child_execution import (
+    ChildExecutionRegistry,
+    ChildExecutionRequest,
+)
 from speakeasy.windows.cryptman import CryptoManager
 from speakeasy.windows.driveman import DriveManager
 from speakeasy.windows.fileman import FileManager
@@ -134,6 +138,9 @@ class WindowsEmulator(BinaryEmulator):
         self.run_complete: bool = False
         self.emu_complete: bool = False
         self.instruction_budget_exhausted: bool = False
+        self._root_pe_data: bytes | None = None
+        self._root_emu_path: str = ""
+        self._root_sample_sha256: str | None = None
         self._dyn_code_caller_pc: int | None = None
         self.global_data: dict[str, Any] = {}
         self.processes: list[Any] = []
@@ -165,6 +172,7 @@ class WindowsEmulator(BinaryEmulator):
         self.cryptman: CryptoManager = CryptoManager(self.handle_allocator)
         self.hammer: ApiHammer = ApiHammer(self)
         self._io_manager: Any | None = None
+        self.child_execution = ChildExecutionRegistry(self)
 
     def _parse_config(self, config):
         """
@@ -1420,6 +1428,45 @@ class WindowsEmulator(BinaryEmulator):
             self.processes.append(p)
 
         return p
+
+    def register_child_fixture(self, path: str, data: bytes) -> None:
+        """Register exact child bytes for model-only target resolution."""
+
+        self.child_execution.register_fixture(path, data)
+
+    def create_child_execution_request(
+        self,
+        source_api: str,
+        path: str | None,
+        cmdline: str | None,
+        cwd: str | None = None,
+    ) -> ChildExecutionRequest:
+        """Record a child request without queuing its entry point."""
+
+        return self.child_execution.create_request(
+            source_api=source_api,
+            path=path,
+            command_line=cmdline,
+            cwd=cwd,
+        )
+
+    def request_child_process(
+        self,
+        source_api: str,
+        path: str | None,
+        cmdline: str | None,
+        cwd: str | None = None,
+    ) -> tuple[Any, ChildExecutionRequest]:
+        """Create the legacy process object and attach model-only evidence.
+
+        The process remains in ``child_processes`` for compatibility with the
+        existing object model, but no run is added to ``run_queue``.
+        """
+
+        request = self.create_child_execution_request(source_api, path, cmdline, cwd=cwd)
+        process = self.create_process(path=path, cmdline=cmdline, child=True)
+        request.mark_process_created(process)
+        return process, request
 
     def create_thread(self, addr, ctx, proc_obj, thread_type="thread", is_suspended=False):
         """

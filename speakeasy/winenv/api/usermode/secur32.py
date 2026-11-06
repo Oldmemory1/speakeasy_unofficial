@@ -34,14 +34,21 @@ class Secur32(api.ApiHandler):
             argv[0] = name_format
 
         user_name = emu.config.user.name
-        user_name_len = len(user_name)
+        user_name_len = len(user_name) + 1
 
         argv[1] = user_name
         argv[2] = user_name_len
 
-        self.write_mem_string(user_name, lpNameBuffer, cw)
-        self.mem_write(nSize, user_name_len.to_bytes(4, "little"))
+        if not nSize or not emu.is_address_valid(nSize):
+            return 0
 
+        current_size = int.from_bytes(self.mem_read(nSize, 4), "little")
+        self.mem_write(nSize, user_name_len.to_bytes(4, "little"))
+        if not lpNameBuffer or current_size < user_name_len:
+            emu.set_last_error(122)  # ERROR_INSUFFICIENT_BUFFER
+            return 0
+
+        self.write_mem_string(user_name, lpNameBuffer, cw)
         return 1
 
     @apihook("EncryptMessage", argc=4)
