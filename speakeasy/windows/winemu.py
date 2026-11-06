@@ -1806,6 +1806,39 @@ class WindowsEmulator(BinaryEmulator):
         self.on_run_complete()
         return True
 
+    def _dispatch_control_return(self):
+        """
+        Consume an internal control-flow return before it is fetched by Unicorn.
+
+        API handlers run in Python and set the guest PC with do_call_return().
+        If that return address is one of the reserved control sentinels, the
+        mapped sentinel page would otherwise be fetched and its zero bytes
+        executed. Complete the SEH/callback transition directly instead.
+        """
+        pc = self.get_pc()
+        if pc == winemu.SEH_RETURN_ADDR:
+            self.continue_seh()
+            if self.run_complete and not self.emu_complete:
+                self.on_run_complete()
+            return True
+
+        if pc == winemu.API_CALLBACK_HANDLER_ADDR:
+            run = self.get_current_run()
+            if run.api_callbacks:
+                ret_addr, orig_func, args = run.api_callbacks.pop(0)
+                self.do_call_return(len(args), ret_addr)
+            else:
+                error = self.get_error_info(
+                    "callback_return_without_callback",
+                    pc,
+                    access_type="fetch",
+                )
+                self.curr_run.error = error  # type: ignore[union-attr]
+                self.on_run_complete()
+            return True
+
+        return False
+
     def _resolve_module_offset(self, addr: int) -> str | None:
         """Return 'module+0xoffset' string for an address inside a loaded module, or None."""
         mod = self.get_module_from_addr(addr)
@@ -2175,6 +2208,7 @@ class WindowsEmulator(BinaryEmulator):
         ret = self.get_ret_address()
         self.log_api(call_pc, imp_api, rv, argv, display=display)
         self.do_call_return(argc, ret, rv, conv=conv)
+        self._dispatch_control_return()
         if not self.run_complete:
             self.enable_code_hook()
         return rv
@@ -2235,6 +2269,7 @@ class WindowsEmulator(BinaryEmulator):
 
             if not self.run_complete and ret == oret and pc == opc:
                 self.do_call_return(argc, ret, rv, conv=conv)
+                self._dispatch_control_return()
 
             # Re-enable the code hook so the next instruction can unmap the
             # sentinel range again. Otherwise adjacent sentinel calls may
@@ -2309,6 +2344,7 @@ class WindowsEmulator(BinaryEmulator):
                 ret = self.get_ret_address()
                 self.log_api(call_pc, imp_api, rv, argv)
                 self.do_call_return(argc, ret, rv, conv=conv)
+                self._dispatch_control_return()
                 if not self.run_complete:
                     self.enable_code_hook()
                 return
@@ -2326,6 +2362,7 @@ class WindowsEmulator(BinaryEmulator):
                 ret = self.get_ret_address()
                 self.log_api(call_pc, imp_api, rv, argv)
                 self.do_call_return(argc, ret, rv, conv=conv)
+                self._dispatch_control_return()
                 if not self.run_complete:
                     self.enable_code_hook()
                 return
