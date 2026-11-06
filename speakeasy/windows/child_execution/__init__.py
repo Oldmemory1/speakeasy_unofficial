@@ -13,10 +13,6 @@ Existing callers may continue importing ``ChildExecutionPolicy``,
 
 from .budget import ExecutionBudgetFactory
 from .dispatcher import ChildLaunchDispatcher
-from .dynamic_adapter import (
-    ChildExecutionReportValidationError,
-    DynamicChildExecutionAdapter,
-)
 from .interfaces import (
     ChildAdmissionPolicyProtocol,
     ChildBudgetFactory,
@@ -66,6 +62,11 @@ from .models import (
 )
 from .policy import ChildExecutionPolicy
 from .registry import ChildExecutionRegistry
+from .reporting import (
+    ChildExecutionReportAdapter,
+    ChildExecutionReportProjectionError,
+    ChildExecutionReportProjector,
+)
 from .request import (
     ChildExecutionRequest,
     ChildExecutionRequestFactory,
@@ -122,7 +123,9 @@ __all__ = [
     "ChildExecutionPolicy",
     "ChildExecutionRegistry",
     "ChildExecutionReportData",
-    "ChildExecutionReportValidationError",
+    "ChildExecutionReportAdapter",
+    "ChildExecutionReportProjectionError",
+    "ChildExecutionReportProjector",
     "ChildExecutionRequest",
     "ChildExecutionRequestFactory",
     "ChildExecutionRunner",
@@ -156,7 +159,6 @@ __all__ = [
     "ChildTargetSource",
     "ChildTerminationReason",
     "DynamicChildResultAdapter",
-    "DynamicChildExecutionAdapter",
     "EmulatedModuleProtocol",
     "EmulatedProcessProtocol",
     "EmulatedRunProtocol",

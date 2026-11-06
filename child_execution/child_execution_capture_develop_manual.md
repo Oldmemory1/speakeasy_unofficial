@@ -735,8 +735,9 @@ engine.run_module(module, emulate_children=True)
 `8 + 6 + 2 + 1 = 17` 的计数口径不同。后续统计必须明确单位是样本数、
 request 数、API 调用数还是机制分类数。
 
-阶段 1 已完成 model-only 代码，但尚未提交和做 1,229 全量验收。当前策略只
-记录 request，不执行 child。后续工作按下列 A-H 工作包推进。
+阶段 1 model-only 和步骤 1-5 的引擎侧模块已经实现并提交过检查点；真实
+scheduler/pipeline 接入与 1,229 全量验收尚未完成。当前策略仍只记录
+request，不执行 child。后续工作按下列 A-H 工作包推进。
 
 当前 model-only 代码中的 `per_child_timeout_sec`、
 `per_child_max_api_count` 和 `per_child_max_instructions` 仍是旧的设计期
@@ -835,6 +836,10 @@ outcome；parent context 可以恢复。
 
 ### 15.7 工作包 F：parent/child outcome 和报告
 
+当前状态：引擎侧已完成强类型 child result/ownership/budget/usage/failure
+报告和 `ChildExecutionReportProjector`。projector 只复制公共标量，不输出
+target bytes 或 Process/Run 对象。
+
 目标：child 失败只影响 child 证据，不改变父样本原本的仿真结果。
 
 - 分别保存 parent/child 的 status、coverage 和 termination reason；
@@ -849,6 +854,12 @@ outcome；parent context 可以恢复。
 验收：child timeout 时 parent 可以保持 `ok`；batch result 能聚合两层状态。
 
 ### 15.8 工作包 G：dynamic stage 和 shell tracker 对接
+
+当前状态：引擎侧已完成 `DynamicChildExecutionAdapter`，它只接受公共
+`ChildExecutionReport`，校验 lineage 后调用 tracker 的显式
+`update_child_execution(report)`。真实 dynamic-stage tracker 的该方法、
+pipeline 注入和旧 `note_execution_context` pid 推断替换留到后续集成，不能
+通过修改 `kernel32.py` 或其它仿真路径绕接。
 
 目标：下游消费引擎权威 request/result，不自行推断执行事实。
 

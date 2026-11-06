@@ -571,6 +571,57 @@ class ChildExecutionRequestReport(BaseModel):
     rejection_reason: str | None = Field(default=None, description="Admission rejection reason.")
 
 
+class ChildExecutionBudgetReport(BaseModel):
+    """Execution limits inherited from the parent configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(default="parent_config", description="Budget limit source.")
+    timeout_seconds: float = Field(description="Per-run wall-clock limit.")
+    max_api_count: int = Field(description="Per-run API-call limit.")
+    max_instructions: int = Field(description="Per-run instruction limit; -1 means unlimited.")
+
+
+class ChildExecutionBudgetUsageReport(BaseModel):
+    """Consumption counters owned by one child run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    timeout_seconds_used: float = Field(default=0.0, description="Elapsed child wall-clock time.")
+    api_count_used: int = Field(default=0, description="Emulated API calls consumed.")
+    instructions_used: int = Field(default=0, description="Emulated instructions consumed.")
+
+
+class ChildExecutionFailureReport(BaseModel):
+    """Structured child-local failure information."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = Field(description="Failure boundary classification.")
+    message: str = Field(description="Human-readable failure detail.")
+    pc: int | None = Field(default=None, description="Program counter associated with the failure.")
+    api_name: str | None = Field(default=None, description="API active at the failure, when known.")
+
+
+class ChildExecutionResultReport(BaseModel):
+    """Final result for one controlled child execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    launch_id: str = Field(description="Stable engine-generated launch identifier.")
+    ownership: ChildExecutionOwnership = Field(description="Parent/child lineage for the result.")
+    state: str = Field(description="Terminal child execution state.")
+    outcome: str = Field(description="High-level child outcome.")
+    termination_reason: str = Field(description="Machine-readable child termination reason.")
+    budget: ChildExecutionBudgetReport = Field(description="Limits inherited from the parent.")
+    usage: ChildExecutionBudgetUsageReport = Field(description="Counters consumed by this child.")
+    run_indexes: list[int] = Field(default_factory=list, description="Report entry-point indexes owned by the child.")
+    failure: ChildExecutionFailureReport | None = Field(
+        default=None,
+        description="Child-local failure; never a substitute for parent outcome.",
+    )
+
+
 class ChildExecutionReport(BaseModel):
     """Stage-one child request summary attached to the root emulation report."""
 
@@ -592,6 +643,10 @@ class ChildExecutionReport(BaseModel):
     requests: list[ChildExecutionRequestReport] = Field(
         default_factory=list,
         description="Recorded process-launch requests in deterministic order.",
+    )
+    results: list[ChildExecutionResultReport] = Field(
+        default_factory=list,
+        description="Completed or failed child execution results in launch order.",
     )
 
 

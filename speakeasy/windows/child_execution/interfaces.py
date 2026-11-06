@@ -20,6 +20,8 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from typing import Protocol, runtime_checkable
 
+from speakeasy.report import ChildExecutionReport
+
 from .models import (
     AdmissionDecision,
     BudgetUsage,
@@ -532,12 +534,13 @@ class ProcessExecutionTrackerProtocol(Protocol):
 
     def update_child_execution(
         self,
-        report: ChildExecutionReportData,
+        report: ChildExecutionReport,
     ) -> None:
         """Apply one immutable child report snapshot to tracker-owned state.
 
         Args:
-            report: Engine-produced child request and result summary.
+            report: Serialized public child request and result summary.  The
+                tracker must not require access to engine runtime objects.
 
         Returns:
             ``None``.
@@ -556,13 +559,13 @@ class DynamicChildResultAdapter(Protocol):
     def apply(
         self,
         tracker: ProcessExecutionTrackerProtocol,
-        report: ChildExecutionReportData,
+        report: ChildExecutionReport,
     ) -> None:
         """Apply authoritative child fields to a process tracker.
 
         Args:
             tracker: Dynamic-stage tracker receiving launch and result fields.
-            report: Engine-produced immutable report DTO.
+            report: Public immutable report DTO produced by the projector.
 
         Returns:
             ``None``.

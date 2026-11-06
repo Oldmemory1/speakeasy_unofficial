@@ -431,7 +431,20 @@ class ChildFailure:
 
 @dataclass(frozen=True)
 class ChildRunResult:
-    """Final result for one child execution."""
+    """Final result for one child execution.
+
+    Args:
+        launch_id: Stable launch identifier owning the result.
+        ownership: Root, parent, child, and depth correlation fields.
+        state: Terminal lifecycle state.
+        outcome: High-level execution outcome.
+        termination_reason: Machine-readable stop reason.
+        budget: Immutable limits inherited from the parent.
+        usage: Consumption counters owned by this child only.
+        run_indexes: Root-report entry-point indexes owned by this child.
+        error: Structured child-local failure, when present.
+        entrypoint_reached: Whether the one-shot entrypoint hook fired.
+    """
 
     launch_id: str
     ownership: ChildEventOwnership
@@ -442,6 +455,7 @@ class ChildRunResult:
     usage: BudgetUsage
     run_indexes: tuple[int, ...]
     error: ChildFailure | None
+    entrypoint_reached: bool = False
 
 
 @dataclass(frozen=True)

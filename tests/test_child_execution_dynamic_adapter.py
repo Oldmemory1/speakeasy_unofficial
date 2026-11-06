@@ -1,17 +1,20 @@
-"""Tests for the report-to-dynamic-stage adapter boundary."""
+"""Tests for the public-report-to-dynamic-tracker adapter boundary."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
+from speakeasy.report import ChildExecutionReport
 from speakeasy.windows.child_execution.dynamic_adapter import (
     ChildExecutionReportValidationError,
     DynamicChildExecutionAdapter,
 )
 from speakeasy.windows.child_execution.interfaces import DynamicChildResultAdapter
 from speakeasy.windows.child_execution.models import (
+    AdmissionDecision,
     BudgetUsage,
     ChildEventOwnership,
     ChildExecutionReportData,
@@ -20,8 +23,13 @@ from speakeasy.windows.child_execution.models import (
     ChildLaunchRequest,
     ChildOutcome,
     ChildRunResult,
+    ChildTargetSource,
     ChildTerminationReason,
     ExecutionBudget,
+    ResolvedChildTarget,
+)
+from speakeasy.windows.child_execution.reporting import (
+    ChildExecutionReportProjector,
 )
 
 ROOT_SHA256 = "a" * 64
@@ -29,27 +37,22 @@ ROOT_SHA256 = "a" * 64
 
 @dataclass
 class FakeTrackerView:
-    """Recording tracker that implements only the declared public method."""
+    """Recording tracker implementing only the declared public method."""
 
-    reports: list[ChildExecutionReportData]
+    reports: list[ChildExecutionReport]
 
-    def update_child_execution(
-        self,
-        report: ChildExecutionReportData,
-    ) -> None:
-        """Record one immutable report snapshot."""
+    def update_child_execution(self, report: ChildExecutionReport) -> None:
+        """Record one immutable public report."""
 
         self.reports.append(report)
 
 
-def _request(
-    launch_id: str = "child-000001",
-    *,
-    root_sample_sha256: str = ROOT_SHA256,
-) -> ChildLaunchRequest:
-    return ChildLaunchRequest(
-        launch_id=launch_id,
-        root_sample_sha256=root_sample_sha256,
+def _report() -> ChildExecutionReport:
+    """Build one projected terminal child report."""
+
+    request = ChildLaunchRequest(
+        launch_id="child-000001",
+        root_sample_sha256=ROOT_SHA256,
         parent_launch_id=None,
         source_api="CreateProcess",
         parent_pid=101,
@@ -62,91 +65,70 @@ def _request(
         command_sha256="b" * 64,
         parent_budget=ExecutionBudget(12.0, 200, 2_000),
     )
-
-
-def _result(
-    launch_id: str = "child-000001",
-    *,
-    root_sample_sha256: str = ROOT_SHA256,
-    child_pid: int = 303,
-    state: ChildExecutionState = ChildExecutionState.COMPLETED,
-) -> ChildRunResult:
-    budget = ExecutionBudget(12.0, 200, 2_000)
-    return ChildRunResult(
-        launch_id=launch_id,
+    target = ResolvedChildTarget(
+        source=ChildTargetSource.DROPPED_FILE,
+        normalized_path=request.normalized_target,
+        payload_ref=None,
+        sha256="c" * 64,
+        size=4096,
+        file_format="pe",
+        arch="x86",
+        module_type="exe",
+        entrypoint_rva=0x1000,
+        resolved=True,
+        reason=None,
+    )
+    record = ChildLaunchRecord(
+        request=request,
+        target=target,
+        decision=AdmissionDecision(
+            eligible=True,
+            state=ChildExecutionState.ELIGIBLE,
+            reason=None,
+        ),
+        process=SimpleNamespace(pid=303),
+        state=ChildExecutionState.COMPLETED,
+    )
+    result = ChildRunResult(
+        launch_id=request.launch_id,
         ownership=ChildEventOwnership(
-            root_sample_sha256=root_sample_sha256,
-            launch_id=launch_id,
+            root_sample_sha256=ROOT_SHA256,
+            launch_id=request.launch_id,
             parent_pid=101,
-            child_pid=child_pid,
+            child_pid=303,
             depth=1,
         ),
-        state=state,
+        state=ChildExecutionState.COMPLETED,
         outcome=ChildOutcome.OK,
         termination_reason=ChildTerminationReason.NORMAL_EXIT,
-        budget=budget,
-        usage=BudgetUsage(),
+        budget=ExecutionBudget(12.0, 200, 2_000),
+        usage=BudgetUsage(1.25, 17, 250),
         run_indexes=(7,),
         error=None,
+        entrypoint_reached=True,
     )
-
-
-def _report(
-    *,
-    records: tuple[ChildLaunchRecord, ...] | None = None,
-    results: tuple[ChildRunResult, ...] | None = None,
-) -> ChildExecutionReportData:
-    actual_records = records or (
-        ChildLaunchRecord(
-            request=_request(),
-            state=ChildExecutionState.COMPLETED,
-        ),
-    )
-    actual_results = results or (_result(),)
-    return ChildExecutionReportData(
+    snapshot = ChildExecutionReportData(
         mode="scheduled",
         execution_enabled=True,
-        request_count=len(actual_records),
-        eligible_count=sum(
-            record.decision is not None and record.decision.eligible
-            for record in actual_records
-        ),
-        target_resolved_count=sum(
-            record.target is not None and record.target.resolved
-            for record in actual_records
-        ),
-        process_object_created_count=sum(
-            record.process is not None for record in actual_records
-        ),
-        thread_queued_count=sum(
-            record.state
-            in {
-                ChildExecutionState.THREAD_QUEUED,
-                ChildExecutionState.ENTRYPOINT_REACHED,
-                ChildExecutionState.COMPLETED,
-                ChildExecutionState.PARTIAL,
-            }
-            for record in actual_records
-        ),
-        entrypoint_reached_count=sum(
-            record.state
-            in {
-                ChildExecutionState.ENTRYPOINT_REACHED,
-                ChildExecutionState.COMPLETED,
-                ChildExecutionState.PARTIAL,
-            }
-            for record in actual_records
-        ),
-        records=actual_records,
-        results=actual_results,
+        request_count=1,
+        eligible_count=1,
+        target_resolved_count=1,
+        process_object_created_count=1,
+        thread_queued_count=1,
+        entrypoint_reached_count=1,
+        records=(record,),
+        results=(result,),
     )
+    return ChildExecutionReportProjector(
+        policy={"max_depth": 1}
+    ).project(snapshot)
 
 
 def test_adapter_is_runtime_protocol_compatible() -> None:
     assert isinstance(DynamicChildExecutionAdapter(), DynamicChildResultAdapter)
 
 
-def test_adapter_forwards_authoritative_report_once() -> None:
+def test_adapter_forwards_public_report_once() -> None:
     tracker = FakeTrackerView([])
     report = _report()
 
@@ -157,10 +139,8 @@ def test_adapter_forwards_authoritative_report_once() -> None:
 
 
 def test_adapter_rejects_duplicate_launch_ids_before_tracker_call() -> None:
-    record = ChildLaunchRecord(
-        request=_request(),
-        state=ChildExecutionState.COMPLETED,
-    )
+    report = _report()
+    request = report.requests[0]
     tracker = FakeTrackerView([])
 
     with pytest.raises(
@@ -169,13 +149,22 @@ def test_adapter_rejects_duplicate_launch_ids_before_tracker_call() -> None:
     ):
         DynamicChildExecutionAdapter().apply(
             tracker,
-            _report(records=(record, record)),
+            report.model_copy(
+                update={
+                    "request_count": 2,
+                    "requests": [request, request],
+                }
+            ),
         )
 
     assert tracker.reports == []
 
 
-def test_adapter_rejects_result_without_launch_record() -> None:
+def test_adapter_rejects_orphan_result_before_tracker_call() -> None:
+    report = _report()
+    orphan = report.results[0].model_copy(
+        update={"launch_id": "child-999999"}
+    )
     tracker = FakeTrackerView([])
 
     with pytest.raises(
@@ -184,13 +173,18 @@ def test_adapter_rejects_result_without_launch_record() -> None:
     ):
         DynamicChildExecutionAdapter().apply(
             tracker,
-            _report(results=(_result("child-999999"),)),
+            report.model_copy(update={"results": [orphan]}),
         )
 
     assert tracker.reports == []
 
 
-def test_adapter_rejects_root_ownership_mismatch() -> None:
+def test_adapter_rejects_ownership_mismatch_before_tracker_call() -> None:
+    report = _report()
+    result = report.results[0]
+    ownership = result.ownership.model_copy(
+        update={"root_sample_sha256": "c" * 64}
+    )
     tracker = FakeTrackerView([])
 
     with pytest.raises(
@@ -199,22 +193,52 @@ def test_adapter_rejects_root_ownership_mismatch() -> None:
     ):
         DynamicChildExecutionAdapter().apply(
             tracker,
-            _report(results=(_result(root_sample_sha256="c" * 64),)),
+            report.model_copy(
+                update={
+                    "results": [
+                        result.model_copy(update={"ownership": ownership})
+                    ]
+                }
+            ),
         )
 
     assert tracker.reports == []
 
 
-def test_adapter_rejects_invalid_child_pid() -> None:
+def test_adapter_rejects_state_count_mismatch_before_tracker_call() -> None:
     tracker = FakeTrackerView([])
 
     with pytest.raises(
         ChildExecutionReportValidationError,
-        match="child pid is invalid",
+        match="states do not match",
     ):
         DynamicChildExecutionAdapter().apply(
             tracker,
-            _report(results=(_result(child_pid=0),)),
+            _report().model_copy(update={"states": {}}),
+        )
+
+    assert tracker.reports == []
+
+
+def test_adapter_rejects_invalid_child_budget_before_tracker_call() -> None:
+    report = _report()
+    result = report.results[0]
+    budget = result.budget.model_copy(update={"max_instructions": -2})
+    tracker = FakeTrackerView([])
+
+    with pytest.raises(
+        ChildExecutionReportValidationError,
+        match="instruction budget is invalid",
+    ):
+        DynamicChildExecutionAdapter().apply(
+            tracker,
+            report.model_copy(
+                update={
+                    "results": [
+                        result.model_copy(update={"budget": budget})
+                    ]
+                }
+            ),
         )
 
     assert tracker.reports == []

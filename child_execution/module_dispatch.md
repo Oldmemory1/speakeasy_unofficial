@@ -2,7 +2,8 @@
 
 > 日期：2026-11-04
 >
-> 状态：步骤 1-4 已实现；scheduler 接入和 report/dynamic adapter 尚未实现
+> 状态：步骤 1-5 的引擎侧模块已实现；真实 scheduler/pipeline 接入和步骤 6
+> 小批实验尚未完成
 >
 > 上位设计：
 > [child_execution_capture_develop_manual.md](child_execution_capture_develop_manual.md)
@@ -845,6 +846,7 @@ Report.child_execution
   entrypoint_reached_count
   states
   requests[]
+  results[]
 ```
 
 执行阶段增加：
@@ -853,17 +855,31 @@ Report.child_execution
 results[]
   launch_id
   ownership
+  state
   outcome
   termination_reason
-  budget_source
-  budget_limits
-  budget_usage
+  budget
+    source
+    timeout_seconds
+    max_api_count
+    max_instructions
+  usage
+    timeout_seconds_used
+    api_count_used
+    instructions_used
   run_indexes
   failure
 ```
 
 child 实际 Run 继续进入 `Report.entry_points`，由 ownership 关联；不得为 child
 复制一套 API/file/network 数据结构。
+
+引擎内部 `ChildExecutionReportData` 通过
+`ChildExecutionReportProjector`/`ChildExecutionReportAdapter` 投影为
+`speakeasy.report.ChildExecutionReport`。投影只复制标量和强类型报告字段，
+不序列化 target bytes、Process、Thread、Run、queue 或其它 engine 对象。
+`DynamicChildExecutionAdapter` 只接受这份公共报告，并在完整校验后调用
+tracker 的显式 `update_child_execution(report)` 方法。
 
 ## 12. Dynamic stage 接口
 
@@ -996,9 +1012,36 @@ tracker 不得从 API result、Process 是否存在或后续任意 pid 事件反
 
 ### 步骤 5：report/dynamic adapter
 
-- 增加 child result 和 ownership；
-- 让 tracker 消费权威报告；
-- 移除基于 API result 和 pid 活动的推断。
+- [x] 在 `speakeasy/report.py` 增加强类型 child result、ownership、budget、
+      usage 和 failure 报告；
+- [x] 实现 `ChildExecutionReportProjector`，将内部快照投影为公共报告；
+- [x] 保留 `ChildExecutionReportAdapter` 兼容名称，并支持显式传入 policy；
+- [x] `ChildRunResult` 保留 `entrypoint_reached` 权威事实，避免从 pid 或
+      API result 反推；
+- [x] `DynamicChildExecutionAdapter` 只接受公共
+      `speakeasy.report.ChildExecutionReport`；
+- [x] adapter 通过 tracker 的显式 `update_child_execution(report)` 协议一次
+      应用权威结果，不访问 tracker 私有 map 或 engine 对象；
+- [x] adapter 在任何写入前校验 request/result 计数、states、ownership、
+      root SHA、parent pid、depth、child pid、terminal state、run indexes、
+      budget 和 usage；
+- [x] 校验失败时 tracker 不会被调用，不会把推断结果写成权威事实；
+- [x] `ChildRunResult`、报告投影和 adapter 均有显式类型、
+      Args/Returns/Side effects/Raises docstring；
+- [x] 未修改 `kernel32.py`、`win32.py`、`winemu.py`、`profiler.py`，
+      也未修改现有 tracker/pipeline 运行行为；
+- [x] 未使用 `ENV_ENABLE=1`、环境变量传参、monkey patch、动态属性注入、
+      私有字段穿透或跨项目目录操作；
+- [x] 新增 engine report 投影与 dynamic adapter 测试；全部 child-execution
+      回归：`112 passed`；
+- [x] Ruff、`py_compile` 和 `git diff --check`：通过；
+- [x] 全量 Speakeasy 测试：`454 passed, 26 skipped, 5 failed`；失败仍为缺失
+      capa 测试资产和既有 PYNative/PEB 行为差异，与步骤 5 无关；
+- [ ] 真实 dynamic-stage tracker 尚未实现
+      `update_child_execution(report)`，也尚未接入 pipeline；
+- [ ] 现有 `note_execution_context` 的 pid 推断尚未切换为权威报告，留到
+      pipeline 集成步骤；
+- [ ] 步骤 6 小批实验尚未执行。
 
 ### 步骤 6：小批实验
 
@@ -1020,7 +1063,7 @@ tracker 不得从 API result、Process 是否存在或后续任意 pid 事件反
 - [x] child loader 使用 `primary=False`，不覆盖 root metadata。
 - [ ] scheduler 在 parent 完成前不 drain。
 - [x] runner 的入口 hook 是 `entrypoint_reached` 唯一证据。
-- [ ] child result 有稳定 ownership 并可回溯 run index。
-- [ ] dynamic adapter 只消费报告 DTO。
-- [ ] 生产代码没有 monkey patch、动态属性注入或私有字段穿透。
-- [ ] 测试使用显式 stub/fake、依赖注入和非默认 parent 配置。
+- [x] child result 有稳定 ownership 并可回溯 run index。
+- [x] dynamic adapter 只消费报告 DTO。
+- [x] 生产代码没有 monkey patch、动态属性注入或私有字段穿透。
+- [x] 测试使用显式 stub/fake、依赖注入和非默认 parent 配置。

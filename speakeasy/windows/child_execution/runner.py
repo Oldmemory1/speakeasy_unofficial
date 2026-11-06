@@ -328,6 +328,7 @@ class ChildExecutionRunner:
             usage=usage,
             run_indexes=run_indexes,
             error=failure,
+            entrypoint_reached=entrypoint_reached,
         )
 
     def _validate_run_inputs(

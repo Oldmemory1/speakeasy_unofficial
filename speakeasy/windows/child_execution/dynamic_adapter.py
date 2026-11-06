@@ -1,212 +1,282 @@
-"""Adapter from authoritative child report DTOs to dynamic-stage trackers.
-
-The dynamic stage consumes engine facts only through
-:class:`ChildExecutionReportData`.  This module deliberately has no dependency
-on emulator processes, scheduler queues, API-handler results, or private
-tracker dictionaries.
-"""
+"""Apply authoritative public child reports to a dynamic-stage tracker."""
 
 from __future__ import annotations
 
+from collections import Counter
+
+from speakeasy.report import (
+    ChildExecutionBudgetReport,
+    ChildExecutionBudgetUsageReport,
+    ChildExecutionReport,
+    ChildExecutionRequestReport,
+    ChildExecutionResultReport,
+)
+
 from .interfaces import ProcessExecutionTrackerProtocol
-from .models import (
-    ChildExecutionReportData,
-    ChildExecutionState,
-    ChildLaunchRecord,
+
+_TERMINAL_STATES = frozenset({"completed", "partial", "failed"})
+_QUEUED_OR_LATER = frozenset(
+    {"thread_queued", "entrypoint_reached", "completed", "partial"}
+)
+_ENTRYPOINT_OR_LATER = frozenset(
+    {"entrypoint_reached", "completed", "partial"}
 )
 
 
 class ChildExecutionReportValidationError(ValueError):
-    """Raised when a report cannot be applied without inventing ownership."""
+    """Raised when a report cannot be applied without inventing child state."""
 
 
 class DynamicChildExecutionAdapter:
-    """Validate and apply one immutable child report to a process tracker.
+    """Validate one public child report and apply it to a tracker.
 
     Args:
-        None.  The tracker is supplied per :meth:`apply` call so one adapter
-        can serve multiple independent samples.
+        None.  The target tracker is supplied to :meth:`apply`, allowing one
+        stateless adapter instance to serve independent samples.
 
-    The adapter owns no launch or tracker state.  It validates report
-    referential integrity and delegates state changes to the tracker's
-    explicit public interface.
+    The adapter owns no engine or tracker state.  It accesses tracker state
+    only through the explicit ``update_child_execution`` protocol method.
     """
 
     def apply(
         self,
         tracker: ProcessExecutionTrackerProtocol,
-        report: ChildExecutionReportData,
+        report: ChildExecutionReport,
     ) -> None:
-        """Apply authoritative child fields to a dynamic-stage tracker.
+        """Apply authoritative launch and result fields to a tracker.
 
         Args:
-            tracker: Tracker implementing the explicit
-                ``update_child_execution`` protocol method.  Its storage and
-                private fields are not accessed by this adapter.
-            report: Immutable engine snapshot containing launch records and
-                completed child results.
+            tracker: Dynamic-stage tracker implementing
+                ``update_child_execution(report)``.
+            report: Public child report containing requests and terminal
+                results.  Engine runtime objects must not be attached.
 
         Returns:
             ``None``.
 
         Side effects:
-            Calls ``tracker.update_child_execution(report)`` exactly once after
-            validation succeeds.  It does not mutate engine or scheduler state.
+            Calls ``tracker.update_child_execution(report)`` exactly once,
+            after validation succeeds.  Engine and scheduler state are not
+            modified.
 
         Raises:
-            ChildExecutionReportValidationError: If launch identities are
-                duplicated, result ownership is orphaned, or result ownership
-                disagrees with its request.
+            ChildExecutionReportValidationError: If report counters, lineage,
+                ownership, budgets, usage, or terminal states are inconsistent.
         """
 
         self._validate(report)
         tracker.update_child_execution(report)
 
-    def _validate(self, report: ChildExecutionReportData) -> None:
-        """Reject snapshots whose result lineage cannot be proven.
+    def _validate(self, report: ChildExecutionReport) -> None:
+        """Validate all report facts required for conservative tracker updates.
 
         Args:
-            report: Immutable report snapshot to validate.
+            report: Public child report to validate.
 
         Returns:
-            ``None`` when every result can be tied to exactly one request.
+            ``None`` when launch and result lineage is internally consistent.
 
         Side effects:
             None.
 
         Raises:
-            ChildExecutionReportValidationError: If the report is internally
-                inconsistent.
+            ChildExecutionReportValidationError: If a summary counter, state
+                count, launch identity, or result relationship is invalid.
         """
 
-        if report.request_count != len(report.records):
+        if report.request_count != len(report.requests):
             raise ChildExecutionReportValidationError(
-                "request_count does not match launch records"
+                "request_count does not match launch requests"
             )
 
-        records_by_launch_id = {}
-        for record in report.records:
-            launch_id = record.request.launch_id
-            if launch_id in records_by_launch_id:
+        requests_by_id: dict[str, ChildExecutionRequestReport] = {}
+        roots: set[str] = set()
+        for request in report.requests:
+            if request.launch_id in requests_by_id:
                 raise ChildExecutionReportValidationError(
-                    f"duplicate child launch id: {launch_id}"
+                    f"duplicate child launch id: {request.launch_id}"
                 )
-            records_by_launch_id[launch_id] = record
+            requests_by_id[request.launch_id] = request
+            if request.root_sample_sha256:
+                roots.add(request.root_sample_sha256)
 
-        result_launch_ids: set[str] = set()
-        for result in report.results:
-            launch_id = result.launch_id
-            record = records_by_launch_id.get(launch_id)
-            if record is None:
-                raise ChildExecutionReportValidationError(
-                    f"child result has no launch record: {launch_id}"
-                )
-            if launch_id in result_launch_ids:
-                raise ChildExecutionReportValidationError(
-                    f"duplicate child result for launch id: {launch_id}"
-                )
-            result_launch_ids.add(launch_id)
+        if len(roots) > 1:
+            raise ChildExecutionReportValidationError(
+                "child report contains multiple root sample identities"
+            )
 
-            ownership = result.ownership
-            request = record.request
-            if ownership.launch_id != launch_id:
-                raise ChildExecutionReportValidationError(
-                    f"result ownership launch id mismatch: {launch_id}"
-                )
-            if ownership.root_sample_sha256 != request.root_sample_sha256:
-                raise ChildExecutionReportValidationError(
-                    f"result root sample mismatch: {launch_id}"
-                )
-            if ownership.parent_pid != request.parent_pid:
-                raise ChildExecutionReportValidationError(
-                    f"result parent pid mismatch: {launch_id}"
-                )
-            if ownership.depth != request.depth:
-                raise ChildExecutionReportValidationError(
-                    f"result depth mismatch: {launch_id}"
-                )
-            if ownership.child_pid <= 0:
-                raise ChildExecutionReportValidationError(
-                    f"result child pid is invalid: {launch_id}"
-                )
-
-            if result.state not in (
-                ChildExecutionState.COMPLETED,
-                ChildExecutionState.PARTIAL,
-                ChildExecutionState.FAILED,
-            ):
-                raise ChildExecutionReportValidationError(
-                    f"result state is not terminal: {launch_id}"
-                )
-
-        self._validate_counts(report, records_by_launch_id)
-
-    @staticmethod
-    def _validate_counts(
-        report: ChildExecutionReportData,
-        records_by_launch_id: dict[str, ChildLaunchRecord],
-    ) -> None:
-        """Check summary counters against immutable launch records.
-
-        Args:
-            report: Snapshot whose summary counters are checked.
-            records_by_launch_id: Validated records indexed by stable launch id.
-
-        Returns:
-            ``None`` when all summary counters agree with the records.
-
-        Side effects:
-            None.
-
-        Raises:
-            ChildExecutionReportValidationError: If a counter disagrees.
-        """
-
-        records = tuple(records_by_launch_id.values())
         expected_counts = {
-            "eligible_count": sum(
-                record.decision is not None and record.decision.eligible
-                for record in records
-            ),
+            "eligible_count": sum(r.eligible for r in report.requests),
             "target_resolved_count": sum(
-                record.target is not None and record.target.resolved
-                for record in records
+                r.target_resolved for r in report.requests
             ),
             "process_object_created_count": sum(
-                record.process is not None for record in records
+                r.process_object_created for r in report.requests
             ),
             "thread_queued_count": sum(
-                record.state
-                in {
-                    ChildExecutionState.THREAD_QUEUED,
-                    ChildExecutionState.ENTRYPOINT_REACHED,
-                    ChildExecutionState.COMPLETED,
-                    ChildExecutionState.PARTIAL,
-                }
-                for record in records
+                r.thread_queued or r.state in _QUEUED_OR_LATER
+                for r in report.requests
             ),
             "entrypoint_reached_count": sum(
-                record.state
-                in {
-                    ChildExecutionState.ENTRYPOINT_REACHED,
-                    ChildExecutionState.COMPLETED,
-                    ChildExecutionState.PARTIAL,
-                }
-                for record in records
+                r.entrypoint_reached or r.state in _ENTRYPOINT_OR_LATER
+                for r in report.requests
             ),
         }
         actual_counts = {
             "eligible_count": report.eligible_count,
             "target_resolved_count": report.target_resolved_count,
-            "process_object_created_count": report.process_object_created_count,
+            "process_object_created_count": (
+                report.process_object_created_count
+            ),
             "thread_queued_count": report.thread_queued_count,
             "entrypoint_reached_count": report.entrypoint_reached_count,
         }
         for name, expected in expected_counts.items():
             if actual_counts[name] != expected:
                 raise ChildExecutionReportValidationError(
-                    f"{name} does not match launch records"
+                    f"{name} does not match launch requests"
                 )
+
+        expected_states = Counter(r.state for r in report.requests)
+        if report.states != dict(expected_states):
+            raise ChildExecutionReportValidationError(
+                "states do not match launch requests"
+            )
+
+        result_ids: set[str] = set()
+        for result in report.results:
+            if result.launch_id in result_ids:
+                raise ChildExecutionReportValidationError(
+                    f"duplicate child result for launch id: {result.launch_id}"
+                )
+            result_ids.add(result.launch_id)
+            request = requests_by_id.get(result.launch_id)
+            if request is None:
+                raise ChildExecutionReportValidationError(
+                    f"child result has no launch record: {result.launch_id}"
+                )
+            self._validate_result(request, result)
+
+    @staticmethod
+    def _validate_result(
+        request: ChildExecutionRequestReport,
+        result: ChildExecutionResultReport,
+    ) -> None:
+        """Validate one terminal result against its launch request.
+
+        Args:
+            request: Public request carrying root, parent, and depth identity.
+            result: Public result carrying ownership and execution facts.
+
+        Returns:
+            ``None`` when result lineage and terminal facts are valid.
+
+        Side effects:
+            None.
+
+        Raises:
+            ChildExecutionReportValidationError: If ownership, run indexes,
+                terminal state, budget, or usage is invalid.
+        """
+
+        launch_id = result.launch_id
+        ownership = result.ownership
+        if ownership.launch_id != launch_id:
+            raise ChildExecutionReportValidationError(
+                f"result ownership launch id mismatch: {launch_id}"
+            )
+        if (
+            request.root_sample_sha256 is not None
+            and ownership.root_sample_sha256 != request.root_sample_sha256
+        ):
+            raise ChildExecutionReportValidationError(
+                f"result root sample mismatch: {launch_id}"
+            )
+        if (
+            request.parent_pid is not None
+            and ownership.parent_pid != request.parent_pid
+        ):
+            raise ChildExecutionReportValidationError(
+                f"result parent pid mismatch: {launch_id}"
+            )
+        if ownership.depth != request.depth:
+            raise ChildExecutionReportValidationError(
+                f"result depth mismatch: {launch_id}"
+            )
+        if ownership.child_pid is None or ownership.child_pid <= 0:
+            raise ChildExecutionReportValidationError(
+                f"result child pid is invalid: {launch_id}"
+            )
+        if result.state not in _TERMINAL_STATES:
+            raise ChildExecutionReportValidationError(
+                f"result state is not terminal: {launch_id}"
+            )
+        if len(set(result.run_indexes)) != len(result.run_indexes):
+            raise ChildExecutionReportValidationError(
+                f"result run indexes are duplicated: {launch_id}"
+            )
+        if any(index < 0 for index in result.run_indexes):
+            raise ChildExecutionReportValidationError(
+                f"result run index is negative: {launch_id}"
+            )
+        DynamicChildExecutionAdapter._validate_budget(result.budget)
+        DynamicChildExecutionAdapter._validate_usage(result.usage)
+
+    @staticmethod
+    def _validate_budget(budget: ChildExecutionBudgetReport) -> None:
+        """Validate limits without substituting child-specific defaults.
+
+        Args:
+            budget: Public child budget report.
+
+        Returns:
+            ``None`` when all limits satisfy the frozen contract.
+
+        Side effects:
+            None.
+
+        Raises:
+            ChildExecutionReportValidationError: If any limit is invalid.
+        """
+
+        if budget.timeout_seconds <= 0:
+            raise ChildExecutionReportValidationError(
+                "child timeout budget is invalid"
+            )
+        if budget.max_api_count < 1:
+            raise ChildExecutionReportValidationError(
+                "child API budget is invalid"
+            )
+        if budget.max_instructions < -1:
+            raise ChildExecutionReportValidationError(
+                "child instruction budget is invalid"
+            )
+
+    @staticmethod
+    def _validate_usage(usage: ChildExecutionBudgetUsageReport) -> None:
+        """Validate independent per-child consumption counters.
+
+        Args:
+            usage: Public child budget-usage report.
+
+        Returns:
+            ``None`` when every consumed counter is non-negative.
+
+        Side effects:
+            None.
+
+        Raises:
+            ChildExecutionReportValidationError: If usage is negative.
+        """
+
+        if (
+            usage.timeout_seconds_used < 0
+            or usage.api_count_used < 0
+            or usage.instructions_used < 0
+        ):
+            raise ChildExecutionReportValidationError(
+                "child budget usage cannot be negative"
+            )
 
 
 __all__ = [
