@@ -3,7 +3,7 @@
   "date": "2026-11-06",
   "speakeasy_commit": "c16440d8daef7ca343437acd0b9211cbf1ee71e4",
   "source_batch": "artifacts/dynamic_stage_new/uncertain_samples_20261101_suspicious_shell_w8",
-  "conclusion": "experiment_executed_but_child_execution_blocked",
+  "conclusion": "explicit_mira_and_r3_dropped_depth1_reviewed_default_child_execution_still_disabled",
   "full_batch": {
     "samples": 1229,
     "samples_with_launch": 81,
@@ -58,26 +58,133 @@
       "49ff71a51610dbab8831d35a6e4bad50e835ec84b32884b3107b2817402fb54c"
     ],
     "representative_exact_fixture_resolutions": 3,
-    "production_path_mapping": "blocked"
+    "representative_production_path_resolutions": 3,
+    "production_path_mapping": "implemented_exact_filemanager_snapshot"
+  },
+  "r3_dropped_depth1": {
+    "explicit_scope_only": true,
+    "max_depth": 1,
+    "max_children_per_root": 2,
+    "allowed_sources": [
+      "dropped_file"
+    ],
+    "roots": 25,
+    "request_count": 36,
+    "request_states": {
+      "unavailable": 16,
+      "rejected": 11,
+      "failed": 6,
+      "completed": 3
+    },
+    "result_count": 9,
+    "termination_reasons": {
+      "normal_exit": 3,
+      "load_error": 4,
+      "invalid_fetch": 2
+    },
+    "entrypoint_reached": 5,
+    "entrypoint_reached_normal_exit": 3,
+    "parent_outcomes": {
+      "ok": 21,
+      "simulation_error": 2,
+      "budget_exhausted": 1,
+      "timed_out": 1
+    },
+    "parent_status_differences_from_historical_state_only": 3,
+    "summary_file": "dropped_depth1_e2e_summary.json"
+  },
+  "benign_installer_review": {
+    "roots": 2,
+    "parent_outcome_preserved": 2,
+    "child_termination_reason": "load_error",
+    "runs": [
+      {
+        "root_sha256": "45a93d1969d921f82d7897ccd3065de6ce03d378be03d0fbff9c70bc78c18cd1",
+        "parent_outcome": "ok",
+        "drop_sha256": "d2e9c5966937beadba64d89d3ce31212c61a85118d9662adb98fdeac1ad6eb44",
+        "drop_size": 387072,
+        "child_outcome": "error",
+        "child_termination_reason": "load_error"
+      },
+      {
+        "root_sha256": "49ff71a51610dbab8831d35a6e4bad50e835ec84b32884b3107b2817402fb54c",
+        "parent_outcome": "timed_out",
+        "drop_sha256": "995ca25e8ac883429e67e2985887c2dc122e4d3cca48d6ab5b545e6a896ae2e1",
+        "drop_size": 386048,
+        "child_outcome": "error",
+        "child_termination_reason": "load_error"
+      }
+    ]
   },
   "model_tests": {
-    "pytest": "112 passed",
+    "child_execution_pytest": "152 passed",
+    "child_execution_detection_pytest": "42 passed",
+    "full_speakeasy_pytest": "494 passed, 26 skipped, 5 known failures",
     "ruff": "All checks passed!"
+  },
+  "mira_depth1": {
+    "explicit_scope_only": true,
+    "max_depth": 1,
+    "max_children_per_root": 1,
+    "allowed_sources": [
+      "self"
+    ],
+    "samples": 4,
+    "parent_ok": 4,
+    "request_count": 4,
+    "entrypoint_reached": 4,
+    "completed": 4,
+    "nested_request_outcome": "depth_limit",
+    "parent_context_restore_verified": 4,
+    "runs": [
+      {
+        "dataset_alias": "493dc2de1df71b25c690cd92e540064a9d10ad41e1fdb16f6d19ffc16c0b1e76",
+        "root_sha256": "f9b1ad6458942dbb68e3114058a8b9fdb35425d833f7165aec94ba795141c461",
+        "child_pid": 1256,
+        "api_count_used": 27,
+        "instructions_used": 3034
+      },
+      {
+        "dataset_alias": "81a5f5c263c3241f9bde4ed224a3cd8fe4abecd1581b8e6cdcb2efaee5a797ee",
+        "root_sha256": "b245ad4b6c796945e54fb44c650aa8c9175207682784fe787316c8145376c848",
+        "child_pid": 1256,
+        "api_count_used": 27,
+        "instructions_used": 2884
+      },
+      {
+        "dataset_alias": "82cf0cd85dfe34ed17c05f1c3f78b016c3365b6ccc1105aa240b53b14182c82b",
+        "root_sha256": "16dad7457f561af34779223a889eac7a885e76d8875f52fe51d730f1d160e888",
+        "child_pid": 1256,
+        "api_count_used": 27,
+        "instructions_used": 2884
+      },
+      {
+        "dataset_alias": "b977b18c216bf9760f90d7e7afff5b6f841783f0c532dd3839b570b21f1ed611",
+        "root_sha256": "e216b550b5c28a8c9cd75942c9d31598f2c6b57c97e06bc3ff02695ee0d73edb",
+        "child_pid": 1256,
+        "api_count_used": 27,
+        "instructions_used": 2884
+      }
+    ]
   },
   "gate_status": {
     "state_only": "pass",
-    "real_child_execution": "blocked",
-    "mira_self_target": "fail",
-    "padodor_api_failure_semantics": "fail",
+    "real_child_execution": "pass_explicit_mira_and_r3_dropped_depth1",
+    "default_child_execution": "disabled",
+    "mira_self_target": "pass",
+    "mira_depth1_e2e": "pass",
+    "parent_context_restore": "pass",
+    "independent_child_budget": "pass",
+    "padodor_api_failure_semantics": "pass",
     "systex_no_default_ie": "pass",
-    "r3_dropped_target_binding": "partial",
+    "r3_dropped_target_binding": "pass",
+    "r3_dropped_depth1_matrix": "complete_25_roots_5_entrypoints_3_normal_exit",
+    "benign_installer_review": "pass_parent_child_isolated",
     "depth_2": "not_approved"
   },
   "blockers": [
-    "No production ChildScheduler implementation or pipeline run_queue integration",
-    "Pipeline reports omit child_execution snapshots",
-    "mira self target is truncated before stable resolver",
-    "WinExec reports success_request/api_result=32 with no child pid",
-    "Dropped artifact bytes need an explicit production path mapping"
+    "Only 5 dropped children reached entrypoints, of which 3 completed normally",
+    "Three R3 parent outcomes differ from the historical state-only records",
+    "Depth=2 remains unapproved"
   ]
 }

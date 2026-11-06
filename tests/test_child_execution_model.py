@@ -8,16 +8,21 @@ from types import SimpleNamespace
 import pytest
 
 import speakeasy.winenv.arch as _arch
+from speakeasy.profiler_events import PROC_CREATE
 from speakeasy.report import Report
 from speakeasy.windows.child_execution import (
     ChildExecutionPolicy,
     ChildExecutionRegistry,
     ChildExecutionState,
     ChildTargetResolver,
+    ProcessCreationResult,
 )
+from speakeasy.windows.fileman import File
+from speakeasy.windows.objman import HandleAllocator
 from speakeasy.winenv.api.usermode.advapi32 import AdvApi32
 from speakeasy.winenv.api.usermode.kernel32 import Kernel32
 from speakeasy.winenv.api.usermode.shell32 import Shell32
+from speakeasy.winenv.defs.windows import windows as windefs
 
 
 class FakeProcess:
@@ -40,7 +45,11 @@ class FakeFileManager:
         return None
 
     def get_dropped_files(self):
-        return self.files
+        return [
+            target
+            for target in self.files
+            if target.bytes_written == target.get_size()
+        ]
 
 
 class DroppedFile:
@@ -48,12 +57,24 @@ class DroppedFile:
         self.path = path
         self.data = data
         self.bytes_written = len(data)
+        self.offset = 0
 
     def get_size(self):
         return len(self.data)
 
+    def duplicate(self):
+        """Return a detached copy with an independent cursor."""
+
+        return DroppedFile(self.path, self.data)
+
     def get_data(self, reset_pointer=False):
-        return self.data
+        """Return remaining bytes, optionally after resetting this copy."""
+
+        if reset_pointer:
+            self.offset = 0
+        data = self.data[self.offset :]
+        self.offset = len(self.data)
+        return data
 
 
 class FakeEmu:
@@ -71,6 +92,10 @@ class FakeEmu:
         self.child_processes = []
         self.run_queue = []
         self._arch = _arch.ARCH_X86
+        self.last_error = None
+        self.child_creation_available = True
+        self.child_creation_reason = "target_unavailable"
+        self.child_creation_pid_override = None
 
     def get_arch(self):
         return self._arch
@@ -80,6 +105,42 @@ class FakeEmu:
         proc = FakeProcess()
         self.child_processes.append(proc)
         return proc, SimpleNamespace(launch_id="child-000001")
+
+    def request_process_execution(self, **kwargs):
+        self.calls.append(kwargs)
+        request = SimpleNamespace(launch_id="child-000001")
+        if not self.child_creation_available:
+            return (
+                None,
+                request,
+                ProcessCreationResult(
+                    process=None,
+                    created_pid=None,
+                    created_tid=None,
+                    created=False,
+                    reason=self.child_creation_reason,
+                ),
+            )
+        proc = FakeProcess()
+        self.child_processes.append(proc)
+        created_pid = (
+            proc.pid
+            if self.child_creation_pid_override is None
+            else self.child_creation_pid_override
+        )
+        return (
+            proc,
+            request,
+            ProcessCreationResult(
+                process=proc,
+                created_pid=created_pid,
+                created_tid=proc.threads[0].tid,
+                created=True,
+            ),
+        )
+
+    def set_last_error(self, error):
+        self.last_error = error
 
     def read_mem_string(self, addr, width=1, max_chars=0):
         return {0x10: r"C:\Windows\System32\cmd.exe", 0x20: "cmd.exe /c whoami"}[addr]
@@ -131,6 +192,66 @@ def test_self_request_is_eligible_and_never_queues(
         assert report.child_execution.requests[0].launch_id == request.launch_id
     finally:
         se.shutdown()
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        "b" * 64,
+        f"{'b' * 64}.exe",
+        "b" * 63,
+        f"{'b' * 63}.exe",
+    ],
+)
+def test_self_target_accepts_full_and_truncated_filename_aliases(
+    load_test_bin,
+    target_name,
+):
+    data = load_test_bin("argv_test_x86.exe.xz")
+    emu = FakeEmu(data, root_name=f"{'b' * 64}.exe")
+    emu._root_sample_sha256 = "a" * 64
+    registry = ChildExecutionRegistry(emu)
+
+    request = registry.create_request(
+        source_api="ShellExecute",
+        path=rf"C:\Windows\System32\{target_name}",
+        command_line="",
+    )
+
+    assert request.target_source == "self"
+    assert request.target_resolved is True
+    assert request.eligible is True
+    assert request.target_sha256 == hashlib.sha256(data).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        "b" * 62,
+        f"{'b' * 62}.exe",
+        f"{'b' * 63}c",
+        f"{'b' * 63}c.exe",
+        f"{'b' * 63}.dll",
+    ],
+)
+def test_self_target_rejects_inexact_or_shorter_filename_aliases(
+    load_test_bin,
+    target_name,
+):
+    data = load_test_bin("argv_test_x86.exe.xz")
+    emu = FakeEmu(data, root_name=f"{'b' * 64}.exe")
+    emu._root_sample_sha256 = "a" * 64
+    registry = ChildExecutionRegistry(emu)
+
+    request = registry.create_request(
+        source_api="ShellExecute",
+        path=rf"C:\Windows\System32\{target_name}",
+        command_line="",
+    )
+
+    assert request.target_source == "unavailable"
+    assert request.target_resolved is False
+    assert request.rejection_reason == "target_unavailable"
 
 
 def test_unavailable_request_keeps_process_fact_separate(load_test_bin):
@@ -195,6 +316,133 @@ def test_complete_dropped_file_is_modeled_as_resolved(load_test_bin):
     assert request.target_sha256 == hashlib.sha256(data).hexdigest()
 
 
+def test_dropped_file_mapping_uses_exact_path_and_full_bytes(load_test_bin):
+    data = load_test_bin("argv_test_x86.exe.xz")
+    target_path = r"C:\Windows\Temp\dropped.exe"
+    dropped = File(HandleAllocator(), target_path, data=data)
+    dropped.bytes_written = len(data)
+    dropped.seek(17, os.SEEK_SET)
+    emu = FakeEmu(b"MZ")
+    emu.fileman = FakeFileManager([dropped])
+    resolver = ChildTargetResolver(emu)
+
+    target = resolver.resolve(
+        target_path,
+        command_line=r"C:\Windows\Temp\dropped.exe /quiet",
+    )
+
+    assert target.source.value == "dropped_file"
+    assert target.resolved is True
+    assert target.payload_ref is not None
+    assert target.payload_ref.data == data
+    assert target.sha256 == hashlib.sha256(data).hexdigest()
+    assert target.size == len(data)
+    assert dropped.tell() == 17
+
+
+def test_dropped_file_mapping_rejects_basename_only_match(load_test_bin):
+    data = load_test_bin("argv_test_x86.exe.xz")
+    emu = FakeEmu(b"MZ")
+    emu.fileman = FakeFileManager(
+        [DroppedFile(r"C:\Windows\Temp\dropped.exe", data)]
+    )
+    resolver = ChildTargetResolver(emu)
+
+    target = resolver.resolve(
+        r"C:\Users\Public\dropped.exe",
+        command_line="dropped.exe",
+    )
+
+    assert target.source.value == "unavailable"
+    assert target.resolved is False
+    assert target.reason == "target_unavailable"
+
+
+def test_dropped_file_mapping_accepts_device_prefix_alias(load_test_bin):
+    data = load_test_bin("argv_test_x86.exe.xz")
+    target_path = r"C:\Windows\Temp\dropped.exe"
+    emu = FakeEmu(b"MZ")
+    emu.fileman = FakeFileManager([DroppedFile(target_path, data)])
+    resolver = ChildTargetResolver(emu)
+
+    target = resolver.resolve(
+        r"\\?\C:\Windows\Temp\dropped.exe",
+        command_line="dropped.exe",
+    )
+
+    assert target.source.value == "dropped_file"
+    assert target.resolved is True
+    assert target.payload_ref is not None
+    assert target.payload_ref.data == data
+    assert target.sha256 == hashlib.sha256(data).hexdigest()
+
+
+def test_dropped_file_mapping_rejects_incomplete_file(load_test_bin):
+    data = load_test_bin("argv_test_x86.exe.xz")
+    target_path = r"C:\Windows\Temp\dropped.exe"
+    dropped = DroppedFile(target_path, data)
+    dropped.bytes_written -= 1
+    emu = FakeEmu(b"MZ")
+    emu.fileman = FakeFileManager([dropped])
+    resolver = ChildTargetResolver(emu)
+
+    target = resolver.resolve(target_path, command_line="dropped.exe")
+
+    assert target.source.value == "unavailable"
+    assert target.resolved is False
+    assert target.reason == "target_unavailable"
+
+
+def test_dropped_file_mapping_rejects_ambiguous_exact_path(load_test_bin):
+    data = load_test_bin("argv_test_x86.exe.xz")
+    emu = FakeEmu(b"MZ")
+    emu.fileman = FakeFileManager(
+        [
+            DroppedFile(r"C:\Windows\Temp\dropped.exe", data),
+            DroppedFile(r"c:\windows\temp\DROPPED.EXE", data),
+        ]
+    )
+    resolver = ChildTargetResolver(emu)
+
+    target = resolver.resolve(
+        r"C:\Windows\Temp\dropped.exe",
+        command_line="dropped.exe",
+    )
+
+    assert target.source.value == "unavailable"
+    assert target.resolved is False
+    assert target.reason == "target_unavailable"
+
+
+def test_real_filemanager_maps_dropped_path_to_artifact_bytes(
+    base_config,
+    load_test_bin,
+):
+    from speakeasy import Speakeasy
+
+    child_data = load_test_bin("argv_test_x86.exe.xz")
+    target_path = r"C:\Users\Public\dropped.exe"
+    se = Speakeasy(config=base_config, argv=[])
+    try:
+        se.load_module(data=child_data)
+        dropped = se.emu.fileman.create_file(target_path)
+        dropped.add_data(child_data)
+
+        target = se.emu.child_execution.resolver.resolve(
+            target_path,
+            command_line=target_path,
+        )
+
+        assert target.source.value == "dropped_file"
+        assert target.resolved is True
+        assert target.payload_ref is not None
+        assert target.payload_ref.data == child_data
+        assert target.sha256 == hashlib.sha256(child_data).hexdigest()
+        assert target.size == len(child_data)
+    finally:
+        se.shutdown()
+
+
 def test_path_normalization_expands_environment_and_cwd():
     emu = FakeEmu(b"MZ")
     resolver = ChildTargetResolver(emu)
@@ -205,6 +453,15 @@ def test_path_normalization_expands_environment_and_cwd():
     assert resolver.normalize_path("child.exe", cwd=r"C:\Temp") == (
         r"C:\Temp\child.exe"
     )
+    assert resolver.normalize_path(r"\Windows\System32\child.exe") == (
+        r"C:\Windows\System32\child.exe"
+    )
+    assert resolver.normalize_path(
+        r"\\?\C:\Windows\System32\child.exe"
+    ) == (r"C:\Windows\System32\child.exe")
+    assert resolver.normalize_path(
+        r"\??\C:\Windows\System32\child.exe"
+    ) == (r"C:\Windows\System32\child.exe")
 
 
 def test_duplicate_target_and_canonical_command_is_rejected(load_test_bin):
@@ -371,6 +628,88 @@ def test_process_api_handlers_route_requests():
         {"func_name": "CreateProcessAsUserA"},
     ) == 1
     assert emu.calls[-1]["source_api"] == "CreateProcessAsUser"
+
+
+def test_winexec_unavailable_target_returns_failure_without_pid():
+    emu = FakeEmu(b"MZ", root_name="deadbeef.exe")
+    emu.child_creation_available = False
+    kernel = Kernel32(emu)
+    kernel.record_process_event = pytest.fail
+
+    result = kernel.WinExec(emu, [0x20, 0], {})
+
+    assert result == windefs.ERROR_FILE_NOT_FOUND
+    assert emu.last_error == windefs.ERROR_FILE_NOT_FOUND
+    assert emu.child_processes == []
+    assert emu.calls[-1] == {
+        "source_api": "WinExec",
+        "path": "cmd.exe",
+        "cmdline": "cmd.exe /c whoami",
+    }
+
+
+def test_winexec_created_process_returns_success_with_created_pid():
+    emu = FakeEmu(b"MZ", root_name="deadbeef.exe")
+    kernel = Kernel32(emu)
+    events = []
+    kernel.record_process_event = lambda process, event: events.append(
+        (process.pid, event)
+    )
+
+    result = kernel.WinExec(emu, [0x20, 0], {})
+
+    assert result == 32
+    assert emu.last_error is None
+    assert [process.pid for process in emu.child_processes] == [FakeProcess.pid]
+    assert events == [(FakeProcess.pid, PROC_CREATE)]
+
+
+def test_winexec_rejects_creation_result_with_invalid_created_pid():
+    """WinExec must not report success without a positive authoritative PID."""
+
+    emu = FakeEmu(b"MZ", root_name="deadbeef.exe")
+    emu.child_creation_pid_override = 0
+    kernel = Kernel32(emu)
+    events = []
+    kernel.record_process_event = lambda process, event: events.append(
+        (process.pid, event)
+    )
+
+    result = kernel.WinExec(emu, [0x20, 0], {})
+
+    assert result == 0
+    assert emu.last_error == 0
+    assert events == []
+
+
+def test_request_process_execution_unavailable_target_has_no_decoy_process(
+    base_config,
+    load_test_bin,
+):
+    from speakeasy import Speakeasy
+
+    data = load_test_bin("argv_test_x86.exe.xz")
+    se = Speakeasy(config=base_config, argv=[])
+    try:
+        se.load_module(data=data)
+        before = len(se.emu.child_processes)
+
+        process, request, creation = se.emu.request_process_execution(
+            source_api="WinExec",
+            path=r"C:\Windows\System32\Hlklda32",
+            cmdline=r"C:\Windows\System32\Hlklda32",
+        )
+
+        assert process is None
+        assert creation.created is False
+        assert creation.created_pid is None
+        assert creation.created_tid is None
+        assert creation.reason == "target_unavailable"
+        assert request.target_resolved is False
+        assert request.created_child_pid is None
+        assert len(se.emu.child_processes) == before
+    finally:
+        se.shutdown()
 
 
 def test_stage_one_resume_thread_does_not_queue_child():

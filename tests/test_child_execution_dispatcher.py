@@ -100,11 +100,7 @@ class FakeAdmissionPolicy:
         """Return one deterministic immutable decision."""
 
         self.history_sizes.append(len(launch_history))
-        state = (
-            ChildExecutionState.ELIGIBLE
-            if self.eligible
-            else ChildExecutionState.REJECTED
-        )
+        state = ChildExecutionState.ELIGIBLE if self.eligible else ChildExecutionState.REJECTED
         return AdmissionDecision(
             eligible=self.eligible,
             state=state,
@@ -159,9 +155,7 @@ class FakeScheduler:
     """Record calls to the public scheduler protocol."""
 
     def __init__(self) -> None:
-        self.submissions: list[
-            tuple[ChildLaunchRequest, ResolvedChildTarget, AdmissionDecision, Any]
-        ] = []
+        self.submissions: list[tuple[ChildLaunchRequest, ResolvedChildTarget, AdmissionDecision, Any]] = []
         self.drain_calls: list[ParentRunOutcome] = []
         self.stops: list[str] = []
 
@@ -316,16 +310,22 @@ def test_failed_process_creation_is_reported_and_not_scheduled() -> None:
     assert report.records[-1].reason == "load_error"
 
 
-def test_parent_finished_drains_and_closes_intake() -> None:
+def test_parent_finished_drains_and_contains_late_child_request() -> None:
+    """A depth-one child's late request becomes a contained depth limit."""
+
     dispatcher, _, _, scheduler = _dispatcher(enabled=True)
     dispatcher.submit(_spec(), parent_context=_parent_context())
 
     dispatcher.parent_finished(_parent_result())
     dispatcher.parent_finished(_parent_result())
+    outcome = dispatcher.submit(_spec(), parent_context=_parent_context())
 
     assert len(scheduler.drain_calls) == 1
-    with pytest.raises(RuntimeError, match="closed"):
-        dispatcher.submit(_spec(), parent_context=_parent_context())
+    assert outcome.decision.eligible is False
+    assert outcome.decision.reason == "depth_limit"
+    assert outcome.creation.created is False
+    assert outcome.creation.created_pid is None
+    assert dispatcher.report().request_count == 1
 
 
 def test_model_only_parent_finish_and_stop_never_touch_scheduler() -> None:

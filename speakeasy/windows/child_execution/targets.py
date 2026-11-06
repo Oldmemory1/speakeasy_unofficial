@@ -197,6 +197,7 @@ class ChildTargetResolver:
         path = re.sub(r"%([^%]+)%", replace_env, path)
         if re.match(r"^[a-z][a-z0-9+.-]*://", path, re.IGNORECASE):
             return path
+        path = self._canonical_path(path)
 
         if not ntpath.isabs(path):
             base = (
@@ -210,7 +211,51 @@ class ChildTargetResolver:
             )
             if base:
                 path = ntpath.join(base, path)
-        return ntpath.normpath(path)
+        elif path.startswith("\\") and not path.startswith("\\\\"):
+            base = (
+                cwd
+                or getattr(self.emu, "cd", "")
+                or getattr(
+                    getattr(self.emu, "config", None),
+                    "current_dir",
+                    "",
+                )
+            )
+            drive, _ = ntpath.splitdrive(str(base or ""))
+            if drive:
+                path = drive + path
+        return self._canonical_path(path)
+
+    @staticmethod
+    def _canonical_path(path: str) -> str:
+        """Normalize separators and remove Windows device-path prefixes.
+
+        Args:
+            path: Windows-style path that may use a device namespace such as
+                ``\\\\?\\C:\\Temp\\child.exe`` or ``\\??\\C:\\Temp\\child.exe``.
+
+        Returns:
+            A normalized Win32-style path with forward slashes converted to
+            backslashes and a drive or UNC device prefix removed.
+
+        Side effects:
+            None.
+        """
+
+        value = str(path or "").strip().strip('"').replace("/", "\\")
+        upper = value.upper()
+        unc_prefixes = ("\\\\?\\UNC\\", "\\??\\UNC\\", "\\\\??\\UNC\\")
+        for prefix in unc_prefixes:
+            if upper.startswith(prefix.upper()):
+                value = "\\\\" + value[len(prefix) :]
+                break
+        else:
+            prefixes = ("\\\\?\\", "\\??\\", "\\\\??\\")
+            for prefix in prefixes:
+                if upper.startswith(prefix.upper()):
+                    value = value[len(prefix) :]
+                    break
+        return ntpath.normpath(value) if value else ""
 
     def _is_self_target(self, target: str) -> bool:
         """Return whether ``target`` names the loaded root sample.
@@ -219,7 +264,10 @@ class ChildTargetResolver:
             target: Normalized Windows path.
 
         Returns:
-            ``True`` for the root file name, stem, or root digest.
+            ``True`` for the root file name, stem, root digest, or the
+            one-character-truncated 64-character root filename alias observed
+            from ``ShellExecute``. The alias may have an ``.exe`` extension or
+            no extension.
 
         Side effects:
             None.
@@ -227,15 +275,31 @@ class ChildTargetResolver:
 
         target_name = ntpath.basename(target).lower()
         target_stem = ntpath.splitext(target_name)[0]
+        target_suffix = ntpath.splitext(target_name)[1]
         root_path = getattr(self.emu, "_root_emu_path", "")
         root_name = ntpath.basename(root_path).lower()
         root_stem = ntpath.splitext(root_name)[0]
+        root_sha256 = self.root_sample_sha256
         candidates = {
             name
-            for name in (root_name, root_stem, self.root_sample_sha256)
+            for name in (root_name, root_stem, root_sha256)
             if name
         }
-        return target_name in candidates or target_stem in candidates
+        if target_name in candidates or target_stem in candidates:
+            return True
+
+        # Some ShellExecute samples derive their path from the 64-character
+        # root filename but omit the final filename character and the
+        # executable extension. The filename need not equal the content SHA.
+        # Match only the exact root stem minus one character; accepting
+        # shorter prefixes would make unrelated executables resolve as root.
+        return (
+            len(root_stem) == 64
+            and all(character in "0123456789abcdef" for character in root_stem)
+            and len(target_stem) == 63
+            and target_suffix in {"", ".exe"}
+            and target_stem == root_stem[:-1]
+        )
 
     def _fixture_bytes(self, normalized: str) -> bytes | None:
         """Return registered fixture bytes for a normalized path.
@@ -259,29 +323,98 @@ class ChildTargetResolver:
             normalized: Normalized Windows target path.
 
         Returns:
-            Immutable dropped-file bytes, or ``None`` when the path is absent,
-            not recognized as a dropped file, or unreadable.
+            A complete, immutable snapshot of the uniquely path-matched
+            dropped file, or ``None`` when the path is absent, ambiguous,
+            incomplete, or unreadable.
 
         Side effects:
-            Reads the emulator-owned file manager. It does not mutate file
-            manager state beyond the existing ``get_data`` API contract.
+            Reads the emulator-owned file manager. The snapshot is obtained
+            through ``File.duplicate`` so the live file's cursor is unchanged.
         """
 
         fileman = getattr(self.emu, "fileman", None)
         if fileman is None:
             return None
         try:
-            target_file = fileman.get_file_from_path(normalized)
             dropped_files = fileman.get_dropped_files()
         except Exception:
             return None
-        if target_file is None or target_file not in dropped_files:
+        target_file = self._exact_dropped_file(dropped_files, normalized)
+        if target_file is None:
+            return None
+
+        data = self._snapshot_file_bytes(target_file)
+        if data is None:
             return None
         try:
-            data = target_file.get_data(reset_pointer=True)
+            expected_size = int(target_file.get_size())
         except Exception:
             return None
-        return bytes(data) if data else None
+        if len(data) != expected_size:
+            return None
+        return data
+
+    @staticmethod
+    def _exact_dropped_file(dropped_files: Any, normalized: str) -> Any | None:
+        """Return the sole dropped file whose full path equals the target.
+
+        Args:
+            dropped_files: Iterable of file-manager objects that are fully
+                written and eligible to be treated as dropped artifacts.
+            normalized: Normalized Windows target path from the launch request.
+
+        Returns:
+            The unique object with an exactly matching normalized path, or
+            ``None`` when no such object or more than one object matches.
+
+        Side effects:
+            None. The file-manager collection and file objects are read only.
+        """
+
+        target_path = ChildTargetResolver._canonical_path(normalized).casefold()
+        matches: list[Any] = []
+        seen: set[int] = set()
+        for candidate in dropped_files:
+            candidate_path = getattr(candidate, "path", None)
+            if not candidate_path:
+                continue
+            try:
+                candidate_key = ChildTargetResolver._canonical_path(
+                    str(candidate_path)
+                ).casefold()
+            except (TypeError, ValueError):
+                continue
+            if candidate_key != target_path or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            matches.append(candidate)
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _snapshot_file_bytes(target_file: Any) -> bytes | None:
+        """Return a detached full-byte snapshot of a completed dropped file.
+
+        Args:
+            target_file: Fully written file-manager object selected by exact
+                normalized path.
+
+        Returns:
+            Complete immutable file bytes, or ``None`` when the object cannot
+            provide a detached snapshot.
+
+        Side effects:
+            None on ``target_file``. ``File.duplicate`` creates a separate
+            in-memory file object whose cursor can be reset safely.
+        """
+
+        try:
+            snapshot = target_file.duplicate()
+            data = snapshot.get_data(reset_pointer=True)
+        except Exception:
+            return None
+        if data is None:
+            return None
+        return bytes(data)
 
     def _describe_bytes(
         self,
@@ -418,7 +551,7 @@ class ChildTargetResolver:
             None.
         """
 
-        return ntpath.normpath(path).lower()
+        return ChildTargetResolver._canonical_path(path).casefold()
 
 
 __all__ = ["ChildTargetResolver"]

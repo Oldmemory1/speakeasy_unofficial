@@ -1,0 +1,1266 @@
+{
+  "schema_version": 1,
+  "scope": "R3 dropped-executable depth=1 explicit experiment",
+  "sample_count": 25,
+  "timeout_seconds_per_parent": 90,
+  "depth_two_evaluated": false,
+  "detector_modules_consumed": [],
+  "results": [
+    {
+      "sample_sha256": "0135ba3620bcd80165cb3acc6a238899cc7b047f1851038d3a5382453f86facf",
+      "label": "malicious",
+      "family": "upatre",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 0,
+      "target_resolved_count": 0,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "036ae268bc59c78d5f664a42344b67f921b66d87495d807bff6e1857c60a0c85",
+      "label": "malicious",
+      "family": "upatre",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 0,
+      "target_resolved_count": 0,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "0b4e54b807253cc698ce55b71e59216e2326946229a16f19b30a54ce276b5527",
+      "label": "malicious",
+      "family": "salgorea",
+      "baseline_parent_status": "simulation_error",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 1,
+      "target_resolved_count": 1,
+      "process_object_created_count": 1,
+      "thread_queued_count": 1,
+      "entrypoint_reached_count": 1,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "CreateProcess",
+          "target_source": "dropped_file",
+          "target_sha256": "31aef95aa2f7b7a724123f5408761048db94c0a61ecbfe24bda7c33ac824ff8f",
+          "target_size": 2797056,
+          "target_resolved": true,
+          "eligible": true,
+          "state": "completed",
+          "created_child_pid": 1256,
+          "entrypoint_reached": true,
+          "rejection_reason": null
+        }
+      ],
+      "results": [
+        {
+          "launch_id": "child-000001",
+          "state": "completed",
+          "outcome": "ok",
+          "termination_reason": "normal_exit",
+          "ownership": {
+            "launch_id": "child-000001",
+            "root_sample_sha256": "29e996948ea2cc8c53627abd3fa25802db37927731a30e7e44ff8db9387979a7",
+            "parent_pid": 1056,
+            "child_pid": 1256,
+            "depth": 1
+          },
+          "budget": {
+            "source": "parent_config",
+            "timeout_seconds": 120.0,
+            "max_api_count": 10000,
+            "max_instructions": 300000000
+          },
+          "usage": {
+            "timeout_seconds_used": 0.9418196179904044,
+            "api_count_used": 356,
+            "instructions_used": 46502
+          },
+          "failure": null
+        }
+      ]
+    },
+    {
+      "sample_sha256": "0d930bda4f792160d9551cfda27195e2b61d56f34b75aefad0ab4286cd5189ef",
+      "label": "malicious",
+      "family": "urelas",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 2,
+      "baseline_r3_findings": 2,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 0,
+      "target_resolved_count": 1,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "ShellExecute",
+          "target_source": "dropped_file",
+          "target_sha256": "5cf5a39137816887e1b774f5b80d404da89534fa44cbc86f2160e5e54d325da7",
+          "target_size": 278,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "115a579537a86929376c2811cc84ecb45a365f6a126d7e39be750e1d2ce5deff",
+      "label": "malicious",
+      "family": "unknown",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 3,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 0,
+      "target_resolved_count": 1,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "dropped_file",
+          "target_sha256": "a57c3586bd5eddda421aee0b9b6f6d14a79ac91b2a495e9d94b039c5e8206aaf",
+          "target_size": 211,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "20241370a830c0e8b57ee94a2223cec08319d6afe6ea7d2a106f8820b5df75e1",
+      "label": "malicious",
+      "family": "ceeinject",
+      "baseline_parent_status": "simulation_error",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "simulation_error",
+      "parent_termination_reason": "Invalid memory mapping (UC_ERR_MAP)",
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 1,
+      "target_resolved_count": 2,
+      "process_object_created_count": 1,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "CreateProcess",
+          "target_source": "dropped_file",
+          "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "target_size": 0,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "CreateProcess",
+          "target_source": "dropped_file",
+          "target_sha256": "84447185da176758adc453d45dd7c2ab73efd17b89d0affdba404b270090f49c",
+          "target_size": 60416,
+          "target_resolved": true,
+          "eligible": true,
+          "state": "failed",
+          "created_child_pid": 1280,
+          "entrypoint_reached": true,
+          "rejection_reason": null
+        }
+      ],
+      "results": [
+        {
+          "launch_id": "child-000002",
+          "state": "failed",
+          "outcome": "error",
+          "termination_reason": "invalid_fetch",
+          "ownership": {
+            "launch_id": "child-000002",
+            "root_sample_sha256": "615ca532fb8de0e748274d4a7d5ce7c76307253cb509081e0f1e6eea197067ed",
+            "parent_pid": 1056,
+            "child_pid": 1280,
+            "depth": 1
+          },
+          "budget": {
+            "source": "parent_config",
+            "timeout_seconds": 120.0,
+            "max_api_count": 10000,
+            "max_instructions": 300000000
+          },
+          "usage": {
+            "timeout_seconds_used": 0.18791942717507482,
+            "api_count_used": 0,
+            "instructions_used": 22822
+          },
+          "failure": {
+            "kind": "runtime",
+            "message": "child run failed: type='Invalid memory mapping (UC_ERR_MAP)' pc=182032 instr='mov eax, dword ptr [eax + 0x14]' address=182032 access_type=None regs={'esp': '0x012fe9bc', 'ebp': '0x012ff1dc', 'eip': '0x0002c710', 'esi': '0x0000000a', 'edi': '0xfeedf154', 'eax': '0x00000000', 'ebx': '0x00000000', 'ecx': '0x00008cf8', 'edx': '0x00000000'} stack=['sp+0x00: 0x00000001', 'sp+0x04: 0xf0000000', 'sp+0x08: 0x0002c932 -> emu.module.CTS.0x27000', 'sp+0x0c: 0x0000000a', 'sp+0x10: 0x00330032', 'sp+0x14: 0x00350034', 'sp+0x18: 0x00370036', 'sp+0x1c: 0x00390038', 'sp+0x20: 0x003b003a', 'sp+0x24: 0x003d003c', 'sp+0x28: 0x003f003e', 'sp+0x2c: 0x00410040 -> emu.module.20241370a830c0e8b57ee94a2223cec08319d6afe6ea7d2a106f8820b5df75e1.0x400000', 'sp+0x30: 0x00430042', 'sp+0x34: 0x00450044', 'sp+0x38: 0x00470046', 'sp+0x3c: 0x00490048'] pc_module='CTS+0x5710' address_region=RegionInfo(tag='emu.module.CTS.0x27000', base=159744, size=77824, prot='rwx') nearby_regions=None thread_id=1316 process_id=1300 context_summary='Invalid memory mapping (UC_ERR_MAP) at 0x2c710; from CTS+0x5710; in emu.module.CTS.0x27000 [0x27000-0x39fff]' traceback='Traceback (most recent call last):\\n  File \"/home/lab420/research_on_speakeasy/speakeasy_unofficial/speakeasy/windows/winemu.py\", line 652, in _execute_runs\\n    self.emu_eng.start(resume_addr, timeout=timeout, count=instruction_count)  # type: ignore[union-attr]\\n    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \"/home/lab420/research_on_speakeasy/speakeasy_unofficial/speakeasy/engines/unicorn_eng.py\", line 214, in start\\n    return self.emu.emu_start(addr, 0xFFFFFFFF, timeout=timeout, count=count)  # type: ignore[union-attr]\\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \"/home/lab420/research_on_speakeasy/.venv/lib/python3.11/site-packages/unicorn/unicorn_py3/unicorn.py\", line 766, in emu_start\\n    raise UcError(status)\\nunicorn.unicorn_py3.unicorn.UcError: Invalid memory mapping (UC_ERR_MAP)\\n' api_name=None count=None last_api=None interrupt_num=None",
+            "pc": null,
+            "api_name": null
+          }
+        }
+      ]
+    },
+    {
+      "sample_sha256": "293213777ed57c6c2eba6afa9bd4f19844077f51a5092bdfb43d6a17ec37c310",
+      "label": "malicious",
+      "family": "urelas",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 2,
+      "baseline_r3_findings": 2,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 0,
+      "target_resolved_count": 1,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "ShellExecute",
+          "target_source": "dropped_file",
+          "target_sha256": "06e0a2e85052e6805723fb13f7585db785a3540a6b5e794766bebbaf3849b61e",
+          "target_size": 280,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "2967f114d03860da0c4e1627aa1266497422d65f21fc887b33f095847471a57c",
+      "label": "malicious",
+      "family": "upatre",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 0,
+      "target_resolved_count": 0,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "360a88e0df806b5867b29305d9b82545fa02f7c7ed91d3f76dbf629540f21910",
+      "label": "malicious",
+      "family": "autorun",
+      "baseline_parent_status": "budget_exhausted",
+      "baseline_candidates": 5,
+      "baseline_r3_findings": 2,
+      "parent_outcome": "budget_exhausted",
+      "parent_termination_reason": "api_budget",
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 2,
+      "target_resolved_count": 2,
+      "process_object_created_count": 2,
+      "thread_queued_count": 1,
+      "entrypoint_reached_count": 1,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "WinExec",
+          "target_source": "dropped_file",
+          "target_sha256": "6ed3ad7053bc359766d8c0d455aafe7402d256191eb360056c31d981ecb2a276",
+          "target_size": 1291751,
+          "target_resolved": true,
+          "eligible": true,
+          "state": "completed",
+          "created_child_pid": 1280,
+          "entrypoint_reached": true,
+          "rejection_reason": null
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "WinExec",
+          "target_source": "dropped_file",
+          "target_sha256": "05ad05ef0eeef4fab9e3f3dd91b80e11ec1fc56248ec78f13d1b48ff45b95dc0",
+          "target_size": 29597,
+          "target_resolved": true,
+          "eligible": true,
+          "state": "failed",
+          "created_child_pid": 1320,
+          "entrypoint_reached": false,
+          "rejection_reason": null
+        }
+      ],
+      "results": [
+        {
+          "launch_id": "child-000001",
+          "state": "completed",
+          "outcome": "ok",
+          "termination_reason": "normal_exit",
+          "ownership": {
+            "launch_id": "child-000001",
+            "root_sample_sha256": "081796013a15ff69d1873ff7e565f66d21b5afcc0320f0baa977d14889a38381",
+            "parent_pid": 1056,
+            "child_pid": 1280,
+            "depth": 1
+          },
+          "budget": {
+            "source": "parent_config",
+            "timeout_seconds": 120.0,
+            "max_api_count": 10000,
+            "max_instructions": 300000000
+          },
+          "usage": {
+            "timeout_seconds_used": 74.89502802677453,
+            "api_count_used": 51,
+            "instructions_used": 830
+          },
+          "failure": null
+        },
+        {
+          "launch_id": "child-000002",
+          "state": "failed",
+          "outcome": "error",
+          "termination_reason": "load_error",
+          "ownership": {
+            "launch_id": "child-000002",
+            "root_sample_sha256": "081796013a15ff69d1873ff7e565f66d21b5afcc0320f0baa977d14889a38381",
+            "parent_pid": 1056,
+            "child_pid": 1320,
+            "depth": 1
+          },
+          "budget": {
+            "source": "parent_config",
+            "timeout_seconds": 120.0,
+            "max_api_count": 10000,
+            "max_instructions": 300000000
+          },
+          "usage": {
+            "timeout_seconds_used": 0.0,
+            "api_count_used": 0,
+            "instructions_used": 0
+          },
+          "failure": {
+            "kind": "load",
+            "message": "cannot load child image: ChildImageLoadError: cannot map child image for child-000002: UcError: Invalid memory read (UC_ERR_READ_UNMAPPED)",
+            "pc": null,
+            "api_name": null
+          }
+        }
+      ]
+    },
+    {
+      "sample_sha256": "3c15af5597fbe23645ce3e7ff747b644fb33cd6879ca17fea8a718819b9fbee6",
+      "label": "malicious",
+      "family": "upatre",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 0,
+      "target_resolved_count": 0,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "45a93d1969d921f82d7897ccd3065de6ce03d378be03d0fbff9c70bc78c18cd1",
+      "label": "benign",
+      "family": "unknown",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 1,
+      "target_resolved_count": 1,
+      "process_object_created_count": 1,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "CreateProcess",
+          "target_source": "dropped_file",
+          "target_sha256": "d2e9c5966937beadba64d89d3ce31212c61a85118d9662adb98fdeac1ad6eb44",
+          "target_size": 387072,
+          "target_resolved": true,
+          "eligible": true,
+          "state": "failed",
+          "created_child_pid": 1256,
+          "entrypoint_reached": false,
+          "rejection_reason": null
+        }
+      ],
+      "results": [
+        {
+          "launch_id": "child-000001",
+          "state": "failed",
+          "outcome": "error",
+          "termination_reason": "load_error",
+          "ownership": {
+            "launch_id": "child-000001",
+            "root_sample_sha256": "45a93d1969d921f82d7897ccd3065de6ce03d378be03d0fbff9c70bc78c18cd1",
+            "parent_pid": 1056,
+            "child_pid": 1256,
+            "depth": 1
+          },
+          "budget": {
+            "source": "parent_config",
+            "timeout_seconds": 120.0,
+            "max_api_count": 10000,
+            "max_instructions": 300000000
+          },
+          "usage": {
+            "timeout_seconds_used": 0.0,
+            "api_count_used": 0,
+            "instructions_used": 0
+          },
+          "failure": {
+            "kind": "load",
+            "message": "cannot load child image: ChildImageLoadError: cannot parse child PE: PEFormatError: \"data at RVA can't be fetched. Corrupt header?\"",
+            "pc": null,
+            "api_name": null
+          }
+        }
+      ]
+    },
+    {
+      "sample_sha256": "49ff71a51610dbab8831d35a6e4bad50e835ec84b32884b3107b2817402fb54c",
+      "label": "benign",
+      "family": "unknown",
+      "baseline_parent_status": "timed_out",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "timed_out",
+      "parent_termination_reason": "timeout",
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 1,
+      "target_resolved_count": 1,
+      "process_object_created_count": 1,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "CreateProcess",
+          "target_source": "dropped_file",
+          "target_sha256": "995ca25e8ac883429e67e2985887c2dc122e4d3cca48d6ab5b545e6a896ae2e1",
+          "target_size": 386048,
+          "target_resolved": true,
+          "eligible": true,
+          "state": "failed",
+          "created_child_pid": 1256,
+          "entrypoint_reached": false,
+          "rejection_reason": null
+        }
+      ],
+      "results": [
+        {
+          "launch_id": "child-000001",
+          "state": "failed",
+          "outcome": "error",
+          "termination_reason": "load_error",
+          "ownership": {
+            "launch_id": "child-000001",
+            "root_sample_sha256": "49ff71a51610dbab8831d35a6e4bad50e835ec84b32884b3107b2817402fb54c",
+            "parent_pid": 1056,
+            "child_pid": 1256,
+            "depth": 1
+          },
+          "budget": {
+            "source": "parent_config",
+            "timeout_seconds": 120.0,
+            "max_api_count": 10000,
+            "max_instructions": 300000000
+          },
+          "usage": {
+            "timeout_seconds_used": 0.0,
+            "api_count_used": 0,
+            "instructions_used": 0
+          },
+          "failure": {
+            "kind": "load",
+            "message": "cannot load child image: ChildImageLoadError: cannot parse child PE: PEFormatError: \"data at RVA can't be fetched. Corrupt header?\"",
+            "pc": null,
+            "api_name": null
+          }
+        }
+      ]
+    },
+    {
+      "sample_sha256": "4a58fef1b9360354fbbd0869a077dc49a46d9f76ea9777df59bda82cd8ab0b74",
+      "label": "malicious",
+      "family": "urelas",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 2,
+      "baseline_r3_findings": 2,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 0,
+      "target_resolved_count": 1,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "ShellExecute",
+          "target_source": "dropped_file",
+          "target_sha256": "69783ea5b8733d7fb6d06ef50126c41771fa05405435b57851b5f0124eb6651b",
+          "target_size": 281,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "55d056891ce2a2fc91bc7a92f5aaa1a6d2e611d88408390131ff751326c1255d",
+      "label": "malicious",
+      "family": "urelas",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 2,
+      "baseline_r3_findings": 2,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 0,
+      "target_resolved_count": 1,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "ShellExecute",
+          "target_source": "dropped_file",
+          "target_sha256": "dac334eb1be131c8bc69e2368e9b671a384fb3bbf83ecd63992af9541b391fda",
+          "target_size": 280,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "6e6106f62cb0da86ee7a5d517c2d608ca0c545bdab7f5d6d59f3765d341de3da",
+      "label": "malicious",
+      "family": "ceeinject",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 2,
+      "baseline_r3_findings": 2,
+      "parent_outcome": "simulation_error",
+      "parent_termination_reason": "Invalid memory mapping (UC_ERR_MAP)",
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 1,
+      "target_resolved_count": 2,
+      "process_object_created_count": 1,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "CreateProcess",
+          "target_source": "dropped_file",
+          "target_sha256": "9b250c32cbec90d2a61cb90055ac825d7a5f9a5923209cfd0625fca09a908d0a",
+          "target_size": 150,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "CreateProcess",
+          "target_source": "dropped_file",
+          "target_sha256": "84447185da176758adc453d45dd7c2ab73efd17b89d0affdba404b270090f49c",
+          "target_size": 60416,
+          "target_resolved": true,
+          "eligible": true,
+          "state": "failed",
+          "created_child_pid": 1296,
+          "entrypoint_reached": true,
+          "rejection_reason": null
+        }
+      ],
+      "results": [
+        {
+          "launch_id": "child-000002",
+          "state": "failed",
+          "outcome": "error",
+          "termination_reason": "invalid_fetch",
+          "ownership": {
+            "launch_id": "child-000002",
+            "root_sample_sha256": "e3337d7f4019217b4202cb5fdc42815d649909f2fa02178d2c9f395be4d5446b",
+            "parent_pid": 1056,
+            "child_pid": 1296,
+            "depth": 1
+          },
+          "budget": {
+            "source": "parent_config",
+            "timeout_seconds": 120.0,
+            "max_api_count": 10000,
+            "max_instructions": 300000000
+          },
+          "usage": {
+            "timeout_seconds_used": 0.12501397775486112,
+            "api_count_used": 0,
+            "instructions_used": 22826
+          },
+          "failure": {
+            "kind": "runtime",
+            "message": "child run failed: type='Invalid memory mapping (UC_ERR_MAP)' pc=182032 instr='mov eax, dword ptr [eax + 0x14]' address=182032 access_type=None regs={'esp': '0x012fe9bc', 'ebp': '0x012ff1dc', 'eip': '0x0002c710', 'esi': '0x0000000a', 'edi': '0xfeedf154', 'eax': '0x00000000', 'ebx': '0x00000000', 'ecx': '0x00008cf8', 'edx': '0x00000000'} stack=['sp+0x00: 0x00000001', 'sp+0x04: 0xf0000000', 'sp+0x08: 0x0002c932 -> emu.module.CTS.0x27000', 'sp+0x0c: 0x0000000a', 'sp+0x10: 0x00330032', 'sp+0x14: 0x00350034', 'sp+0x18: 0x00370036', 'sp+0x1c: 0x00390038', 'sp+0x20: 0x003b003a', 'sp+0x24: 0x003d003c', 'sp+0x28: 0x003f003e', 'sp+0x2c: 0x00410040 -> emu.module.6e6106f62cb0da86ee7a5d517c2d608ca0c545bdab7f5d6d59f3765d341de3da.0x400000', 'sp+0x30: 0x00430042', 'sp+0x34: 0x00450044', 'sp+0x38: 0x00470046', 'sp+0x3c: 0x00490048'] pc_module='CTS+0x5710' address_region=RegionInfo(tag='emu.module.CTS.0x27000', base=159744, size=77824, prot='rwx') nearby_regions=None thread_id=1332 process_id=1316 context_summary='Invalid memory mapping (UC_ERR_MAP) at 0x2c710; from CTS+0x5710; in emu.module.CTS.0x27000 [0x27000-0x39fff]' traceback='Traceback (most recent call last):\\n  File \"/home/lab420/research_on_speakeasy/speakeasy_unofficial/speakeasy/windows/winemu.py\", line 652, in _execute_runs\\n    self.emu_eng.start(resume_addr, timeout=timeout, count=instruction_count)  # type: ignore[union-attr]\\n    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \"/home/lab420/research_on_speakeasy/speakeasy_unofficial/speakeasy/engines/unicorn_eng.py\", line 214, in start\\n    return self.emu.emu_start(addr, 0xFFFFFFFF, timeout=timeout, count=count)  # type: ignore[union-attr]\\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \"/home/lab420/research_on_speakeasy/.venv/lib/python3.11/site-packages/unicorn/unicorn_py3/unicorn.py\", line 766, in emu_start\\n    raise UcError(status)\\nunicorn.unicorn_py3.unicorn.UcError: Invalid memory mapping (UC_ERR_MAP)\\n' api_name=None count=None last_api=None interrupt_num=None",
+            "pc": null,
+            "api_name": null
+          }
+        }
+      ]
+    },
+    {
+      "sample_sha256": "70cba05ef630aeb0aa798fd0262bf204802b2c2020ed3c344f89c61fdff682cd",
+      "label": "malicious",
+      "family": "unknown",
+      "baseline_parent_status": "simulation_error",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 1,
+      "target_resolved_count": 1,
+      "process_object_created_count": 1,
+      "thread_queued_count": 1,
+      "entrypoint_reached_count": 1,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "CreateProcess",
+          "target_source": "dropped_file",
+          "target_sha256": "52b6c41731b95005149e8317c6b3f26d1ee1f8a11b4943ed1726389323b94500",
+          "target_size": 1859072,
+          "target_resolved": true,
+          "eligible": true,
+          "state": "completed",
+          "created_child_pid": 1256,
+          "entrypoint_reached": true,
+          "rejection_reason": null
+        }
+      ],
+      "results": [
+        {
+          "launch_id": "child-000001",
+          "state": "completed",
+          "outcome": "ok",
+          "termination_reason": "normal_exit",
+          "ownership": {
+            "launch_id": "child-000001",
+            "root_sample_sha256": "885187de514d7d38bfa42c553e80e07149581ddcb65cf9e9e8e9429a59dcbf6d",
+            "parent_pid": 1056,
+            "child_pid": 1256,
+            "depth": 1
+          },
+          "budget": {
+            "source": "parent_config",
+            "timeout_seconds": 120.0,
+            "max_api_count": 10000,
+            "max_instructions": 300000000
+          },
+          "usage": {
+            "timeout_seconds_used": 0.5636659539304674,
+            "api_count_used": 278,
+            "instructions_used": 48493
+          },
+          "failure": null
+        }
+      ]
+    },
+    {
+      "sample_sha256": "864e52a539b01b06f4a56d85419ceb1b966baaee5cea391b0801d4895efa817f",
+      "label": "malicious",
+      "family": "upatre",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 0,
+      "target_resolved_count": 0,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "a57fd50091d1b18374bcea4bb0ea5c8d12988006b2d1aa7f1370919865f3f423",
+      "label": "malicious",
+      "family": "upatre",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 0,
+      "target_resolved_count": 0,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "c662385d2dfc94a14bf89ec2664e5064f2c8e756edccaac36f03a7e0eca53682",
+      "label": "malicious",
+      "family": "urelas",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 2,
+      "baseline_r3_findings": 2,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 0,
+      "target_resolved_count": 1,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "ShellExecute",
+          "target_source": "dropped_file",
+          "target_sha256": "84fe77961f5d28dab024509908b83907c749fde7332e2fedee1ac50d401889bf",
+          "target_size": 278,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "ccdd19fa044e3fc03be2afe46e1e76a59986959814c93c1604af0b1d996c0a4d",
+      "label": "malicious",
+      "family": "upatre",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 0,
+      "target_resolved_count": 0,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "ce7bf1e4e2c8c4d68c579ee006df1fa9e6ca104e22380a3dc75dbf905123007f",
+      "label": "malicious",
+      "family": "urelas",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 2,
+      "baseline_r3_findings": 2,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 0,
+      "target_resolved_count": 1,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "ShellExecute",
+          "target_source": "dropped_file",
+          "target_sha256": "787614aa96e0012bf19187dd3d524f095882f17d82db74b0a437b9d949ae0454",
+          "target_size": 278,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "e5dae6bf1a8caaaa02c638c25be780cfb3e740e7477588ff125f205696c296a1",
+      "label": "malicious",
+      "family": "urelas",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 2,
+      "baseline_r3_findings": 2,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 0,
+      "target_resolved_count": 1,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "ShellExecute",
+          "target_source": "dropped_file",
+          "target_sha256": "a31bc0cce113309836aa92fee60ae3e511e1fe9b9c19c2125bfbac61d8d4cd99",
+          "target_size": 278,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "e65d55664e8db0cb5f24dcc50ce7bb8523935514fc0abab9a58cbaf29fc5597d",
+      "label": "malicious",
+      "family": "urelas",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 2,
+      "baseline_r3_findings": 2,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 2,
+      "eligible_count": 0,
+      "target_resolved_count": 1,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        },
+        {
+          "launch_id": "child-000002",
+          "source_api": "ShellExecute",
+          "target_source": "dropped_file",
+          "target_sha256": "bdb06fe94180abd8dda8ce8a08f9e7ae1977d9c51cda35a2b0708d69622d4a36",
+          "target_size": 278,
+          "target_resolved": true,
+          "eligible": false,
+          "state": "rejected",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_not_pe"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "f942d5cc9253bc40729630b0381370ee3ad5212a089c1d63438d3dabfccb0b6c",
+      "label": "malicious",
+      "family": "upatre",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 0,
+      "target_resolved_count": 0,
+      "process_object_created_count": 0,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "ShellExecute",
+          "target_source": "unavailable",
+          "target_sha256": null,
+          "target_size": 0,
+          "target_resolved": false,
+          "eligible": false,
+          "state": "unavailable",
+          "created_child_pid": null,
+          "entrypoint_reached": false,
+          "rejection_reason": "target_unavailable"
+        }
+      ],
+      "results": []
+    },
+    {
+      "sample_sha256": "fa80e5f2ad1c8156b38409f70a25fceba042340d2fea950ff7d6d25994969750",
+      "label": "malicious",
+      "family": "unknown",
+      "baseline_parent_status": "ok",
+      "baseline_candidates": 1,
+      "baseline_r3_findings": 1,
+      "parent_outcome": "ok",
+      "parent_termination_reason": null,
+      "mode": "scheduled",
+      "execution_enabled": true,
+      "request_count": 1,
+      "eligible_count": 1,
+      "target_resolved_count": 1,
+      "process_object_created_count": 1,
+      "thread_queued_count": 0,
+      "entrypoint_reached_count": 0,
+      "requests": [
+        {
+          "launch_id": "child-000001",
+          "source_api": "WinExec",
+          "target_source": "dropped_file",
+          "target_sha256": "fcd1e814d849e4d8c736051628459f3851e62bf59a000d93c32eea158d08a6e4",
+          "target_size": 871682,
+          "target_resolved": true,
+          "eligible": true,
+          "state": "failed",
+          "created_child_pid": 1280,
+          "entrypoint_reached": false,
+          "rejection_reason": null
+        }
+      ],
+      "results": [
+        {
+          "launch_id": "child-000001",
+          "state": "failed",
+          "outcome": "error",
+          "termination_reason": "load_error",
+          "ownership": {
+            "launch_id": "child-000001",
+            "root_sample_sha256": "e0a20dbbd556ff79117403ac86e40e46b057be8d3d1e85b1f60d4a2cd03fd8fa",
+            "parent_pid": 1056,
+            "child_pid": 1280,
+            "depth": 1
+          },
+          "budget": {
+            "source": "parent_config",
+            "timeout_seconds": 120.0,
+            "max_api_count": 10000,
+            "max_instructions": 300000000
+          },
+          "usage": {
+            "timeout_seconds_used": 0.0,
+            "api_count_used": 0,
+            "instructions_used": 0
+          },
+          "failure": {
+            "kind": "load",
+            "message": "cannot load child image: ChildImageLoadError: cannot parse child PE: PEFormatError: \"data at RVA can't be fetched. Corrupt header?\"",
+            "pc": null,
+            "api_name": null
+          }
+        }
+      ]
+    }
+  ]
+}

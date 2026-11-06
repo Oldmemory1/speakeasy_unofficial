@@ -17,16 +17,19 @@ from .interfaces import (
     ChildTargetResolverProtocol,
 )
 from .models import (
+    AdmissionDecision,
     ChildExecutionOptions,
     ChildExecutionReportData,
     ChildExecutionState,
     ChildLaunchRecord,
     ChildRunResult,
+    ChildTargetSource,
     ParentExecutionSnapshot,
     ParentRunOutcome,
     ProcessCreationResult,
     ProcessLaunchOutcome,
     ProcessLaunchSpec,
+    ResolvedChildTarget,
 )
 
 _PARENT_FAILURE_STATUSES = frozenset(
@@ -124,12 +127,17 @@ class ChildLaunchDispatcher:
             delegates an eligible request only after process-object creation.
 
         Raises:
-            RuntimeError: If parent intake has already been closed.
             ValueError: If ``parent_context`` changes root identity or budget
                 after the first request.
+
+        A launch requested after parent intake has closed is not a parent
+        failure.  It returns a non-eligible ``depth_limit`` outcome so a
+        depth-one child can safely attempt nested APIs without being recorded
+        as another request or creating a grandchild.
         """
 
-        self._ensure_intake_open()
+        if self._parent_finished:
+            return self._closed_submission_outcome(spec, parent_context)
         self._establish_parent_context(parent_context)
 
         request = self._request_factory.build(
@@ -291,25 +299,11 @@ class ChildLaunchDispatcher:
             mode="scheduled" if self._options.enabled else "model_only",
             execution_enabled=self._options.enabled,
             request_count=len(records),
-            eligible_count=sum(
-                record.decision is not None and record.decision.eligible
-                for record in records
-            ),
-            target_resolved_count=sum(
-                record.target is not None and record.target.resolved
-                for record in records
-            ),
-            process_object_created_count=sum(
-                record.process is not None for record in records
-            ),
-            thread_queued_count=sum(
-                record.state in _QUEUED_OR_LATER_STATES
-                for record in records
-            ),
-            entrypoint_reached_count=sum(
-                record.state in _ENTRYPOINT_OR_LATER_STATES
-                for record in records
-            ),
+            eligible_count=sum(record.decision is not None and record.decision.eligible for record in records),
+            target_resolved_count=sum(record.target is not None and record.target.resolved for record in records),
+            process_object_created_count=sum(record.process is not None for record in records),
+            thread_queued_count=sum(record.state in _QUEUED_OR_LATER_STATES for record in records),
+            entrypoint_reached_count=sum(record.state in _ENTRYPOINT_OR_LATER_STATES for record in records),
             records=records,
             results=tuple(self._results),
         )
@@ -333,22 +327,15 @@ class ChildLaunchDispatcher:
         if not isinstance(snapshot, ChildExecutionReportData):
             return
 
-        records_by_launch_id = {
-            record.request.launch_id: record for record in snapshot.records
-        }
-        self._records = [
-            records_by_launch_id.get(record.request.launch_id, record)
-            for record in self._records
-        ]
-        results_by_launch_id = {
-            result.launch_id: result for result in self._results
-        }
+        records_by_launch_id = {record.request.launch_id: record for record in snapshot.records}
+        self._records = [records_by_launch_id.get(record.request.launch_id, record) for record in self._records]
+        results_by_launch_id = {result.launch_id: result for result in self._results}
         for result in snapshot.results:
             results_by_launch_id[result.launch_id] = result
         self._results = list(results_by_launch_id.values())
 
     def _ensure_intake_open(self) -> None:
-        """Reject submissions after parent intake has closed.
+        """Check whether child intake remains open for an ordinary submission.
 
         Returns:
             ``None`` when intake remains open.
@@ -362,6 +349,71 @@ class ChildLaunchDispatcher:
 
         if self._parent_finished:
             raise RuntimeError("parent child-execution intake is closed")
+
+    def _closed_submission_outcome(
+        self,
+        spec: ProcessLaunchSpec,
+        parent_context: ParentExecutionSnapshot,
+    ) -> ProcessLaunchOutcome:
+        """Return a contained depth-limit outcome after parent completion.
+
+        Args:
+            spec: API request received from an executing depth-one child.
+            parent_context: Context of the calling child process.
+
+        Returns:
+            A rejected output with no target bytes, process object, or PID.
+
+        Side effects:
+            Does not append report records, mutate scheduler state, or raise
+            into the child runtime.  The request remains child-local recursion
+            evidence rather than becoming a parent simulation error.
+        """
+
+        caller_record = next(
+            (
+                record
+                for record in reversed(self._records)
+                if record.process is not None and int(record.process.pid) == parent_context.pid
+            ),
+            None,
+        )
+        parent_launch_id = caller_record.request.launch_id if caller_record is not None else None
+        depth = caller_record.request.depth + 1 if caller_record is not None else self._options.max_depth + 1
+        request = self._request_factory.build(
+            spec,
+            root_sample_sha256=parent_context.root_sample_sha256,
+            parent_pid=parent_context.pid,
+            parent_tid=parent_context.tid,
+            parent_launch_id=parent_launch_id,
+            depth=depth,
+            parent_budget=parent_context.budget,
+            cwd=parent_context.cwd,
+        )
+        target = ResolvedChildTarget(
+            source=ChildTargetSource.UNAVAILABLE,
+            normalized_path=request.normalized_target,
+            payload_ref=None,
+            sha256=None,
+            size=0,
+            file_format="unknown",
+            arch="unknown",
+            module_type="unknown",
+            entrypoint_rva=0,
+            resolved=False,
+            reason="depth_limit",
+        )
+        decision = AdmissionDecision(
+            eligible=False,
+            state=ChildExecutionState.REJECTED,
+            reason="depth_limit",
+        )
+        return ProcessLaunchOutcome(
+            request=request,
+            resolution=target,
+            decision=decision,
+            creation=_not_created("depth_limit"),
+        )
 
     def _establish_parent_context(
         self,
@@ -386,8 +438,7 @@ class ChildLaunchDispatcher:
             self._parent_context = parent_context
             return
         if (
-            parent_context.root_sample_sha256
-            != self._parent_context.root_sample_sha256
+            parent_context.root_sample_sha256 != self._parent_context.root_sample_sha256
             or parent_context.pid != self._parent_context.pid
             or parent_context.cwd != self._parent_context.cwd
             or parent_context.budget != self._parent_context.budget
@@ -462,4 +513,6 @@ def _not_created(reason: str | None) -> ProcessCreationResult:
         created=False,
         reason=reason,
     )
+
+
 __all__ = ["ChildLaunchDispatcher"]

@@ -79,6 +79,12 @@ from .runner import (
     ChildExecutionRunner,
     ChildExecutionRuntimeError,
 )
+from .runtime_backend import (
+    EngineChildEntrypointHookBackend,
+    EngineChildExecutionBackend,
+    EngineChildRuntimeContextBackend,
+    create_engine_child_scheduler,
+)
 from .runtime_context import (
     ChildCodeHook,
     ChildContextSession,
@@ -169,6 +175,9 @@ __all__ = [
     "ExecutionBudgetFactory",
     "EngineChildImageBaseAllocator",
     "EngineChildImageMapper",
+    "EngineChildEntrypointHookBackend",
+    "EngineChildExecutionBackend",
+    "EngineChildRuntimeContextBackend",
     "LoadedChildImage",
     "ParentExecutionSnapshot",
     "ParentRunOutcome",
@@ -183,4 +192,5 @@ __all__ = [
     "OneShotChildEntrypointObserver",
     "TargetPayloadRef",
     "canonicalize_command_line",
+    "create_engine_child_scheduler",
 ]

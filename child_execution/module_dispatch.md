@@ -3,9 +3,10 @@
 > 日期：2026-11-04
 >
 > 状态：步骤 1-7 已执行。步骤 1-5 的引擎侧模块已完成；步骤 6 的
-> state-only 小批、目标解析门槛和 R3 审计已完成。生产 scheduler 已实现并
-> 成为 child execution 包内唯一 queue/drain 路径；pipeline 接线仍缺失，
-> 因此真实 child execution 和 depth=2 仍被阻断。
+> state-only 小批、目标解析门槛、`WinExec` target-unavailable API/pid
+> 语义、R3 审计、dropped-path 权威映射、`mira` depth=1、完整 R3 dropped
+> EXE 矩阵和两个良性安装器复核已完成。生产 scheduler 已实现并成为 child
+> execution 包内唯一 queue/drain 路径；默认仍关闭，depth=2 未获批准。
 >
 > 上位设计：
 > [child_execution_capture_develop_manual.md](child_execution_capture_develop_manual.md)
@@ -1046,8 +1047,8 @@ tracker 不得从 API result、Process 是否存在或后续任意 pid 事件反
       pipeline 集成步骤；
 - [x] 步骤 6 state-only 小批和目标门槛实验已执行；结果见
       [step6_experiments/README.md](step6_experiments/README.md)。
-- [ ] 真实 child execution 仍被缺失的 pipeline 接线以及 target/API 语义
-      门槛阻断；depth=2 未获批准。
+- [ ] 真实 child execution 仍被真实 backend/预算计数门槛阻断；
+      depth=2 未获批准。
 
 ### 步骤 6：小批实验
 
@@ -1057,12 +1058,20 @@ tracker 不得从 API result、Process 是否存在或后续任意 pid 事件反
       `target_unavailable`，self bytes 门槛失败；
 - [x] `padodor` 6/6 target unavailable，但 6/6 仍返回
       `success_request`/API 32，失败语义门槛失败；
+- [x] `WinExec` target-unavailable 修复后，6/6 `padodor` 真实样本均返回
+      `ERROR_FILE_NOT_FOUND=2`，`launch_result=failure`，
+      `process_object_created=false`，`created_child_pid=null`，且不再
+      生成 decoy process；
+- [x] child-execution 回归：`152 passed`；
+      child-execution-detection 动态阶段回归：`42 passed`；
 - [x] `systex` 2/2 保留完整 URL/target，并且不默认执行 IE；
 - [x] R3 清单为 25 个样本、35 个 finding、23 恶意/2 良性；代表 dropped
-      PE 可被显式 fixture resolver 解析，但生产路径映射仍未接线；
-- [x] child execution 定向测试：`112 passed`；Ruff 通过；
-- [ ] 真实 child E2E：`BLOCKED`，生产 scheduler 已实现，但 pipeline
-      `child_execution` 报告尚未接线；
+      PE 通过生产路径映射直接绑定到 FileManager 中完整落盘的 artifact
+      bytes，不需要显式 fixture；
+- [x] 修复前 child execution 定向测试基线：`112 passed`；Ruff 通过；
+- [ ] 真实 child E2E：`BLOCKED`。生产 scheduler、dispatcher 和 pipeline
+      `child_execution` 报告已接线，target 解析和 `WinExec` API 失败语义
+      已通过；dropped bytes 映射已通过，真实 backend/预算计数仍未通过；
 - [ ] depth=2：**REJECTED / NOT APPROVED**。
 
 ### 步骤 6 后续门槛：接入 `dynamic_stage_new`
@@ -1073,16 +1082,59 @@ execution，也不得开放 depth=2：
 1. [x] 实现生产 scheduler，并让它成为唯一 queue/drain 路径。
        `ChildExecutionScheduler` 独占 FIFO，`submit()` 只入队，
        `drain()` 只在 parent 完成后执行；dispatcher 只通过该公共接口
-       提交、停止和读取结果。
-2. pipeline 接入 dispatcher，报告输出完整 `child_execution`。
-3. 修复 `ShellExecute` self target 的最后字符和扩展名解析。
-4. 修复 `WinExec` 在 target unavailable 时的返回值与 pid 语义。
-5. 完成 dropped request path 到 artifact bytes 的权威映射。
-6. 重跑同样的 12 个 state-only 样本，确认父状态无漂移。
-7. 在显式开关下只开启 `mira` depth=1，确认真实
+       提交、停止和读取结果。旧 `child_processes` load/start 循环已删除，
+       `Win32Emulator.run_module()` 只能通过 dispatcher/scheduler drain。
+2. [x] pipeline 接入 dispatcher，报告输出完整 `child_execution`。
+   实现位于 `src/dynamic_stage_new/child-execution-detection/`，顶层
+   `pipeline.py` 只负责安装 bridge、parent finish 和报告合并。默认仍为
+   model-only；event-first report 与磁盘 JSON 均保留完整 requests/results
+   空数组。真实 `mira` 烟测已记录 1 个 unavailable `ShellExecute` request。
+3. [x] 修复 `ShellExecute` self target 的最后字符和扩展名解析。
+       `ChildTargetResolver` 只接受根文件名为 64 位十六进制、目标 stem
+       恰好少最后一个字符且后缀为无扩展名或 `.exe` 的严格 alias；4 个真实
+       `mira` 目标均解析到根样本原始 PE，不匹配更短或不相等前缀。
+4. [x] 修复 `WinExec` 在 target unavailable 时的返回值与 pid 语义。
+   `WinExec` 只消费 `ProcessCreationResult`：仅 `created=true`、
+   `process` 与返回值一致且 `created_pid>0` 时返回 `32` 并记录
+   `PROC_CREATE`；unavailable/rejected 请求返回
+   `ERROR_FILE_NOT_FOUND=2` 或对应失败码，设置 last error，不创建 PID。
+   dynamic-stage 的模块化真实样本测试位于
+   `src/dynamic_stage_new/child-execution-detection/`。
+5. [x] 完成 dropped request path 到 artifact bytes 的权威映射。
+   `ChildTargetResolver` 只遍历 `FileManager.get_dropped_files()` 返回的
+   完整落盘集合，按统一大小写、分隔符、NT device prefix 和 root-relative
+   drive 后的完整路径唯一匹配，并通过 detached
+   `File.duplicate()` 快照读取完整 bytes；basename 相似、歧义路径和游标
+   位于文件中部的读取都不会产生截断 payload。三个代表 R3 样本均从真实
+   pipeline 解析为 `dropped_file`，SHA-256/size 分别为
+   `84447185...0090f49c`/60416、`d2e9c596...ad6eb44`/387072 和
+   `995ca25e...896ae2e1`/386048。该能力位于 Speakeasy
+   child-execution 引擎层，不消费其他 dynamic-stage detector。
+6. [x] 重跑同样的 12 个 state-only 样本，确认父状态无漂移。
+7. [x] 在显式开关下只开启 `mira` depth=1，确认真实
    `entrypoint_reached`、ownership、独立预算和 parent context 恢复。
-8. `mira` 通过后再跑完整 dropped EXE，并单独复核两个良性安装器。
-9. 最后才评估 depth=2。
+   4/4 个批准 root 均产生一个 self child，`entrypoint_reached_count=1`，
+   parent/child PID 不同，child usage 独立，parent process/thread/run
+   在 child 退出后逐项校验恢复。child 内嵌套请求返回本地
+   `depth_limit`，不创建 grandchild，也不污染 parent outcome。
+8. [x] `mira` 通过后再跑完整 dropped EXE，并单独复核两个良性安装器。
+   显式 dropped scope 覆盖 25 个 R3 root，共记录 36 个 request；9 个
+   artifact request 进入 child，其中 3 个真实到达入口并 `normal_exit`，
+   另 2 个到达入口后 `invalid_fetch`，合计 5 个入口命中；4 个
+   `load_error`。两个良性安装器单独的 child
+   均为本地 `load_error`；`45a93d19` parent 保持 `ok`，`49ff71a5`
+   parent 保持历史 `timed_out`，没有 child 覆盖 parent outcome。
+   完整逐样本证据见
+   `step6_experiments/dropped_depth1_e2e_summary.json`；该 scope 固定
+   depth=1、只允许 `dropped_file`，不消费其他 detector。
+9. [ ] 最后才评估 depth=2。
+
+当前提交状态：
+
+- Speakeasy scheduler/report/engine 接线：`fce9f04`。
+- dynamic-stage dispatcher/report 接线：`298ec1f`。
+- `pipeline.py` 默认 `enabled=False`；真实执行需要显式
+  `scheduler_factory`，不得通过环境变量隐式开启。
 
 接入验收证据见
 [step6_experiments/README.md](step6_experiments/README.md) 和
@@ -1139,12 +1191,18 @@ execution，也不得开放 depth=2：
 - [x] child-execution 相关回归：`123 passed`；Ruff、`py_compile` 通过；
 - [x] 全量 Speakeasy 回归：`472 passed, 26 skipped, 5 failed`；5 个失败仍是
       既有 capa 测试资产缺失和引擎历史行为差异；
-- [ ] 生产 backend 尚未把 API/instruction 预算计数接到实际 child 指令循环；
+- [x] 生产 backend 已把 API/instruction 预算计数接到实际 child 执行；
+      instruction code hook 覆盖映射 child image，并在独立 usage 超限时
+      停止 child；parent 的 engine budget 标志在 child 前后恢复；
 - [ ] 当前 pipeline 默认仍为 model-only；真实 enabled scheduler 需要显式
       `scheduler_factory`，不能在缺少 loader/context/runner adapter 时开启；
-- [x] 真实 `mira` pipeline 烟测已记录 1 个 unavailable `ShellExecute`
-      request，child results 为 0；
-- [ ] 真实 `mira` child E2E 和 dropped EXE 执行仍未获准。
+- [x] 真实 `mira` child E2E：4/4 个批准 root 均完成 depth=1，真实入口
+      命中、ownership、独立预算和 parent context 恢复均有报告证据；
+- [x] 完整 R3 dropped EXE 矩阵和两个良性安装器已执行；3/25 root 真实
+      到达入口，其余失败均有权威分类，未伪造成功；
+- [ ] R3 parent 状态仍有 3 个与历史 state-only 记录不一致，未据此批准
+      depth=2；
+- [ ] depth=2 仍未获准。
 
 ## 14. 接口验收清单
 

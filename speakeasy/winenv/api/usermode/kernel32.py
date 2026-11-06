@@ -44,6 +44,33 @@ FILE_MAP_READ = 0x0004
 FILE_MAP_EXECUTE = 0x0020
 FILE_MAP_ALL_ACCESS = 0xF001F
 
+_WINE_EXEC_ERROR_BAD_FORMAT = 11
+
+
+def _winexec_failure_code(reason: str | None) -> int:
+    """Map a child request failure to a documented WinExec failure code.
+
+    Args:
+        reason: Machine-readable target or process-creation failure reason.
+
+    Returns:
+        ``ERROR_FILE_NOT_FOUND`` for an unavailable target,
+        ``ERROR_BAD_FORMAT`` for bytes rejected as an executable, and ``0``
+        for failures where WinExec does not define a more specific code.
+    """
+
+    if reason == "target_unavailable":
+        return windefs.ERROR_FILE_NOT_FOUND
+    if reason in {
+        "target_not_pe",
+        "arch_mismatch",
+        "entrypoint_missing",
+        "entrypoint_out_of_range",
+        "invalid_fetch",
+    }:
+        return _WINE_EXEC_ERROR_BAD_FORMAT
+    return 0
+
 
 class Kernel32(api.ApiHandler):
     """
@@ -851,24 +878,48 @@ class Kernel32(api.ApiHandler):
             LPCSTR lpCmdLine,
             UINT   uCmdShow
         );
+
+        Args:
+            emu: Emulator exposing authoritative child process requests.
+            argv: ``[lpCmdLine, uCmdShow]`` API arguments.
+            ctx: Optional API call metadata.
+
+        Returns:
+            A value greater than 31 only after a process object was actually
+            created. Otherwise returns a documented WinExec failure code.
+
+        Side effects:
+            Reads the command string, records one child launch request, sets
+            the emulated last error on failure, and records a process-creation
+            event only for a successfully created process.
         """
 
         lpCmdLine, uCmdShow = argv
-        rv = 1
+        if not lpCmdLine:
+            emu.set_last_error(_WINE_EXEC_ERROR_BAD_FORMAT)
+            return _WINE_EXEC_ERROR_BAD_FORMAT
 
-        if lpCmdLine:
-            cmd = self.read_mem_string(lpCmdLine, 1)
-            argv[0] = cmd
-            app = ChildTargetResolver.command_target(cmd)
-            proc, _request = emu.request_child_process(
-                source_api="WinExec",
-                path=app,
-                cmdline=cmd,
-            )
-            self.record_process_event(proc, PROC_CREATE)
-            rv = 32
+        cmd = self.read_mem_string(lpCmdLine, 1)
+        argv[0] = cmd
+        app = ChildTargetResolver.command_target(cmd)
+        proc, _request, creation = emu.request_process_execution(
+            source_api="WinExec",
+            path=app,
+            cmdline=cmd,
+        )
+        if (
+            not creation.created
+            or proc is None
+            or creation.process is not proc
+            or creation.created_pid is None
+            or creation.created_pid <= 0
+        ):
+            rv = _winexec_failure_code(creation.reason)
+            emu.set_last_error(rv)
+            return rv
 
-        return rv
+        self.record_process_event(proc, PROC_CREATE)
+        return 32
 
     @apihook("LoadLibraryEx", argc=3)
     def LoadLibraryEx(self, emu, argv, ctx: api.ApiContext = None):

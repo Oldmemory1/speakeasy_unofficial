@@ -31,6 +31,7 @@ from speakeasy.windows.child_execution import (
     ChildSchedulerProtocol,
     ExecutionBudget,
     ParentExecutionSnapshot,
+    ProcessCreationResult,
     ProcessLaunchSpec,
 )
 from speakeasy.windows.cryptman import CryptoManager
@@ -1499,17 +1500,35 @@ class WindowsEmulator(BinaryEmulator):
             cwd=cwd,
         )
 
-    def request_child_process(
+    def request_process_execution(
         self,
         source_api: str,
         path: str | None,
         cmdline: str | None,
         cwd: str | None = None,
-    ) -> tuple[Any, ChildExecutionRequest | ChildLaunchRequest]:
-        """Create the legacy process object and attach model-only evidence.
+    ) -> tuple[
+        Any | None,
+        ChildExecutionRequest | ChildLaunchRequest,
+        ProcessCreationResult,
+    ]:
+        """Request one child launch and return authoritative creation facts.
 
-        The process remains in ``child_processes`` for compatibility with the
-        existing object model, but no run is added to ``run_queue``.
+        Args:
+            source_api: Process-launch API that produced the request.
+            path: Explicit target path, if supplied by the API.
+            cmdline: Complete command line supplied by the API.
+            cwd: Optional emulated working directory.
+
+        Returns:
+            A tuple of the created process (or ``None``), its launch request,
+            and a ``ProcessCreationResult``. The creation result is the sole
+            source for success, reason, and created PID/TID decisions.
+
+        Side effects:
+            In the legacy registry path, creates a process only for an
+            admitted request and marks that request's creation fields. In the
+            dispatcher path, delegates all request handling to the dispatcher.
+            It never creates a fallback process for an unavailable target.
         """
 
         if self.child_dispatcher is None:
@@ -1519,9 +1538,42 @@ class WindowsEmulator(BinaryEmulator):
                 cmdline,
                 cwd=cwd,
             )
-            process = self.create_process(path=path, cmdline=cmdline, child=True)
+            if not request.eligible:
+                return (
+                    None,
+                    request,
+                    ProcessCreationResult(
+                        process=None,
+                        created_pid=None,
+                        created_tid=None,
+                        created=False,
+                        reason=(
+                            request.rejection_reason
+                            or request.skip_reason
+                            or "child_request_rejected"
+                        ),
+                    ),
+                )
+
+            process = self.create_process(
+                path=path,
+                cmdline=cmdline,
+                child=True,
+            )
             request.mark_process_created(process)
-            return process, request
+            thread = process.threads[0] if process.threads else None
+            return (
+                process,
+                request,
+                ProcessCreationResult(
+                    process=process,
+                    created_pid=int(getattr(process, "pid", process.id)),
+                    created_tid=(
+                        int(thread.tid) if thread is not None else None
+                    ),
+                    created=True,
+                ),
+            )
 
         parent = self.curr_process
         parent_thread = self.curr_thread
@@ -1551,14 +1603,48 @@ class WindowsEmulator(BinaryEmulator):
             ),
             parent_context=parent_context,
         )
-        if outcome.creation.created and outcome.creation.process is not None:
-            return outcome.creation.process, outcome.request
+        return outcome.creation.process, outcome.request, outcome.creation
+
+    def request_child_process(
+        self,
+        source_api: str,
+        path: str | None,
+        cmdline: str | None,
+        cwd: str | None = None,
+    ) -> tuple[Any, ChildExecutionRequest | ChildLaunchRequest]:
+        """Return the legacy process/request pair for non-WinExec callers.
+
+        Args:
+            source_api: Process-launch API that owns the request.
+            path: Explicit target path supplied by the API, if any.
+            cmdline: Complete child command line, if any.
+            cwd: Emulated working directory, if supplied by the API.
+
+        Returns:
+            The created process or a compatibility fallback process, together
+            with the request evidence. Callers that require authoritative
+            success and PID facts must use :meth:`request_process_execution`.
+
+        Side effects:
+            May create a process object in ``child_processes`` for legacy
+            handler compatibility. It never adds a run to ``run_queue``; the
+            fallback process must not be treated as evidence of creation.
+        """
+
+        process, request, creation = self.request_process_execution(
+            source_api,
+            path,
+            cmdline,
+            cwd=cwd,
+        )
+        if creation.created and process is not None:
+            return process, request
 
         # Preserve the legacy API-handler object contract for unavailable or
         # rejected targets. The dispatcher report remains authoritative and
         # still records the request as unresolved/rejected.
         process = self.create_process(path=path, cmdline=cmdline, child=True)
-        return process, outcome.request
+        return process, request
 
     def create_thread(self, addr, ctx, proc_obj, thread_type="thread", is_suspended=False):
         """
