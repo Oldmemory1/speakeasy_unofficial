@@ -100,6 +100,7 @@ class Kernel32(api.ApiHandler):
 
         self.command_lines = [None] * 3
         self.startup_info = {}
+        self._process_user_mode_exception_policy = 0
 
         self.k32types = k32types
 
@@ -4688,6 +4689,33 @@ class Kernel32(api.ApiHandler):
         UINT GetErrorMode();
         """
         return 0
+
+    @apihook("GetProcessUserModeExceptionPolicy", argc=1)
+    def GetProcessUserModeExceptionPolicy(self, emu, argv, ctx: api.ApiContext = None):
+        """BOOL GetProcessUserModeExceptionPolicy(LPDWORD lpFlags)."""
+        (flags_address,) = argv
+        if not flags_address:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        try:
+            emu.mem_write(
+                flags_address,
+                self._process_user_mode_exception_policy.to_bytes(4, "little"),
+            )
+        except Exception:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        return 1
+
+    @apihook("SetProcessUserModeExceptionPolicy", argc=1)
+    def SetProcessUserModeExceptionPolicy(self, emu, argv, ctx: api.ApiContext = None):
+        """BOOL SetProcessUserModeExceptionPolicy(DWORD dwFlags)."""
+        (flags,) = argv
+        if flags & ~1:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        self._process_user_mode_exception_policy = flags
+        return 1
 
     @apihook("WerGetFlags", argc=2)
     def WerGetFlags(self, emu, argv, ctx={}):

@@ -60,6 +60,8 @@ class Msvcrt(api.ApiHandler):
         self.tick_counter: int = TICK_BASE
         self.errno_t: int | None = None
         self.file_streams: dict[int, Any] = {}
+        self.signal_handlers: dict[int, int] = {}
+        self._environ_pointer: int | None = None
 
         super().__get_hook_attrs__(self)
 
@@ -392,6 +394,25 @@ class Msvcrt(api.ApiHandler):
             sptr += len(v)
 
         return envp
+
+    @apihook("__p__environ", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p__environ(self, emu, argv, ctx: api.ApiContext = None):
+        """char*** __p__environ(void)."""
+        if self._environ_pointer:
+            return self._environ_pointer
+
+        ptr_size = emu.get_ptr_size()
+        environment = self._get_initial_narrow_environment(emu, argv, ctx)
+        environ_pointer = self.mem_alloc(
+            size=ptr_size,
+            tag="api.msvcrt.__p__environ",
+        )
+        self.mem_write(
+            environ_pointer,
+            environment.to_bytes(ptr_size, "little"),
+        )
+        self._environ_pointer = environ_pointer
+        return environ_pointer
 
     @apihook("_get_initial_wide_environment", argc=0, conv=e_arch.CALL_CONV_CDECL)
     def _get_initial_wide_environment(self, emu, argv, ctx: api.ApiContext = None):
@@ -2107,9 +2128,30 @@ class Msvcrt(api.ApiHandler):
             int (*func)(int, int)
         );
         """
-        sig, _ = argv
-
-        if sig in [SIGINT, SIGILL, SIGFPE, SIGSEGV, SIGTERM, SIGBREAK, SIGABRT]:
-            return SIG_IGN
-        else:
+        sig, handler = argv
+        valid_signals = {
+            SIGINT,
+            SIGILL,
+            SIGFPE,
+            SIGSEGV,
+            SIGTERM,
+            SIGBREAK,
+            SIGABRT,
+        }
+        if sig not in valid_signals:
             return SIG_ERR
+        if handler == SIG_ERR:
+            return SIG_ERR
+
+        previous = self.signal_handlers.get(sig, SIG_DFL)
+        if handler != SIG_GET:
+            self.signal_handlers[sig] = handler
+        return previous
+
+    @apihook("atexit", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def atexit(self, emu, argv, ctx: api.ApiContext = None):
+        """Register a process-exit callback without executing it early."""
+        callback = int(argv[0])
+        if not callback:
+            return 1
+        return 0

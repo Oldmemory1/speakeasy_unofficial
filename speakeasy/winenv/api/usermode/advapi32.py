@@ -17,6 +17,9 @@ from speakeasy.windows.child_execution import ChildTargetResolver
 from .. import api
 
 SERVICE_STATUS_HANDLE_BASE = 0x1000
+TOKEN_USER_INFORMATION_CLASS = 1
+TOKEN_ELEVATION_INFORMATION_CLASS = 20
+TOKEN_INTEGRITY_LEVEL_INFORMATION_CLASS = 25
 
 
 class AdvApi32(api.ApiHandler):
@@ -1262,19 +1265,81 @@ class AdvApi32(api.ApiHandler):
             PDWORD                  ReturnLength
         );
         """
-        hnd, info_class, info, info_len, ret_len = argv
-        rv = True
+        _hnd, info_class, info, info_len, ret_len = argv
 
-        if not info_len:
-            rv = False
-            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+        if info_class == TOKEN_USER_INFORMATION_CLASS:
+            return self._write_token_sid_structure(
+                emu,
+                info,
+                info_len,
+                ret_len,
+                emu.config.user.sid,
+                attributes=0,
+            )
 
-        if info_class == 20 and info and emu.config.user.is_admin:
-            self.mem_write(info, (1).to_bytes(4, "little"))
+        if info_class == TOKEN_INTEGRITY_LEVEL_INFORMATION_CLASS:
+            integrity_sid = (
+                "S-1-16-12288"
+                if emu.config.user.is_admin
+                else "S-1-16-8192"
+            )
+            return self._write_token_sid_structure(
+                emu,
+                info,
+                info_len,
+                ret_len,
+                integrity_sid,
+                attributes=0x20,
+            )
+
+        if info_class == TOKEN_ELEVATION_INFORMATION_CLASS:
+            required = 4
+            if ret_len:
+                self.mem_write(ret_len, required.to_bytes(4, "little"))
+            if not info or info_len < required:
+                emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+                return 0
+            elevation = int(emu.config.user.is_admin)
+            self.mem_write(info, elevation.to_bytes(4, "little"))
+            emu.set_last_error(windefs.ERROR_SUCCESS)
+            return 1
+
         if ret_len:
-            self.mem_write(ret_len, (4).to_bytes(4, "little"))
+            self.mem_write(ret_len, (0).to_bytes(4, "little"))
+        emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+        return 0
 
-        return rv
+    def _write_token_sid_structure(
+        self,
+        emu,
+        info: int,
+        info_len: int,
+        ret_len: int,
+        sid_text: str,
+        attributes: int,
+    ) -> int:
+        """Write TOKEN_USER or TOKEN_MANDATORY_LABEL with an inline SID."""
+        ptr_size = emu.get_ptr_size()
+        sid_struct = windefs.convert_sid_str_to_struct(ptr_size, sid_text)
+        sid = self.get_bytes(sid_struct)
+        header_size = 16 if ptr_size == 8 else 8
+        sid_address = header_size
+        required = sid_address + len(sid)
+        if ret_len:
+            self.mem_write(ret_len, required.to_bytes(4, "little"))
+        if not info or info_len < required:
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            return 0
+        padding = b"\x00" * (header_size - ptr_size - 4)
+        self.mem_write(
+            info,
+            (info + sid_address).to_bytes(ptr_size, "little")
+            + attributes.to_bytes(4, "little")
+            + padding
+            + sid,
+        )
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return 1
 
     @apihook("EqualSid", argc=2)
     def EqualSid(self, emu, argv, ctx: api.ApiContext = None):
