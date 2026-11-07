@@ -4,8 +4,10 @@ import binascii
 import os
 
 import speakeasy.windows.common as winemu
+import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.nt.ntoskrnl as ntos
+from speakeasy.errors import ApiEmuError
 
 from .. import api
 
@@ -28,6 +30,49 @@ class Ntdll(api.ApiHandler):
         self.data = {}
 
         super().__get_hook_attrs__(self)
+
+    @apihook("_alloca_probe", argc=0, conv=_arch.CALL_CONV_CDECL)
+    def _alloca_probe(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        Reserve space in the caller's x86 stack frame.
+
+        ``_alloca_probe`` is not a normal cdecl API. Its requested byte count
+        is in EAX and it does not consume a stack argument. The real ntdll
+        implementation lowers ESP by that count, copies the return address to
+        the new stack top, and returns with EAX still containing the return
+        address. The caller normally follows the call with ``mov eax, esp``.
+
+        Copying the return address to the new stack top lets the existing API
+        return path read the original return address after this handler has
+        moved ESP and then complete the equivalent of the probe's final RET.
+        """
+        if emu.get_arch() != _arch.ARCH_X86:
+            raise ApiEmuError("ntdll._alloca_probe is only supported on x86")
+
+        byte_count = emu.reg_read(_arch.X86_REG_EAX)
+        stack_pointer = emu.get_stack_ptr()
+        ptr_size = self.get_ptr_size()
+
+        # The helper copies the return address to ESP - EAX and the final RET
+        # consumes it from there. Keep the complete destination inside the
+        # caller's stack mapping so a corrupt size cannot redirect the probe
+        # into unrelated guest memory.
+        new_stack_pointer = stack_pointer - byte_count
+        stack_map = emu.get_address_map(stack_pointer)
+        destination_map = emu.get_address_map(new_stack_pointer)
+        destination_end = new_stack_pointer + ptr_size - 1
+        if stack_map is None or destination_map is not stack_map or destination_end >= stack_map.base + stack_map.size:
+            raise ApiEmuError(
+                f"ntdll._alloca_probe stack allocation is out of range: size=0x{byte_count:x}, esp=0x{stack_pointer:x}"
+            )
+
+        return_address = emu.get_ret_address()
+        emu.mem_write(
+            new_stack_pointer,
+            return_address.to_bytes(ptr_size, "little"),
+        )
+        emu.set_stack_ptr(new_stack_pointer)
+        return return_address
 
     @apihook("RtlGetLastWin32Error", argc=0)
     def RtlGetLastWin32Error(self, emu, argv, ctx: api.ApiContext = None):
