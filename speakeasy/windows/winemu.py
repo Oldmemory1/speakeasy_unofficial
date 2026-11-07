@@ -36,6 +36,12 @@ from speakeasy.windows.child_execution import (
 )
 from speakeasy.windows.cryptman import CryptoManager
 from speakeasy.windows.driveman import DriveManager
+from speakeasy.windows.fast_fail import (
+    FAST_FAIL_INTERRUPT_VECTOR,
+    STATUS_STACK_BUFFER_OVERRUN,
+    TERMINATION_KIND,
+    requires_kernel_bootstrap_recovery,
+)
 from speakeasy.windows.fileman import FileManager
 from speakeasy.windows.hammer import ApiHammer
 from speakeasy.windows.loaders import get_prot_string
@@ -1912,11 +1918,16 @@ class WindowsEmulator(BinaryEmulator):
         return "; ".join(parts)
 
     def get_error_info(
-        self, desc: str, address: int, traceback: str | None = None, access_type: str | None = None
+        self,
+        desc: str,
+        address: int,
+        traceback: str | None = None,
+        access_type: str | None = None,
+        pc_override: int | None = None,
     ) -> ErrorInfo:
         """Collect emulator state information in the event of an error."""
         run = self.get_current_run()
-        pc = self.get_pc()
+        pc = self.get_pc() if pc_override is None else pc_override
 
         try:
             mnem, op, instr = self.get_disasm(pc, DISASM_SIZE)
@@ -3482,11 +3493,25 @@ class WindowsEmulator(BinaryEmulator):
                 self.reg_write(_arch.X86_REG_EFLAGS, eflags)
                 return True
 
-        # Handle __fastfail interrupt introduced in Windows 8
-        if intnum == 0x29:
-            ecx = self.reg_read(_arch.X86_REG_ECX)
-            # Cookie security init failed, just return since we are in __security_init_cookie
-            if ecx == 6:
+        # Handle __fastfail interrupt introduced in Windows 8. Fast fail is a
+        # process-termination contract and must not be converted into a
+        # recoverable SEH exception or a normal API return.
+        if intnum == FAST_FAIL_INTERRUPT_VECTOR:
+            if self.get_arch() == _arch.ARCH_AMD64:
+                fast_fail_code = self.reg_read(_arch.AMD64_REG_RCX) & 0xFFFFFFFF
+                fast_fail_data = self.reg_read(_arch.AMD64_REG_RDX)
+            else:
+                fast_fail_code = self.reg_read(_arch.X86_REG_ECX)
+                fast_fail_data = self.reg_read(_arch.X86_REG_EDX)
+
+            if requires_kernel_bootstrap_recovery(
+                fast_fail_code,
+                kernel_mode=self.kernel_mode,
+            ):
+                # Windows initializes this cookie before entering driver code.
+                # Complete the missing bootstrap transition without reporting a
+                # guest fast-fail termination or dispatching an SEH exception.
+                logger.debug("recovering kernel GS cookie initialization")
                 hook_ref = [None]
 
                 def _tmp_hook(emu, addr, size):
@@ -3496,6 +3521,28 @@ class WindowsEmulator(BinaryEmulator):
 
                 hook_ref[0] = self.add_code_hook(cb=_tmp_hook)
                 return True
+
+            # Unicorn advances EIP/RIP past ``int 0x29`` before invoking the
+            # interrupt hook. Record the trapping instruction rather than the
+            # following instruction so the report points at the fast-fail site.
+            interrupt_pc = max(self.get_pc() - 2, 0)
+            error = self.get_error_info(
+                "fast_fail",
+                interrupt_pc,
+                pc_override=interrupt_pc,
+            )
+            error.interrupt_num = intnum
+            error.termination_kind = TERMINATION_KIND
+            error.status_code = STATUS_STACK_BUFFER_OVERRUN
+            error.fast_fail_code = fast_fail_code
+            error.fast_fail_data = fast_fail_data
+            self.curr_run.error = error  # type: ignore[union-attr]
+            self.restart_curr_run = False
+            self.run_complete = True
+            # __fastfail terminates the process, not just the current run.
+            # Stop the engine so queued threads or entrypoints cannot resume.
+            self.stop()
+            return True
 
         pc = self.get_pc()
         logger.debug("interrupt: intnum=0x%x", intnum)

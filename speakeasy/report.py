@@ -1,5 +1,5 @@
 from base64 import b64encode
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer
 
@@ -215,7 +215,23 @@ class ErrorInfo(BaseModel):
     )
     interrupt_num: int | None = Field(
         default=None,
-        description="Interrupt number for unhandled-interrupt errors.",
+        description="Software interrupt vector associated with the error or termination.",
+    )
+    termination_kind: Literal["process_terminated"] | None = Field(
+        default=None,
+        description="Explicit guest process-termination category, when applicable.",
+    )
+    status_code: HexIntOptional = Field(
+        default=None,
+        description="Windows status or exception code associated with the termination.",
+    )
+    fast_fail_code: int | None = Field(
+        default=None,
+        description="Windows __fastfail code captured from ECX/RCX.",
+    )
+    fast_fail_data: int | None = Field(
+        default=None,
+        description="Optional Windows __fastfail payload captured from EDX/RDX.",
     )
 
 

@@ -28,6 +28,10 @@ from speakeasy.profiler_events import (
     THREAD_INJECT,
 )
 from speakeasy.windows.child_execution import ChildTargetResolver
+from speakeasy.windows.os_capabilities import (
+    WindowsOsVersion,
+    processor_feature_override,
+)
 
 from .. import api
 from .pseudo_handles import is_current_process_pseudo_handle
@@ -1889,7 +1893,6 @@ class Kernel32(api.ApiHandler):
               DWORD ProcessorFeature
         );"""
 
-        rv = 1
         """
         Not all the features must return 1, because those can represent a feature which can be unavailable
         for your processor. For example PF_FLOATING_POINT_PRECISION_ERRATA is a Pentium instructions
@@ -1927,6 +1930,8 @@ class Kernel32(api.ApiHandler):
             20: {"name": "PF_SECOND_LEVEL_ADDRESS_TRANSLATION", "return": 0},
             21: {"name": "PF_VIRT_FIRMWARE_ENABLED", "return": 1},
             22: {"name": "PF_RDWRFSGSBASE_AVAILABLE", "return": 1},
+            # OS-dependent: Windows 7 does not expose this feature even
+            # though the emulated CPU can execute INT 0x29.
             23: {"name": "PF_FASTFAIL_AVAILABLE", "return": 1},
             24: {"name": "PF_ARM_DIVIDE_INSTRUCTION_AVAILABLE", "return": 0},
             25: {"name": "PF_ARM_64BIT_LOADSTORE_ATOMIC", "return": 0},
@@ -1948,8 +1953,19 @@ class Kernel32(api.ApiHandler):
             41: {"name": "PF_AVX512F_INSTRUCTIONS_AVAILABLE", "return": 0},
         }
 
-        rv = lookup[argv[0]]["return"]
-        argv[0] = lookup[argv[0]]["name"]
+        feature = argv[0]
+        entry = lookup.get(feature)
+        if entry is None:
+            return 0
+
+        os_ver = getattr(getattr(emu, "config", None), "os_ver", None)
+        os_version = WindowsOsVersion(
+            major=getattr(os_ver, "major", None),
+            minor=getattr(os_ver, "minor", None),
+        )
+        os_override = processor_feature_override(feature, os_version)
+        rv = entry["return"] if os_override is None else os_override
+        argv[0] = entry["name"]
 
         return rv
 
