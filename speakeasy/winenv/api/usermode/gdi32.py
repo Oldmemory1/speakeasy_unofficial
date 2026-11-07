@@ -8,6 +8,33 @@ class GDI32(api.ApiHandler):
     Implements exported functions from gdi32.dll
     """
 
+    # GET_STOCK_OBJECT_FLAGS values. Value 9 is not defined and invalid stock
+    # object identifiers must fail rather than aliasing another object.
+    STOCK_OBJECT_TYPES = frozenset(
+        {
+            0,  # WHITE_BRUSH
+            1,  # LTGRAY_BRUSH
+            2,  # GRAY_BRUSH
+            3,  # DKGRAY_BRUSH
+            4,  # BLACK_BRUSH
+            5,  # NULL_BRUSH / HOLLOW_BRUSH
+            6,  # WHITE_PEN
+            7,  # BLACK_PEN
+            8,  # NULL_PEN
+            10,  # OEM_FIXED_FONT
+            11,  # ANSI_FIXED_FONT
+            12,  # ANSI_VAR_FONT
+            13,  # SYSTEM_FONT
+            14,  # DEVICE_DEFAULT_FONT
+            15,  # DEFAULT_PALETTE
+            16,  # SYSTEM_FIXED_FONT
+            17,  # DEFAULT_GUI_FONT
+            18,  # DC_BRUSH
+            19,  # DC_PEN
+        }
+    )
+    STOCK_OBJECT_HANDLE_BASE = 0x7000
+
     name = "gdi32"
     apihook = api.ApiHandler.apihook
     impdata = api.ApiHandler.impdata
@@ -19,12 +46,24 @@ class GDI32(api.ApiHandler):
         self.data = {}
         self.handle = 0
         self.count = 0
+        self.stock_objects: dict[int, int] = {}
         super().__get_hook_attrs__(self)
 
     def get_handle(self):
         self.handle += 4
         hnd = self.handle
         return hnd
+
+    def get_stock_object_handle(self, stock_object: int) -> int:
+        """Return a stable pseudo-handle for a valid GDI stock object."""
+        if stock_object not in self.STOCK_OBJECT_TYPES:
+            return 0
+
+        handle = self.stock_objects.get(stock_object)
+        if handle is None:
+            handle = self.STOCK_OBJECT_HANDLE_BASE + stock_object * 4
+            self.stock_objects[stock_object] = handle
+        return handle
 
     @apihook("CreateBitmap", argc=5)
     def CreateBitmap(self, emu, argv, ctx: api.ApiContext = None):
@@ -69,7 +108,7 @@ class GDI32(api.ApiHandler):
             int i
         );
         """
-        return 0
+        return self.get_stock_object_handle(argv[0])
 
     @apihook("GetMapMode", argc=1)
     def GetMapMode(self, emu, argv, ctx: api.ApiContext = None):
