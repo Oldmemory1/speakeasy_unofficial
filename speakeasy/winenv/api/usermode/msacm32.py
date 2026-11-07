@@ -22,11 +22,24 @@ logger = logging.getLogger(__name__)
 
 MMSYSERR_NOERROR = 0
 MMSYSERR_INVALHANDLE = 5
+MMSYSERR_INVALFLAG = 10
 MMSYSERR_INVALPARAM = 11
 
-ACMSTREAMHEADER_STATUSF_DONE = 0x00000001
-ACMSTREAMHEADER_STATUSF_PREPARED = 0x00010000
-ACMSTREAMHEADER_STATUSF_INQUEUE = 0x00020000
+ACMERR_BUSY = 513
+ACMERR_UNPREPARED = 514
+
+ACMSTREAMHEADER_STATUSF_DONE = 0x00010000
+ACMSTREAMHEADER_STATUSF_PREPARED = 0x00020000
+ACMSTREAMHEADER_STATUSF_INQUEUE = 0x00100000
+
+ACM_STREAMCONVERTF_BLOCKALIGN = 0x00000004
+ACM_STREAMCONVERTF_START = 0x00000010
+ACM_STREAMCONVERTF_END = 0x00000020
+_VALID_CONVERT_FLAGS = (
+    ACM_STREAMCONVERTF_BLOCKALIGN
+    | ACM_STREAMCONVERTF_START
+    | ACM_STREAMCONVERTF_END
+)
 
 _HANDLE_BASE = 0xA0C00000
 _HANDLE_STRIDE = 8
@@ -206,15 +219,6 @@ class Msacm32(api.ApiHandler):
     def _stream(self, handle: int) -> _AcmStream | None:
         return self._streams.get(handle)
 
-    def _read_u32(self, address: int) -> int | None:
-        if not address:
-            return None
-        try:
-            return int.from_bytes(self.emu.mem_read(address, 4), "little")
-        except Exception:
-            logger.debug("failed to read ACM u32 at 0x%x", address, exc_info=True)
-            return None
-
     def _read_header(self, address: int) -> AcmStreamHeader | None:
         if not address:
             return None
@@ -237,6 +241,11 @@ class Msacm32(api.ApiHandler):
                 "failed to write ACMSTREAMHEADER at 0x%x", address, exc_info=True
             )
             return False
+
+    @staticmethod
+    def _has_valid_header_size(header: AcmStreamHeader) -> bool:
+        # Callers may pass a larger private extension of ACMSTREAMHEADER.
+        return header.cb_struct >= header.layout.size
 
     @apihook("acmStreamOpen", argc=8)
     def acmStreamOpen(self, emu, argv, ctx: api.ApiContext = None):
@@ -270,12 +279,14 @@ class Msacm32(api.ApiHandler):
     @apihook("acmStreamPrepareHeader", argc=3)
     def acmStreamPrepareHeader(self, emu, argv, ctx: api.ApiContext = None):
         """MMRESULT acmStreamPrepareHeader(HACMSTREAM, LPACMSTREAMHEADER, DWORD);"""
-        stream_handle, header_address, _flags = argv
+        stream_handle, header_address, flags = argv
         if self._stream(stream_handle) is None:
             return MMSYSERR_INVALHANDLE
         header = self._read_header(header_address)
-        if header is None or header.cb_struct != header.layout.size:
+        if header is None or not self._has_valid_header_size(header):
             return MMSYSERR_INVALPARAM
+        if flags:
+            return MMSYSERR_INVALFLAG
 
         header.fdw_status |= ACMSTREAMHEADER_STATUSF_PREPARED
         header.fdw_status &= ~ACMSTREAMHEADER_STATUSF_INQUEUE
@@ -286,16 +297,18 @@ class Msacm32(api.ApiHandler):
     @apihook("acmStreamConvert", argc=3)
     def acmStreamConvert(self, emu, argv, ctx: api.ApiContext = None):
         """MMRESULT acmStreamConvert(HACMSTREAM, LPACMSTREAMHEADER, DWORD);"""
-        stream_handle, header_address, _flags = argv
+        stream_handle, header_address, flags = argv
         if self._stream(stream_handle) is None:
             return MMSYSERR_INVALHANDLE
+        if flags & ~_VALID_CONVERT_FLAGS:
+            return MMSYSERR_INVALFLAG
         header = self._read_header(header_address)
-        if header is None or header.cb_struct != header.layout.size:
+        if header is None or not self._has_valid_header_size(header):
             return MMSYSERR_INVALPARAM
         if not (header.fdw_status & ACMSTREAMHEADER_STATUSF_PREPARED):
-            return MMSYSERR_INVALPARAM
+            return ACMERR_UNPREPARED
         if header.fdw_status & ACMSTREAMHEADER_STATUSF_INQUEUE:
-            return MMSYSERR_INVALPARAM
+            return ACMERR_BUSY
 
         transfer_size = min(header.cb_src_length, header.cb_dst_length)
         if transfer_size and (not header.pb_src or not header.pb_dst):
@@ -318,16 +331,18 @@ class Msacm32(api.ApiHandler):
     @apihook("acmStreamUnprepareHeader", argc=3)
     def acmStreamUnprepareHeader(self, emu, argv, ctx: api.ApiContext = None):
         """MMRESULT acmStreamUnprepareHeader(HACMSTREAM, LPACMSTREAMHEADER, DWORD);"""
-        stream_handle, header_address, _flags = argv
+        stream_handle, header_address, flags = argv
         if self._stream(stream_handle) is None:
             return MMSYSERR_INVALHANDLE
         header = self._read_header(header_address)
-        if header is None or header.cb_struct != header.layout.size:
+        if header is None or not self._has_valid_header_size(header):
             return MMSYSERR_INVALPARAM
+        if flags:
+            return MMSYSERR_INVALFLAG
         if not (header.fdw_status & ACMSTREAMHEADER_STATUSF_PREPARED):
-            return MMSYSERR_INVALPARAM
+            return ACMERR_UNPREPARED
         if header.fdw_status & ACMSTREAMHEADER_STATUSF_INQUEUE:
-            return MMSYSERR_INVALPARAM
+            return ACMERR_BUSY
 
         header.fdw_status &= ~(
             ACMSTREAMHEADER_STATUSF_PREPARED
@@ -341,8 +356,10 @@ class Msacm32(api.ApiHandler):
     @apihook("acmStreamClose", argc=2)
     def acmStreamClose(self, emu, argv, ctx: api.ApiContext = None):
         """MMRESULT acmStreamClose(HACMSTREAM, DWORD);"""
-        stream_handle, _flags = argv
+        stream_handle, flags = argv
         if self._stream(stream_handle) is None:
             return MMSYSERR_INVALHANDLE
+        if flags:
+            return MMSYSERR_INVALFLAG
         del self._streams[stream_handle]
         return MMSYSERR_NOERROR

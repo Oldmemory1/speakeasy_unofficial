@@ -6,8 +6,12 @@ import pytest
 
 import speakeasy.winenv.arch as _arch
 from speakeasy.winenv.api.usermode.msacm32 import (
+    ACM_STREAMCONVERTF_END,
+    ACMERR_UNPREPARED,
     ACMSTREAMHEADER_STATUSF_DONE,
+    ACMSTREAMHEADER_STATUSF_INQUEUE,
     ACMSTREAMHEADER_STATUSF_PREPARED,
+    MMSYSERR_INVALFLAG,
     MMSYSERR_INVALHANDLE,
     MMSYSERR_INVALPARAM,
     MMSYSERR_NOERROR,
@@ -15,6 +19,12 @@ from speakeasy.winenv.api.usermode.msacm32 import (
     AcmStreamHeaderLayout,
     Msacm32,
 )
+
+
+def test_acm_header_status_values_match_windows_sdk() -> None:
+    assert ACMSTREAMHEADER_STATUSF_DONE == 0x00010000
+    assert ACMSTREAMHEADER_STATUSF_PREPARED == 0x00020000
+    assert ACMSTREAMHEADER_STATUSF_INQUEUE == 0x00100000
 
 
 class _Memory:
@@ -197,3 +207,52 @@ def test_header_size_mismatch_is_invalid_parameter() -> None:
     assert handler.acmStreamPrepareHeader(
         handler.emu, [stream_handle, header_address, 0], None
     ) == MMSYSERR_INVALPARAM
+
+
+def test_larger_header_extension_is_accepted() -> None:
+    handler, memory = _handler()
+    stream_out = 0x3000
+    header_address = 0x4000
+    assert handler.acmStreamOpen(
+        handler.emu,
+        [stream_out, 0x1000, 0x2000, 0, 0, 0, 0, 0],
+        None,
+    ) == MMSYSERR_NOERROR
+    stream_handle = int.from_bytes(memory.mem_read(stream_out, 4), "little")
+    layout = AcmStreamHeaderLayout.for_pointer_size(4)
+    header = AcmStreamHeader(layout=layout, cb_struct=layout.size + 8)
+    memory.write(header_address, header.to_bytes())
+
+    assert handler.acmStreamPrepareHeader(
+        handler.emu, [stream_handle, header_address, 0], None
+    ) == MMSYSERR_NOERROR
+
+
+def test_unprepared_convert_and_invalid_flags_have_documented_errors() -> None:
+    handler, memory = _handler()
+    stream_out = 0x3000
+    header_address = 0x4000
+    assert handler.acmStreamOpen(
+        handler.emu,
+        [stream_out, 0x1000, 0x2000, 0, 0, 0, 0, 0],
+        None,
+    ) == MMSYSERR_NOERROR
+    stream_handle = int.from_bytes(memory.mem_read(stream_out, 4), "little")
+    layout = AcmStreamHeaderLayout.for_pointer_size(4)
+    header = AcmStreamHeader(layout=layout, cb_struct=layout.size)
+    memory.write(header_address, header.to_bytes())
+
+    assert handler.acmStreamConvert(
+        handler.emu, [stream_handle, header_address, 0], None
+    ) == ACMERR_UNPREPARED
+    assert handler.acmStreamPrepareHeader(
+        handler.emu, [stream_handle, header_address, 1], None
+    ) == MMSYSERR_INVALFLAG
+    assert handler.acmStreamPrepareHeader(
+        handler.emu, [stream_handle, header_address, 0], None
+    ) == MMSYSERR_NOERROR
+    assert handler.acmStreamConvert(
+        handler.emu,
+        [stream_handle, header_address, ACM_STREAMCONVERTF_END | 0x80],
+        None,
+    ) == MMSYSERR_INVALFLAG
