@@ -166,11 +166,25 @@ class ChildExecutionReportProjector:
         """
 
         records = snapshot.records
+        results_by_launch_id = {
+            result.launch_id: result for result in snapshot.results
+        }
         if snapshot.request_count != len(records):
             raise ChildExecutionReportProjectionError(
                 "request_count does not match launch records"
             )
 
+        thread_queued_count = 0
+        entrypoint_reached_count = 0
+        for record in records:
+            result = results_by_launch_id.get(record.request.launch_id)
+            if record.state in _QUEUED_OR_LATER_STATES or result is not None:
+                thread_queued_count += 1
+            if (
+                record.state in _ENTRYPOINT_OR_LATER_STATES
+                or (result is not None and result.entrypoint_reached)
+            ):
+                entrypoint_reached_count += 1
         expected_counts = {
             "eligible_count": sum(
                 record.decision is not None and record.decision.eligible
@@ -183,13 +197,8 @@ class ChildExecutionReportProjector:
             "process_object_created_count": sum(
                 record.process is not None for record in records
             ),
-            "thread_queued_count": sum(
-                record.state in _QUEUED_OR_LATER_STATES for record in records
-            ),
-            "entrypoint_reached_count": sum(
-                record.state in _ENTRYPOINT_OR_LATER_STATES
-                for record in records
-            ),
+            "thread_queued_count": thread_queued_count,
+            "entrypoint_reached_count": entrypoint_reached_count,
         }
         actual_counts = {
             "eligible_count": snapshot.eligible_count,
@@ -383,7 +392,10 @@ class ChildExecutionReportProjector:
             state=state.value,
             process_object_created=process is not None,
             created_child_pid=process.pid if process is not None else None,
-            thread_queued=state in _QUEUED_OR_LATER_STATES,
+            thread_queued=(
+                state in _QUEUED_OR_LATER_STATES
+                or result is not None
+            ),
             entrypoint_reached=(
                 state in _ENTRYPOINT_OR_LATER_STATES
                 or bool(result is not None and result.entrypoint_reached)
@@ -434,6 +446,7 @@ class ChildExecutionReportProjector:
             budget=ChildExecutionReportProjector._project_budget(result.budget),
             usage=ChildExecutionReportProjector._project_usage(result.usage),
             run_indexes=list(result.run_indexes),
+            entrypoint_reached=result.entrypoint_reached,
             failure=ChildExecutionReportProjector._project_failure(
                 result.error
             ),
@@ -504,6 +517,8 @@ class ChildExecutionReportProjector:
             kind=failure.kind.value,
             message=failure.message,
             pc=failure.pc,
+            fault_address=failure.fault_address,
+            access_type=failure.access_type,
             api_name=failure.api_name,
         )
 

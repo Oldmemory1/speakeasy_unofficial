@@ -551,7 +551,7 @@ class Win32Emulator(WindowsEmulator):
 
         self._ensure_core_dlls_loaded()
         self.mem_map_reserve(proc.peb_ldr_data.address)
-        self.init_peb(self._ordered_peb_modules())
+        self.init_peb(self._ordered_peb_modules(), proc=proc)
 
         return peb
 

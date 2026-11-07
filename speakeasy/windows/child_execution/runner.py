@@ -86,10 +86,20 @@ class ChildExecutionRuntimeError(Exception):
         *,
         kind: ChildFailureKind = ChildFailureKind.RUNTIME,
         termination_reason: ChildTerminationReason = ChildTerminationReason.INTERNAL_ERROR,
+        run_indexes: tuple[int, ...] = (),
+        pc: int | None = None,
+        fault_address: int | None = None,
+        access_type: str | None = None,
+        api_name: str | None = None,
     ) -> None:
         super().__init__(message)
         self.kind = kind
         self.termination_reason = termination_reason
+        self.run_indexes = run_indexes
+        self.pc = pc
+        self.fault_address = fault_address
+        self.access_type = access_type
+        self.api_name = api_name
 
 
 class ChildExecutionBackend(Protocol):
@@ -248,9 +258,14 @@ class ChildExecutionRunner:
             backend_reason = backend_result.reason
             returned_to_caller = backend_result.returned_to_caller
         except ChildExecutionRuntimeError as exc:
+            run_indexes = exc.run_indexes
             failure = ChildFailure(
                 kind=exc.kind,
                 message=str(exc),
+                pc=exc.pc,
+                fault_address=exc.fault_address,
+                access_type=exc.access_type,
+                api_name=exc.api_name,
             )
             termination = exc.termination_reason
         except Exception as exc:
@@ -466,6 +481,7 @@ class ChildExecutionRunner:
         if termination in {
             ChildTerminationReason.LOAD_ERROR,
             ChildTerminationReason.INVALID_FETCH,
+            ChildTerminationReason.INVALID_MEMORY,
             ChildTerminationReason.INTERNAL_ERROR,
         }:
             return ChildExecutionState.FAILED, ChildOutcome.ERROR

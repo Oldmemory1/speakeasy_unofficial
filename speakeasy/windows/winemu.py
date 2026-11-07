@@ -701,7 +701,17 @@ class WindowsEmulator(BinaryEmulator):
                 except Exception as dis_err:
                     logger.error(str(dis_err))
 
-                error = self.get_error_info(str(e), self.get_pc(), traceback=stack_trace)
+                error_pc = self.get_pc()
+                fault_address, access_type = self._resolve_uc_map_fault(
+                    str(e),
+                    error_pc,
+                )
+                error = self.get_error_info(
+                    str(e),
+                    fault_address if fault_address is not None else error_pc,
+                    traceback=stack_trace,
+                    access_type=access_type,
+                )
                 self.curr_run.error = error  # type: ignore[union-attr]
                 terminal_signal = 11
 
@@ -890,11 +900,13 @@ class WindowsEmulator(BinaryEmulator):
         """
         Initialize the Process Environment Block
         """
-        p = proc
-        if not p:
-            p = self.curr_process
+        p = proc if proc is not None else self.curr_process
         p.init_peb(user_mods)
-        self.mem_write(self.peb_addr, p.peb.address.to_bytes(self.get_ptr_size(), "little"))
+        if p is self.get_current_process():
+            self.mem_write(
+                self.peb_addr,
+                p.peb.address.to_bytes(self.get_ptr_size(), "little"),
+            )
         return p.peb
 
     def init_teb(self, thread, peb):
@@ -1916,6 +1928,95 @@ class WindowsEmulator(BinaryEmulator):
             nearest = nearby_regions[0]
             parts.append(f"nearest: {nearest.tag} [0x{nearest.base:x}-0x{nearest.base + nearest.size - 1:x}]")
         return "; ".join(parts)
+
+    def _resolve_uc_map_fault(
+        self,
+        description: str,
+        pc: int,
+    ) -> tuple[int | None, str | None]:
+        """Resolve the memory operand address for an Unicorn map fault.
+
+        ``UcError(UC_ERR_MAP)`` does not expose the access address.  The
+        register state and faulting instruction are still available, so this
+        helper reconstructs a simple base/index/displacement operand.  It
+        intentionally skips segmented operands, whose effective address needs
+        the descriptor base that is not exposed by the public register state.
+
+        Args:
+            description: Exception string captured from the engine.
+            pc: Program counter of the faulting instruction.
+
+        Returns:
+            A ``(fault_address, access_type)`` pair, or ``(None, None)`` when
+            the instruction cannot be decoded safely.
+
+        Side effects:
+            Reads guest memory and registers. It does not map memory or alter
+            execution state.
+        """
+
+        folded = description.casefold()
+        if "uc_err_map" not in folded and "invalid memory mapping" not in folded:
+            return None, None
+
+        try:
+            import capstone
+            import capstone.x86_const as x86
+
+            mode = (
+                capstone.CS_MODE_64
+                if self.get_arch() == _arch.ARCH_AMD64
+                else capstone.CS_MODE_32
+            )
+            decoder = capstone.Cs(capstone.CS_ARCH_X86, mode)
+            decoder.detail = True
+            code = bytes(self.mem_read(pc, 16))
+            instruction = next(decoder.disasm(code, pc, count=1))
+            registers = self.get_register_state()
+            mask = (1 << (self.get_ptr_size() * 8)) - 1
+        except Exception:
+            return None, None
+
+        candidates: list[tuple[int, str | None]] = []
+        try:
+            for operand in instruction.operands:
+                if operand.type != capstone.CS_OP_MEM:
+                    continue
+                if operand.mem.segment != x86.X86_REG_INVALID:
+                    continue
+
+                if operand.mem.base == x86.X86_REG_RIP:
+                    base = instruction.address + instruction.size
+                elif operand.mem.base == x86.X86_REG_INVALID:
+                    base = 0
+                else:
+                    base_name = instruction.reg_name(operand.mem.base)
+                    base = int(registers[base_name], 0)
+
+                if operand.mem.index == x86.X86_REG_INVALID:
+                    index = 0
+                else:
+                    index_name = instruction.reg_name(operand.mem.index)
+                    index = int(registers[index_name], 0)
+
+                address = (
+                    base
+                    + index * operand.mem.scale
+                    + operand.mem.disp
+                ) & mask
+                access_type = None
+                if operand.access & capstone.CS_AC_WRITE:
+                    access_type = "write"
+                elif operand.access & capstone.CS_AC_READ:
+                    access_type = "read"
+                candidates.append((address, access_type))
+        except (KeyError, TypeError, ValueError):
+            return None, None
+
+        for address, access_type in candidates:
+            if self._resolve_region_info(address) is None:
+                return address, access_type
+        return candidates[0] if candidates else (None, None)
 
     def get_error_info(
         self,
@@ -2999,7 +3100,15 @@ class WindowsEmulator(BinaryEmulator):
         # This file could have been read from, so don't mess
         # with its file offset pointer. Just get the raw bytes
         # from the BytesIO object
-        return mod_file.data.getvalue()
+        data = mod_file.data
+        if data is None:
+            return None
+        getvalue = getattr(data, "getvalue", None)
+        if callable(getvalue):
+            return getvalue()
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            return bytes(data)
+        return None
 
     def init_environment(self, system_modules=None, user_modules=None):
         if system_modules is None:

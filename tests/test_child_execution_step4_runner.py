@@ -396,7 +396,12 @@ def test_expected_backend_error_is_returned_as_child_failure() -> None:
     failure = ChildExecutionRuntimeError(
         "invalid child fetch",
         kind=ChildFailureKind.RUNTIME,
-        termination_reason=ChildTerminationReason.INVALID_FETCH,
+        termination_reason=ChildTerminationReason.INVALID_MEMORY,
+        run_indexes=(7,),
+        pc=0x401000,
+        fault_address=0x14,
+        access_type="read",
+        api_name="kernel32.LeaveCriticalSection",
     )
     runner = _runner(Backend(observer, raised=failure), observer, Clock())
 
@@ -411,9 +416,14 @@ def test_expected_backend_error_is_returned_as_child_failure() -> None:
 
     assert result.state is ChildExecutionState.FAILED
     assert result.outcome is ChildOutcome.ERROR
-    assert result.termination_reason is ChildTerminationReason.INVALID_FETCH
+    assert result.termination_reason is ChildTerminationReason.INVALID_MEMORY
+    assert result.run_indexes == (7,)
     assert result.error is not None
     assert result.error.message == "invalid child fetch"
+    assert result.error.pc == 0x401000
+    assert result.error.fault_address == 0x14
+    assert result.error.access_type == "read"
+    assert result.error.api_name == "kernel32.LeaveCriticalSection"
 
 
 def test_unexpected_backend_exception_is_contained() -> None:

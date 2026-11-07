@@ -6,12 +6,49 @@ import pytest
 
 from speakeasy import Speakeasy
 from speakeasy.report import ErrorInfo
+from speakeasy.windows.win32 import Win32Emulator
 
 # -- x86 shellcode fragments ------------------------------------------------
 # mov eax, 0xdeadbeef; mov eax, [eax]   -> invalid read from 0xdeadbeef
 _SC_INVALID_READ = b"\xb8\xef\xbe\xad\xde\x8b\x00"
 # mov eax, 0xdeadbeef; mov [eax], ebx   -> invalid write to 0xdeadbeef
 _SC_INVALID_WRITE = b"\xb8\xef\xbe\xad\xde\x89\x18"
+
+
+class UcMapFaultHarness(Win32Emulator):
+    """Expose map-fault decoding without constructing a Unicorn engine."""
+
+    def __init__(self) -> None:
+        """Initialize only the read-only seams used by fault decoding."""
+
+    def get_arch(self) -> int:
+        """Use the child sample's x86 register model."""
+
+        from speakeasy.winenv import arch
+
+        return arch.ARCH_X86
+
+    def get_ptr_size(self) -> int:
+        """Return the x86 pointer width."""
+
+        return 4
+
+    def mem_read(self, address: int, size: int) -> bytes:
+        """Return the observed faulting instruction at the CTS PC."""
+
+        assert address == 0x2C710
+        assert size == 16
+        return bytes.fromhex("8b40146a008b40206a0068245c0300a3")
+
+    def get_register_state(self) -> dict[str, str]:
+        """Return the register values captured at the original fault."""
+
+        return {"eax": "0x0", "eip": "0x2c710", "esp": "0x12fe9bc"}
+
+    def _resolve_region_info(self, address: int) -> object | None:
+        """Model address 0x14 as the sole unmapped operand."""
+
+        return None if address == 0x14 else object()
 
 
 @pytest.fixture(scope="module")
@@ -119,3 +156,24 @@ def test_error_info_round_trips_through_json(_read_error):
     assert restored.access_type == e.access_type
     assert restored.context_summary == e.context_summary
     assert restored.regs == e.regs
+
+
+def test_uc_map_fault_separates_pc_from_memory_operand_address() -> None:
+    """The fault report must use ``[eax+0x14]`` rather than the PC."""
+
+    address, access_type = UcMapFaultHarness()._resolve_uc_map_fault(
+        "Invalid memory mapping (UC_ERR_MAP)",
+        0x2C710,
+    )
+
+    assert address == 0x14
+    assert access_type == "read"
+
+
+def test_non_map_errors_do_not_infer_a_memory_operand() -> None:
+    """Only Unicorn map errors use instruction-operand reconstruction."""
+
+    assert UcMapFaultHarness()._resolve_uc_map_fault(
+        "unsupported API",
+        0x2C710,
+    ) == (None, None)

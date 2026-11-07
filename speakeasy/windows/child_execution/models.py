@@ -69,6 +69,7 @@ class ChildTerminationReason(str, Enum):
     ENTRYPOINT_OUT_OF_RANGE = "entrypoint_out_of_range"
     LOAD_ERROR = "load_error"
     INVALID_FETCH = "invalid_fetch"
+    INVALID_MEMORY = "invalid_memory"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -426,6 +427,8 @@ class ChildFailure:
     kind: ChildFailureKind
     message: str
     pc: int | None = None
+    fault_address: int | None = None
+    access_type: str | None = None
     api_name: str | None = None
 
 

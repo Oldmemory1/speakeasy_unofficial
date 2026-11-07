@@ -616,6 +616,14 @@ class ChildExecutionFailureReport(BaseModel):
     kind: str = Field(description="Failure boundary classification.")
     message: str = Field(description="Human-readable failure detail.")
     pc: int | None = Field(default=None, description="Program counter associated with the failure.")
+    fault_address: int | None = Field(
+        default=None,
+        description="Memory address that faulted, when distinct from the program counter.",
+    )
+    access_type: str | None = Field(
+        default=None,
+        description="Memory access type that faulted: read, write, or fetch.",
+    )
     api_name: str | None = Field(default=None, description="API active at the failure, when known.")
 
 
@@ -632,6 +640,10 @@ class ChildExecutionResultReport(BaseModel):
     budget: ChildExecutionBudgetReport = Field(description="Limits inherited from the parent.")
     usage: ChildExecutionBudgetUsageReport = Field(description="Counters consumed by this child.")
     run_indexes: list[int] = Field(default_factory=list, description="Report entry-point indexes owned by the child.")
+    entrypoint_reached: bool = Field(
+        default=False,
+        description="One-shot entry hook evidence retained independently of terminal state.",
+    )
     failure: ChildExecutionFailureReport | None = Field(
         default=None,
         description="Child-local failure; never a substitute for parent outcome.",

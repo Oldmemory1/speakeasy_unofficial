@@ -295,6 +295,20 @@ class ChildLaunchDispatcher:
 
         self._refresh_from_scheduler()
         records = tuple(self._records)
+        results_by_launch_id = {
+            result.launch_id: result for result in self._results
+        }
+        thread_queued_count = 0
+        entrypoint_reached_count = 0
+        for record in records:
+            result = results_by_launch_id.get(record.request.launch_id)
+            if record.state in _QUEUED_OR_LATER_STATES or result is not None:
+                thread_queued_count += 1
+            if (
+                record.state in _ENTRYPOINT_OR_LATER_STATES
+                or (result is not None and result.entrypoint_reached)
+            ):
+                entrypoint_reached_count += 1
         return ChildExecutionReportData(
             mode="scheduled" if self._options.enabled else "model_only",
             execution_enabled=self._options.enabled,
@@ -302,8 +316,8 @@ class ChildLaunchDispatcher:
             eligible_count=sum(record.decision is not None and record.decision.eligible for record in records),
             target_resolved_count=sum(record.target is not None and record.target.resolved for record in records),
             process_object_created_count=sum(record.process is not None for record in records),
-            thread_queued_count=sum(record.state in _QUEUED_OR_LATER_STATES for record in records),
-            entrypoint_reached_count=sum(record.state in _ENTRYPOINT_OR_LATER_STATES for record in records),
+            thread_queued_count=thread_queued_count,
+            entrypoint_reached_count=entrypoint_reached_count,
             records=records,
             results=tuple(self._results),
         )

@@ -53,8 +53,9 @@ class EngineChildRuntimeContextBackend(ChildRuntimeContextBackend):
             process collections, and the existing run-queue API.
 
     The backend captures and restores only the emulator's public current
-    process/thread/run handles.  It does not schedule or execute child code
-    during activation.
+    process/thread/run handles and initializes the child PEB through the
+    emulator's explicit-process ``alloc_peb`` operation. It does not schedule
+    or execute child code during activation.
     """
 
     def __init__(self, emulator: Any) -> None:
@@ -94,8 +95,9 @@ class EngineChildRuntimeContextBackend(ChildRuntimeContextBackend):
             queued until :class:`EngineChildExecutionBackend` starts it.
 
         Side effects:
-            Sets the emulator's current process, thread, module, and run to the
-            child-owned values.  It does not execute instructions.
+            Binds and initializes the child process PEB, then sets the
+            emulator's current process, thread, module, and run to the
+            child-owned values. It does not execute instructions.
 
         Raises:
             ChildRuntimeContextError: If the child process or thread created by
@@ -120,12 +122,15 @@ class EngineChildRuntimeContextBackend(ChildRuntimeContextBackend):
         run.thread = thread
 
         # The child process is a dispatcher-owned object.  Bind its image to
-        # the exact mapped child module so child PEB data does not describe the
-        # compatibility module used during process-object creation.
+        # the exact mapped child module before allocating the PEB.  This avoids
+        # inheriting the compatibility module or image base used merely to
+        # create the process object.
         process.pe = image.module
+        process.base = image.module.base
         process.path = request.normalized_target
         process.cmdline = request.command_line
         thread.process = process
+        self._emulator.alloc_peb(process)
 
         self._emulator.set_current_process(process)
         self._emulator.set_current_thread(thread)
@@ -346,14 +351,6 @@ class EngineChildExecutionBackend:
             child_budget_exhausted = bool(getattr(self._emulator, "instruction_budget_exhausted", False))
             self._emulator.instruction_budget_exhausted = parent_budget_exhausted
 
-        run_error = getattr(context.run, "error", None)
-        if run_error is not None:
-            raise ChildExecutionRuntimeError(
-                f"child run failed: {run_error}",
-                kind=ChildFailureKind.RUNTIME,
-                termination_reason=ChildTerminationReason.INVALID_FETCH,
-            )
-
         try:
             api_count = max(0, int(getattr(context.run, "num_apis", 0)))
             for _ in range(api_count):
@@ -374,6 +371,26 @@ class EngineChildExecutionBackend:
         run_indexes = tuple(
             index for index in range(start_index, len(self._emulator.runs)) if self._emulator.runs[index] is context.run
         )
+        run_error = getattr(context.run, "error", None)
+        if run_error is not None:
+            pc = getattr(run_error, "pc", None)
+            fault_address = getattr(run_error, "address", None)
+            access_type = getattr(run_error, "access_type", None)
+            if access_type is None:
+                fault_address = None
+            error_type = str(
+                getattr(run_error, "type", "unknown child runtime error")
+            )
+            raise ChildExecutionRuntimeError(
+                f"child run failed: {error_type}",
+                kind=ChildFailureKind.RUNTIME,
+                termination_reason=self._termination_for_run_error(run_error),
+                run_indexes=run_indexes,
+                pc=pc,
+                fault_address=fault_address,
+                access_type=access_type,
+                api_name=getattr(run_error, "api_name", None),
+            )
         if not run_indexes:
             raise ChildExecutionRuntimeError(
                 "child entry-point run was not recorded",
@@ -381,6 +398,41 @@ class EngineChildExecutionBackend:
                 termination_reason=ChildTerminationReason.INVALID_FETCH,
             )
         return ChildExecutionBackendResult(run_indexes=run_indexes)
+
+    @staticmethod
+    def _termination_for_run_error(
+        run_error: Any,
+    ) -> ChildTerminationReason:
+        """Map one engine run error to a stable child termination reason.
+
+        Args:
+            run_error: Emulator ``ErrorInfo``-compatible failure record.
+
+        Returns:
+            A child-local terminal reason that preserves the underlying fault
+            category instead of treating every execution exception as an
+            invalid instruction fetch.
+
+        Side effects:
+            None.
+        """
+
+        error_type = str(getattr(run_error, "type", "")).casefold()
+        if any(
+            marker in error_type
+            for marker in (
+                "invalid memory mapping",
+                "uc_err_map",
+                "invalid_read",
+                "invalid_write",
+                "invalid_protect_write",
+                "access violation",
+            )
+        ):
+            return ChildTerminationReason.INVALID_MEMORY
+        if "invalid fetch" in error_type or "invalid_fetch" in error_type:
+            return ChildTerminationReason.INVALID_FETCH
+        return ChildTerminationReason.INTERNAL_ERROR
 
 
 def create_engine_child_scheduler(

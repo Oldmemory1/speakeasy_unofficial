@@ -148,6 +148,10 @@ scope 才允许 depth=1。已完成：
 - parent 完成后才 drain child，停止信号可传播，parent process/thread/run
   在 child 结束后逐项恢复；
 - child result 的 `entrypoint_reached` 只由真实 hook 证明；
+- child process 激活时显式初始化其 PEB；`alloc_peb()` 接收目标 process，
+  不再使用 current parent process 作为隐式默认值；
+- child failure 保留 child-only run index、API/instruction usage、PC 与
+  fault address，`UC_ERR_MAP` 不再误记为 `invalid_fetch`；
 - engine report projector 与 dynamic-stage report adapter 已接入，默认
   model-only 报告仍有稳定的空 requests/results 合同。
 
@@ -171,8 +175,11 @@ scope 才允许 depth=1。已完成：
 - 3 个 R3 parent 状态与历史 state-only 记录不一致，不能据此开放 depth=2；
 - 1,229 model-only 全量回归仍需在统一最终代码上重新确认。
 
-2026-11-07 本轮没有继续修改 child process 状态机或 child execution 生产代码；
-该文件只记录当前设计和实验边界。完整实验证据见
+2026-11-07 后续专项修复了 child PEB 初始化：此前 child 已进入入口，但
+`PEB_LDR_DATA` 仍为 0，导致 `[eax+0x14]` 被错误表现为 child 空指针。
+两个原先稳定复现的 CTS root 现均为 parent `ok`、child `completed`、
+`normal_exit`，且 `entrypoint_reached_count=1`、run index 与 child usage
+均有记录。完整历史实验证据见
 [`step6_experiments/README.md`](step6_experiments/README.md) 与
 [`step6_experiments/step6_summary.json`](step6_experiments/step6_summary.json)。
 

@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from speakeasy.report import Report
+from speakeasy.windows.child_execution.dynamic_adapter import (
+    DynamicChildExecutionAdapter,
+)
 from speakeasy.windows.child_execution.models import (
     AdmissionDecision,
     BudgetUsage,
@@ -75,8 +78,8 @@ def _report_data() -> ChildExecutionReportData:
             reason=None,
         ),
         process=process,
-        state=ChildExecutionState.ENTRYPOINT_REACHED,
-        reason=None,
+        state=ChildExecutionState.FAILED,
+        reason="invalid_memory",
     )
     result = ChildRunResult(
         launch_id=request.launch_id,
@@ -95,6 +98,8 @@ def _report_data() -> ChildExecutionReportData:
             kind=ChildFailureKind.RUNTIME,
             message="invalid child fetch",
             pc=0x401000,
+            fault_address=0x14,
+            access_type="read",
             api_name="kernel32.CreateProcess",
         ),
         entrypoint_reached=True,
@@ -129,7 +134,38 @@ def test_report_adapter_serializes_results_and_ownership() -> None:
     assert result["termination_reason"] == "invalid_fetch"
     assert result["budget"]["max_api_count"] == 900
     assert result["usage"]["api_count_used"] == 20
+    assert result["entrypoint_reached"] is True
     assert result["failure"]["kind"] == "runtime"
+    assert result["failure"]["pc"] == 0x401000
+    assert result["failure"]["fault_address"] == 0x14
+    assert result["failure"]["access_type"] == "read"
+
+
+def test_failed_result_preserves_queue_history_for_consumers() -> None:
+    """A terminal failed state does not erase prior queue and entry evidence."""
+
+    child_report = ChildExecutionReportAdapter().from_report_data(
+        _report_data()
+    )
+
+    assert child_report.requests[0].thread_queued is True
+    assert child_report.requests[0].entrypoint_reached is True
+    assert child_report.thread_queued_count == 1
+    assert child_report.entrypoint_reached_count == 1
+
+    class Tracker:
+        """Record one validated report from the dynamic adapter."""
+
+        def __init__(self) -> None:
+            self.reports = []
+
+        def update_child_execution(self, report: object) -> None:
+            self.reports.append(report)
+
+    tracker = Tracker()
+    DynamicChildExecutionAdapter().apply(tracker, child_report)
+
+    assert tracker.reports == [child_report]
 
 
 def test_report_adapter_preserves_root_report_identity() -> None:
