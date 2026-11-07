@@ -30,6 +30,7 @@ from speakeasy.profiler_events import (
 from speakeasy.windows.child_execution import ChildTargetResolver
 
 from .. import api
+from .pseudo_handles import is_current_process_pseudo_handle
 
 PAGE_SIZE = 0x1000
 LANG_EN_US = 0x409
@@ -841,14 +842,20 @@ class Kernel32(api.ApiHandler):
         """
 
         hProcess, uExitCode = argv
-        rv = False
+        current_process = is_current_process_pseudo_handle(
+            hProcess,
+            emu.get_ptr_size(),
+        )
 
-        proc = emu.get_object_from_handle(hProcess)
+        proc = emu.get_current_process() if current_process else emu.get_object_from_handle(hProcess)
         if not proc:
-            return rv
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
 
         emu.kill_process(proc)
-        rv = True
+        if current_process or proc is emu.get_current_process():
+            emu.exit_process()
+        return True
 
     @apihook("FreeLibraryAndExitThread", argc=2)
     def FreeLibraryAndExitThread(self, emu, argv, ctx: api.ApiContext = None):
