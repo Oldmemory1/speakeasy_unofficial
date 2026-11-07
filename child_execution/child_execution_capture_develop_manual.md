@@ -1,10 +1,11 @@
 # Speakeasy 受控 child execution 开发手册
 
-> 状态：阶段 1 model-only 已实现；步骤 6 小批实验已执行，child execution
-> 仍关闭。真实 scheduler/pipeline 接入、`mira` self-target 和 `padodor`
-> 失败语义尚未通过，depth=2 未获批准。
+> 状态：默认 child execution 仍为 model-only/关闭；生产 scheduler、loader、
+> runner、显式 budget 和动态报告接线已实现。受限 depth=1 实验中，4/4 个
+> 批准 `mira` self-root 到达真实 child 入口并完成；25 个 R3 root 中 5 个
+> child 到达入口，其中 3 个正常退出。depth=2 仍未获批准。
 >
-> 日期：2026-11-01；当前工作包更新于 2026-11-04
+> 日期：2026-11-01；当前工作包更新于 2026-11-07
 >
 > Speakeasy 修复前基线：`b970251` (`chore: checkpoint emulation engine before controlled child execution`)
 >
@@ -129,26 +130,51 @@ engine.run_module(module, emulate_children=True)
 
 必须先增加受控执行协调器。
 
-### 3.4 阶段 1 当前状态
+### 3.4 当前状态（2026-11-07）
 
-阶段 1 的 model-only 代码已经落地，但尚未提交：
+默认生产策略仍是 child execution 关闭，只有显式、按 root SHA 限定的实验
+scope 才允许 depth=1。已完成：
 
-- 四类进程 API 已统一记录 request；
-- target 来源和 PE admission 已建模；
-- `launch_id`、parent/child pid、target/command hash、depth 和原因已写入报告；
-- `run_module(emulate_children=True)` 不会执行 child；
-- `ResumeThread`、`CreateRemoteThread` 和 child thread 的
-  `QueueUserAPC` 已被 model-only policy 阻断；
-- 报告中的 `execution_enabled=false`、`thread_queued_count=0`、
-  `entrypoint_reached_count=0`。
+- 四类进程 API 统一记录 request，target 来源和 PE admission 显式建模；
+- `launch_id`、parent/child PID、target/command hash、depth 和失败原因写入
+  request/result/report；
+- `ChildTargetResolver` 拒绝 decoy、截断文件、歧义路径和错误架构；
+- `ShellExecute` 的 `mira` self-target 尾字符/扩展名 alias 已修复；
+- `WinExec` target unavailable 返回 `ERROR_FILE_NOT_FOUND=2`，不创建虚假 PID；
+- 专用 child loader、context manager、one-shot entry hook、runner、生产
+  scheduler 和唯一 FIFO drain 路径已实现；
+- child budget 的 timeout/API/instruction 限额从 parent 显式继承，usage
+  独立计数；child 内再次启动在 depth=1 下返回 `depth_limit`；
+- parent 完成后才 drain child，停止信号可传播，parent process/thread/run
+  在 child 结束后逐项恢复；
+- child result 的 `entrypoint_reached` 只由真实 hook 证明；
+- engine report projector 与 dynamic-stage report adapter 已接入，默认
+  model-only 报告仍有稳定的空 requests/results 合同。
 
-当前仍未实现：
+显式实验状态：
 
-- 合格 request 的专用 child loader 和独立 run context；
-- child scheduler、独立 budget 和递归停止；
-- child 入口 hook、事件 ownership 和 child outcome；
-- dynamic stage / shell tracker 对引擎权威结果的消费；
-- 1,229 model-only 全量回归。
+| 实验 | 结果 |
+|---|---|
+| 12 个 state-only 父样本 | 12/12 `ok`，child execution 为 0 |
+| 4 个批准 `mira` self-root | 4/4 到达真实入口并完成，parent context 恢复 |
+| 25 个 R3 root dropped EXE 矩阵 | 36 request；5 个入口命中，3 个正常退出 |
+| 2 个良性安装器 | child `load_error` 不覆盖 parent outcome |
+| `padodor` unavailable | 6/6 返回 file-not-found，不创建 process/PID |
+| `systex` | URL/target 保留，不默认执行 IE |
+| depth=2 | 未获批准 |
+
+仍未完成：
+
+- 默认生产 path 尚未批准开启 child execution；
+- R3 dropped matrix 只有 3/25 root 正常完成，仍需调查其余 load/invalid-fetch
+  路径；
+- 3 个 R3 parent 状态与历史 state-only 记录不一致，不能据此开放 depth=2；
+- 1,229 model-only 全量回归仍需在统一最终代码上重新确认。
+
+2026-11-07 本轮没有继续修改 child process 状态机或 child execution 生产代码；
+该文件只记录当前设计和实验边界。完整实验证据见
+[`step6_experiments/README.md`](step6_experiments/README.md) 与
+[`step6_experiments/step6_summary.json`](step6_experiments/step6_summary.json)。
 
 ## 4. 必须维持的不变量
 
@@ -859,9 +885,10 @@ target bytes 或 Process/Run 对象。
 
 当前状态：引擎侧已完成 `DynamicChildExecutionAdapter`，它只接受公共
 `ChildExecutionReport`，校验 lineage 后调用 tracker 的显式
-`update_child_execution(report)`。真实 dynamic-stage tracker 的该方法、
-pipeline 注入和旧 `note_execution_context` pid 推断替换留到后续集成，不能
-通过修改 `kernel32.py` 或其它仿真路径绕接。
+`update_child_execution(report)`。dynamic-stage bridge、pipeline 注入和
+报告合并已接通；默认策略仍为 model-only，真实执行必须由显式
+`scheduler_factory` 和限定 scope 开启。不能通过修改 `kernel32.py`、环境
+变量或其它仿真路径绕接。
 
 目标：下游消费引擎权威 request/result，不自行推断执行事实。
 
@@ -874,7 +901,7 @@ pipeline 注入和旧 `note_execution_context` pid 推断替换留到后续集�
 - pipeline 收集 `Report.child_execution`；
 - child errors 和 parent errors 分开；
 - 保留现有 command、URL 和 review signal 合同；
-- 小批使用显式开关，不直接改变 1,229 默认批次。
+- 小批使用显式 scope/factory，不直接改变 1,229 默认批次。
 
 验收：tracker 字段逐项可追溯；`target_resolved=false` 的 Process 对象不会
 被标为 child started；batch summary 包含 request、queued、entrypoint、
@@ -901,10 +928,13 @@ completed、partial、skipped 和 rejected。
 | R3 完整 dropped EXE | source/hash/ownership 完整 |
 | 2 个良性安装器 | parent status 不被 child 噪声覆盖 |
 
-2026-11-06 小批实验结果：state-only 重跑 12 个样本全部 `ok`，但真实
-child execution 仍被生产 scheduler/pipeline 接线阻断。`mira` self-target
-4/4 未解析，`padodor` 6/6 仍表现为虚假成功，因此 depth=2 未获批准。
-完整证据见
+2026-11-06 至 2026-11-07 小批实验结果：state-only 重跑 12 个样本全部
+`ok`；修复 self-target alias 后，4/4 个批准 `mira` root 真实到达 child
+入口并正常退出；`padodor` 6/6 在 target unavailable 时返回
+`ERROR_FILE_NOT_FOUND=2`，不创建虚假 process/PID。R3 dropped EXE 矩阵中
+25 个 root 产生 36 个 request，5 个 child 到达入口，其中 3 个正常退出，
+其余失败均记录为 child-local `load_error`/`invalid_fetch`。默认 child
+execution 仍关闭，depth=2 未获批准。完整证据见
 [step6_experiments/README.md](step6_experiments/README.md)。
 
 ### 15.10 依赖关系和阶段顺序
@@ -1033,6 +1063,30 @@ fixture 应由 URL/command evidence 与命中收益决定，不能作为默认 c
 per-process memory map/object namespace。不要把这项高风险改动混入第一轮
 target resolution 和 launch tracking 修复。
 
+### 18.5 child 早期空指针访问
+
+部分样本在 child 运行早期出现以下访问：
+
+```text
+mov eax, dword ptr [eax + 0x14]
+eax = 0
+```
+
+该失败必须归属于 child-local runtime error，并保留 child PID、run index、
+PC、寄存器和父/子 ownership；不能因为它发生在 child 内就把 parent 改写成
+`simulation_error`，也不能把“创建了 Process”当成 child 已成功执行。
+
+当前 child framework、budget 和 report 边界已经建立，但这一类样本级早期
+空指针路径尚未继续修复。后续调查应优先区分：
+
+- child PE 初始化/重定位或 TLS 状态未建立；
+- child API 返回值导致样本进入空指针路径；
+- 样本自身对 `NULL` 不做检查；
+- parent 与 child 共享 engine 状态导致的污染。
+
+在完成 Windows VM 或独立 memory context 差分前，不通过伪造非零 API
+返回值掩盖该错误，也不据此开放 depth=2。
+
 ## 19. 实施前检查清单
 
 - [x] 当前修复前基线仍为 `b970251`。
@@ -1040,9 +1094,10 @@ target resolution 和 launch tracking 修复。
 - [x] 明确 `emulate_children=True` 不是完整修复本身。
 - [x] target resolver 不经过 decoy/default.bin fallback。
 - [x] API success、Process、queue 和 entrypoint 分别建模。
-- [ ] 完成 1,229 样本 model-only 全量回归。
+- [ ] 在统一最终代码上完成 1,229 样本 model-only 全量回归；历史批次
+      `child_started=0`、`child_emulated=0`，不等价于最终回归已通过。
 - [x] 完成 child loader、context manager、one-shot 入口 hook 和 runner 的
-      独立实现；真实 scheduler 接入仍未完成。
+      独立实现；生产 scheduler 与显式 pipeline 注入已完成。
 - [x] child loader 使用显式 base allocator、`primary=False` 映射，并保留
       root metadata。
 - [x] child runner 使用与 parent 等额但独立的 usage 计数，并将预期 child
@@ -1057,7 +1112,9 @@ target resolution 和 launch tracking 修复。
 - [ ] detector 接受权威 `launch_id` 和 child result。
 - [x] 先跑 state-only 回归：12 个样本全部 `ok`，child started/emulated 为 0。
 - [x] 完成 `mira` model-only 门槛复核：4 个真实 launch 均未解析为 self。
-- [ ] 真实 `mira` child execution：被 pipeline 接线阻断。
+- [x] 真实 `mira` child execution：4/4 显式 root 到达入口并完成；
+      默认 execution 仍关闭。
 - [x] 完成 R3 dropped artifact 清单及两个良性安装器标记。
-- [ ] 真实 dropped EXE child execution：被生产路径映射和 pipeline 接线阻断。
+- [x] 真实 dropped EXE child execution 矩阵已执行：25 个 root 中 5 个入口
+      命中、3 个正常退出，其余为 child-local 失败。
 - [ ] depth=2：未获批准。
