@@ -23,22 +23,34 @@ class _FeatureEmu:
 
 
 class _InterruptHarness:
-    def __init__(self, *, bits: int, fast_fail_code: int, fast_fail_data: int) -> None:
+    def __init__(
+        self,
+        *,
+        bits: int,
+        fast_fail_code: int,
+        fast_fail_data: int,
+        exception_list: int = 0x200000,
+        dispatch_handlers: bool = True,
+    ) -> None:
         self.bits = bits
         self.fast_fail_code = fast_fail_code
         self.fast_fail_data = fast_fail_data
+        self.exception_list = exception_list
         self.config = SimpleNamespace(
-            exceptions=SimpleNamespace(dispatch_handlers=True),
+            exceptions=SimpleNamespace(dispatch_handlers=dispatch_handlers),
         )
         self.kernel_mode = False
         self.curr_run = SimpleNamespace(error=None)
+        self.curr_exception_code = 0
+        self.prev_pc: int | None = None
         self.restart_curr_run = True
         self.run_complete = False
         self.run_complete_calls = 0
+        self.code_hook_enabled = 0
         self.stop_calls = 0
 
     def _get_exception_list(self) -> int:
-        return 0x200000
+        return self.exception_list
 
     def get_arch(self) -> int:
         return self.bits
@@ -52,6 +64,9 @@ class _InterruptHarness:
 
     def get_pc(self) -> int:
         return 0x401236
+
+    def enable_code_hook(self) -> None:
+        self.code_hook_enabled += 1
 
     def get_error_info(
         self,
@@ -221,3 +236,38 @@ def test_other_unhandled_interrupt_keeps_existing_semantics() -> None:
     assert harness.curr_run.error.type == "unhandled_interrupt"
     assert harness.curr_run.error.interrupt_num == 0x2E
     assert harness.curr_run.error.termination_kind is None
+
+
+def test_int4_is_dispatched_as_integer_overflow() -> None:
+    harness = _InterruptHarness(
+        bits=arch.ARCH_X86,
+        fast_fail_code=0,
+        fast_fail_data=0,
+    )
+
+    handled = WindowsEmulator._hook_interrupt(harness, None, 4)
+
+    assert handled is True
+    assert harness.curr_exception_code == 0xC0000144
+    assert harness.prev_pc == 0x401236
+    assert harness.code_hook_enabled == 1
+    assert harness.run_complete_calls == 0
+    assert harness.curr_run.error is None
+
+
+def test_int4_without_seh_remains_diagnostic_failure() -> None:
+    harness = _InterruptHarness(
+        bits=arch.ARCH_X86,
+        fast_fail_code=0,
+        fast_fail_data=0,
+        exception_list=0,
+    )
+
+    handled = WindowsEmulator._hook_interrupt(harness, None, 4)
+
+    assert handled is False
+    assert harness.curr_exception_code == 0
+    assert harness.code_hook_enabled == 0
+    assert harness.run_complete_calls == 1
+    assert harness.curr_run.error.type == "unhandled_interrupt"
+    assert harness.curr_run.error.interrupt_num == 4

@@ -44,6 +44,10 @@ from speakeasy.windows.fast_fail import (
 )
 from speakeasy.windows.fileman import FileManager
 from speakeasy.windows.hammer import ApiHammer
+from speakeasy.windows.import_sentinel import (
+    find_import_sentinel,
+    import_probe_prefix,
+)
 from speakeasy.windows.loaders import get_prot_string
 from speakeasy.windows.netman import NetworkManager
 from speakeasy.windows.objman import HandleAllocator
@@ -2722,6 +2726,19 @@ class WindowsEmulator(BinaryEmulator):
 
         if address >= winemu.EMU_RESERVED and address <= (winemu.EMU_RESERVED + winemu.EMU_RESERVE_SIZE):
             self._unset_emu_hooks()
+            # Some samples inspect API prologues through an imported function
+            # pointer. Serve those data reads from the zero-filled sentinel page
+            # while leaving subsequent fetches unmapped for import interception.
+            sentinel = find_import_sentinel(
+                self.import_table,
+                address,
+                size,
+                self.get_ptr_size(),
+            )
+            if sentinel is not None:
+                prefix = import_probe_prefix(self.get_arch())
+                if prefix:
+                    self.mem_write(sentinel, prefix)
             return True
 
         if self.config.exceptions.dispatch_handlers:
@@ -3600,6 +3617,15 @@ class WindowsEmulator(BinaryEmulator):
                 # Remove the trap flag
                 eflags &= 0xFFFFFEFF
                 self.reg_write(_arch.X86_REG_EFLAGS, eflags)
+                return True
+            # INT 4 is the overflow exception vector. Both an explicit INT 4
+            # and an INTO taken with OF set arrive here with user-mode SEH
+            # available. Unicorn has already decided whether INTO traps, so
+            # testing OF here would incorrectly suppress explicit INT 4.
+            elif intnum == 4:
+                self.curr_exception_code = ddk.STATUS_INTEGER_OVERFLOW
+                self.enable_code_hook()
+                self.prev_pc = self.get_pc()
                 return True
 
         # Handle __fastfail interrupt introduced in Windows 8. Fast fail is a
