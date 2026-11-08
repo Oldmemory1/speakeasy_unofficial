@@ -52,6 +52,10 @@ from speakeasy.windows.loaders import get_prot_string
 from speakeasy.windows.netman import NetworkManager
 from speakeasy.windows.objman import HandleAllocator
 from speakeasy.windows.regman import RegistryManager
+from speakeasy.windows.x86_interrupts import (
+    OverflowTrapKind,
+    classify_overflow_trap,
+)
 from speakeasy.winenv.api import sigdb, sigfmt
 
 # When disassembling, a minimum instruction size needs to be supplied
@@ -3618,11 +3622,28 @@ class WindowsEmulator(BinaryEmulator):
                 eflags &= 0xFFFFFEFF
                 self.reg_write(_arch.X86_REG_EFLAGS, eflags)
                 return True
-            # INT 4 is the overflow exception vector. Both an explicit INT 4
-            # and an INTO taken with OF set arrive here with user-mode SEH
-            # available. Unicorn has already decided whether INTO traps, so
-            # testing OF here would incorrectly suppress explicit INT 4.
             elif intnum == 4:
+                # Unicorn invokes this hook for explicit ``int 4`` and for
+                # ``into``. The latter is conditional, so distinguish the
+                # trapping opcode before dispatching an overflow SEH.
+                trap_kind = OverflowTrapKind.UNKNOWN
+                previous_pc = getattr(self, "prev_pc", None)
+                if (
+                    self.get_arch() == _arch.ARCH_X86
+                    and isinstance(previous_pc, int)
+                    and previous_pc > 0
+                ):
+                    try:
+                        opcode_prefix = bytes(self.mem_read(previous_pc, 2))
+                        eflags = self.reg_read(_arch.X86_REG_EFLAGS)
+                        trap_kind = classify_overflow_trap(
+                            opcode_prefix,
+                            eflags=eflags,
+                        )
+                    except Exception:
+                        trap_kind = OverflowTrapKind.UNKNOWN
+                if trap_kind is OverflowTrapKind.INTO_NOT_TAKEN:
+                    return True
                 self.curr_exception_code = ddk.STATUS_INTEGER_OVERFLOW
                 self.enable_code_hook()
                 self.prev_pc = self.get_pc()

@@ -31,10 +31,14 @@ class _InterruptHarness:
         fast_fail_data: int,
         exception_list: int = 0x200000,
         dispatch_handlers: bool = True,
+        previous_opcode: bytes = b"\xCD\x04",
+        eflags: int = 0x202,
     ) -> None:
         self.bits = bits
         self.fast_fail_code = fast_fail_code
         self.fast_fail_data = fast_fail_data
+        self.previous_opcode = previous_opcode
+        self.eflags = eflags
         self.exception_list = exception_list
         self.config = SimpleNamespace(
             exceptions=SimpleNamespace(dispatch_handlers=dispatch_handlers),
@@ -42,7 +46,7 @@ class _InterruptHarness:
         self.kernel_mode = False
         self.curr_run = SimpleNamespace(error=None)
         self.curr_exception_code = 0
-        self.prev_pc: int | None = None
+        self.prev_pc: int | None = 0x401234
         self.restart_curr_run = True
         self.run_complete = False
         self.run_complete_calls = 0
@@ -60,7 +64,14 @@ class _InterruptHarness:
             return self.fast_fail_code
         if register in (arch.X86_REG_EDX, arch.AMD64_REG_RDX):
             return self.fast_fail_data
+        if register == arch.X86_REG_EFLAGS:
+            return self.eflags
         raise AssertionError(f"unexpected register: {register}")
+
+    def mem_read(self, address: int, size: int) -> bytes:
+        assert address == self.prev_pc
+        assert size == 2
+        return self.previous_opcode
 
     def get_pc(self) -> int:
         return 0x401236
@@ -255,6 +266,39 @@ def test_int4_is_dispatched_as_integer_overflow() -> None:
     assert harness.curr_run.error is None
 
 
+def test_into_without_overflow_continues_after_interrupt() -> None:
+    harness = _InterruptHarness(
+        bits=arch.ARCH_X86,
+        fast_fail_code=0,
+        fast_fail_data=0,
+        previous_opcode=b"\xCE\x90",
+        eflags=0x202,
+    )
+
+    handled = WindowsEmulator._hook_interrupt(harness, None, 4)
+
+    assert handled is True
+    assert harness.curr_exception_code == 0
+    assert harness.code_hook_enabled == 0
+    assert harness.curr_run.error is None
+
+
+def test_into_with_overflow_dispatches_integer_overflow() -> None:
+    harness = _InterruptHarness(
+        bits=arch.ARCH_X86,
+        fast_fail_code=0,
+        fast_fail_data=0,
+        previous_opcode=b"\xCE\x90",
+        eflags=0xA02,
+    )
+
+    handled = WindowsEmulator._hook_interrupt(harness, None, 4)
+
+    assert handled is True
+    assert harness.curr_exception_code == 0xC0000095
+    assert harness.code_hook_enabled == 1
+
+
 def test_int4_without_seh_remains_diagnostic_failure() -> None:
     harness = _InterruptHarness(
         bits=arch.ARCH_X86,
@@ -271,3 +315,59 @@ def test_int4_without_seh_remains_diagnostic_failure() -> None:
     assert harness.run_complete_calls == 1
     assert harness.curr_run.error.type == "unhandled_interrupt"
     assert harness.curr_run.error.interrupt_num == 4
+
+
+def test_x64_int4_does_not_apply_x86_into_semantics() -> None:
+    harness = _InterruptHarness(
+        bits=arch.ARCH_AMD64,
+        fast_fail_code=0,
+        fast_fail_data=0,
+        previous_opcode=b"\xCE\x90",
+        eflags=0x202,
+    )
+
+    handled = WindowsEmulator._hook_interrupt(harness, None, 4)
+
+    assert handled is True
+    assert harness.curr_exception_code == 0xC0000095
+
+
+def test_x86_into_of_zero_shellcode_continues() -> None:
+    code = bytes.fromhex(
+        "b801000000"  # mov eax, 1
+        "83c001"      # add eax, 1 (OF=0)
+        "ce"          # into
+        "b834120000"  # mov eax, 0x1234
+        "c3"
+    )
+    emulator = Speakeasy()
+    try:
+        address = emulator.load_shellcode(data=code, arch="x86")
+        emulator.run_shellcode(address)
+        report = emulator.get_report()
+    finally:
+        emulator.shutdown()
+
+    assert report.entry_points[0].error is None
+
+
+def test_x86_into_of_one_shellcode_still_reports_overflow() -> None:
+    code = bytes.fromhex(
+        "b8ffffff7f"  # mov eax, 0x7fffffff
+        "83c001"      # add eax, 1 (OF=1)
+        "ce"          # into
+        "b834120000"  # mov eax, 0x1234
+        "c3"
+    )
+    emulator = Speakeasy()
+    try:
+        address = emulator.load_shellcode(data=code, arch="x86")
+        emulator.run_shellcode(address)
+        report = emulator.get_report()
+    finally:
+        emulator.shutdown()
+
+    error = report.entry_points[0].error
+    assert error is not None
+    assert error.type == "unhandled_interrupt"
+    assert error.interrupt_num == 4
