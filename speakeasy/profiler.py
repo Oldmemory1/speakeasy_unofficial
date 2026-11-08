@@ -6,6 +6,8 @@ __report_version__ = "4.0.0"
 import hashlib
 import time
 from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from speakeasy.artifacts import MAX_EMBEDDED_FILE_SIZE, ArtifactStore
@@ -88,6 +90,23 @@ class MemAccess:
         self.execs = 0
 
 
+@dataclass
+class ApiCallbackFrame:
+    """Bookkeeping for a guest callback invoked by a Win32 API handler."""
+
+    ret_addr: int | None
+    function: int
+    cleanup_argc: int
+    caller_argv: list[Any] | tuple[Any, ...]
+    return_value: int | None = None
+    complete: Callable[[int | None], int | None] | None = None
+
+    def resolve_api_return(self, callback_result: int | None) -> int | None:
+        if self.complete is not None:
+            return self.complete(callback_result)
+        return self.return_value
+
+
 class Run:
     """
     This class represents the basic execution primative for the emulation engine
@@ -109,7 +128,7 @@ class Run:
         self.unique_apis: list[str] = []
         self.api_hash = hashlib.sha256()
         self.stack: MemAccess | None = None
-        self.api_callbacks: list[tuple[int, str, list[Any] | tuple[Any, ...]]] = []
+        self.api_callbacks: list[ApiCallbackFrame] = []
         self.exec_cache: deque[MemAccess] = deque(maxlen=4)
         self.read_cache: deque[MemAccess] = deque(maxlen=4)
         self.write_cache: deque[MemAccess] = deque(maxlen=4)

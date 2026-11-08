@@ -1,13 +1,14 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import speakeasy.windows.common as winemu
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.nt.ntoskrnl as ntos
 from speakeasy.errors import ApiEmuError
-from speakeasy.profiler import Run
+from speakeasy.profiler import ApiCallbackFrame, Run
 from speakeasy.profiler_events import TracePosition
 from speakeasy.struct import EmuStruct
 
@@ -394,24 +395,42 @@ class ApiHandler:
             ptr += ptrsize
         return args
 
-    def setup_callback(self, func, args, caller_argv=[]):
+    def setup_callback(
+        self,
+        func,
+        args,
+        caller_argv=None,
+        *,
+        return_value: int | None = None,
+        complete: Callable[[int | None], int | None] | None = None,
+    ):
         """
         For APIs that call functions, we will setup the stack to make this flow
         naturally.
         """
 
         run = self.emu.get_current_run()
+        callback_argv = tuple(caller_argv or ())
+        ret = self.emu.get_ret_address()
+        sp = self.emu.get_stack_ptr()
 
-        if not len(run.api_callbacks):
-            # Get the original return address
-            ret = self.emu.get_ret_address()
-            sp = self.emu.get_stack_ptr()
-
-            self.emu.set_func_args(sp, winemu.API_CALLBACK_HANDLER_ADDR, *args, conv=_arch.CALL_CONV_STDCALL)
-            self.emu.set_pc(func)
-            run.api_callbacks.append((ret, func, caller_argv))
-        else:
-            run.api_callbacks.append((None, func, args))
+        self.emu.set_func_args(
+            sp,
+            winemu.API_CALLBACK_HANDLER_ADDR,
+            *args,
+            conv=_arch.CALL_CONV_STDCALL,
+        )
+        self.emu.set_pc(func)
+        run.api_callbacks.append(
+            ApiCallbackFrame(
+                ret_addr=ret,
+                function=func,
+                cleanup_argc=len(callback_argv),
+                caller_argv=callback_argv,
+                return_value=return_value,
+                complete=complete,
+            )
+        )
 
     def do_str_format(self, string, argv):
         """

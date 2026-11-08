@@ -17,6 +17,10 @@ from speakeasy.config import SpeakeasyConfig, get_default_config_dict
 from speakeasy.errors import ConfigError, NotSupportedError, SpeakeasyError
 from speakeasy.report import FileManifestEntry, Report
 from speakeasy.volumes import apply_volumes
+from speakeasy.windows.pe_compat import (
+    InvalidZeroMachineError,
+    normalize_zero_machine,
+)
 from speakeasy.winenv import arch as _arch
 
 logger = logging.getLogger(__name__)
@@ -70,6 +74,7 @@ class Speakeasy:
         self.gdb_port = gdb_port
         self.gdb_host = gdb_host
         self.loaded_bins: list[str | None] = []
+        self.pe_machine_normalization: dict[str, int | str] | None = None
         self.mem_write_hooks: list[tuple[Callable, int, int]] = []
         self.in_insn_hooks: list[tuple[Callable, int, int]] = []
         self.syscall_insn_hooks: list[tuple[Callable, int, int]] = []
@@ -299,22 +304,43 @@ class Speakeasy:
             raise SpeakeasyError(f"Target file not found: {path}")
 
         if data:
-            test = data
+            target_data = bytes(data)
         else:
+            assert path is not None
             with open(path, "rb") as f:
-                test = f.read(4)
+                target_data = f.read()
 
         self.loaded_bins.append(path)
 
-        if not self.is_pe(test):
+        if not self.is_pe(target_data[:4]):
             raise SpeakeasyError("Target file is not a PE")
+
+        try:
+            normalization = normalize_zero_machine(target_data)
+        except InvalidZeroMachineError as err:
+            raise SpeakeasyError(
+                f"PE Machine field is zero and cannot be normalized: {err}"
+            ) from err
+
+        self.pe_machine_normalization = normalization.diagnostic()
+        if normalization.changed:
+            logger.warning(
+                "PE Machine field was zero; normalized to 0x%x (%s)",
+                normalization.normalized_machine,
+                normalization.reason,
+            )
+            target_data = normalization.image
 
         if path:
             self._auto_mount_target_directory(path)
 
-        self._init_emulator(path=path, data=data)
+        self._init_emulator(path=path, data=target_data)
 
-        return self.emu.load_module(path=path, data=data, filename=filename)  # type: ignore[union-attr]
+        return self.emu.load_module(  # type: ignore[union-attr]
+            path=path,
+            data=target_data,
+            filename=filename,
+        )
 
     def load_image(self, image):
         """

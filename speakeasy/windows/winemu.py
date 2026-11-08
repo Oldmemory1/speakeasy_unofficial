@@ -19,7 +19,7 @@ import speakeasy.winenv.defs.windows.windows as windef
 from speakeasy.binemu import BinaryEmulator
 from speakeasy.errors import WindowsEmuError
 from speakeasy.gdb import GdbServer, ResumeAction, StopReason
-from speakeasy.profiler import MemAccess, Run
+from speakeasy.profiler import ApiCallbackFrame, MemAccess, Run
 from speakeasy.profiler_events import TracePosition
 from speakeasy.report import ErrorInfo, RegionInfo
 from speakeasy.struct import EmuStruct
@@ -86,6 +86,45 @@ class BootstrapPhase(IntEnum):
     ENGINE_API_READY = 1
     OBJECT_MANAGER_READY = 2
     FULL_SETUP_READY = 3
+
+
+def _complete_pending_api_callback(emu: Any) -> None:
+    """Complete a pending callback transition on ``emu``."""
+    run = emu.get_current_run()
+    if not run or not run.api_callbacks:
+        error = emu.get_error_info(
+            "callback_return_without_callback",
+            emu.get_pc(),
+            access_type="fetch",
+        )
+        emu.curr_run.error = error
+        emu.on_run_complete()
+        return
+
+    frame = run.api_callbacks.pop()
+    if isinstance(frame, tuple):
+        # Compatibility with runs created by integrations that still enqueue
+        # the historical (return address, function, arguments) tuple.
+        ret_addr, _function, args = frame
+        emu.do_call_return(len(args), ret_addr)
+        return
+
+    if not isinstance(frame, ApiCallbackFrame):
+        raise WindowsEmuError(
+            f"Unsupported API callback frame: {type(frame).__name__}"
+        )
+
+    arch = emu.get_arch()
+    if arch == _arch.ARCH_X86:
+        return_register = _arch.X86_REG_EAX
+    elif arch == _arch.ARCH_AMD64:
+        return_register = _arch.AMD64_REG_RAX
+    else:
+        raise WindowsEmuError(f"Unsupported architecture: {arch}")
+
+    callback_result = int(emu.reg_read(return_register))
+    api_return = frame.resolve_api_return(callback_result)
+    emu.do_call_return(frame.cleanup_argc, frame.ret_addr, api_return)
 
 
 class WindowsEmulator(BinaryEmulator):
@@ -1849,21 +1888,14 @@ class WindowsEmulator(BinaryEmulator):
             return True
 
         if pc == winemu.API_CALLBACK_HANDLER_ADDR:
-            run = self.get_current_run()
-            if run.api_callbacks:
-                ret_addr, orig_func, args = run.api_callbacks.pop(0)
-                self.do_call_return(len(args), ret_addr)
-            else:
-                error = self.get_error_info(
-                    "callback_return_without_callback",
-                    pc,
-                    access_type="fetch",
-                )
-                self.curr_run.error = error  # type: ignore[union-attr]
-                self.on_run_complete()
+            _complete_pending_api_callback(self)
             return True
 
         return False
+
+    def _complete_api_callback(self) -> None:
+        """Complete a guest callback and restore the intercepted API return."""
+        _complete_pending_api_callback(self)
 
     def _resolve_module_offset(self, addr: int) -> str | None:
         """Return 'module+0xoffset' string for an address inside a loaded module, or None."""
@@ -2529,8 +2561,7 @@ class WindowsEmulator(BinaryEmulator):
                 elif address == winemu.API_CALLBACK_HANDLER_ADDR:
                     run = self.get_current_run()
                     if run.api_callbacks:
-                        pc, orig_func, args = run.api_callbacks.pop(0)
-                        self.do_call_return(len(args), pc)
+                        self._complete_api_callback()
                         self._unset_emu_hooks()
                     return True
                 return self._handle_invalid_fetch(emu, address, size, value)

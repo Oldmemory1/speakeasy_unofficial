@@ -356,7 +356,6 @@ class User32(api.ApiHandler):
         self.handle: int = 0
         self.win: Any | None = None
         self.handles: list[int] = []
-        self.wndprocs: dict[int, int] = {}
         self.timer_count: int = 0
         self.sessman = sessman.SessionManager(config=None, allocator=emu.handle_allocator)
         self.synthetic_async_keys = [0x41, 0x42, 0x43]
@@ -516,7 +515,15 @@ class User32(api.ApiHandler):
         );
         """
 
-        return 1
+        class_name, _instance = argv
+        cw = self.get_char_width(ctx)
+        if isinstance(class_name, int) and 0 < class_name <= 0xFFFF:
+            class_key = class_name
+        elif class_name:
+            class_key = self.read_mem_string(class_name, cw)
+        else:
+            class_key = None
+        return int(self.sessman.unregister_window_class(class_key))
 
     @apihook("SetCursorPos", argc=2)
     def SetCursorPos(self, emu, argv, ctx: api.ApiContext = None):
@@ -613,7 +620,8 @@ class User32(api.ApiHandler):
             HWND hWnd
         );
         """
-        return True
+        hnd = argv[0]
+        return int(self.sessman.destroy_window(hnd))
 
     @apihook("DefWindowProc", argc=4)
     def DefWindowProc(self, emu, argv, ctx: api.ApiContext = None):
@@ -647,9 +655,15 @@ class User32(api.ApiHandler):
         """
         ctx = ctx or {}
         cw = self.get_char_width(ctx)
-        _, cn, wn, _, x, y, width, height, parent, menu, inst, param = argv
-        if cn:
-            cn = self.read_mem_string(cn, cw)
+        _, class_token, wn, _, x, y, width, height, parent, menu, inst, param = argv
+        class_atom = None
+        if isinstance(class_token, int) and 0 < class_token <= 0xFFFF:
+            class_atom = class_token
+            window_class = self.sessman.get_window_class(class_atom)
+            cn = window_class.name if window_class is not None else None
+            argv[1] = cn
+        elif class_token:
+            cn = self.read_mem_string(class_token, cw)
             argv[1] = cn
         else:
             cn = None
@@ -658,8 +672,31 @@ class User32(api.ApiHandler):
             argv[2] = wn
         else:
             wn = None
-        hnd = self.sessman.create_window(wn, cn)
+
+        window_class = self.sessman.get_window_class(
+            class_atom if class_atom is not None else cn
+        )
+        wndproc = window_class.wndproc if window_class is not None else None
+        hnd = self.sessman.create_window(
+            wn,
+            cn,
+            class_atom=class_atom,
+            wndproc=wndproc,
+        )
+        if hnd and wndproc:
+            self.setup_callback(
+                wndproc,
+                (hnd, windefs.WM_CREATE, 0, param),
+                caller_argv=argv,
+                complete=lambda result: self._complete_wm_create(hnd, result),
+            )
         return hnd
+
+    def _complete_wm_create(self, hwnd: int, result: int | None) -> int:
+        if result is not None and int(result) & 0xFFFFFFFF == 0xFFFFFFFF:
+            self.sessman.destroy_window(hwnd)
+            return 0
+        return hwnd
 
     @apihook("SetLayeredWindowAttributes", argc=4)
     def SetLayeredWindowAttributes(self, emu, argv, ctx: api.ApiContext = None):
@@ -728,7 +765,6 @@ class User32(api.ApiHandler):
 
         hInstance, uID, lpBuffer, ccBufferMax = argv
         cw = self.get_char_width(ctx)
-        size = 0
 
         if hInstance == 0:
             pe = emu.modules[0] if emu.modules else None
@@ -947,10 +983,17 @@ class User32(api.ApiHandler):
         );
         """
         hWnd, Msg, wParam, lParam = argv
-        if hWnd in self.wndprocs:
-            emu.set_pc(self.wndprocs[hWnd])
+        wndproc = self.sessman.get_window_proc(hWnd)
+        if wndproc:
+            self.setup_callback(
+                wndproc,
+                (hWnd, Msg, wParam, lParam),
+                caller_argv=argv,
+                complete=lambda result: result,
+            )
+            return 0
 
-        return False
+        return 0
 
     @apihook("CallNextHookEx", argc=4)
     def CallNextHookEx(self, emu, argv, ctx: api.ApiContext = None):
@@ -1285,7 +1328,7 @@ class User32(api.ApiHandler):
         if (self.get_ptr_size() == 4 and nIndex == 0xFFFFFFFC) or (
             self.get_ptr_size() == 8 and nIndex == 0xFFFFFFFFFFFFFFFC
         ):
-            self.wndprocs[hWnd] = dwNewLong
+            self.sessman.set_window_proc(hWnd, dwNewLong)
 
         return 1
 

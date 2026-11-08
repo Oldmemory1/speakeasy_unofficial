@@ -78,10 +78,19 @@ class Window(GuiObject):
     Represents a GUI window
     """
 
-    def __init__(self, allocator: HandleAllocator, name=None, class_name=None):
+    def __init__(
+        self,
+        allocator: HandleAllocator,
+        name=None,
+        class_name=None,
+        class_atom: int | None = None,
+        wndproc: int | None = None,
+    ):
         super().__init__(allocator)
         self.name: str | None = name
         self.class_name: str | None = class_name
+        self.class_atom: int | None = class_atom
+        self.wndproc: int | None = wndproc
 
 
 class WindowClass(GuiObject):
@@ -93,6 +102,10 @@ class WindowClass(GuiObject):
         super().__init__(allocator)
         self.wclass: Any = wclass
         self.name: str = name
+
+    @property
+    def wndproc(self) -> int | None:
+        return int(self.wclass.lpfnWndProc or 0) or None
 
 
 class SessionManager:
@@ -135,19 +148,88 @@ class SessionManager:
             self.window_classes.update({class_name: wc})
         return atom
 
-    def create_window(self, window_name=None, class_name=None):
-        wc = Window(self.allocator, window_name, class_name)
-        hnd = wc.get_handle()
-        self.windows.update({hnd: wc})
+    def create_window(
+        self,
+        window_name=None,
+        class_name=None,
+        *,
+        class_atom: int | None = None,
+        wndproc: int | None = None,
+    ):
+        window_class = self.get_window_class(
+            class_atom if class_atom is not None else class_name
+        )
+        resolved_class_name = class_name
+        if window_class is not None:
+            resolved_class_name = resolved_class_name or window_class.name
+            class_atom = window_class.get_handle()
+            if wndproc is None:
+                wndproc = window_class.wndproc
+
+        window = Window(
+            self.allocator,
+            window_name,
+            resolved_class_name,
+            class_atom=class_atom,
+            wndproc=wndproc,
+        )
+        hnd = window.get_handle()
+        self.windows.update({hnd: window})
         if window_name:
-            self.windows.update({window_name: wc})
+            self.windows.update({window_name: window})
         return hnd
 
-    def get_window_class(self, atom):
-        return self.window_classes.get(atom)
+    def get_window_class(self, atom_or_name):
+        return self.window_classes.get(atom_or_name)
 
     def get_window(self, handle):
         return self.windows.get(handle)
+
+    def get_window_proc(self, handle) -> int | None:
+        window = self.get_window(handle)
+        if not isinstance(window, Window):
+            return None
+        if window.wndproc is not None:
+            return window.wndproc
+        window_class = self.get_window_class(window.class_atom)
+        if isinstance(window_class, WindowClass):
+            return window_class.wndproc
+        return None
+
+    def set_window_proc(self, handle, wndproc: int | None) -> bool:
+        window = self.get_window(handle)
+        if not isinstance(window, Window):
+            return False
+        window.wndproc = int(wndproc or 0) or None
+        return True
+
+    def destroy_window(self, handle) -> bool:
+        window = self.get_window(handle)
+        if not isinstance(window, Window):
+            return False
+
+        self.windows.pop(window.get_handle(), None)
+        for key, value in list(self.windows.items()):
+            if value is window:
+                self.windows.pop(key, None)
+        return True
+
+    def unregister_window_class(self, atom_or_name) -> bool:
+        window_class = self.get_window_class(atom_or_name)
+        if not isinstance(window_class, WindowClass):
+            return False
+        class_atom = window_class.get_handle()
+        if any(
+            isinstance(window, Window) and window.class_atom == class_atom
+            for window in set(self.windows.values())
+        ):
+            return False
+
+        self.window_classes.pop(class_atom, None)
+        for key, value in list(self.window_classes.items()):
+            if value is window_class:
+                self.window_classes.pop(key, None)
+        return True
 
     def get_device_context(self):
         return self.dev_ctx

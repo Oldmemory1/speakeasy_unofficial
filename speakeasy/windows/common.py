@@ -199,7 +199,11 @@ class _PeParser(pefile.PE):
     """
 
     def __init__(self, path=None, data=None, imp_id=IMPORT_HOOK_ADDR, imp_step=4, emu_path="", fast_load=False):
-        super().__init__(name=path, data=data, fast_load=fast_load)
+        # An explicit byte buffer must take precedence over a path. pefile
+        # otherwise reads the on-disk file and silently discards normalized
+        # in-memory headers supplied by the loader.
+        parse_path = None if data is not None else path
+        super().__init__(name=parse_path, data=data, fast_load=fast_load)
 
         if 0 == self.OPTIONAL_HEADER.ImageBase:
             self.relocate_image(DEFAULT_LOAD_ADDR)
