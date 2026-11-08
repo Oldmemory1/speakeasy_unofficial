@@ -136,4 +136,16 @@ def test_empty_queue_uses_bounded_idle_pause_without_fake_quit():
     assert _native_message(handler.messages[0]).message == user32_defs.WM_NULL
 
 
+def test_real_message_resets_idle_wakeup_budget():
+    queue = WindowsMessageQueue()
+
+    assert queue.idle_policy.allow_idle_wakeup()
+    assert not queue.idle_policy.allow_idle_wakeup()
+
+    queue.post(0x200, user32_defs.WM_NULL)
+    queue.pop()
+
+    assert queue.idle_policy.allow_idle_wakeup()
+
+
 __all__ = []

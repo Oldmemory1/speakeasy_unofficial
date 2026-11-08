@@ -220,6 +220,20 @@ def test_dispatch_message_without_window_returns_zero():
     assert handler.callback is None
 
 
+def test_dispatch_message_without_message_pointer_returns_zero():
+    manager = _manager()
+    handler = _RecordingUser32(manager)
+
+    result = handler.DispatchMessage(
+        SimpleNamespace(get_ptr_size=lambda: 4),
+        [0],
+        {"func_name": "user32.DispatchMessageA"},
+    )
+
+    assert result == 0
+    assert handler.callback is None
+
+
 def test_callback_frame_preserves_explicit_api_return_value():
     frame = ApiCallbackFrame(
         ret_addr=0x401234,
