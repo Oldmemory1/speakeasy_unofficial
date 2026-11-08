@@ -248,7 +248,7 @@ def test_int4_is_dispatched_as_integer_overflow() -> None:
     handled = WindowsEmulator._hook_interrupt(harness, None, 4)
 
     assert handled is True
-    assert harness.curr_exception_code == 0xC0000144
+    assert harness.curr_exception_code == 0xC0000095
     assert harness.prev_pc == 0x401236
     assert harness.code_hook_enabled == 1
     assert harness.run_complete_calls == 0
