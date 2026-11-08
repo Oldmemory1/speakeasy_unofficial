@@ -303,7 +303,8 @@ class Speakeasy:
         if path and not os.path.exists(path):
             raise SpeakeasyError(f"Target file not found: {path}")
 
-        if data:
+        original_data = data
+        if data is not None:
             target_data = bytes(data)
         else:
             assert path is not None
@@ -329,16 +330,18 @@ class Speakeasy:
                 normalization.normalized_machine,
                 normalization.reason,
             )
-            target_data = normalization.image
+            emulator_data = normalization.image
+        else:
+            emulator_data = original_data
 
         if path:
             self._auto_mount_target_directory(path)
 
-        self._init_emulator(path=path, data=target_data)
+        self._init_emulator(path=path, data=emulator_data)
 
         return self.emu.load_module(  # type: ignore[union-attr]
             path=path,
-            data=target_data,
+            data=emulator_data,
             filename=filename,
         )
 

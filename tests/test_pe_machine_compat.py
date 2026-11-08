@@ -12,6 +12,41 @@ from speakeasy.windows.pe_compat import (
 )
 
 
+class _LoadBoundaryEmulator:
+    """Capture the final byte buffer passed from the Speakeasy load boundary."""
+
+    def __init__(self) -> None:
+        self.path = None
+        self.data = None
+
+    def load_module(self, *, path, data, filename):
+        del filename
+        self.path = path
+        self.data = data
+        return self
+
+
+class _LoadBoundaryHarness:
+    """Exercise ``Speakeasy.load_module`` without constructing an engine."""
+
+    def __init__(self) -> None:
+        self.loaded_bins = []
+        self.pe_machine_normalization = None
+        self.init_data = None
+        self.emu = _LoadBoundaryEmulator()
+
+    def is_pe(self, data: bytes) -> bool:
+        del data
+        return True
+
+    def _auto_mount_target_directory(self, path: str) -> None:
+        del path
+
+    def _init_emulator(self, *, path=None, data=None) -> None:
+        del path
+        self.init_data = data
+
+
 def _image_with_zero_machine(image: bytes) -> bytes:
     pe_offset = int.from_bytes(image[0x3C:0x40], "little")
     patched = bytearray(image)
@@ -69,6 +104,38 @@ def test_zero_machine_with_invalid_optional_header_is_rejected(load_test_bin):
 
     with pytest.raises(InvalidZeroMachineError, match="optional-header magic"):
         normalize_zero_machine(bytes(image))
+
+
+def test_normal_path_load_keeps_original_loader_arguments(
+    load_test_bin,
+    tmp_path,
+):
+    sample = tmp_path / "normal-machine.exe"
+    sample.write_bytes(load_test_bin("argv_test_x86.exe.xz"))
+    harness = _LoadBoundaryHarness()
+
+    Speakeasy.load_module(harness, str(sample))
+
+    assert harness.init_data is None
+    assert harness.emu.path == str(sample)
+    assert harness.emu.data is None
+
+
+def test_zero_machine_path_load_passes_normalized_bytes_only_to_emulator(
+    load_test_bin,
+    tmp_path,
+):
+    image = _image_with_zero_machine(load_test_bin("argv_test_x86.exe.xz"))
+    sample = tmp_path / "normalized-machine.exe"
+    sample.write_bytes(image)
+    harness = _LoadBoundaryHarness()
+
+    Speakeasy.load_module(harness, str(sample))
+
+    assert harness.init_data is not None
+    assert harness.emu.data == harness.init_data
+    assert harness.emu.data != image
+    assert sample.read_bytes() == image
 
 
 def test_speakeasy_loads_zero_machine_without_modifying_disk(
