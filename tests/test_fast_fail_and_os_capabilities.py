@@ -283,6 +283,25 @@ def test_into_without_overflow_continues_after_interrupt() -> None:
     assert harness.curr_run.error is None
 
 
+def test_into_without_overflow_continues_without_seh() -> None:
+    harness = _InterruptHarness(
+        bits=arch.ARCH_X86,
+        fast_fail_code=0,
+        fast_fail_data=0,
+        exception_list=0,
+        previous_opcode=b"\xCE\x90",
+        eflags=0x202,
+    )
+
+    handled = WindowsEmulator._hook_interrupt(harness, None, 4)
+
+    assert handled is True
+    assert harness.curr_exception_code == 0
+    assert harness.code_hook_enabled == 0
+    assert harness.run_complete_calls == 0
+    assert harness.curr_run.error is None
+
+
 def test_into_with_overflow_dispatches_integer_overflow() -> None:
     harness = _InterruptHarness(
         bits=arch.ARCH_X86,
