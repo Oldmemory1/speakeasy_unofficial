@@ -8,6 +8,7 @@ import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.nt.ntoskrnl as ntoskrnl
 import speakeasy.winenv.defs.windows.windows as windef
+from speakeasy.windows.gui_messages import WindowsMessageQueue
 
 
 class HandleAllocator:
@@ -431,7 +432,7 @@ class Thread(KernelObject):
         self.teb: TEB | None = None
         self.seh: SEH = SEH()
         self.tls: list[int] = []
-        self.message_queue: list[Any] = []
+        self.message_queue: WindowsMessageQueue = WindowsMessageQueue()
         self.ctx: Any = self.emu.get_thread_context()
         self.fls: list[int] = []
         self.suspend_count: int = 0

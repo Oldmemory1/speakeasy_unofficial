@@ -122,6 +122,42 @@ def test_wm_create_failure_destroys_window_and_returns_null():
     assert manager.get_window(hwnd) is None
 
 
+def test_send_message_dispatches_window_proc_and_preserves_lresult():
+    manager = _manager()
+    atom = manager.create_window_class(
+        SimpleNamespace(lpfnWndProc=0x401000),
+        "MainWindow",
+    )
+    hwnd = manager.create_window(class_atom=atom)
+    handler = _RecordingUser32(manager)
+
+    result = handler.SendMessage(
+        None,
+        [hwnd, 0x0111, 0x37, 0x1234],
+        {"func_name": "user32.SendMessageA"},
+    )
+
+    assert result == 0
+    assert handler.callback is not None
+    assert handler.callback["func"] == 0x401000
+    assert handler.callback["args"] == (hwnd, 0x0111, 0x37, 0x1234)
+    assert handler.callback["complete"](0xCAFE) == 0xCAFE
+
+
+def test_send_message_without_window_proc_returns_zero():
+    manager = _manager()
+    handler = _RecordingUser32(manager)
+
+    result = handler.SendMessage(
+        None,
+        [0xDEAD, 0x0111, 0, 0],
+        {"func_name": "user32.SendMessageA"},
+    )
+
+    assert result == 0
+    assert handler.callback is None
+
+
 def test_callback_frame_preserves_explicit_api_return_value():
     frame = ApiCallbackFrame(
         ret_addr=0x401234,

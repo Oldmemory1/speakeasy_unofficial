@@ -7,6 +7,7 @@ import speakeasy.windows.sessman as sessman
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.windows.user32 as windefs
 import speakeasy.winenv.defs.windows.windef as windef
+from speakeasy.windows.gui_messages import QueuedWindowMessage
 
 from .. import api
 
@@ -611,7 +612,10 @@ class User32(api.ApiHandler):
             int nExitCode
         );
         """
-        return
+        (exit_code,) = argv
+        thread = emu.get_current_thread()
+        if thread is not None:
+            thread.message_queue.post_quit(exit_code)
 
     @apihook("DestroyWindow", argc=1)
     def DestroyWindow(self, emu, argv, ctx: api.ApiContext = None):
@@ -1069,34 +1073,37 @@ class User32(api.ApiHandler):
         """
         lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax = argv
 
-        t = emu.get_current_thread()
-        msg = None
-
-        try:
-            msg = t.message_queue.pop(0)
-        except IndexError:
+        thread = emu.get_current_thread()
+        queued = thread.message_queue.pop(
+            hwnd=hWnd,
+            message_min=wMsgFilterMin,
+            message_max=wMsgFilterMax,
+        )
+        if queued is None:
             if self.timer_count > 0:
-                msg = windefs.MSG(emu.get_ptr_size())
-                msg.hwnd = hWnd
-                msg.message = windefs.WM_TIMER
+                queued = QueuedWindowMessage(hwnd=hWnd, message=windefs.WM_TIMER)
             else:
                 synthetic = self.emit_synthetic_keyboard_hook_event(emu, argv)
-                if synthetic is None:
-                    return False
-                if lpMsg:
+                if synthetic is not None:
                     wparam, vkey = synthetic
-                    msg = windefs.MSG(emu.get_ptr_size())
-                    msg.hwnd = hWnd
-                    msg.message = wparam
-                    msg.wParam = vkey
-                    msg.lParam = 0
+                    queued = QueuedWindowMessage(
+                        hwnd=hWnd,
+                        message=wparam,
+                        wparam=vkey,
+                    )
                 else:
-                    return True
+                    # GetMessage blocks in Win32 when the queue is empty. The
+                    # emulator cannot block inside an API handler, so expose an
+                    # explicit idle wakeup instead of falsely reporting WM_QUIT.
+                    queued = QueuedWindowMessage(
+                        hwnd=hWnd,
+                        message=windefs.WM_NULL,
+                    )
 
         if lpMsg:
-            self.mem_write(lpMsg, msg.get_bytes())
+            self.mem_write(lpMsg, queued.to_native(emu.get_ptr_size()).get_bytes())
 
-        return True
+        return queued.message != windefs.WM_QUIT
 
     @apihook("TranslateMessage", argc=1)
     def TranslateMessage(self, emu, argv, ctx: api.ApiContext = None):
