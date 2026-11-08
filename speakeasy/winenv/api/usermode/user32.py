@@ -1092,9 +1092,16 @@ class User32(api.ApiHandler):
                         wparam=vkey,
                     )
                 else:
-                    # GetMessage blocks in Win32 when the queue is empty. The
-                    # emulator cannot block inside an API handler, so expose an
-                    # explicit idle wakeup instead of falsely reporting WM_QUIT.
+                    if not thread.message_queue.idle_policy.allow_idle_wakeup():
+                        error = emu.get_error_info(
+                            "gui_message_wait",
+                            emu.get_pc(),
+                        )
+                        emu.curr_run.error = error
+                        emu.on_run_complete()
+                        return True
+                    # GetMessage blocks in Win32 when the queue is empty. Expose
+                    # one bounded idle wakeup without falsely reporting WM_QUIT.
                     queued = QueuedWindowMessage(
                         hwnd=hWnd,
                         message=windefs.WM_NULL,
@@ -1123,8 +1130,21 @@ class User32(api.ApiHandler):
         """
         (lpMsg,) = argv
 
-        msg = windefs.MSG(emu.get_ptr_size())
+        if not lpMsg:
+            return 0
+
+        msg = windefs.MSG(self.get_ptr_size())
         msg = self.mem_cast(msg, lpMsg)
+
+        if msg.hwnd:
+            wndproc = self.sessman.get_window_proc(msg.hwnd)
+            if wndproc:
+                self.setup_callback(
+                    wndproc,
+                    (msg.hwnd, msg.message, msg.wParam, msg.lParam),
+                    caller_argv=argv,
+                    complete=lambda result: result,
+                )
 
         return 0
 

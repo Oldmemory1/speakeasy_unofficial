@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from speakeasy.windows.gui_messages import WindowsMessageQueue
 from speakeasy.winenv.api.usermode.user32 import User32
 from speakeasy.winenv.defs.windows import user32 as user32_defs
@@ -13,12 +15,23 @@ class _Thread:
 class _Emulator:
     def __init__(self) -> None:
         self.thread = _Thread()
+        self.curr_run = SimpleNamespace(error=None)
+        self.run_complete_calls = 0
 
     def get_current_thread(self) -> _Thread:
         return self.thread
 
     def get_ptr_size(self) -> int:
         return 4
+
+    def get_pc(self) -> int:
+        return 0xFEEDF010
+
+    def get_error_info(self, error_type: str, address: int):
+        return SimpleNamespace(type=error_type, pc=address)
+
+    def on_run_complete(self) -> None:
+        self.run_complete_calls += 1
 
 
 class _MessageUser32(User32):
@@ -98,6 +111,29 @@ def test_non_quit_message_returns_true():
     assert record.message == user32_defs.WM_CREATE
     assert record.wParam == 1
     assert record.lParam == 2
+
+
+def test_empty_queue_uses_bounded_idle_pause_without_fake_quit():
+    emu = _Emulator()
+    handler = _MessageUser32()
+
+    first_result = handler.GetMessage(
+        emu,
+        [0x1000, 0, 0, 0],
+        {"func_name": "user32.GetMessageA"},
+    )
+    second_result = handler.GetMessage(
+        emu,
+        [0x1000, 0, 0, 0],
+        {"func_name": "user32.GetMessageA"},
+    )
+
+    assert first_result is True
+    assert second_result is True
+    assert emu.run_complete_calls == 1
+    assert emu.curr_run.error.type == "gui_message_wait"
+    assert len(handler.messages) == 1
+    assert _native_message(handler.messages[0]).message == user32_defs.WM_NULL
 
 
 __all__ = []

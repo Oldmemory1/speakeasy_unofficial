@@ -57,7 +57,9 @@ def test_window_proc_override_and_destruction_are_explicit():
 class _RecordingUser32(User32):
     def __init__(self, manager: SessionManager) -> None:
         self.sessman = manager
+        self.ptr_size = 4
         self.callback = None
+        self.message = None
 
     def setup_callback(
         self,
@@ -75,6 +77,10 @@ class _RecordingUser32(User32):
             "return_value": return_value,
             "complete": complete,
         }
+
+    def mem_cast(self, msg, address):
+        assert address == 0x5000
+        return self.message
 
 
 def test_create_window_dispatches_wm_create_with_window_identity():
@@ -152,6 +158,62 @@ def test_send_message_without_window_proc_returns_zero():
         None,
         [0xDEAD, 0x0111, 0, 0],
         {"func_name": "user32.SendMessageA"},
+    )
+
+    assert result == 0
+    assert handler.callback is None
+
+
+def test_dispatch_message_calls_bound_window_proc_and_preserves_lresult():
+    manager = _manager()
+    atom = manager.create_window_class(
+        SimpleNamespace(lpfnWndProc=0x401000),
+        "MainWindow",
+    )
+    hwnd = manager.create_window(class_atom=atom)
+    handler = _RecordingUser32(manager)
+    handler.message = SimpleNamespace(
+        hwnd=hwnd,
+        message=0x0111,
+        wParam=0x37,
+        lParam=0x1234,
+    )
+
+    emu = SimpleNamespace(get_ptr_size=lambda: 4)
+    result = handler.DispatchMessage(
+        emu,
+        [0x5000],
+        {"func_name": "user32.DispatchMessageA"},
+    )
+
+    assert result == 0
+    assert handler.callback is not None
+    assert handler.callback["func"] == 0x401000
+    assert handler.callback["args"] == (
+        hwnd,
+        0x0111,
+        0x37,
+        0x1234,
+    )
+    assert handler.callback["caller_argv"] == (0x5000,)
+    assert handler.callback["complete"](0xCAFE) == 0xCAFE
+
+
+def test_dispatch_message_without_window_returns_zero():
+    manager = _manager()
+    handler = _RecordingUser32(manager)
+    handler.message = SimpleNamespace(
+        hwnd=0xDEAD,
+        message=0x0111,
+        wParam=0,
+        lParam=0,
+    )
+
+    emu = SimpleNamespace(get_ptr_size=lambda: 4)
+    result = handler.DispatchMessage(
+        emu,
+        [0x5000],
+        {"func_name": "user32.DispatchMessageA"},
     )
 
     assert result == 0

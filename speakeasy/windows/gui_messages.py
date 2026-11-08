@@ -9,6 +9,29 @@ from typing import Any
 from speakeasy.winenv.defs.windows import user32 as user32_defs
 
 
+@dataclass
+class GuiIdlePolicy:
+    """Bound empty ``GetMessage`` wakeups without treating them as ``WM_QUIT``."""
+
+    max_idle_wakeups: int = 1
+    idle_wakeups: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_idle_wakeups < 0:
+            raise ValueError("max_idle_wakeups must be non-negative")
+
+    def allow_idle_wakeup(self) -> bool:
+        """Return whether another synthetic idle wakeup is permitted."""
+        if self.idle_wakeups >= self.max_idle_wakeups:
+            return False
+        self.idle_wakeups += 1
+        return True
+
+    def reset(self) -> None:
+        """Reset idle accounting after a real message is delivered."""
+        self.idle_wakeups = 0
+
+
 @dataclass(frozen=True)
 class QueuedWindowMessage:
     """One message waiting in an emulated thread's GUI queue."""
@@ -53,6 +76,7 @@ class WindowsMessageQueue:
 
     def __init__(self) -> None:
         self._messages: deque[QueuedWindowMessage] = deque()
+        self.idle_policy = GuiIdlePolicy()
 
     def __len__(self) -> int:
         return len(self._messages)
@@ -117,6 +141,8 @@ class WindowsMessageQueue:
             return None
 
         if index == 0:
-            return self._messages.popleft()
-        del self._messages[index]
+            queued = self._messages.popleft()
+        else:
+            del self._messages[index]
+        self.idle_policy.reset()
         return queued

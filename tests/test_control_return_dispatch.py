@@ -123,7 +123,7 @@ def test_nested_api_callbacks_complete_in_lifo_order():
         ),
         (
             "7379271c71866d3dd42ce6c25a1c97701330ae12f56e4674bd17f86010aa3592",
-            "max_api_count",
+            "gui_message_wait",
         ),
     ],
 )
@@ -137,8 +137,7 @@ def test_control_return_samples_reach_expected_terminal_state(
 
     The second sample enters a real GUI idle message loop. It must no longer
     be reported as normal merely because ``GetMessage`` observed an empty
-    queue; without a host idle scheduler, the API limit is the current bounded
-    terminal state.
+    queue; it must stop in an explicit bounded GUI wait state.
     """
 
     sample_dir = (
