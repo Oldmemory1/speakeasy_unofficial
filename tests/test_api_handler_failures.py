@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.windows.iphlpapi as iphlpapi_types
+import speakeasy.winenv.defs.windows.windows as windefs
 import speakeasy.winenv.defs.winsock.ws2_32 as ws2_types
 from speakeasy.config import NetworkAdapterConfig
 from speakeasy.winenv.api.api import ApiHandler
@@ -184,3 +185,89 @@ def test_nt_query_system_information_returns_status_for_unknown_class() -> None:
     assert Ntoskrnl.ZwQuerySystemInformation(handler, emu, [0x86, 0x4000, 0x100, 0x3000]) == (
         ddk.STATUS_INVALID_INFO_CLASS
     )
+
+
+class _StdHandleEmu:
+    """Emulator double for WriteFile std-handle semantics."""
+
+    def __init__(self) -> None:
+        self.ptr_size = 8
+        self.last_error = None
+        self.memory: dict[int, int] = {}
+        self.ranges: list[tuple[int, int]] = []
+        self.stdout = 0xF005
+        self.stderr = 0xF006
+
+    def alloc(self, address: int, size: int) -> None:
+        self.ranges.append((address, address + size))
+
+    def _in_range(self, address: int, size: int) -> bool:
+        return any(start <= address and address + size <= end for start, end in self.ranges)
+
+    def get_ptr_size(self) -> int:
+        return self.ptr_size
+
+    def is_address_valid(self, address: int) -> bool:
+        return self._in_range(address, 1)
+
+    def mem_read(self, address: int, size: int) -> bytes:
+        if not self._in_range(address, size):
+            raise ValueError("invalid read")
+        return bytes(self.memory.get(address + i, 0) for i in range(size))
+
+    def mem_write(self, address: int, data: bytes) -> None:
+        if not self._in_range(address, len(data)):
+            raise ValueError("invalid write")
+        for offset, value in enumerate(data):
+            self.memory[address + offset] = value
+
+    def set_last_error(self, value: int) -> None:
+        self.last_error = value
+
+    def get_address_map(self, _address: int):
+        return None
+
+    def get_current_process(self):
+        return SimpleNamespace(
+            get_std_handle=lambda dev: {
+                0xFFFFFFF5: self.stdout,
+                0xFFFFFFF4: self.stderr,
+            }.get(dev, 0)
+        )
+
+    def file_get(self, _handle: int):
+        return None
+
+    def pipe_get(self, _handle: int):
+        return None
+
+
+def test_write_file_stderr_writes_bytes_written_and_succeeds() -> None:
+    handler = Kernel32.__new__(Kernel32)
+    emu = _StdHandleEmu()
+    handler.emu = emu
+    emu.alloc(0x2000, 8)
+    emu.alloc(0x3000, 4)
+    for offset, value in enumerate(b"abc"):
+        emu.memory[0x2000 + offset] = value
+
+    result = Kernel32.WriteFile(handler, emu, [emu.stderr, 0x2000, 3, 0x3000, 0])
+
+    assert result == 1
+    assert int.from_bytes(emu.mem_read(0x3000, 4), "little") == 3
+    assert emu.last_error == windefs.ERROR_SUCCESS
+
+
+def test_write_file_invalid_handle_still_fails() -> None:
+    handler = Kernel32.__new__(Kernel32)
+    emu = _StdHandleEmu()
+    handler.emu = emu
+    emu.alloc(0x2000, 8)
+    emu.alloc(0x3000, 4)
+    emu.memory[0x2000] = 0x41
+
+    result = Kernel32.WriteFile(handler, emu, [0xDEAD, 0x2000, 1, 0x3000, 0])
+
+    assert result == 0
+    assert int.from_bytes(emu.mem_read(0x3000, 4), "little") == 0
+    assert emu.last_error == windefs.ERROR_INVALID_HANDLE

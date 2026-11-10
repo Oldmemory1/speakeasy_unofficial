@@ -53,6 +53,79 @@ FILE_BEGIN = 0
 FILE_CURRENT = 1
 FILE_END = 2
 
+# CRITICAL_SECTION contract (winnt.h RTL_CRITICAL_SECTION). LockCount == -1
+# means the structure is unlocked. SpinCount is ULONG_PTR sized.
+CRITICAL_SECTION_UNLOCKED = -1
+_CRITICAL_SECTION_LAYOUTS = {
+    4: {
+        "debug_info": 0x00,
+        "lock_count": 0x04,
+        "recursion_count": 0x08,
+        "owning_thread": 0x0C,
+        "lock_semaphore": 0x10,
+        "spin_count": 0x14,
+        "size": 0x18,
+    },
+    8: {
+        "debug_info": 0x00,
+        "lock_count": 0x08,
+        "recursion_count": 0x0C,
+        "owning_thread": 0x10,
+        "lock_semaphore": 0x18,
+        "spin_count": 0x20,
+        "size": 0x28,
+    },
+}
+
+# FormatMessage flags documented in winbase.h.
+FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100
+FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200
+FORMAT_MESSAGE_FROM_STRING = 0x00000400
+FORMAT_MESSAGE_FROM_HMODULE = 0x00000800
+FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000
+FORMAT_MESSAGE_ARGUMENT_ARRAY = 0x00002000
+ERROR_MR_UNKNOWN = 317
+
+# Minimal English system-message table. Message id 0 is the error code the
+# PyInstaller bootloader reads through GetLastError() on its error-printing
+# path; Windows defines it and FormatMessageW must succeed for it.
+_FORMAT_MESSAGE_TEXTS = {
+    0: "The operation completed successfully.\r\n",
+    1: "Incorrect function.\r\n",
+    2: "The system cannot find the file specified.\r\n",
+    3: "The system cannot find the path specified.\r\n",
+    5: "Access is denied.\r\n",
+    6: "The handle is invalid.\r\n",
+    8: "Not enough memory resources are available to process this command.\r\n",
+    13: "The data is invalid.\r\n",
+    14: "Not enough memory resources are available to complete this operation.\r\n",
+    18: "There are no more files.\r\n",
+    87: "The parameter is incorrect.\r\n",
+    109: "The pipe has been ended.\r\n",
+    122: "The data area passed to a system call is too small.\r\n",
+    126: "The specified module could not be found.\r\n",
+    127: "The specified procedure could not be found.\r\n",
+    183: "Cannot create a file when that file already exists.\r\n",
+    193: "%1 is not a valid Win32 application.\r\n",
+    998: "Invalid access to memory location.\r\n",
+    1400: "Invalid window handle.\r\n",
+}
+
+
+def _critical_section_layout(ptr_size: int) -> dict[str, int]:
+    """Return the documented CRITICAL_SECTION field offsets for ``ptr_size``."""
+    layout = _CRITICAL_SECTION_LAYOUTS.get(ptr_size)
+    if layout is None:
+        raise ApiEmuError(f"Unsupported CRITICAL_SECTION pointer size: {ptr_size}")
+    return layout
+
+
+def _pack_unsigned(value: int, size: int) -> bytes:
+    """Encode ``value`` as an unsigned little-endian integer of ``size`` bytes."""
+    mask = (1 << (size * 8)) - 1
+    return (int(value) & mask).to_bytes(size, "little")
+
+
 _WINE_EXEC_ERROR_BAD_FORMAT = 11
 
 
@@ -2667,6 +2740,88 @@ class Kernel32(api.ApiHandler):
 
         return rv
 
+    def _read_critical_section(self, emu, address):
+        """Read a guest CRITICAL_SECTION, or return None when unreadable."""
+        if not address:
+            return None
+        ptr_size = emu.get_ptr_size()
+        layout = _critical_section_layout(ptr_size)
+        try:
+            raw = self.mem_read(address, layout["size"])
+        except Exception:
+            return None
+
+        def _unsigned(offset, size):
+            return int.from_bytes(raw[offset : offset + size], "little")
+
+        return {
+            "debug_info": _unsigned(layout["debug_info"], ptr_size),
+            "lock_count": int.from_bytes(
+                raw[layout["lock_count"] : layout["lock_count"] + 4],
+                "little",
+                signed=True,
+            ),
+            "recursion_count": int.from_bytes(
+                raw[layout["recursion_count"] : layout["recursion_count"] + 4],
+                "little",
+                signed=True,
+            ),
+            "owning_thread": _unsigned(layout["owning_thread"], ptr_size),
+            "lock_semaphore": _unsigned(layout["lock_semaphore"], ptr_size),
+            "spin_count": _unsigned(layout["spin_count"], ptr_size),
+        }
+
+    def _write_critical_section(self, emu, address, state) -> bool:
+        """Write a guest CRITICAL_SECTION; return False when unmapped."""
+        if not address:
+            return False
+        ptr_size = emu.get_ptr_size()
+        layout = _critical_section_layout(ptr_size)
+        data = bytearray(layout["size"])
+        data[layout["debug_info"] : layout["debug_info"] + ptr_size] = _pack_unsigned(
+            state["debug_info"], ptr_size
+        )
+        data[layout["lock_count"] : layout["lock_count"] + 4] = int(
+            state["lock_count"]
+        ).to_bytes(4, "little", signed=True)
+        data[
+            layout["recursion_count"] : layout["recursion_count"] + 4
+        ] = int(state["recursion_count"]).to_bytes(4, "little", signed=True)
+        data[
+            layout["owning_thread"] : layout["owning_thread"] + ptr_size
+        ] = _pack_unsigned(state["owning_thread"], ptr_size)
+        data[
+            layout["lock_semaphore"] : layout["lock_semaphore"] + ptr_size
+        ] = _pack_unsigned(state["lock_semaphore"], ptr_size)
+        data[layout["spin_count"] : layout["spin_count"] + ptr_size] = _pack_unsigned(
+            state["spin_count"], ptr_size
+        )
+        try:
+            self.mem_write(address, bytes(data))
+        except Exception:
+            return False
+        return True
+
+    def _initialize_critical_section(self, emu, address, spin_count: int) -> bool:
+        """Install the documented initialized CRITICAL_SECTION layout."""
+        return self._write_critical_section(
+            emu,
+            address,
+            {
+                "debug_info": 0,
+                "lock_count": CRITICAL_SECTION_UNLOCKED,
+                "recursion_count": 0,
+                "owning_thread": 0,
+                "lock_semaphore": 0,
+                "spin_count": spin_count & 0xFFFFFFFF,
+            },
+        )
+
+    @staticmethod
+    def _current_thread_id(emu) -> int:
+        thread = emu.get_current_thread() if hasattr(emu, "get_current_thread") else None
+        return int(getattr(thread, "tid", 0) or 0)
+
     @apihook("InitializeCriticalSectionAndSpinCount", argc=2)
     def InitializeCriticalSectionAndSpinCount(self, emu, argv, ctx: api.ApiContext = None):
         """
@@ -2677,9 +2832,12 @@ class Kernel32(api.ApiHandler):
         """
 
         lpCriticalSection, dwSpinCount = argv
-        rv = 1
-
-        return rv
+        ok = self._initialize_critical_section(emu, lpCriticalSection, int(dwSpinCount))
+        if not ok:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return 1
 
     @apihook("EnterCriticalSection", argc=1)
     def EnterCriticalSection(self, emu, argv, ctx: api.ApiContext = None):
@@ -2689,7 +2847,54 @@ class Kernel32(api.ApiHandler):
         );
         """
 
-        return
+        (lpCriticalSection,) = argv
+        state = self._read_critical_section(emu, lpCriticalSection)
+        if state is None:
+            return
+
+        tid = self._current_thread_id(emu)
+        if state["lock_count"] == CRITICAL_SECTION_UNLOCKED:
+            state["owning_thread"] = tid
+            state["recursion_count"] = 1
+            state["lock_count"] = 0
+        elif state["owning_thread"] == tid:
+            state["recursion_count"] += 1
+            state["lock_count"] += 1
+        else:
+            # A single-step emulator cannot block the current thread until the
+            # owner releases. Never grant mutual exclusion silently.
+            raise ApiEmuError(
+                "EnterCriticalSection cannot block on a lock owned by another "
+                "thread in the emulator"
+            )
+        self._write_critical_section(emu, lpCriticalSection, state)
+
+    @apihook("TryEnterCriticalSection", argc=1)
+    def TryEnterCriticalSection(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        BOOL TryEnterCriticalSection(
+          LPCRITICAL_SECTION lpCriticalSection
+        );
+        """
+
+        (lpCriticalSection,) = argv
+        state = self._read_critical_section(emu, lpCriticalSection)
+        if state is None:
+            return False
+
+        tid = self._current_thread_id(emu)
+        if state["lock_count"] == CRITICAL_SECTION_UNLOCKED:
+            state["owning_thread"] = tid
+            state["recursion_count"] = 1
+            state["lock_count"] = 0
+        elif state["owning_thread"] == tid:
+            state["recursion_count"] += 1
+            state["lock_count"] += 1
+        else:
+            return False
+        if not self._write_critical_section(emu, lpCriticalSection, state):
+            return False
+        return True
 
     @apihook("LeaveCriticalSection", argc=1)
     def LeaveCriticalSection(self, emu, argv, ctx: api.ApiContext = None):
@@ -2699,7 +2904,24 @@ class Kernel32(api.ApiHandler):
         );
         """
 
-        return
+        (lpCriticalSection,) = argv
+        state = self._read_critical_section(emu, lpCriticalSection)
+        if state is None:
+            return
+
+        tid = self._current_thread_id(emu)
+        if state["owning_thread"] != tid or state["recursion_count"] <= 0:
+            # Leave by a non-owner is a guest error with undefined Windows
+            # behaviour; keep a conservative no-op instead of corrupting state.
+            return
+
+        state["recursion_count"] -= 1
+        if state["recursion_count"] > 0:
+            state["lock_count"] -= 1
+        else:
+            state["lock_count"] = CRITICAL_SECTION_UNLOCKED
+            state["owning_thread"] = 0
+        self._write_critical_section(emu, lpCriticalSection, state)
 
     @apihook("InterlockedIncrement", argc=1)
     def InterlockedIncrement(self, emu, argv, ctx: api.ApiContext = None):
@@ -2976,6 +3198,92 @@ class Kernel32(api.ApiHandler):
         hnd = proc.get_std_handle(nStdHandle)
 
         return hnd
+
+    def _format_message(self, emu, argv, wide: bool) -> int:
+        """Shared FormatMessageA/W implementation for system messages.
+
+        Only FORMAT_MESSAGE_FROM_SYSTEM with an explicit caller buffer is
+        modelled. Message ids outside the small documented table fail with
+        ERROR_MR_UNKNOWN, matching FormatMessage's "message not found"
+        contract. The PyInstaller bootstrap path formats message id 0, which
+        Windows defines, so returning that message breaks its error-printing
+        recursion. ALLOCATE_BUFFER, module/string sources and insert
+        formatting remain unsupported and keep the previous failure result.
+        """
+
+        (
+            dwFlags,
+            _lpSource,
+            dwMessageId,
+            _dwLanguageId,
+            lpBuffer,
+            nSize,
+            _arguments,
+        ) = argv
+
+        if not dwFlags & FORMAT_MESSAGE_FROM_SYSTEM:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        if dwFlags & (
+            FORMAT_MESSAGE_ALLOCATE_BUFFER
+            | FORMAT_MESSAGE_FROM_STRING
+            | FORMAT_MESSAGE_FROM_HMODULE
+        ):
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        if not lpBuffer or nSize <= 0:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        text = _FORMAT_MESSAGE_TEXTS.get(int(dwMessageId))
+        if text is None:
+            emu.set_last_error(ERROR_MR_UNKNOWN)
+            return 0
+
+        unit = 2 if wide else 1
+        encoded = text.encode("utf-16le") if wide else text.encode("ascii", "replace")
+        max_chars = max(0, int(nSize) - 1)
+        truncated = encoded[: max_chars * unit]
+        try:
+            self.mem_write(lpBuffer, truncated + (b"\x00" * unit))
+        except Exception:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return len(truncated) // unit
+
+    @apihook("FormatMessageW", argc=7)
+    def FormatMessageW(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        DWORD FormatMessageW(
+          DWORD   dwFlags,
+          LPCVOID lpSource,
+          DWORD   dwMessageId,
+          DWORD   dwLanguageId,
+          LPWSTR  lpBuffer,
+          DWORD   nSize,
+          va_list *Arguments
+        );
+        """
+
+        return self._format_message(emu, argv, wide=True)
+
+    @apihook("FormatMessageA", argc=7)
+    def FormatMessageA(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        DWORD FormatMessageA(
+          DWORD   dwFlags,
+          LPCVOID lpSource,
+          DWORD   dwMessageId,
+          DWORD   dwLanguageId,
+          LPSTR   lpBuffer,
+          DWORD   nSize,
+          va_list *Arguments
+        );
+        """
+
+        return self._format_message(emu, argv, wide=False)
 
     @apihook("GetFileType", argc=1)
     def GetFileType(self, emu, argv, ctx: api.ApiContext = None):
@@ -4564,6 +4872,19 @@ class Kernel32(api.ApiHandler):
         );
         """
 
+        (lpCriticalSection,) = argv
+        self._write_critical_section(
+            emu,
+            lpCriticalSection,
+            {
+                "debug_info": 0,
+                "lock_count": 0,
+                "recursion_count": 0,
+                "owning_thread": 0,
+                "lock_semaphore": 0,
+                "spin_count": 0,
+            },
+        )
         return None
 
     @apihook("FlsFree", argc=1)
@@ -4619,6 +4940,11 @@ class Kernel32(api.ApiHandler):
         );
         """
 
+        lpCriticalSection, dwSpinCount, _flags = argv
+        ok = self._initialize_critical_section(emu, lpCriticalSection, int(dwSpinCount))
+        if not ok:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return False
         emu.set_last_error(windefs.ERROR_SUCCESS)
         return True
 
@@ -4630,6 +4956,8 @@ class Kernel32(api.ApiHandler):
         );
         """
 
+        (lpCriticalSection,) = argv
+        self._initialize_critical_section(emu, lpCriticalSection, 0)
         emu.set_last_error(windefs.ERROR_SUCCESS)
         return None
 
