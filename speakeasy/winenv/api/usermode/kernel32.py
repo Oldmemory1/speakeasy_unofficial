@@ -49,6 +49,10 @@ FILE_MAP_READ = 0x0004
 FILE_MAP_EXECUTE = 0x0020
 FILE_MAP_ALL_ACCESS = 0xF001F
 
+FILE_BEGIN = 0
+FILE_CURRENT = 1
+FILE_END = 2
+
 _WINE_EXEC_ERROR_BAD_FORMAT = 11
 
 
@@ -4130,18 +4134,63 @@ class Kernel32(api.ApiHandler):
           PLONG  lpDistanceToMoveHigh,
           DWORD  dwMoveMethod
         );
+
+        ``lDistanceToMove`` is a signed 32-bit ``LONG``. If
+        ``lpDistanceToMoveHigh`` is non-NULL, the two 32-bit halves form a
+        signed 64-bit distance; otherwise only the signed low 32 bits are
+        used. The return value is the low 32 bits of the new file pointer and
+        the high 32 bits are written back through ``lpDistanceToMoveHigh``
+        when that pointer is non-NULL. A negative resulting position fails
+        with ``ERROR_NEGATIVE_SEEK`` without moving the file pointer.
         """
         hFile, lDistanceToMove, lpDistanceToMoveHigh, dwMoveMethod = argv
-        rv = 0
 
         f = self.file_get(hFile)
-        if f:
-            # TODO add high offset, log access?
-            f.seek(lDistanceToMove, dwMoveMethod)
-            rv = f.tell()
-            emu.set_last_error(windefs.ERROR_SUCCESS)
+        if not f:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return windefs.INVALID_SET_FILE_POINTER
 
-        return rv
+        low = lDistanceToMove & 0xFFFFFFFF
+        if lpDistanceToMoveHigh:
+            high = int.from_bytes(self.mem_read(lpDistanceToMoveHigh, 4), "little")
+            distance = (high << 32) | low
+            if distance & (1 << 63):
+                distance -= 1 << 64
+        else:
+            distance = low - (1 << 32) if low & 0x80000000 else low
+
+        if dwMoveMethod == FILE_BEGIN:
+            base = 0
+        elif dwMoveMethod == FILE_CURRENT:
+            base = f.tell()
+        elif dwMoveMethod == FILE_END:
+            base = f.get_size()
+        else:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return windefs.INVALID_SET_FILE_POINTER
+
+        if base is None:
+            # Lazy file contents have not been materialized yet.
+            f.get_size()
+            base = f.tell()
+            if base is None:
+                base = 0
+
+        new_position = base + distance
+        if new_position < 0:
+            emu.set_last_error(windefs.ERROR_NEGATIVE_SEEK)
+            return windefs.INVALID_SET_FILE_POINTER
+
+        f.seek(new_position, FILE_BEGIN)
+        new_position = f.tell()
+        if new_position is None:
+            new_position = 0
+
+        if lpDistanceToMoveHigh:
+            self.mem_write(lpDistanceToMoveHigh, (new_position >> 32).to_bytes(4, "little"))
+
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return new_position & 0xFFFFFFFF
 
     @apihook("SetFilePointerEx", argc=5)
     def SetFilePointerEx(self, emu, argv, ctx: api.ApiContext = None):
