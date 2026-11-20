@@ -45,6 +45,7 @@ from speakeasy.windows.fast_fail import (
     requires_kernel_bootstrap_recovery,
 )
 from speakeasy.windows.fileman import FileManager
+from speakeasy.windows.guest_call import GuestCallChain
 from speakeasy.windows.hammer import ApiHammer
 from speakeasy.windows.import_sentinel import (
     find_import_sentinel,
@@ -148,11 +149,6 @@ def _complete_pending_api_callback(emu: Any) -> None:
         emu.do_call_return(len(args), ret_addr)
         return
 
-    if not isinstance(frame, ApiCallbackFrame):
-        raise WindowsEmuError(
-            f"Unsupported API callback frame: {type(frame).__name__}"
-        )
-
     arch = emu.get_arch()
     if arch == _arch.ARCH_X86:
         return_register = _arch.X86_REG_EAX
@@ -162,6 +158,30 @@ def _complete_pending_api_callback(emu: Any) -> None:
         raise WindowsEmuError(f"Unsupported architecture: {arch}")
 
     callback_result = int(emu.reg_read(return_register))
+
+    if isinstance(frame, GuestCallChain):
+        # A handler asked the engine to run an ordered list of guest
+        # functions. Resume at the next function, or finish the intercepted
+        # API call with the chain's result (cdecl: the guest caller cleans
+        # its own argument slots).
+        if frame.advance(emu, callback_result):
+            # The chain is still pending: the next guest function must return
+            # to the same sentinel and be completed the same way.
+            run.api_callbacks.append(frame)
+            return
+        emu.do_call_return(
+            frame.cleanup_argc,
+            frame.ret_addr,
+            frame.api_return(),
+            conv=frame.conv,
+        )
+        return
+
+    if not isinstance(frame, ApiCallbackFrame):
+        raise WindowsEmuError(
+            f"Unsupported API callback frame: {type(frame).__name__}"
+        )
+
     api_return = frame.resolve_api_return(callback_result)
     emu.do_call_return(frame.cleanup_argc, frame.ret_addr, api_return)
 

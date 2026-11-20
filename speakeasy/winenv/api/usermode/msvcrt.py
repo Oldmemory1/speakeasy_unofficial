@@ -6,6 +6,7 @@ from typing import Any
 
 import speakeasy.winenv.arch as e_arch
 import speakeasy.winenv.defs.windows.windows as windef
+from speakeasy.windows.guest_call import start_guest_call_chain
 
 from .. import api
 
@@ -190,9 +191,7 @@ class Msvcrt(api.ApiHandler):
 
         pfbegin, pfend = argv
 
-        rv = 0
-
-        return rv
+        return self._traverse_initterm(emu, pfbegin, pfend, stop_on_nonzero=True)
 
     @apihook("_initterm", argc=2, conv=e_arch.CALL_CONV_CDECL)
     def _initterm(self, emu, argv, ctx: api.ApiContext = None):
@@ -200,9 +199,41 @@ class Msvcrt(api.ApiHandler):
 
         pfbegin, pfend = argv
 
-        rv = 0
+        return self._traverse_initterm(emu, pfbegin, pfend, stop_on_nonzero=False)
 
-        return rv
+    def _traverse_initterm(self, emu, pfbegin, pfend, *, stop_on_nonzero):
+        """Traverse a CRT initializer table and run every non-NULL entry.
+
+        Windows contract: ``[pfbegin, pfend)`` is an array of pointer-sized
+        function pointers; NULL entries are skipped; each non-NULL initializer
+        is called with no arguments. ``_initterm_e`` stops at the first
+        initializer returning a non-zero ``int`` and returns that value;
+        ``_initterm`` ignores results and returns 0. Both return 0 for an
+        empty or all-NULL table.
+
+        Initializers execute as ordinary guest code (ordered chain of guest
+        calls), so they may call APIs again. The true ``_initterm_e`` result
+        reaches EAX/RAX when the chain completes; the value returned to the
+        dispatcher here is the provisional 0 used for API tracing. Raises on
+        an unreadable table instead of reporting a fake success.
+        """
+
+        ptr_size = self.get_ptr_size()
+        functions = []
+        cursor = pfbegin
+        while cursor < pfend:
+            fn = int.from_bytes(self.mem_read(cursor, ptr_size), "little")
+            if fn:
+                functions.append(fn)
+            cursor += ptr_size
+
+        start_guest_call_chain(
+            emu,
+            functions,
+            conv=e_arch.CALL_CONV_CDECL,
+            stop_on_nonzero=stop_on_nonzero,
+        )
+        return 0
 
     @apihook("__getmainargs", argc=5)
     def __getmainargs(self, emu, argv, ctx: api.ApiContext = None):
