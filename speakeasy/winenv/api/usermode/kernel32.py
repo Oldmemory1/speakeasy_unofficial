@@ -512,6 +512,13 @@ class Kernel32(api.ApiHandler):
         hmod = emu.load_library(lib)
         argv[0] = req_lib
 
+        if not hmod:
+            logger.info(
+                "LoadLibrary: %r could not be loaded from guest files, loaded "
+                "modules, API-handler modules, or known system-module decoys",
+                req_lib,
+            )
+
         return hmod
 
     @apihook("CreateToolhelp32Snapshot", argc=2)
@@ -2182,34 +2189,48 @@ class Kernel32(api.ApiHandler):
                 try:
                     proc = self.read_mem_string(proc_name, 1)
                     argv[1] = proc
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Unreadable lpProcName is a guest fault, not a handler
+                    # error: keep the Windows NULL result and record why.
+                    logger.info("GetProcAddress: cannot read lpProcName %#x: %s", proc_name, exc)
+                    proc = ""
 
-        if proc:
-            for mod in emu.modules:
-                if mod.base == hmod:
-                    bn = mod.get_base_name()
-                    mname, _ = os.path.splitext(bn)
-                    entry = next(filter(lambda entry: entry.name == proc, mod.get_exports()), None)
-                    if entry:
-                        rv = emu.get_proc(mname, proc)
-                    # fixF: relax the export-table gate for *dynamically loaded*
-                    # modules (anything that is not the primary image). Those are
-                    # the system DLLs speakeasy simulates itself (kernel32,
-                    # msvcrt, user32, ...) and their export table comes from the
-                    # emulator's internal database, which is incomplete -- e.g.
-                    # msvcrt!_CIfmod is missing. Returning 0 there makes packer
-                    # stubs treat the import as unresolved and call ExitProcess,
-                    # so the unpacked code never runs (400-sample check: 66
-                    # samples hit such a zero). The primary image keeps the
-                    # strict behaviour because its exports are read from the
-                    # real file, matching Windows semantics. 1.5.11 had no such
-                    # gate for loaded modules; this restores that behaviour.
-                    elif (emu.config.modules.functions_always_exist
-                          or emu.has_api_signature(mname, proc)
-                          or not getattr(mod, "is_exe", lambda: True)()):
-                        rv = emu.get_proc(mname, proc)
-                    break
+        mod = emu.get_module_by_handle(hmod) if proc else None
+        if mod is not None:
+            mname, _ = os.path.splitext(mod.get_base_name())
+            if mod.get_export_by_name(proc) is not None:
+                # Real PE modules resolve to their mapped code address;
+                # handler/decoy modules resolve to a dispatch sentinel.
+                rv = emu.resolve_module_export(mod, proc)
+            elif not mod.is_exe() or emu.config.modules.functions_always_exist:
+                # fixF: emulated system DLLs expose the engine's internal
+                # export database, which is incomplete (e.g. msvcrt!_Cifmod).
+                # A NULL for a dynamically loaded non-EXE module makes packer
+                # stubs treat the import as unresolved and call ExitProcess.
+                # The sentinel is a dispatch address, not a fabricated export:
+                # the guest call is routed to the handler/signature path. The
+                # primary image keeps strict Windows semantics (NULL) because
+                # its exports are read from the real file.
+                rv = emu.get_proc(mname, proc)
+                logger.info(
+                    "GetProcAddress: %s!%s is absent from the module export table; "
+                    "returning dispatch sentinel %#x for the loaded non-EXE module",
+                    mname,
+                    proc,
+                    rv,
+                )
+
+        if not rv:
+            # Keep the failure readable: hmod, requested name, and the loaded
+            # module bases are the provenance needed to tell a NULL handle /
+            # wrong handle / genuinely missing export apart. Returning 0 is
+            # Windows semantics for all of them.
+            logger.info(
+                "GetProcAddress: MISS hmod=%#x proc=%r modules=%r",
+                hmod,
+                proc or None,
+                [(m.get_base_name(), hex(m.base)) for m in emu.modules],
+            )
 
         return rv
 

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
+import pefile
+
 import speakeasy.common as common
 import speakeasy.windows.common as winemu
 import speakeasy.windows.objman as objman
@@ -51,7 +53,7 @@ from speakeasy.windows.import_sentinel import (
     find_import_sentinel,
     import_probe_prefix,
 )
-from speakeasy.windows.loaders import PeLoader, get_prot_string
+from speakeasy.windows.loaders import PeLoader, RuntimeModule, get_prot_string
 from speakeasy.windows.netman import NetworkManager
 from speakeasy.windows.objman import HandleAllocator
 from speakeasy.windows.page_protection import image_protection_for_emu_perms
@@ -1246,6 +1248,23 @@ class WindowsEmulator(BinaryEmulator):
             if base_name.lower() == name_lower:
                 return mod
             if mod.name and mod.name.lower() == name_lower:
+                return mod
+        return None
+
+    def get_module_by_handle(self, handle: int) -> RuntimeModule | None:
+        """Return the loaded module addressed by an HMODULE/HINSTANCE value.
+
+        Windows defines an HMODULE as the module's load base
+        (``handle_semantics.HMODULE_HANDLE_APIS``), and this engine stores the
+        mapped base in ``RuntimeModule.base``, so base equality is the module
+        handle equivalence. ``0`` (NULL) and unknown handles return ``None``;
+        no address inside the module is accepted because Windows does not
+        define a module handle as an interior pointer.
+        """
+        if not handle:
+            return None
+        for mod in self.modules:
+            if mod.base == handle:
                 return mod
         return None
 
@@ -3330,6 +3349,66 @@ class WindowsEmulator(BinaryEmulator):
 
         return fp
 
+    def get_guest_module_file_data(self, guest_path: str) -> bytes | None:
+        """Return image bytes for a file materialized in the emulated filesystem.
+
+        ``LoadLibrary`` sees files a sample created, unpacked or opened, not
+        only host-native paths and API-handler modules. Matching is exact
+        (case-insensitive) against ``FileManager`` files; relative paths are
+        resolved against ``config.current_dir`` the same way file I/O does.
+
+        Returns ``None`` when no emulated file matches *guest_path*, and
+        ``b""`` when the file exists but is empty. Configured ``filesystem``
+        by-extension/default stubs are deliberately not treated as module
+        files: they are I/O decoys, not images. The emulated-input-image alias
+        used by file I/O is also not reused here because loading the sample
+        itself as a module would be wrong.
+        """
+        if not guest_path:
+            return None
+
+        path = guest_path
+        if not ntpath.isabs(path):
+            cwd = self.config.current_dir or ""
+            path = ntpath.normpath(ntpath.join(cwd, path))
+        target = ntpath.normpath(path).lower()
+
+        for guest_file in self.fileman.get_all_files():
+            if getattr(guest_file, "is_dir", False):
+                continue
+            if ntpath.normpath(guest_file.path).lower() != target:
+                continue
+            data = guest_file.get_data(reset_pointer=True)
+            if not data:
+                return b""
+            return bytes(data)
+        return None
+
+    def resolve_module_export(self, mod: RuntimeModule, func_name: str) -> int:
+        """Return the guest-callable address of an export in *mod*.
+
+        Handler-backed modules (``ApiModuleLoader``) and decoy modules expose
+        JIT stubs, so their exports must resolve to an import sentinel that
+        dispatches through ``handle_import_func``. Modules loaded from a real
+        PE image (``PeLoader``: native path, configured user module or a guest
+        file) expose actual executable code; returning the export's mapped
+        address lets the guest run the module's own code, matching Windows
+        ``GetProcAddress`` semantics.
+
+        Raises:
+            KeyError: if *func_name* is not present in the module's export
+                table; callers must use their missing-export policy first.
+        """
+        entry = mod.get_export_by_name(func_name)
+        if entry is None:
+            raise KeyError(f"{mod.get_base_name()}!{func_name} is not exported")
+
+        if isinstance(getattr(mod, "loader", None), PeLoader):
+            return entry.address
+
+        module_name, _ = os.path.splitext(mod.get_base_name())
+        return self.get_proc(module_name, func_name)
+
     def load_library(self, mod_name):
         lib = ntpath.basename(mod_name)
         lib = os.path.splitext(lib)[0]
@@ -3337,6 +3416,28 @@ class WindowsEmulator(BinaryEmulator):
         existing = self.get_mod_by_name(lib)
         if existing:
             return existing.base
+
+        # FX-013: a guest-visible file that has already been materialized in
+        # the emulated filesystem is a real load candidate. Packers unpack a
+        # DLL to disk and then LoadLibraryA the path; a host-native/handler
+        # lookup cannot see that file, and returning 0 here is a false
+        # negative. A file that exists but is not a valid PE keeps Windows'
+        # "not a valid module" result (NULL) with a readable diagnostic.
+        guest_image = self.get_guest_module_file_data(mod_name)
+        if guest_image is not None:
+            if not guest_image:
+                logger.info("LoadLibrary: guest file %r exists but is empty", mod_name)
+                return 0
+            try:
+                guest_mod = self.load_module_by_name(
+                    lib,
+                    emu_path=mod_name,
+                    image_data=guest_image,
+                )
+            except (pefile.PEFormatError, winemu.PeParseException, ValueError) as exc:
+                logger.info("LoadLibrary: guest file %r is not a loadable PE: %s", mod_name, exc)
+                return 0
+            return guest_mod.base
 
         native_path = self.get_native_module_path(mod_name=lib)
         if not self.config.modules.modules_always_exist and not native_path:
@@ -3364,11 +3465,17 @@ class WindowsEmulator(BinaryEmulator):
 
         return mod.base
 
-    def load_module_by_name(self, name, emu_path=None, base=None):
+    def load_module_by_name(self, name, emu_path=None, base=None, image_data: bytes | None = None):
         """
         Load a module by name using the appropriate loader.
 
-        Priority: native PE file -> API handler (JIT PE) -> placeholder stub.
+        Priority: caller-supplied image bytes -> native PE file -> API handler
+        (JIT PE) -> placeholder stub.
+
+        ``image_data`` is raw PE file content for a module that only exists in
+        the emulated filesystem (guest-dropped/unpacked DLL). When supplied it
+        takes precedence over host-side loader selection and the image's own PE
+        header determines the module type.
         """
         from speakeasy.windows.loaders import ApiModuleLoader, DecoyLoader, PeLoader
 
@@ -3382,7 +3489,13 @@ class WindowsEmulator(BinaryEmulator):
         def _make_image(load_base):
             """Build the module image at ``load_base`` (loader selection kept as-is)."""
             loader: PeLoader | ApiModuleLoader | DecoyLoader | SystemModuleDecoyLoader
-            if native_path:
+            if image_data is not None:
+                loader = PeLoader(
+                    data=image_data,
+                    base_override=load_base,
+                    emu_path=emu_path,
+                )
+            elif native_path:
                 loader = PeLoader(path=native_path, base_override=load_base, emu_path=emu_path)
             else:
                 handler = self.api.load_api_handler(name) if self.api else None
@@ -3417,7 +3530,10 @@ class WindowsEmulator(BinaryEmulator):
 
             image = loader.make_image()
             image.name = name
-            image.module_type = _module_type_from_path(emu_path)
+            # A caller-supplied image keeps its PE-header module type (DLL vs
+            # EXE); path-derived types only substitute for host-side modules.
+            if image_data is None:
+                image.module_type = _module_type_from_path(emu_path)
             return image
 
         image = _make_image(base)
