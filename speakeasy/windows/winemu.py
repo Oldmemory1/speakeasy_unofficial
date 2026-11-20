@@ -217,6 +217,8 @@ class WindowsEmulator(BinaryEmulator):
         self.unhandled_exception_filter: int = 0
         self._seh_last_fault: tuple[int, int | None] | None = None
         self._seh_repeat_count: int = 0
+        self._invalid_insn_fault_pc: int | None = None
+        self._invalid_insn_repeat_count: int = 0
 
         self.fs_addr: int = 0
         self.gs_addr: int = 0
@@ -496,6 +498,8 @@ class WindowsEmulator(BinaryEmulator):
         self.run_complete = False
         self._seh_last_fault = None
         self._seh_repeat_count = 0
+        self._invalid_insn_fault_pc = None
+        self._invalid_insn_repeat_count = 0
         self.reset_stack(self.stack_base)
         self.reset_cpu_context()
         mm = self.get_address_map(self.stack_base - 1)
@@ -3529,7 +3533,12 @@ class WindowsEmulator(BinaryEmulator):
                 frame.searched = True
 
         if windef.EXCEPTION_CONTINUE_SEARCH == ret_val and not len(seh.frames):
+            # Raw inline SEH frames are not tracked in ``seh.frames``; the
+            # handler edits the CONTEXT that was written to guest memory, so
+            # reload that copy instead of the pre-handler snapshot.
             ctx = seh.context
+            if seh.context_address:
+                ctx = self.mem_cast(ctx, seh.context_address)
             self.set_pc(ctx.Eip)
             return
 
@@ -3595,6 +3604,54 @@ class WindowsEmulator(BinaryEmulator):
         self._seh_repeat_count = 0
         if self.get_arch() == _arch.ARCH_X86:
             self._continue_seh_x86()
+        if self._invalid_insn_fault_pc is not None and self.get_pc() != self._invalid_insn_fault_pc:
+            # A handler resumed guest execution past the illegal opcode, so a
+            # later fault at that PC is a new episode, not a runaway retry.
+            self._invalid_insn_fault_pc = None
+            self._invalid_insn_repeat_count = 0
+
+    def _hook_invalid_instruction(self, emu):
+        """Deliver a CPU #UD (UC_ERR_INSN_INVALID) to the guest exception chain.
+
+        Windows/Wine map an undefined opcode to
+        ``STATUS_ILLEGAL_INSTRUCTION`` (0xC000001D) and dispatch it through the
+        guest VEH/SEH/UEF chain. Unicorn does not advance the PC before
+        invoking this callback, so the current PC is the faulting instruction.
+
+        Args:
+            emu: Emulator object supplied by ``common.InvalidInstructionHook``.
+
+        Returns:
+            True when ``dispatch_seh`` transferred control to a guest handler
+            or the unhandled-exception filter; False otherwise so Unicorn
+            raises ``UC_ERR_INSN_INVALID`` and the run keeps the original
+            invalid-instruction error.
+
+        Applicable architecture: x86 uses the existing SEH dispatcher and the
+        architecture-independent UEF path; AMD64 without an x86 SEH chain keeps
+        the original error. Any illegal opcode takes this path; no byte
+        sequence, address, or sample is special-cased.
+        """
+        if not self.config.exceptions.dispatch_handlers:
+            return False
+
+        pc = self.get_pc()
+        if pc == self._invalid_insn_fault_pc:
+            self._invalid_insn_repeat_count += 1
+        else:
+            self._invalid_insn_fault_pc = pc
+            self._invalid_insn_repeat_count = 1
+
+        # A handler may accept the exception but leave Eip on the illegal
+        # opcode; bound the retries like dispatch_seh's _SEH_MAX_REPEAT guard.
+        if self._invalid_insn_repeat_count > self._SEH_MAX_REPEAT:
+            return False
+
+        # Attribute the fault to the trapping instruction for logging,
+        # profiling, and the error report (prev_pc normally lags one
+        # instruction behind).
+        self.prev_pc = pc
+        return self.dispatch_seh(ddk.STATUS_ILLEGAL_INSTRUCTION)
 
     def create_event(self, name=""):
         """
