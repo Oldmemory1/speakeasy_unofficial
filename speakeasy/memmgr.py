@@ -17,7 +17,19 @@ class MemMap:
     Class that defines a memory mapping (e.g. heap/pool alloc, binary image, etc.)
     """
 
-    def __init__(self, base, size, tag, prot, flags, block_base, block_size, shared=False, process=None):
+    def __init__(
+        self,
+        base,
+        size,
+        tag,
+        prot,
+        flags,
+        block_base,
+        block_size,
+        shared=False,
+        process=None,
+        is_image=False,
+    ):
         self.base = base
         self.size = size
 
@@ -39,6 +51,9 @@ class MemMap:
         self.process = process
         self.block_base = block_base
         self.block_size = block_size
+        # True for PE image views (SEC_IMAGE). Image pages use write-copy
+        # semantics and are reported with PAGE_WRITECOPY by VirtualQuery.
+        self.is_image = is_image
 
     def __hash__(self):
         return hash(self.base)
@@ -70,6 +85,7 @@ class MemoryManager:
         super().__init__()
         self.maps = []
         self._page_protections: dict[int, int] = {}
+        self._page_win_protections: dict[int, int] = {}
         self.emu_eng: EmuEngine | None = None
         self.mem_reserves = []
         self.block_base = 0
@@ -86,9 +102,22 @@ class MemoryManager:
                     if not mem_map_hook.end or mem_map_hook.end > mm.base:
                         mem_map_hook.cb(self, mm.base, mm.size, mm.tag, mm.prot, mm.flags)
 
-    def mem_map(self, size, base=None, perms=common.PERM_MEM_RWX, tag=None, flags=0, shared=False, process=None):
+    def mem_map(
+        self,
+        size,
+        base=None,
+        perms=common.PERM_MEM_RWX,
+        tag=None,
+        flags=0,
+        shared=False,
+        process=None,
+        image=False,
+    ):
         """
         Map a block of memory with specified permissions and a tag
+
+        ``image=True`` marks a PE image view (SEC_IMAGE), which affects
+        write-copy protection semantics; see ``windows.page_protection``.
         """
         if not process and tag and not tag.startswith("emu"):
             process = self.get_current_process()
@@ -109,7 +138,18 @@ class MemoryManager:
                 self.block_offset += size
                 base = addr
 
-                mm = MemMap(base, size, tag, perms, flags, self.block_base, self.block_size, shared, process)
+                mm = MemMap(
+                    base,
+                    size,
+                    tag,
+                    perms,
+                    flags,
+                    self.block_base,
+                    self.block_size,
+                    shared,
+                    process,
+                    is_image=image,
+                )
 
                 self.maps.append(mm)
                 self._hook_mem_map_dispatch(mm)
@@ -121,7 +161,7 @@ class MemoryManager:
         block_size = self.block_size
         if size > self.block_size:
             block_size = size
-        mm = MemMap(base, size, tag, perms, flags, base, block_size, shared, process)
+        mm = MemMap(base, size, tag, perms, flags, base, block_size, shared, process, is_image=image)
         self.emu_eng.mem_map(base, size, perms=perms)  # type: ignore[union-attr]
         self.maps.append(mm)
         self._hook_mem_map_dispatch(mm)
@@ -168,7 +208,7 @@ class MemoryManager:
         # Will unmap as well
         self.mem_free(map.base)
 
-        newmem = self.mem_map(size, base=to, perms=prot, tag=tag)
+        newmem = self.mem_map(size, base=to, perms=prot, tag=tag, image=map.is_image)
 
         if newmem != to:
             return -1
@@ -196,14 +236,19 @@ class MemoryManager:
         """
         return bytes(self.emu_eng.mem_read(addr, size))  # type: ignore[union-attr]
 
-    def mem_protect(self, addr, size, perms):
+    def mem_protect(self, addr, size, perms, win_protect=None):
         """
-        Change memory protections
+        Change memory protections.
+
+        ``win_protect`` optionally records the Win32 protection value that the
+        guest should observe for these pages (for example PAGE_WRITECOPY on
+        writable image pages). When omitted, any previous Win32 override is
+        dropped and VirtualQuery derives the value from the emulator perms.
         """
         self.emu_eng.mem_protect(addr, size, perms)  # type: ignore[union-attr]
-        self._set_page_protections(addr, size, perms)
+        self._set_page_protections(addr, size, perms, win_protect)
 
-    def _set_page_protections(self, addr, size, perms):
+    def _set_page_protections(self, addr, size, perms, win_protect=None):
         """Record effective page protections overlaid on broad memory maps."""
         if size <= 0:
             return
@@ -212,6 +257,10 @@ class MemoryManager:
         end = addr + size
         while page < end:
             self._page_protections[page] = perms
+            if win_protect is None:
+                self._page_win_protections.pop(page, None)
+            else:
+                self._page_win_protections[page] = win_protect
             page += self.page_size
 
     def clear_page_protections(self, addr, size):
@@ -223,6 +272,7 @@ class MemoryManager:
         end = addr + size
         while page < end:
             self._page_protections.pop(page, None)
+            self._page_win_protections.pop(page, None)
             page += self.page_size
 
     def get_address_perms(self, address):
@@ -240,28 +290,50 @@ class MemoryManager:
         page = address & ~(self.page_size - 1)
         return self._page_protections.get(page, mm.prot)
 
+    def get_address_win_protection(self, address):
+        """Return the recorded Win32 PAGE_* value for an address, if any.
+
+        Image pages carry explicit write-copy/read-only values recorded when
+        the image was mapped or when VirtualProtect changed them. None means
+        the caller should derive the Win32 value from ``get_address_perms``.
+        """
+        if not self.get_address_map(address):
+            return None
+
+        page = address & ~(self.page_size - 1)
+        return self._page_win_protections.get(page)
+
+    def _protection_state(self, address):
+        """Return the (emulator perms, Win32 protection) pair for a page."""
+        page = address & ~(self.page_size - 1)
+        return self.get_address_perms(page), self._page_win_protections.get(page)
+
     def get_protection_region(self, address):
         """
         Return the page-aligned region with one effective protection.
+
+        Both the emulator permissions and the recorded Win32 protection must
+        match: PAGE_READWRITE and PAGE_WRITECOPY are both writable in the
+        emulator but are distinct VirtualQuery regions.
         """
         mm = self.get_address_map(address)
         if not mm:
             return None
 
         page = address & ~(self.page_size - 1)
-        perms = self.get_address_perms(page)
+        state = self._protection_state(page)
         map_end = mm.base + mm.size
 
         start = page
         while start > mm.base:
             previous = start - self.page_size
-            if previous < mm.base or self.get_address_perms(previous) != perms:
+            if previous < mm.base or self._protection_state(previous) != state:
                 break
             start = previous
 
         end = page + self.page_size
         while end < map_end:
-            if self.get_address_perms(end) != perms:
+            if self._protection_state(end) != state:
                 break
             end += self.page_size
 

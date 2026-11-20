@@ -32,6 +32,11 @@ from speakeasy.windows.os_capabilities import (
     WindowsOsVersion,
     processor_feature_override,
 )
+from speakeasy.windows.page_protection import (
+    apply_page_protection,
+    emu_perms_to_win_protect,
+    win_protect_to_emu_perms,
+)
 
 from .. import api
 from .pseudo_handles import is_current_process_pseudo_handle
@@ -245,41 +250,12 @@ class Kernel32(api.ApiHandler):
         return heap
 
     def win_perms_to_emu_perms(self, win_perms):
-        new = 0
-        if win_perms & windefs.PAGE_EXECUTE_READWRITE:
-            new = common.PERM_MEM_RWX
-        elif win_perms & windefs.PAGE_NOACCESS:
-            new = common.PERM_MEM_NONE
-        else:
-            if win_perms & windefs.PAGE_EXECUTE or win_perms & windefs.PAGE_EXECUTE_READ:
-                new |= common.PERM_MEM_EXEC
-            if (
-                win_perms & windefs.PAGE_EXECUTE_READ
-                or win_perms & windefs.PAGE_READONLY
-                or win_perms & windefs.PAGE_READWRITE
-            ):  # noqa
-                new |= common.PERM_MEM_READ
-            if win_perms & windefs.PAGE_READWRITE:
-                new |= common.PERM_MEM_WRITE
-        return new
+        """Convert a Win32 PAGE_* protection to emulator permissions."""
+        return win_protect_to_emu_perms(win_perms)
 
     def emu_perms_to_win_perms(self, emu_perms):
-        execute = bool(emu_perms & common.PERM_MEM_EXEC)
-        read = bool(emu_perms & common.PERM_MEM_READ)
-        write = bool(emu_perms & common.PERM_MEM_WRITE)
-
-        if execute:
-            if write:
-                return windefs.PAGE_EXECUTE_READWRITE
-            if read:
-                return windefs.PAGE_EXECUTE_READ
-            return windefs.PAGE_EXECUTE
-        if write:
-            # Windows has no user-mode write-only page protection.
-            return windefs.PAGE_READWRITE
-        if read:
-            return windefs.PAGE_READONLY
-        return windefs.PAGE_NOACCESS
+        """Convert emulator permissions to a Win32 PAGE_* protection."""
+        return emu_perms_to_win_protect(emu_perms)
 
     def map_view_access_to_emu_perms(self, desired_access, mapping_protect):
         perms = 0
@@ -1579,9 +1555,12 @@ class Kernel32(api.ApiHandler):
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return rv
 
-        effective_prot = emu.get_address_perms(lpAddress)
+        effective_prot = emu.get_address_win_protection(lpAddress)
         if effective_prot is None:
-            effective_prot = mm.prot
+            perms = emu.get_address_perms(lpAddress)
+            if perms is None:
+                perms = mm.prot
+            effective_prot = self.emu_perms_to_win_perms(perms)
         region = emu.get_protection_region(lpAddress)
         if region is None:
             region_base, region_size = mm.base, mm.size
@@ -1593,7 +1572,7 @@ class Kernel32(api.ApiHandler):
         mbi.AllocationProtect = self.emu_perms_to_win_perms(mm.prot)
         mbi.RegionSize = region_size
         mbi.State = windefs.MEM_COMMIT
-        mbi.Protect = self.emu_perms_to_win_perms(effective_prot)
+        mbi.Protect = effective_prot
         mbi.Type = 0
 
         self.mem_write(lpBuffer, mbi.get_bytes())
@@ -1609,45 +1588,20 @@ class Kernel32(api.ApiHandler):
           _In_  DWORD  flNewProtect,
           _Out_ PDWORD lpflOldProtect
         );"""
-        rv = 0
-        mm = None
-        new = 0
-
         lpAddress, dwSize, flNewProtect, lpflOldProtect = argv
 
-        maps = emu.get_mem_maps()
-        for m in maps:
-            if m.base <= lpAddress < m.base + m.size:
-                mm = m
-                break
+        if not lpflOldProtect:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
 
-        # convert the mem flags
-        if mm and lpflOldProtect:
-            # See if we saved off the flags if this chunk is from a previous
-            # VirtualAlloc()
-            old_prot = mm.flags
-            if not old_prot:
-                # Use page-level permissions when the containing map spans
-                # several PE sections with different protections.
-                old_perms = emu.get_address_perms(lpAddress)
-                if old_perms is None:
-                    old_perms = mm.prot
-                old_prot = self.emu_perms_to_win_perms(old_perms)
-            # Check for page alignment
-            addr = lpAddress & 0xFFFFFFFFFFFFF000
-            size = dwSize & 0xFFFFFFFFFFFFF000
-            new = self.win_perms_to_emu_perms(flNewProtect)
+        result = apply_page_protection(emu, lpAddress, dwSize, flNewProtect)
+        if not result.success:
+            if result.error is not None:
+                emu.set_last_error(result.error)
+            return 0
 
-            remainder = dwSize & 0xFFF
-            if remainder:
-                size += 0x1000
-
-            emu.mem_protect(addr, size, new)
-            mm.prot = new
-            self.mem_write(lpflOldProtect, old_prot.to_bytes(4, "little"))
-            return 1
-
-        return rv
+        self.mem_write(lpflOldProtect, result.old_protect.to_bytes(4, "little"))
+        return 1
 
     @apihook("VirtualProtectEx", argc=5)
     def VirtualProtectEx(self, emu, argv, ctx: api.ApiContext = None):

@@ -49,9 +49,10 @@ from speakeasy.windows.import_sentinel import (
     find_import_sentinel,
     import_probe_prefix,
 )
-from speakeasy.windows.loaders import get_prot_string
+from speakeasy.windows.loaders import PeLoader, get_prot_string
 from speakeasy.windows.netman import NetworkManager
 from speakeasy.windows.objman import HandleAllocator
+from speakeasy.windows.page_protection import image_protection_for_emu_perms
 from speakeasy.windows.regman import RegistryManager
 from speakeasy.windows.tls import TlsManager
 from speakeasy.windows.veh import VectoredExceptionRegistry, VehDispatchState
@@ -1265,14 +1266,17 @@ class WindowsEmulator(BinaryEmulator):
             and image.regions[0].base == image.image_base
             and image.image_size > len(image.regions[0].data)
         )
+        # Only PE loader images are image views (SEC_IMAGE) with write-copy
+        # protection semantics. Shellcode and raw blobs are private memory.
+        is_pe_image = isinstance(image.loader, PeLoader)
         for region in image.regions:
             base = region.base
             size = image.image_size if single_region_pe else len(region.data)
             if base == 0:
-                base = self.mem_map(size, tag=f"emu.module.{image.name}")
+                base = self.mem_map(size, tag=f"emu.module.{image.name}", image=is_pe_image)
                 image.image_base = base
             else:
-                self.mem_map(size, base=base, tag=f"emu.module.{image.name}")
+                self.mem_map(size, base=base, tag=f"emu.module.{image.name}", image=is_pe_image)
             self.mem_write(base, region.data)
 
         ptr_size = self.get_ptr_size()
@@ -1285,14 +1289,17 @@ class WindowsEmulator(BinaryEmulator):
             except Exception:
                 pass
 
-        from speakeasy.windows.loaders import PeLoader as _PeLoaderType
-
-        if isinstance(image.loader, _PeLoaderType) and image.sections:
+        if isinstance(image.loader, PeLoader) and image.sections:
             base = image.image_base
             first_section_rva = image.sections[0].virtual_address
             if first_section_rva > 0:
                 aligned_headers = (first_section_rva + self.page_size - 1) & ~(self.page_size - 1)
-                self.mem_protect(base, aligned_headers, common.PERM_MEM_READ)
+                self.mem_protect(
+                    base,
+                    aligned_headers,
+                    common.PERM_MEM_READ,
+                    win_protect=image_protection_for_emu_perms(common.PERM_MEM_READ),
+                )
 
             page_perms = {}
             for sect in image.sections:
@@ -1322,7 +1329,12 @@ class WindowsEmulator(BinaryEmulator):
 
             for start, end, perms in runs:
                 try:
-                    self.mem_protect(start, end - start, perms)
+                    self.mem_protect(
+                        start,
+                        end - start,
+                        perms,
+                        win_protect=image_protection_for_emu_perms(perms),
+                    )
                 except Exception:
                     pass
 
@@ -1339,7 +1351,7 @@ class WindowsEmulator(BinaryEmulator):
                     module_name=mod.get_base_name(),
                 )
 
-        is_primary = isinstance(image.loader, _PeLoaderType) or image.module_type == "shellcode"
+        is_primary = isinstance(image.loader, PeLoader) or image.module_type == "shellcode"
 
         mod_base_name = ntpath.basename(image.emu_path)
         mod_base_name_no_ext = _normalize_mod_name(mod_base_name)
