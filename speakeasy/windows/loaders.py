@@ -7,6 +7,7 @@ from typing import Any, Protocol
 
 import speakeasy.common as common
 import speakeasy.winenv.arch as _arch
+from speakeasy.windows.tls import TlsDirectory
 
 
 @dataclass
@@ -97,6 +98,7 @@ class LoadedImage:
     stack_size: int = 0x12000
     tls_callbacks: list[int] = field(default_factory=list)
     tls_directory_va: int | None = None
+    tls_directory: TlsDirectory | None = None
     loader: Loader | None = None
     sections: list[SectionEntry] = field(default_factory=list)
     pe_metadata: PeMetadata | None = None
@@ -162,6 +164,11 @@ class RuntimeModule:
 
     def get_tls_callbacks(self) -> list[int]:
         return self._image.tls_callbacks
+
+    def get_tls_directory(self) -> TlsDirectory | None:
+        """Return the parsed ``IMAGE_TLS_DIRECTORY`` for this image, if any."""
+
+        return self._image.tls_directory
 
     def get_pe_metadata(self) -> PeMetadata | None:
         return self._image.pe_metadata
@@ -233,16 +240,27 @@ class PeLoader:
 
         tls_callbacks: list[int] = []
         tls_directory_va: int | None = None
+        tls_directory: TlsDirectory | None = None
         ptr_size = 4 if pe.arch == _arch.ARCH_X86 else 8
         if hasattr(pe, "DIRECTORY_ENTRY_TLS"):
             tls_directory_va = pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress + base
-            rva = pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks - base
-            for i in range(100):
-                ptr = pe.get_data(rva + ptr_size * i, ptr_size)
-                ptr = int.from_bytes(ptr, "little")
-                if ptr == 0:
-                    break
-                tls_callbacks.append(ptr)
+            tls_struct = pe.DIRECTORY_ENTRY_TLS.struct
+            tls_directory = TlsDirectory(
+                start=tls_struct.StartAddressOfRawData,
+                end=tls_struct.EndAddressOfRawData,
+                index_va=tls_struct.AddressOfIndex,
+                callbacks_va=tls_struct.AddressOfCallBacks,
+                zero_fill=tls_struct.SizeOfZeroFill,
+                characteristics=tls_struct.Characteristics,
+            )
+            if tls_struct.AddressOfCallBacks:
+                rva = tls_struct.AddressOfCallBacks - base
+                for i in range(100):
+                    ptr = pe.get_data(rva + ptr_size * i, ptr_size)
+                    ptr = int.from_bytes(ptr, "little")
+                    if ptr == 0:
+                        break
+                    tls_callbacks.append(ptr)
 
         sections = []
         for sect in pe.sections:
@@ -349,6 +367,7 @@ class PeLoader:
             stack_size=max(pe.OPTIONAL_HEADER.SizeOfStackReserve or 0, 0x12000),
             tls_callbacks=tls_callbacks,
             tls_directory_va=tls_directory_va,
+            tls_directory=tls_directory,
             loader=self,
             sections=sections,
             pe_metadata=pe_metadata,

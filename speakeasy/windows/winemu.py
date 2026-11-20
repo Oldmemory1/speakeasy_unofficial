@@ -52,6 +52,7 @@ from speakeasy.windows.loaders import get_prot_string
 from speakeasy.windows.netman import NetworkManager
 from speakeasy.windows.objman import HandleAllocator
 from speakeasy.windows.regman import RegistryManager
+from speakeasy.windows.tls import TlsManager
 from speakeasy.windows.x86_interrupts import (
     OverflowTrapKind,
     classify_overflow_trap,
@@ -226,6 +227,7 @@ class WindowsEmulator(BinaryEmulator):
 
         self.wintypes = windef
         self.handle_allocator: HandleAllocator = HandleAllocator()
+        self.tls: TlsManager = TlsManager()
         # OS resource managers
         self.regman: RegistryManager = RegistryManager(self.handle_allocator, self.config.registry)
         self.fileman: FileManager = FileManager(config, self)
@@ -967,32 +969,21 @@ class WindowsEmulator(BinaryEmulator):
 
     def init_tls(self, thread):
         """
-        Initialize implicit thread local storage. Meant to be
-        called after init_teb.
+        Initialize implicit thread local storage for a thread.
+
+        Each module with an ``IMAGE_TLS_DIRECTORY`` received a TLS index at load
+        time. Here the :class:`TlsManager` allocates this thread's pointer array
+        and its writable copy of every registered template. The returned array is
+        published through ``TEB->ThreadLocalStoragePointer``; the read-only image
+        template itself is never written.
         """
-        from speakeasy.windows.loaders import RuntimeModule
-
-        ptrsz = self.get_ptr_size()
-        run = self.curr_run
-        module = self.get_mod_from_addr(run.start_addr)  # type: ignore[union-attr]
-
-        if module:
-            if isinstance(module, RuntimeModule):
-                modname = ntpath.basename(module.emu_path)
-                if module._image and module._image.tls_directory_va:
-                    tls_dirp = module._image.tls_directory_va
-                    tls_dir = self.mem_read(tls_dirp, ptrsz)
-                    thread.init_tls(tls_dir, os.path.splitext(modname)[0])
-            else:
-                modname = module.emu_path
-                tokens = modname.split("\\")
-                modname = tokens[len(tokens) - 1]
-                tls_dirp = module.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress
-                tls_dirp += module.OPTIONAL_HEADER.ImageBase
-                tls_dir = self.mem_read(tls_dirp, ptrsz)
-                thread.init_tls(tls_dir, os.path.splitext(modname)[0])
-
-        return
+        tls_array = self.tls.init_thread(self, thread)
+        if tls_array is None:
+            return
+        if thread.teb is None:
+            raise WindowsEmuError("init_tls called before init_teb")
+        thread.teb.object.ThreadLocalStoragePointer = tls_array
+        thread.teb.write_back()
 
     def load_pe(self, path=None, data=None, imp_id=winemu.IMPORT_HOOK_ADDR):
         """
@@ -1281,6 +1272,15 @@ class WindowsEmulator(BinaryEmulator):
         mod = RuntimeModule(image)
         if image.image_base != 0 and mod.base != image.image_base:
             mod.base = image.image_base
+
+        if image.module_type in ("exe", "dll"):
+            tls_directory = mod.get_tls_directory()
+            if tls_directory is not None:
+                self.tls.register_module(
+                    self,
+                    tls_directory,
+                    module_name=mod.get_base_name(),
+                )
 
         is_primary = isinstance(image.loader, _PeLoaderType) or image.module_type == "shellcode"
 
