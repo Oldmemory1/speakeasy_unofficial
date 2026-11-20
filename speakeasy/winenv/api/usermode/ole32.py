@@ -2,6 +2,7 @@
 
 import logging
 
+import speakeasy.common as common
 import speakeasy.winenv.defs.windows.com as com
 import speakeasy.winenv.defs.windows.windows as windefs
 
@@ -14,6 +15,12 @@ class Ole32(api.ApiHandler):
     name = "ole32"
     apihook = api.ApiHandler.apihook
     impdata = api.ApiHandler.impdata
+
+    # Largest CoTaskMemAlloc request that is backed with real emulator memory.
+    # This is an emulator policy bound: mapping multi-GB ranges is not a
+    # faithful allocation success and can hang Unicorn. It is not a Windows
+    # semantic; larger requests fail with NULL like an out-of-memory malloc.
+    MAX_TASK_ALLOC = 0x10000000
 
     # Clipboard formats that carry a GDI object handle instead of an HGLOBAL.
     # Wine duplicates these with CopyEnhMetaFileW/CopyMetaFileW/CreatePalette/
@@ -36,6 +43,10 @@ class Ole32(api.ApiHandler):
         super().__get_hook_attrs__(self)
         self.netman = emu.get_network_manager()
         self.names = {}
+        # Explicit ownership tracking for the COM task allocator: block base ->
+        # requested cb. CoTaskMemFree/CoTaskMemRealloc only touch these blocks;
+        # image pages and mappings owned by other APIs are never released.
+        self._task_allocs: dict[int, int] = {}
 
     @apihook("OleInitialize", argc=1)
     def OleInitialize(self, emu, argv, ctx: api.ApiContext = None):
@@ -319,3 +330,101 @@ class Ole32(api.ApiHandler):
                 self.emu.mem_map(pguid & ~0xFFF, 0x1000)
                 self.emu.mem_write(pguid, guid_bytes)
         return 0
+
+    @apihook("CoTaskMemAlloc", argc=1)
+    def CoTaskMemAlloc(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        void *CoTaskMemAlloc(SIZE_T cb);
+
+        Allocate a writable block of ``cb`` bytes and return its address, or
+        NULL when the request is too large for the emulator or the underlying
+        mapping fails. This is the COM task allocator's documented contract,
+        not a generic ``ret=p`` rule: a successful call returns a page-aligned,
+        guest-readable/writable block, and the block is recorded in
+        ``_task_allocs`` so that only this handler's own memory can be freed.
+        """
+        (cb,) = argv
+        return self._task_alloc(cb)
+
+    @apihook("CoTaskMemFree", argc=1)
+    def CoTaskMemFree(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        void CoTaskMemFree(LPVOID pv);
+
+        Release a block previously returned by this handler. Untracked
+        pointers (image pages, mappings owned by other APIs, NULL, or a second
+        free) are ignored: the task allocator must never unmap memory it does
+        not own.
+        """
+        (pv,) = argv
+        self._task_free(pv)
+
+    @apihook("CoTaskMemRealloc", argc=2)
+    def CoTaskMemRealloc(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        void *CoTaskMemRealloc(LPVOID pv, SIZE_T cb);
+
+        Reallocate a tracked task-allocator block. ``pv == NULL`` behaves like
+        ``CoTaskMemAlloc(cb)``; ``cb == 0`` frees the block and returns NULL.
+        An untracked pointer returns NULL without touching the caller's
+        memory. On success the old contents are copied up to
+        ``min(old_cb, cb)`` bytes before the old block is released.
+        """
+        pv, cb = argv
+        pv = int(pv)
+        cb = int(cb)
+
+        if not pv:
+            return self._task_alloc(cb)
+        if cb == 0:
+            self._task_free(pv)
+            return 0
+
+        old_cb = self._task_allocs.get(pv)
+        if old_cb is None:
+            logger.debug("CoTaskMemRealloc: ignoring untracked pointer %#x", pv)
+            return 0
+
+        new_addr = self._task_alloc(cb)
+        if not new_addr:
+            # Allocation failure leaves the original block valid and tracked,
+            # matching the C realloc contract.
+            return 0
+
+        copy_len = min(old_cb, cb)
+        if copy_len:
+            self.mem_copy(new_addr, pv, copy_len)
+
+        self._task_free(pv)
+        return new_addr
+
+    def _task_alloc(self, cb: int) -> int:
+        """Map and track a task-allocator block for ``cb`` bytes (0 on failure)."""
+        if cb < 0 or cb > self.MAX_TASK_ALLOC:
+            logger.debug("CoTaskMemAlloc: refusing oversized request %#x", cb)
+            return 0
+
+        page_size = int(self.emu.page_size)
+        size = max(int(cb), 1)
+        size = (size + page_size - 1) & ~(page_size - 1)
+
+        try:
+            addr = self.mem_alloc(size, tag="api.CoTaskMemAlloc", perms=common.PERM_MEM_RW)
+        except Exception:
+            logger.debug("CoTaskMemAlloc: could not map %#x bytes", size, exc_info=True)
+            return 0
+        if not addr:
+            return 0
+
+        self._task_allocs[addr] = int(cb)
+        return addr
+
+    def _task_free(self, pv: int) -> None:
+        """Release an owned task-allocator block; untracked pointers are ignored."""
+        pv = int(pv)
+        if not pv:
+            return
+        if self._task_allocs.pop(pv, None) is None:
+            logger.debug("CoTaskMemFree: ignoring untracked pointer %#x", pv)
+            return
+        self.mem_free(pv)
