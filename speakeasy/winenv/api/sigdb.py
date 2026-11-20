@@ -92,6 +92,187 @@ def normalize_dll(name: str) -> str:
     return name
 
 
+# BOOL return semantics. A BOOL return says "nonzero == true" but not *which*
+# question the API answers. The two classes have different safe defaults:
+#
+# * ``predicate_bool``: "is this condition true?" (``IsZoomed``, ``IsWindow``).
+#   An unknown state is answered FALSE; claiming TRUE sends the caller down a
+#   branch that depends on state the emulator does not have.
+# * ``status_bool``: "did this operation succeed?" (``AdjustTokenGroups``,
+#   ``MoveFileExW``). An operation the emulator cannot perform is answered
+#   FALSE and GetLastError names the failure; claiming TRUE fabricates a state
+#   change that never happened.
+#
+# The registries below are explicit and auditable. APIs not listed are
+# classified from the signature's SetLastError flag, which win32metadata sets
+# for functions that report failures through GetLastError; BOOL APIs with no
+# signature information are predicates. Misclassifying an unlisted API can
+# only change whether LastError is set on the FALSE return - never the FALSE
+# return itself - so the residual risk is bounded.
+BOOL_SEMANTICS_STATUS = "status_bool"
+BOOL_SEMANTICS_PREDICATE = "predicate_bool"
+
+# Query predicates ("is X true?"). Pinned explicitly where the generated
+# SetLastError flag cannot express the semantic: IsClipboardFormatAvailable,
+# IsDBCSLeadByte, IsTokenRestricted and the IsChar* family carry
+# SetLastError=True even though TRUE/FALSE reports a condition, not the
+# outcome of a state change.
+PREDICATE_BOOL_APIS: dict[str, frozenset[str]] = {
+    "user32": frozenset(
+        {
+            "IsCharAlphaA",
+            "IsCharAlphaW",
+            "IsCharAlphaNumericA",
+            "IsCharAlphaNumericW",
+            "IsCharLowerA",
+            "IsCharLowerW",
+            "IsCharUpperA",
+            "IsCharUpperW",
+            "IsClipboardFormatAvailable",
+            "IsHungAppWindow",
+            "IsIconic",
+            "IsWindow",
+            "IsWindowEnabled",
+            "IsWindowUnicode",
+            "IsWindowVisible",
+            "IsZoomed",
+        }
+    ),
+    "kernel32": frozenset(
+        {
+            "IsBadReadPtr",
+            "IsBadStringPtrA",
+            "IsBadStringPtrW",
+            "IsBadWritePtr",
+            "IsDBCSLeadByte",
+            "IsDBCSLeadByteEx",
+            "IsDebuggerPresent",
+            "IsProcessorFeaturePresent",
+            "IsSystemResumeAutomatic",
+            "IsThreadAFiber",
+            "IsValidCodePage",
+            "IsValidLanguageGroup",
+            "IsValidLocale",
+            "IsValidLocaleName",
+            "SwitchToThread",
+            "TryAcquireSRWLockExclusive",
+            "TryAcquireSRWLockShared",
+            "TryEnterCriticalSection",
+        }
+    ),
+    "advapi32": frozenset(
+        {
+            "IsTextUnicode",
+            "IsTokenRestricted",
+            "IsTokenUntrusted",
+            "IsValidAcl",
+            "IsValidSecurityDescriptor",
+            "IsValidSid",
+            "IsWellKnownSid",
+        }
+    ),
+}
+
+# State changes ("did it succeed?"). Pinned explicitly where win32metadata
+# omits SetLastError even though the API reports the outcome of an operation.
+STATUS_BOOL_APIS: dict[str, frozenset[str]] = {
+    "advapi32": frozenset(
+        {
+            "AccessCheckAndAuditAlarmW",
+            "AccessCheckByTypeAndAuditAlarmW",
+            "AdjustTokenGroups",
+            "AdjustTokenPrivileges",
+            "ObjectCloseAuditAlarmW",
+            "ObjectDeleteAuditAlarmW",
+            "ObjectOpenAuditAlarmW",
+            "ObjectPrivilegeAuditAlarmW",
+            "PrivilegedServiceAuditAlarmW",
+            "SetFileSecurityA",
+            "SetFileSecurityW",
+            "SystemFunction036",
+        }
+    ),
+    "kernel32": frozenset(
+        {
+            "CallNamedPipeW",
+            "CancelTimerQueueTimer",
+            "DeleteSynchronizationBarrier",
+            "EnterSynchronizationBarrier",
+            "K32EmptyWorkingSet",
+            "LocalFileTimeToLocalSystemTime",
+            "LocalSystemTimeToLocalFileTime",
+            "QueueUserAPC2",
+            "RtlAddFunctionTable",
+            "RtlDeleteFunctionTable",
+            "RtlInstallFunctionTableCallback",
+            "SetCachedSigningLevel",
+            "SetComputerNameEx2W",
+            "SetConsoleNumberOfCommandsA",
+            "SetConsoleNumberOfCommandsW",
+            "SetCurrentDirectoryA",
+            "SetCurrentDirectoryW",
+            "SetEnvironmentStringsA",
+            "SetEnvironmentStringsW",
+            "SetMessageWaitingIndicator",
+            "SetProcessDefaultCpuSets",
+            "SetStdHandleEx",
+            "SetThreadGroupAffinity",
+            "SetThreadLocale",
+            "SetThreadPreferredUILanguages",
+            "SetThreadPreferredUILanguages2",
+            "SetThreadpoolTimerEx",
+            "SetThreadpoolWaitEx",
+            "SetXStateFeaturesMask",
+            "WaitNamedPipeW",
+            "Wow64EnableWow64FsRedirection",
+        }
+    ),
+    "user32": frozenset(
+        {
+            "AttachThreadInput",
+            "CancelShutdown",
+            "ChangeClipboardChain",
+        }
+    ),
+}
+
+
+def _lowercase_index(table: dict[str, frozenset[str]]) -> dict[str, frozenset[str]]:
+    return {dll: frozenset(name.lower() for name in names) for dll, names in table.items()}
+
+
+_PREDICATE_BOOL_INDEX = _lowercase_index(PREDICATE_BOOL_APIS)
+_STATUS_BOOL_INDEX = _lowercase_index(STATUS_BOOL_APIS)
+
+
+def bool_return_semantics(dll: str, name: str, sig: FuncSig | None = None) -> str:
+    """Classify a BOOL-returning API as ``status_bool`` or ``predicate_bool``.
+
+    Args:
+        dll: DLL the API is imported from (extension and case are ignored).
+        name: Exported function name (case-insensitive).
+        sig: The API's :class:`FuncSig`, when one is known. Its
+            ``set_last_error`` flag distinguishes state changes (TRUE/FALSE
+            plus GetLastError) from predicates for APIs not in the explicit
+            registries.
+
+    Returns:
+        :data:`BOOL_SEMANTICS_STATUS` or :data:`BOOL_SEMANTICS_PREDICATE`.
+        Unknown inputs never raise: an unlisted API without a signature is a
+        predicate, which is the conservative "condition is not known true"
+        answer (the return value is FALSE either way; only LastError differs).
+    """
+    canonical = normalize_dll(dll)
+    lowered = name.lower()
+    if lowered in _PREDICATE_BOOL_INDEX.get(canonical, ()):
+        return BOOL_SEMANTICS_PREDICATE
+    if lowered in _STATUS_BOOL_INDEX.get(canonical, ()):
+        return BOOL_SEMANTICS_STATUS
+    if sig is not None and sig.set_last_error:
+        return BOOL_SEMANTICS_STATUS
+    return BOOL_SEMANTICS_PREDICATE
+
+
 @dataclass(frozen=True)
 class EnumDef:
     """A named set of integer constants, optionally combinable as flags."""

@@ -24,7 +24,7 @@ from speakeasy.profiler import ApiCallbackFrame, MemAccess, Run
 from speakeasy.profiler_events import TracePosition
 from speakeasy.report import ErrorInfo, RegionInfo
 from speakeasy.struct import EmuStruct
-from speakeasy.windows import handle_semantics
+from speakeasy.windows import bool_semantics, handle_semantics
 from speakeasy.windows.child_execution import (
     ChildExecutionDispatcher,
     ChildExecutionRegistry,
@@ -2400,6 +2400,13 @@ class WindowsEmulator(BinaryEmulator):
         """
         Pick a plausible return value for a call we only know the signature of.
 
+        BOOL returns are semantic, not just typed: a predicate ("is the window
+        maximized?") and a status change ("did AdjustTokenGroups succeed?")
+        both spell ``b``/``B``, but neither may be claimed when the emulator
+        has no state behind it. Both classes therefore return FALSE
+        (:mod:`speakeasy.windows.bool_semantics`); status APIs additionally get
+        a failure LastError from ``_apply_signature_last_error``.
+
         Handle returns are domain-sensitive: the signature says ``h`` but not
         whether that handle is an NT kernel object, an HGLOBAL, an HWND, an
         HGDIOBJ or an HMODULE. Only the kernel-object domain may receive a
@@ -2410,7 +2417,7 @@ class WindowsEmulator(BinaryEmulator):
         if kind == "v":
             return None
         if kind in sigdb.BOOL_KINDS:
-            return 1
+            return bool_semantics.default_bool_return(sig)
         if kind == "h":
             allocate = self.om.new_handle if self.om is not None else None
             rv = handle_semantics.signature_handle_return(sig.dll, sig.name, allocate)
@@ -2424,6 +2431,30 @@ class WindowsEmulator(BinaryEmulator):
         # Status codes (HRESULT, NTSTATUS, WIN32_ERROR), counts and pointers all
         # read as "nothing happened" at zero.
         return 0
+
+    def _apply_signature_last_error(self, sig: sigdb.FuncSig, rv: int | None) -> None:
+        """
+        Set LastError for a call emulated from its signature alone.
+
+        BOOL signatures follow the signature-library policy: a ``status_bool``
+        returning FALSE reports ``ERROR_CALL_NOT_IMPLEMENTED`` because the
+        emulator did not perform the state change; a ``predicate_bool`` leaves
+        LastError untouched because a false condition is not an error.
+
+        All other signatures keep the previous behavior: APIs that declare
+        SetLastError report ERROR_SUCCESS for the "nothing happened" value.
+        """
+        set_last_error = getattr(self, "set_last_error", None)
+        if not set_last_error:
+            return
+        if sig.ret_kind in sigdb.BOOL_KINDS:
+            if rv == 0:
+                error = bool_semantics.last_error_for_default(sig)
+                if error is not None:
+                    set_last_error(error)
+            return
+        if sig.set_last_error:
+            set_last_error(0)
 
     def emulate_api_from_signature(self, dll: str, name: str, sig: sigdb.FuncSig, call_pc: int) -> int | None:
         """
@@ -2459,10 +2490,7 @@ class WindowsEmulator(BinaryEmulator):
 
         self.hammer.handle_import_func(imp_api, conv, argc)
         self._zero_fill_out_params(sig, values, ptr_size)
-        if sig.set_last_error:
-            set_last_error = getattr(self, "set_last_error", None)
-            if set_last_error:
-                set_last_error(0)
+        self._apply_signature_last_error(sig, rv)
 
         ret = self.get_ret_address()
         self.log_api(call_pc, imp_api, rv, argv, display=display)
@@ -2588,16 +2616,25 @@ class WindowsEmulator(BinaryEmulator):
                 if sig is not None:
                     # Default implementation for the hook == what the engine
                     # would have done on its own: zero-fill the out parameters
-                    # and return a type-appropriate "success" value.
+                    # and return the signature-policy default value.
                     values = sig.values_from_slots(argv, ptr_size)
                     self._zero_fill_out_params(sig, values, ptr_size)
-                    if sig.set_last_error:
-                        set_last_error = getattr(self, "set_last_error", None)
-                        if set_last_error:
-                            set_last_error(0)
+                    if sig.ret_kind in sigdb.BOOL_KINDS:
+                        # BOOL defaults have no allocation side effects, so the
+                        # value and its LastError policy are applied eagerly.
+                        default_rv = self._default_return_for_signature(sig)
+                        self._apply_signature_last_error(sig, default_rv)
 
-                    def orig(args, _sig=sig):
-                        return self._default_return_for_signature(_sig)
+                        def orig(args, _rv=default_rv):
+                            return _rv
+                    else:
+                        if sig.set_last_error:
+                            set_last_error = getattr(self, "set_last_error", None)
+                            if set_last_error:
+                                set_last_error(0)
+
+                        def orig(args, _sig=sig):
+                            return self._default_return_for_signature(_sig)
 
                 rv = hook.cb(self, imp_api, orig, argv)
                 ret = self.get_ret_address()

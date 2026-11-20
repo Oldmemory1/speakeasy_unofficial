@@ -7,6 +7,7 @@ import speakeasy.windows.sessman as sessman
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.windows.user32 as windefs
 import speakeasy.winenv.defs.windows.windef as windef
+from speakeasy.windows import window_placement
 from speakeasy.windows.gui_messages import QueuedWindowMessage
 from speakeasy.windows.window_state import (
     GWL_WNDPROC,
@@ -20,6 +21,9 @@ from .. import api
 logger = logging.getLogger(__name__)
 
 IDCANCEL = 2
+
+# WinError.h: the HWND is not a window the session manager knows about.
+ERROR_INVALID_WINDOW_HANDLE = 1400
 
 IDI_APPLICATION = 32512
 IDI_ASTERISK = 32516
@@ -366,6 +370,7 @@ class User32(api.ApiHandler):
         self.timer_count: int = 0
         self.sessman = sessman.SessionManager(config=None, allocator=emu.handle_allocator)
         self.window_state = WindowState()
+        self.window_placement = window_placement.WindowPlacement()
         self.synthetic_async_keys = [0x41, 0x42, 0x43]
         self.synthetic_async_key_index = 0
         self.synthetic_hook_keys = [0x41, 0x42, 0x43]
@@ -448,6 +453,8 @@ class User32(api.ApiHandler):
           int  nCmdShow
         );"""
 
+        hWnd, nCmdShow = argv
+        self.window_placement.apply_show_command(hWnd, nCmdShow)
         rv = 1
 
         return rv
@@ -632,6 +639,7 @@ class User32(api.ApiHandler):
         );
         """
         hnd = argv[0]
+        self.window_placement.forget(hnd)
         return int(self.sessman.destroy_window(hnd))
 
     @apihook("DefWindowProc", argc=4)
@@ -666,7 +674,7 @@ class User32(api.ApiHandler):
         """
         ctx = ctx or {}
         cw = self.get_char_width(ctx)
-        _, class_token, wn, _, x, y, width, height, parent, menu, inst, param = argv
+        _, class_token, wn, style, x, y, width, height, parent, menu, inst, param = argv
         class_atom = None
         if isinstance(class_token, int) and 0 < class_token <= 0xFFFF:
             class_atom = class_token
@@ -694,6 +702,8 @@ class User32(api.ApiHandler):
             class_atom=class_atom,
             wndproc=wndproc,
         )
+        if hnd and style & window_placement.WS_MAXIMIZE:
+            self.window_placement.set_maximized(hnd, True)
         if hnd and wndproc:
             self.setup_callback(
                 wndproc,
@@ -1534,6 +1544,25 @@ class User32(api.ApiHandler):
         );
         """
         return True
+
+    @apihook("IsZoomed", argc=1)
+    def IsZoomed(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        BOOL IsZoomed(
+            HWND hWnd
+        );
+
+        Nonzero only while the window is maximized. The maximize state is
+        maintained by CreateWindowEx (WS_MAXIMIZE) and ShowWindow
+        (SW_MAXIMIZE / restore commands); an unknown HWND is not zoomed and
+        sets ERROR_INVALID_WINDOW_HANDLE, matching the documented predicate
+        contract instead of the old unconditional TRUE signature fallback.
+        """
+        hWnd = argv[0]
+        if self.sessman.get_window(hWnd) is None:
+            emu.set_last_error(ERROR_INVALID_WINDOW_HANDLE)
+            return 0
+        return 1 if self.window_placement.is_maximized(hWnd) else 0
 
     @apihook("BeginPaint", argc=2)
     def BeginPaint(self, emu, argv, ctx: api.ApiContext = None):

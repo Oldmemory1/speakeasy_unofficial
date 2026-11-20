@@ -215,8 +215,10 @@ def test_unhooked_import_is_emulated_from_signature(config: dict[str, Any], arch
         f'lpNewFileName: "{NEW_NAME}"',
         "dwFlags: MOVEFILE_REPLACE_EXISTING",
     ]
-    # BOOL return: fake success
-    assert move.ret_val == "0x1"
+    # BOOL status return: MoveFileExW sets LastError and reports failure.
+    # The file operation is not emulated by the signature fallback, so TRUE
+    # would fabricate a completed move (FX-011).
+    assert move.ret_val == "0x0"
 
     # The stack (x86) / registers (x64) were left exactly as the caller expects
     assert events[1].args == [f"{EXIT_CODE:#x}"]
@@ -264,7 +266,9 @@ def test_in_struct_pointer_is_decoded(config: dict[str, Any]) -> None:
         'lpNewDirectory: "C:\\new"',
         "lpSecurityAttributes: {nLength: 0xc, lpSecurityDescriptor: 0x0, bInheritHandle: TRUE}",
     ]
-    assert events[0].ret_val == "0x1"
+    # BOOL status return: the directory is not created by the signature
+    # fallback, so the honest result is FALSE (FX-011).
+    assert events[0].ret_val == "0x0"
     assert events[1].args == [f"{EXIT_CODE:#x}"]
 
 

@@ -6,6 +6,7 @@ from typing import Any
 from Crypto.Cipher import ARC4
 
 import speakeasy.windows.objman as objman
+import speakeasy.windows.token_groups as token_groups
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.registry.reg as regdefs
 import speakeasy.winenv.defs.windows.advapi32 as adv32
@@ -1237,6 +1238,75 @@ class AdvApi32(api.ApiHandler):
             rv = True
 
         return rv
+
+    @apihook("AdjustTokenGroups", argc=6, conv=_arch.CALL_CONV_STDCALL)
+    def AdjustTokenGroups(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        BOOL AdjustTokenGroups(
+            HANDLE        TokenHandle,
+            BOOL          ResetToDefault,
+            PTOKEN_GROUPS NewState,
+            DWORD         BufferLength,
+            PTOKEN_GROUPS PreviousState,
+            PDWORD        ReturnLength
+        );
+
+        An invalid token handle returns FALSE and sets ERROR_INVALID_HANDLE: a
+        fabricated TRUE here made sample 7dfcfbf9 take the "success" branch and
+        execute obfuscated state writes that ended at a wild address.
+
+        For a valid token, ResetToDefault TRUE restores the default (empty)
+        group state; otherwise NewState is decoded as a TOKEN_GROUPS buffer of
+        BufferLength bytes and stored on the token. When PreviousState is
+        requested it receives the pre-call groups, and ReturnLength receives
+        the buffer size they need.
+        """
+        (
+            token_handle,
+            reset_to_default,
+            new_state,
+            buffer_length,
+            previous_state,
+            return_length,
+        ) = argv
+
+        token = self.get_object_from_handle(token_handle)
+        if not isinstance(token, objman.Token):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        ptr_size = self.get_ptr_size()
+
+        if reset_to_default:
+            new_groups = None
+        else:
+            if not new_state:
+                emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+                return 0
+            try:
+                new_groups = token_groups.read_token_groups(
+                    self.mem_read, ptr_size, new_state, buffer_length
+                )
+            except token_groups.TokenGroupsBufferError:
+                emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+                return 0
+
+        previous_groups = token_groups.get_token_groups(token)
+        if previous_state:
+            required = token_groups.token_groups_size(ptr_size, len(previous_groups))
+            if return_length:
+                self.mem_write(return_length, required.to_bytes(4, "little"))
+            token_groups.write_token_groups(
+                self.mem_write, ptr_size, previous_state, previous_groups
+            )
+
+        if new_groups is None:
+            token_groups.reset_token_groups(token)
+        else:
+            token_groups.set_token_groups(token, new_groups)
+
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return 1
 
     @apihook("AdjustTokenPrivileges", argc=6)
     def AdjustTokenPrivileges(self, emu, argv, ctx: api.ApiContext = None):
