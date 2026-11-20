@@ -24,6 +24,7 @@ from speakeasy.profiler import ApiCallbackFrame, MemAccess, Run
 from speakeasy.profiler_events import TracePosition
 from speakeasy.report import ErrorInfo, RegionInfo
 from speakeasy.struct import EmuStruct
+from speakeasy.windows import handle_semantics
 from speakeasy.windows.child_execution import (
     ChildExecutionDispatcher,
     ChildExecutionRegistry,
@@ -2377,7 +2378,13 @@ class WindowsEmulator(BinaryEmulator):
 
     def _default_return_for_signature(self, sig: sigdb.FuncSig) -> int | None:
         """
-        Pick a plausible "success" return value for a call we only know the signature of
+        Pick a plausible return value for a call we only know the signature of.
+
+        Handle returns are domain-sensitive: the signature says ``h`` but not
+        whether that handle is an NT kernel object, an HGLOBAL, an HWND, an
+        HGDIOBJ or an HMODULE. Only the kernel-object domain may receive a
+        fresh ``ObjectManager.new_handle()`` value; every other (and unknown)
+        domain returns NULL rather than a fabricated kernel handle.
         """
         kind = sig.ret_kind
         if kind == "v":
@@ -2385,9 +2392,15 @@ class WindowsEmulator(BinaryEmulator):
         if kind in sigdb.BOOL_KINDS:
             return 1
         if kind == "h":
-            if self.om is not None:
-                return self.om.new_handle()
-            return 4
+            allocate = self.om.new_handle if self.om is not None else None
+            rv = handle_semantics.signature_handle_return(sig.dll, sig.name, allocate)
+            if rv == 0:
+                logger.debug(
+                    "%s: %s return domain is not a kernel handle; returning NULL",
+                    sig.name,
+                    sig.dll,
+                )
+            return rv
         # Status codes (HRESULT, NTSTATUS, WIN32_ERROR), counts and pointers all
         # read as "nothing happened" at zero.
         return 0

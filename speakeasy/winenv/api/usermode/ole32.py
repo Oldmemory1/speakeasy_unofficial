@@ -15,6 +15,20 @@ class Ole32(api.ApiHandler):
     apihook = api.ApiHandler.apihook
     impdata = api.ApiHandler.impdata
 
+    # Clipboard formats that carry a GDI object handle instead of an HGLOBAL.
+    # Wine duplicates these with CopyEnhMetaFileW/CopyMetaFileW/CreatePalette/
+    # CreateBitmapIndirect (ole32/ole2.c:3094). Speakeasy does not model those
+    # GDI objects for this API, so they fail with NULL rather than returning a
+    # fabricated handle of the wrong kind.
+    GDI_CLIPBOARD_FORMATS = frozenset(
+        {
+            2,  # CF_BITMAP
+            3,  # CF_METAFILEPICT
+            9,  # CF_PALETTE
+            14,  # CF_ENHMETAFILE
+        }
+    )
+
     def __init__(self, emu):
         super().__init__(emu)
         self.funcs = {}
@@ -193,6 +207,66 @@ class Ole32(api.ApiHandler):
             argv[3] = iid_name
         logger.info("No COM class object for CLSID %s (IID %s)", clsid_name, riid_str)
         return com.E_NOINTERFACE
+
+    @apihook("OleDuplicateData", argc=3)
+    def OleDuplicateData(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        HGLOBAL OleDuplicateData(
+          HGLOBAL   hSrc,
+          CLIPFORMAT cfFormat,
+          UINT      uiFlags
+        );
+
+        Duplicate a clipboard data handle. Wine (ole32/ole2.c:3094) routes the
+        GDI-object formats through their GDI copy functions and every other
+        format through GlobalSize/GlobalAlloc/memcpy. Speakeasy models an
+        HGLOBAL as a mapped block, so:
+
+        * NULL source -> NULL (Wine's GlobalSize(NULL) is 0);
+        * GDI-object formats -> NULL (no GDI object duplication model; a kernel
+          handle is not an HBITMAP/HPALETTE/HMETAFILE);
+        * other formats -> a new mapped block with the source contents, or NULL
+          when the source is not a mapped HGLOBAL.
+
+        ``uiFlags`` selects GMEM_* flags in Windows; Speakeasy HGLOBALs are
+        plain mapped addresses, so the flags are accepted and ignored.
+        """
+        hsrc, cf_format, _ui_flags = argv
+        cf_format = int(cf_format) & 0xFFFF
+
+        if not hsrc:
+            return 0
+        if cf_format in self.GDI_CLIPBOARD_FORMATS:
+            logger.info("OleDuplicateData: unsupported GDI clipboard format %#x", cf_format)
+            return 0
+
+        size = self._source_global_size(hsrc)
+        if not size:
+            logger.info("OleDuplicateData: source %#x is not a mapped HGLOBAL", hsrc)
+            return 0
+
+        try:
+            source = self.mem_read(hsrc, size)
+        except Exception:
+            logger.debug("OleDuplicateData: cannot read source %#x (%#x bytes)", hsrc, size, exc_info=True)
+            return 0
+
+        dest = self.mem_alloc(size, tag="api.OleDuplicateData")
+        try:
+            self.mem_write(dest, source)
+        except Exception:
+            logger.debug("OleDuplicateData: cannot write duplicate at %#x (%#x bytes)", dest, size, exc_info=True)
+            self.mem_free(dest)
+            return 0
+
+        return dest
+
+    def _source_global_size(self, hsrc: int) -> int:
+        """Size of the mapped HGLOBAL block whose base is ``hsrc`` (0 if none)."""
+        mm = self.emu.get_address_map(hsrc)
+        if mm is None or mm.base != hsrc or mm.free:
+            return 0
+        return mm.size
 
     @apihook("CoSetProxyBlanket", argc=8)
     def CoSetProxyBlanket(self, emu, argv, ctx: api.ApiContext = None):
