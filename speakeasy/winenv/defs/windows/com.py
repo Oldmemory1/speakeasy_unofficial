@@ -6,6 +6,13 @@ from speakeasy.struct import EmuStruct, Ptr
 
 S_OK = 0
 
+# Standard COM HRESULT failure codes (winerror.h). COM callers use
+# SUCCEEDED()/FAILED() on the full 32-bit value, so these must be returned
+# unchanged rather than collapsed into a generic nonzero value.
+REGDB_E_CLASSNOTREG = 0x80040154
+E_NOINTERFACE = 0x80004002
+E_POINTER = 0x80004003
+
 RPC_C_AUTHN_LEVEL_DEFAULT = 0
 RPC_C_AUTHN_LEVEL_NONE = 1
 RPC_C_AUTHN_LEVEL_CONNECT = 2
