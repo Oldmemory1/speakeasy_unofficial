@@ -7,6 +7,7 @@ import uuid
 import lznt1
 
 import speakeasy.common as common
+import speakeasy.windows.objman as objman
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.nt.ntoskrnl as ntos
@@ -14,6 +15,7 @@ import speakeasy.winenv.defs.registry.reg as regdefs
 import speakeasy.winenv.defs.windows.windows as windefs
 from speakeasy.errors import ApiEmuError
 from speakeasy.profiler_events import FILE_OPEN, FILE_READ, FILE_WRITE, MEM_WRITE
+from speakeasy.windows.page_protection import ERROR_INVALID_ADDRESS, apply_page_protection
 from speakeasy.winenv.api import api
 
 logger = logging.getLogger(__name__)
@@ -1414,6 +1416,23 @@ class Ntoskrnl(api.ApiHandler):
         # ApcState = argv[0]
         return
 
+    def _resolve_process_handle(self, emu, hnd):
+        """
+        Resolve a kernel memory-service ``ProcessHandle`` argument.
+
+        Returns the ``Process`` object denoted by the current-process pseudo
+        handle or by an object handle, or None when the handle does not denote
+        a process. The emulator currently models a single shared address space
+        (per-process address spaces are FX-012); this helper only validates the
+        handle and does not fake cross-process isolation.
+        """
+        if hnd == self.get_max_int():
+            return emu.get_current_process()
+        obj = self.get_object_from_handle(hnd)
+        if isinstance(obj, objman.Process):
+            return obj
+        return None
+
     @apihook("ZwProtectVirtualMemory", argc=5)
     def ZwProtectVirtualMemory(self, emu, argv, ctx: api.ApiContext = None):
         """
@@ -1424,19 +1443,46 @@ class Ntoskrnl(api.ApiHandler):
             IN ULONG NewAccessProtection,
             OUT PULONG OldAccessProtection
             )
-        """
-        hnd, base, byte_len, new_prot, old_prot = argv
 
-        if base:
-            addr = self.mem_read(base, emu.get_ptr_size())
-            addr = int.from_bytes(addr, "little")
-            argv[1] = addr
-        if byte_len:
-            size = self.mem_read(byte_len, emu.get_ptr_size())
-            size = int.from_bytes(size, "little")
-            argv[2] = size
-        rv = ddk.STATUS_SUCCESS
-        return rv
+        Applies ``NewAccessProtection`` to every page covering
+        ``[*BaseAddress, *BaseAddress + *NumberOfBytesToProtect)`` and writes
+        back the page-rounded base/size plus the old protection of the first
+        affected page. Returns STATUS_SUCCESS on success, STATUS_INVALID_HANDLE
+        for an unresolvable/non-process handle, STATUS_INVALID_PARAMETER for
+        null IN OUT pointers or an invalid ``PAGE_*`` value, and
+        STATUS_ACCESS_VIOLATION for an unmapped range or a null
+        ``OldAccessProtection`` pointer.
+        """
+        hnd, base_ptr, size_ptr, new_prot, old_ptr = argv
+
+        if not old_ptr:
+            return ddk.STATUS_ACCESS_VIOLATION
+
+        if self._resolve_process_handle(emu, hnd) is None:
+            return ddk.STATUS_INVALID_HANDLE
+
+        if not base_ptr or not size_ptr:
+            return ddk.STATUS_INVALID_PARAMETER
+
+        ptr_size = emu.get_ptr_size()
+        addr = int.from_bytes(self.mem_read(base_ptr, ptr_size), "little")
+        size = int.from_bytes(self.mem_read(size_ptr, ptr_size), "little")
+        argv[1] = addr
+        argv[2] = size
+
+        result = apply_page_protection(emu, addr, size, new_prot)
+        if not result.success:
+            if result.error == ERROR_INVALID_ADDRESS:
+                return ddk.STATUS_ACCESS_VIOLATION
+            return ddk.STATUS_INVALID_PARAMETER
+
+        rounded_size = result.end - result.start
+        self.mem_write(base_ptr, result.start.to_bytes(ptr_size, "little"))
+        self.mem_write(size_ptr, rounded_size.to_bytes(ptr_size, "little"))
+        self.mem_write(old_ptr, result.old_protect.to_bytes(4, "little"))
+        argv[1] = result.start
+        argv[2] = rounded_size
+        return ddk.STATUS_SUCCESS
 
     @apihook("ZwWriteVirtualMemory", argc=5)
     def ZwWriteVirtualMemory(self, emu, argv, ctx: api.ApiContext = None):
