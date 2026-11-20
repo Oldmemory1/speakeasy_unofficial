@@ -8,6 +8,12 @@ import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.windows.user32 as windefs
 import speakeasy.winenv.defs.windows.windef as windef
 from speakeasy.windows.gui_messages import QueuedWindowMessage
+from speakeasy.windows.window_state import (
+    GWL_WNDPROC,
+    WindowState,
+    canonical_window_long_index,
+    mask_window_long_value,
+)
 
 from .. import api
 
@@ -359,6 +365,7 @@ class User32(api.ApiHandler):
         self.handles: list[int] = []
         self.timer_count: int = 0
         self.sessman = sessman.SessionManager(config=None, allocator=emu.handle_allocator)
+        self.window_state = WindowState()
         self.synthetic_async_keys = [0x41, 0x42, 0x43]
         self.synthetic_async_key_index = 0
         self.synthetic_hook_keys = [0x41, 0x42, 0x43]
@@ -1326,38 +1333,120 @@ class User32(api.ApiHandler):
 
         return rv
 
+    def _window_proc_value(self, hWnd: int) -> int:
+        """Current window procedure for ``hWnd`` as an integer (0 if unknown).
+
+        The SessionManager is the single source of truth for ``GWL_WNDPROC``:
+        a window's own procedure overrides its class procedure, and a handle
+        that does not identify a window has no procedure.
+        """
+        return int(self.sessman.get_window_proc(hWnd) or 0)
+
+    def _get_window_long(self, hWnd: int, nIndex: int, value_size: int) -> int:
+        """Read one window long attribute.
+
+        Args:
+            hWnd: window handle. Unknown handles read as 0.
+            nIndex: ``GWL_*`` selector; 32-bit and 64-bit sign-extended forms
+                address the same attribute.
+            value_size: result width in bytes (4 for ``LONG``, pointer size for
+                ``LONG_PTR``).
+
+        Returns:
+            The stored value truncated to ``value_size``. ``GWL_WNDPROC``
+            returns the SessionManager window procedure; an attribute that was
+            never set returns 0. No placeholder value is fabricated.
+        """
+        index = canonical_window_long_index(nIndex)
+        if index == canonical_window_long_index(GWL_WNDPROC):
+            value = self._window_proc_value(hWnd)
+        else:
+            value = self.window_state.get(hWnd, index)
+        return mask_window_long_value(value, value_size)
+
+    def _set_window_long(self, hWnd: int, nIndex: int, dwNewLong: int, value_size: int) -> int:
+        """Store one window long attribute and return the previous value.
+
+        ``GWL_WNDPROC`` is routed exclusively through
+        ``SessionManager.set_window_proc`` so the stored procedure and message
+        dispatch stay consistent; the procedure itself is pointer-sized.
+        Other selectors are stored in ``WindowState`` keyed by
+        ``(hWnd, canonical nIndex)``. Unknown handles are accepted for those
+        selectors (the GUI layer does not validate HWNDs), while
+        ``GWL_WNDPROC`` on an unknown handle cannot create procedure state and
+        reads back as 0.
+
+        Returns:
+            The previous value truncated to ``value_size`` (0 when unset).
+        """
+        index = canonical_window_long_index(nIndex)
+        if index == canonical_window_long_index(GWL_WNDPROC):
+            old = self._window_proc_value(hWnd)
+            new_proc = mask_window_long_value(dwNewLong, self.get_ptr_size())
+            self.sessman.set_window_proc(hWnd, new_proc)
+        else:
+            old = self.window_state.get(hWnd, index)
+            self.window_state.set(hWnd, index, mask_window_long_value(dwNewLong, value_size))
+        return mask_window_long_value(old, value_size)
+
     @apihook("GetWindowLong", argc=2)
     def GetWindowLong(self, emu, argv, ctx: api.ApiContext = None):
         """
-        LONG GetWindowLongA(
+        LONG GetWindowLongA/W(
             HWND hWnd,
             int  nIndex
         );
-        """
-        (
-            hWnd,
-            nIndex,
-        ) = argv
-        rv = 2
 
-        return rv
+        Returns the stored window long value, or 0 when it was never set.
+        ``GWL_WNDPROC`` reflects the SessionManager window procedure.
+        """
+        hWnd, nIndex = argv
+        return self._get_window_long(hWnd, nIndex, 4)
+
+    @apihook("GetWindowLongPtr", argc=2)
+    def GetWindowLongPtr(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        LONG_PTR GetWindowLongPtrA/W(
+            HWND hWnd,
+            int  nIndex
+        );
+
+        Pointer-width variant of GetWindowLong, used by 64-bit guests. Shares
+        the same attribute storage; values are truncated to the pointer size.
+        """
+        hWnd, nIndex = argv
+        return self._get_window_long(hWnd, nIndex, self.get_ptr_size())
 
     @apihook("SetWindowLong", argc=3)
     def SetWindowLong(self, emu, argv, ctx: api.ApiContext = None):
         """
-        LONG SetWindowLongA(
+        LONG SetWindowLongA/W(
           HWND hWnd,
           int  nIndex,
           LONG dwNewLong
         );
+
+        Stores ``dwNewLong`` and returns the previous value (0 when unset).
+        ``GWL_WNDPROC`` (-4) additionally updates the window procedure used for
+        message dispatch.
         """
         hWnd, nIndex, dwNewLong = argv
-        if (self.get_ptr_size() == 4 and nIndex == 0xFFFFFFFC) or (
-            self.get_ptr_size() == 8 and nIndex == 0xFFFFFFFFFFFFFFFC
-        ):
-            self.sessman.set_window_proc(hWnd, dwNewLong)
+        return self._set_window_long(hWnd, nIndex, dwNewLong, 4)
 
-        return 1
+    @apihook("SetWindowLongPtr", argc=3)
+    def SetWindowLongPtr(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        LONG_PTR SetWindowLongPtrA/W(
+          HWND    hWnd,
+          int     nIndex,
+          LONG_PTR dwNewLong
+        );
+
+        Pointer-width variant of SetWindowLong, used by 64-bit guests. Shares
+        the same attribute storage; ``GWL_WNDPROC`` updates the window procedure.
+        """
+        hWnd, nIndex, dwNewLong = argv
+        return self._set_window_long(hWnd, nIndex, dwNewLong, self.get_ptr_size())
 
     @apihook("DialogBoxParam", argc=5)
     def DialogBoxParam(self, emu, argv, ctx: api.ApiContext = None):
