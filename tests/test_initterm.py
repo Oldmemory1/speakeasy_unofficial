@@ -51,6 +51,9 @@ class _Asm32:
         self.buf += b"\x68"
         self.imm32(key, addend)
 
+    def push_imm32(self, value: int) -> None:
+        self.buf += b"\x68" + struct.pack("<I", value & 0xFFFFFFFF)
+
     def mov_eax(self, key: str, addend: int = 0) -> None:
         self.buf += b"\xb8"
         self.imm32(key, addend)
@@ -99,6 +102,9 @@ class _Asm64:
     def mov_rdx_r11(self) -> None:
         self.buf += b"\x4c\x89\xda"
 
+    def mov_ecx_imm32(self, value: int) -> None:
+        self.buf += b"\xb9" + struct.pack("<I", value & 0xFFFFFFFF)
+
     def mov_rax(self, key: str, addend: int = 0) -> None:
         self.buf += b"\x48\xb8"
         self.imm64(key, addend)
@@ -126,6 +132,7 @@ def _build(
     *,
     init_a_returns: int | None = None,
     nested_api: bool = False,
+    init_a_calls_narrow_argv: bool = False,
 ) -> tuple[object, int, int]:
     """Build entry + initA + initB shellcode.
 
@@ -156,6 +163,10 @@ def _build(
         asm.mov_mem_r11_imm32(1)
         asm.mov_r11("data", D_A)
         asm.mov_mem_r11_imm32(1)
+        if init_a_calls_narrow_argv:
+            asm.mov_ecx_imm32(1)
+            asm.mov_rax("api:msvcrt._configure_narrow_argv")
+            asm.call_rax()
         if init_a_returns is not None:
             asm.mov_eax_imm32(init_a_returns)
         asm.ret()
@@ -182,6 +193,11 @@ def _build(
             asm.mov_mem_eax(D_NEST)
         asm.mov_mem_imm32(D_ORDER, 1)
         asm.mov_mem_imm32(D_A, 1)
+        if init_a_calls_narrow_argv:
+            asm.push_imm32(1)
+            asm.mov_eax("api:msvcrt._configure_narrow_argv")
+            asm.call_eax()
+            asm.add_esp_imm8(4)
         if init_a_returns is not None:
             asm.mov_eax_imm32(init_a_returns)
         asm.ret()
@@ -192,6 +208,31 @@ def _build(
         asm.ret()
 
     return asm, init_a, init_b
+
+
+def _build_call1(arch: str, api: str, arg: int) -> object:
+    """Build shellcode that calls ``api(arg)`` and stores the 32-bit result.
+
+    The guest calls the import stub with one integer argument, stores EAX/RAX
+    into ``D_RV`` and returns to the engine. Used to drive CRT init-stub return
+    semantics through the real API dispatcher.
+    """
+    asm = _Asm64() if arch == "x64" else _Asm32()
+    if arch == "x64":
+        asm.mov_r11("data", D_RV)
+        asm.mov_ecx_imm32(arg)
+        asm.mov_rax(f"api:{api}")
+        asm.call_rax()
+        asm.mov_mem_r11_eax()
+        asm.ret()
+    else:
+        asm.push_imm32(arg)
+        asm.mov_eax(f"api:{api}")
+        asm.call_eax()
+        asm.add_esp_imm8(4)  # cdecl caller cleans the single argument
+        asm.mov_mem_eax(D_RV)
+        asm.ret()
+    return asm
 
 
 @contextmanager
@@ -332,3 +373,109 @@ def test_initializer_can_call_apis(config, arch):
 
         names = [e.api_name for e in _api_events(report)]
         assert "kernel32.GetTickCount" in names
+
+
+# ---------------------------------------------------------------------------
+# UCRT startup initializer compatibility (FX-008 attempt 2)
+#
+# FX-008 makes CRT initializer tables execute. The UCRT startup initializers
+# then call narrow-argv / narrow-environment / file-mode initialization
+# imports and branch on their ``errno_t`` results. Those handlers used to
+# return ``None``; ``do_call_return`` skips the return register for ``None``,
+# so EAX kept a stale non-zero value and the UCRT fast-fail path ran
+# (the six suite pass->fail regressions). These tests pin the errno_t
+# contract at the handler and at the initializer-chain level.
+# ---------------------------------------------------------------------------
+
+EINVAL = 22
+O_TEXT = 0x4000
+O_BINARY = 0x8000
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("mode", [0, 1, 2])
+def test_configure_narrow_argv_valid_mode_returns_zero(config, arch, mode):
+    """``_configure_narrow_argv`` is ``errno_t``: every valid mode returns 0."""
+    asm = _build_call1(arch, "msvcrt._configure_narrow_argv", mode)
+
+    with _guest(config, arch, asm, [], 0, 0) as (emu, report, data):
+        entry = report.entry_points[0]
+        assert entry.error is None, entry.error
+        assert _u32(emu, data + D_RV) == 0
+
+        names = [e.api_name for e in _api_events(report)]
+        assert "msvcrt._configure_narrow_argv" in names
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_configure_narrow_argv_invalid_mode_returns_einval(config, arch):
+    """A mode outside the documented enum returns EINVAL, never a fake 0."""
+    asm = _build_call1(arch, "msvcrt._configure_narrow_argv", 3)
+
+    with _guest(config, arch, asm, [], 0, 0) as (emu, report, data):
+        entry = report.entry_points[0]
+        assert entry.error is None, entry.error
+        assert _u32(emu, data + D_RV) == EINVAL
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_initialize_narrow_environment_returns_zero(config, arch):
+    """``_initialize_narrow_environment`` is ``errno_t``: success is 0."""
+    asm = _build_call1(arch, "msvcrt._initialize_narrow_environment", 0)
+
+    with _guest(config, arch, asm, [], 0, 0) as (emu, report, data):
+        entry = report.entry_points[0]
+        assert entry.error is None, entry.error
+        assert _u32(emu, data + D_RV) == 0
+
+        names = [e.api_name for e in _api_events(report)]
+        assert "msvcrt._initialize_narrow_environment" in names
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("mode", [O_TEXT, O_BINARY])
+def test_set_fmode_valid_modes_return_zero(config, arch, mode):
+    """``_set_fmode`` is ``errno_t``: _O_TEXT and _O_BINARY return 0."""
+    asm = _build_call1(arch, "msvcrt._set_fmode", mode)
+
+    with _guest(config, arch, asm, [], 0, 0) as (emu, report, data):
+        entry = report.entry_points[0]
+        assert entry.error is None, entry.error
+        assert _u32(emu, data + D_RV) == 0
+
+        names = [e.api_name for e in _api_events(report)]
+        assert "msvcrt._set_fmode" in names
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_set_fmode_invalid_mode_returns_einval(config, arch):
+    """An unsupported file mode returns EINVAL, matching the UCRT contract."""
+    asm = _build_call1(arch, "msvcrt._set_fmode", 1)
+
+    with _guest(config, arch, asm, [], 0, 0) as (emu, report, data):
+        entry = report.entry_points[0]
+        assert entry.error is None, entry.error
+        assert _u32(emu, data + D_RV) == EINVAL
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_initializer_configure_narrow_argv_success_keeps_initterm_e_running(config, arch):
+    """A UCRT startup initializer returning 0 must not stop ``_initterm_e``.
+
+    This is the engine-test-binary path: an initializer calls
+    ``_configure_narrow_argv(1)`` and returns its ``errno_t`` result. A handler
+    that leaves EAX stale (returns ``None``) makes the initializer return a
+    non-zero failure value, ``_initterm_e`` stops, and the process fast-fails.
+    """
+    asm, init_a, init_b = _build(arch, "msvcrt._initterm_e", 2, init_a_calls_narrow_argv=True)
+
+    with _guest(config, arch, asm, ["initA", "initB"], init_a, init_b) as (emu, report, data):
+        entry = report.entry_points[0]
+        assert entry.error is None, entry.error
+        assert _u32(emu, data + D_A) == 1
+        assert _u32(emu, data + D_B) == 1, "initB must still run after a successful argv init"
+        assert _u32(emu, data + D_ORDER) == 2
+        assert _u32(emu, data + D_RV) == 0
+
+        names = [e.api_name for e in _api_events(report)]
+        assert "msvcrt._configure_narrow_argv" in names

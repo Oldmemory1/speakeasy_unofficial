@@ -14,6 +14,11 @@ EINVAL = 22
 ERANGE = 34
 _TRUNCATE = 0xFFFFFFFF
 
+# UCRT startup enums used by the CRT initialization stubs below.
+_CRT_ARGV_MODES = (0, 1, 2)  # no arguments, unexpanded, expanded
+_O_TEXT = 0x4000
+_O_BINARY = 0x8000
+
 TIME_BASE = 1576292568
 RAND_BASE = 0
 TICK_BASE = 86400000  # 1 day in millisecs
@@ -1792,15 +1797,57 @@ class Msvcrt(api.ApiHandler):
 
     @apihook("_initialize_narrow_environment", argc=0, conv=e_arch.CALL_CONV_CDECL)
     def _initialize_narrow_environment(self, emu, argv, ctx: api.ApiContext = None):
-        return
+        """errno_t _initialize_narrow_environment(void).
+
+        UCRT startup calls this from the CRT initializer table and branches on
+        the ``errno_t`` result: 0 is success. The engine already exposes the
+        environment through ``_get_initial_narrow_environment``/
+        ``__p__environ``, so no additional guest-visible setup is required here.
+
+        Returns:
+            0 (success), on x86 and x64. Unknown inputs: none (no arguments).
+        """
+        return 0
 
     @apihook("_configure_narrow_argv", argc=1, conv=e_arch.CALL_CONV_CDECL)
     def _configure_narrow_argv(self, emu, argv, ctx: api.ApiContext = None):
-        return
+        """errno_t _configure_narrow_argv(_crt_argv_mode mode).
+
+        UCRT startup calls this from an initializer table and checks the
+        ``errno_t`` result. Returning ``None`` left EAX with a stale non-zero
+        value, so a success looked like a failure and the fast-fail path ran.
+        Argument data is provided by the ``__getmainargs``/``__p___argv``
+        handlers; this stub implements the documented mode check and result.
+
+        Args:
+            mode: 0 = no arguments, 1 = unexpanded arguments,
+                2 = expanded arguments.
+
+        Returns:
+            0 for a documented mode, EINVAL (22) otherwise, on x86 and x64.
+        """
+        (mode,) = argv
+        if mode in _CRT_ARGV_MODES:
+            return 0
+        return EINVAL
 
     @apihook("_set_fmode", argc=1, conv=e_arch.CALL_CONV_CDECL)
     def _set_fmode(self, emu, argv, ctx: api.ApiContext = None):
-        return
+        """errno_t _set_fmode(int mode).
+
+        Sets the default file translation mode. Called from a UCRT initializer
+        whose caller may branch on the ``errno_t`` result.
+
+        Args:
+            mode: ``_O_TEXT`` (0x4000) or ``_O_BINARY`` (0x8000).
+
+        Returns:
+            0 for a documented mode, EINVAL (22) otherwise, on x86 and x64.
+        """
+        (mode,) = argv
+        if mode in (_O_TEXT, _O_BINARY):
+            return 0
+        return EINVAL
 
     @apihook("_itoa", argc=3, conv=e_arch.CALL_CONV_CDECL)
     def _itoa(self, emu, argv, ctx: api.ApiContext = None):
