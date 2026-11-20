@@ -68,6 +68,7 @@ class Msvcrt(api.ApiHandler):
         self.file_streams: dict[int, Any] = {}
         self.signal_handlers: dict[int, int] = {}
         self._environ_pointer: int | None = None
+        self._wcmdln_pointer: int | None = None
 
         super().__get_hook_attrs__(self)
 
@@ -103,6 +104,59 @@ class Msvcrt(api.ApiHandler):
         cmdln = self._acmdln()
 
         return cmdln
+
+    def _resolved_wcmdln_cell(self) -> int | None:
+        """Return the loader-resolved ``_wcmdln`` data-import cell, if any.
+
+        ``Win32Emulator.load_image`` records every resolved data import in
+        ``emu.global_data`` as ``[dll.symbol, data_ptr]``. The handler instance
+        that runs later may differ from the one bound at load time (the engine
+        rebuilds its API registry during setup), so this explicit engine record
+        keeps the CRT global identity stable across those instances.
+        """
+        for symbol, data_ptr in self.emu.global_data.values():
+            if not data_ptr or not symbol:
+                continue
+            if symbol.rsplit(".", 1)[-1] == "_wcmdln":
+                return int(data_ptr)
+        return None
+
+    @impdata("_wcmdln")
+    def _wcmdln(self, ptr=0):
+        """Wide command line global CRT variable (``wchar_t *_wcmdln``).
+
+        Returns the address of the writable pointer cell. The cell holds a
+        NUL-terminated UTF-16LE copy of the emulated command line
+        (``" ".join(emu.get_argv())``). One cell is reused per emulator so the
+        data import and ``__p__wcmdln`` observe the same CRT global.
+        ``ptr`` is the loader-supplied cell address and is returned unchanged
+        when non-zero. Architecture-neutral; raises only if guest memory
+        cannot be allocated or written.
+        """
+        if ptr:
+            return ptr
+        resolved = self._resolved_wcmdln_cell()
+        if resolved is not None:
+            return resolved
+        if self._wcmdln_pointer is not None:
+            return self._wcmdln_pointer
+
+        ptr_size = self.emu.get_ptr_size()
+        _argv = " ".join(self.emu.get_argv())
+        wide = _argv.encode("utf-16le") + b"\x00\x00"
+
+        cmdln = self.mem_alloc(ptr_size + len(wide), base=None, tag="api.msvcrt._wcmdln")
+        p_cmdln = cmdln + ptr_size
+        self.emu.mem_write(cmdln, p_cmdln.to_bytes(ptr_size, "little"))
+        self.emu.mem_write(p_cmdln, wide)
+        self._wcmdln_pointer = cmdln
+        return cmdln
+
+    @apihook("__p__wcmdln", argc=0)
+    def __p__wcmdln(self, emu, argv, ctx: api.ApiContext = None):
+        """WCHAR ** __p__wcmdln(void); returns the ``_wcmdln`` pointer cell."""
+
+        return self._wcmdln()
 
     @apihook("_onexit", argc=1, conv=e_arch.CALL_CONV_CDECL)
     def _onexit(self, emu, argv, ctx: api.ApiContext = None):
