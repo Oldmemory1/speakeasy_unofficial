@@ -32,6 +32,9 @@ from __future__ import annotations
 
 import struct
 
+import pytest
+
+import speakeasy.common as common
 from speakeasy import Speakeasy
 
 STATUS_ACCESS_VIOLATION = 0xC0000005
@@ -379,6 +382,7 @@ def _run_program(
             "target": target_value,
             "fault_va": sc_addr + offsets["fault"],
             "target_va": target_va,
+            "target_perms": emu.get_address_perms(target_va) if target_va else None,
         }
         return report, observations
     finally:
@@ -466,6 +470,23 @@ def test_protected_read_without_seh_keeps_original_error(config):
     assert error.access_type == "read"
     assert obs["hit"] == 0
     assert obs["exec"] == 0
+
+
+def test_protected_read_seh_handler_can_restore_page_permissions(config):
+    # A handler that restores enough protection and leaves CONTEXT.Eip on the
+    # faulting instruction must retry the access; it did not decline.
+    report, obs = _run_program(
+        config,
+        access="read",
+        prot=PAGE_NOACCESS,
+        seh_mode="fix",
+    )
+
+    error = _entry_error(report)
+    assert error is None, error
+    assert obs["code"] == STATUS_ACCESS_VIOLATION
+    assert obs["hit"] == 1
+    assert obs["exec"] == EXEC_MARKER
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +631,136 @@ def test_veh_declines_keep_original_error_without_runaway_retries(config):
     assert 1 <= obs["hit"] <= 4
     assert 1 <= obs["hit_b"] <= 4
     assert obs["exec"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Declining handlers for protected fetches/reads: the original error must
+# survive, and the faulting page must never be executed or re-protected.
+# ---------------------------------------------------------------------------
+
+
+def test_protected_fetch_veh_declines_keep_original_error(config):
+    report, obs = _run_program(
+        config,
+        access="fetch",
+        prot=PAGE_READONLY,
+        veh_modes=(("search", OUT_HIT), ("search", OUT_HIT_B)),
+        veh_registrations=((0, 0), (1, 1)),
+    )
+
+    error = _entry_error(report)
+    assert error is not None
+    # The original fetch fault must survive the declining chain; resuming the
+    # instruction used to execute the fault page and record a write instead.
+    assert error.type == "invalid_protect_fetch"
+    assert error.access_type == "fetch"
+    assert error.pc == obs["target_va"]
+    assert error.address == obs["target_va"]
+    assert error.instr and error.instr != "disasm_failed"
+    assert 1 <= obs["hit"] <= 4
+    assert 1 <= obs["hit_b"] <= 4
+    # The non-executable page was not executed and was not made executable.
+    assert obs["exec"] == 0
+    assert obs["target_perms"] == common.PERM_MEM_READ
+
+
+def test_protected_read_veh_declines_keep_original_error(config):
+    report, obs = _run_program(
+        config,
+        access="read",
+        prot=PAGE_NOACCESS,
+        veh_modes=(("search", OUT_HIT), ("search", OUT_HIT_B)),
+        veh_registrations=((0, 0), (1, 1)),
+    )
+
+    error = _entry_error(report)
+    assert error is not None
+    assert error.type == "invalid_prot_read"
+    assert error.access_type == "read"
+    assert error.pc == obs["fault_va"]
+    assert error.address == obs["target_va"]
+    assert error.instr and error.instr != "disasm_failed"
+    assert 1 <= obs["hit"] <= 4
+    assert 1 <= obs["hit_b"] <= 4
+    assert obs["exec"] == 0
+    # The no-access page was not mapped or re-protected by the emulator.
+    assert obs["target_perms"] == common.PERM_MEM_NONE
+
+
+def test_protected_fetch_declining_seh_keeps_original_error(config):
+    # "fix" restores PAGE_READWRITE but returns CONTINUE_SEARCH without
+    # advancing CONTEXT.Eip. The fetch still faults (the page is not
+    # executable), so the handler declined: keep the original error instead of
+    # resuming the instruction until max_api_count.
+    report, obs = _run_program(
+        config,
+        access="fetch",
+        prot=PAGE_READONLY,
+        seh_mode="fix",
+    )
+
+    error = _entry_error(report)
+    assert error is not None
+    assert error.type == "invalid_protect_fetch"
+    assert error.access_type == "fetch"
+    assert error.pc == obs["target_va"]
+    assert error.address == obs["target_va"]
+    assert error.instr and error.instr != "disasm_failed"
+    assert 1 <= obs["hit"] <= 4
+    assert obs["exec"] == 0
+
+
+# ---------------------------------------------------------------------------
+# RemoveVectoredExceptionHandler input contract
+# ---------------------------------------------------------------------------
+
+
+def test_veh_registry_remove_accepts_argv_list_and_single_address():
+    from speakeasy.windows.veh import VectoredExceptionRegistry
+
+    registry = VectoredExceptionRegistry()
+    registry.add(True, 0x1111)
+    # kernel32!RemoveVectoredExceptionHandler passes the emulated argv list.
+    registry.remove([0x1111])
+    assert registry.dispatch_order() == []
+
+    registry.add(False, 0x2222)
+    registry.remove(0x2222)
+    assert registry.dispatch_order() == []
+
+    registry.add(True, 0x3333)
+    with pytest.raises(ValueError):
+        registry.remove([])
+    with pytest.raises(ValueError):
+        registry.remove([0x3333, 0x4444])
+    with pytest.raises(TypeError):
+        registry.remove("0x3333")
+    # Malformed input is rejected explicitly; it must not remove anything.
+    assert registry.dispatch_order() == [0x3333]
+
+
+def test_emulator_remove_vectored_exception_handler_accepts_argv_list(config):
+    se = Speakeasy(config=config)
+    try:
+        se.load_shellcode(data=b"\xc3", arch="x86")
+        emu = se.emu
+
+        emu.add_vectored_exception_handler(1, 0x1234)
+        emu.remove_vectored_exception_handler([0x1234])
+        assert emu.veh_handlers == []
+
+        emu.add_vectored_exception_handler(0, 0x5678)
+        emu.remove_vectored_exception_handler(0x5678)
+        assert emu.veh_handlers == []
+
+        emu.add_vectored_exception_handler(1, 0x9ABC)
+        with pytest.raises(ValueError):
+            emu.remove_vectored_exception_handler([])
+        with pytest.raises(TypeError):
+            emu.remove_vectored_exception_handler(object())
+        assert emu.veh_handlers == [0x9ABC]
+    finally:
+        se.shutdown()
 
 
 def test_veh_registry_preserves_first_and_last_chance_order():

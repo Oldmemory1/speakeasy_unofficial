@@ -136,9 +136,15 @@ class Win32Emulator(WindowsEmulator):
         """
         self.veh_registry.add(bool(first), handler)
 
-    def remove_vectored_exception_handler(self, handler):
-        """
-        Remove a vectored exception handler that will be executed on an exception
+    def remove_vectored_exception_handler(self, handler: int | list | tuple) -> None:
+        """Remove a guest vectored exception handler.
+
+        ``handler`` is either the handler address or a one-element sequence
+        holding it: ``kernel32!RemoveVectoredExceptionHandler`` forwards the
+        emulated ``argv`` list, while internal callers pass the address
+        directly. Malformed input raises explicitly (``TypeError`` for a
+        non-integer, ``ValueError`` for a sequence that does not hold exactly
+        one address) instead of being silently ignored.
         """
         self.veh_registry.remove(handler)
 

@@ -15,8 +15,45 @@ context/control transfer and interprets the handler return value.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
+
+
+def coerce_handler_address(handler: int | Sequence[int]) -> int:
+    """Normalize a guest VEH handler identifier to a single address.
+
+    ``kernel32!RemoveVectoredExceptionHandler`` receives the handler pointer as
+    its only argument, but the emulated API wrapper forwards the whole ``argv``
+    list.  Accept both spellings explicitly here instead of failing on
+    ``int(list)`` (or silently ignoring the list).
+
+    Args:
+        handler: Handler address, or a one-element sequence holding it (the
+            emulated ``argv`` list).
+
+    Returns:
+        The handler address truncated to pointer width.
+
+    Raises:
+        ValueError: The sequence does not hold exactly one handler address.
+        TypeError: The value is neither an integer nor a one-element sequence.
+
+    Unknown input behaviour: any integer address, including 0, is accepted as
+    supplied; the registry stores/removes it verbatim.
+    """
+    if isinstance(handler, (list, tuple)):
+        if len(handler) != 1:
+            raise ValueError(
+                f"expected exactly one vectored exception handler address, got {len(handler)}"
+            )
+        handler = handler[0]
+    if isinstance(handler, bool) or not isinstance(handler, int):
+        raise TypeError(
+            "vectored exception handler must be an integer address "
+            f"or a one-element sequence, got {type(handler).__name__}"
+        )
+    return handler & 0xFFFFFFFFFFFFFFFF
 
 
 @dataclass(frozen=True)
@@ -67,7 +104,7 @@ class VectoredExceptionRegistry:
         Returns:
             None.  Re-registering an address replaces its previous entry.
         """
-        address = int(handler) & 0xFFFFFFFFFFFFFFFF
+        address = coerce_handler_address(handler)
         self.remove(address)
         entry = VectoredExceptionHandler(address=address, first=bool(first))
         if entry.first:
@@ -75,9 +112,23 @@ class VectoredExceptionRegistry:
         else:
             self._entries.append(entry)
 
-    def remove(self, handler: int) -> None:
-        """Remove every registration for ``handler`` (no-op when absent)."""
-        address = int(handler) & 0xFFFFFFFFFFFFFFFF
+    def remove(self, handler: int | Sequence[int]) -> None:
+        """Remove every registration for ``handler`` (no-op when absent).
+
+        Args:
+            handler: Handler address, or a one-element sequence holding it
+                (the emulated ``argv`` list used by the API wrappers).
+
+        Returns:
+            None.  An address that is not registered is ignored.
+
+        Raises:
+            ValueError: A sequence did not hold exactly one handler address.
+            TypeError: The value is neither an integer nor a one-element
+                sequence.  Malformed input is rejected explicitly rather than
+                silently ignored.
+        """
+        address = coerce_handler_address(handler)
         self._entries = [entry for entry in self._entries if entry.address != address]
 
     def dispatch_order(self) -> list[int]:
@@ -107,6 +158,12 @@ class VehDispatchState:
         record_address: Guest VA of the EXCEPTION_RECORD structure.
         handlers: Handler addresses in dispatch order.
         next_index: Index of the next handler to invoke.
+        deferred_fault: Engine-owned snapshot of a protected read/fetch fault
+            whose exception dispatch was deferred (opaque to this module).  It
+            is ``None`` for faults dispatched directly from the memory-error
+            path.  When set, the emulator finalizes the original fatal error
+            instead of resuming the faulting instruction if every handler
+            declines.
     """
 
     except_code: int
@@ -119,3 +176,4 @@ class VehDispatchState:
     record_address: int
     handlers: tuple[int, ...]
     next_index: int = 0
+    deferred_fault: Any | None = None

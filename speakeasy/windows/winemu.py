@@ -233,6 +233,7 @@ class WindowsEmulator(BinaryEmulator):
         self.veh_registry = VectoredExceptionRegistry()
         self._veh_dispatch_state: VehDispatchState | None = None
         self._deferred_protected_fault: DeferredProtectedFault | None = None
+        self._seh_deferred_fault: DeferredProtectedFault | None = None
 
         self.run_complete: bool = False
         self.emu_complete: bool = False
@@ -551,6 +552,7 @@ class WindowsEmulator(BinaryEmulator):
         self._invalid_insn_repeat_count = 0
         self._veh_dispatch_state = None
         self._deferred_protected_fault = None
+        self._seh_deferred_fault = None
         self.reset_stack(self.stack_base)
         self.reset_cpu_context()
         mm = self.get_address_map(self.stack_base - 1)
@@ -2772,33 +2774,44 @@ class WindowsEmulator(BinaryEmulator):
         self.set_pc(fault.fault_pc)
         self.prev_pc = fault.fault_pc
 
-        if self.dispatch_seh(ddk.STATUS_ACCESS_VIOLATION, fault.address):
+        if self.dispatch_seh(
+            ddk.STATUS_ACCESS_VIOLATION,
+            fault.address,
+            deferred_fault=fault,
+        ):
             return True
 
+        self._finalize_unhandled_deferred_fault(fault)
+        return True
+
+    def _finalize_unhandled_deferred_fault(self, fault: DeferredProtectedFault) -> None:
+        """Record the original protected read/fetch error and end the run.
+
+        Called only after VEH, SEH and the unhandled-exception filter all
+        declined a deferred protected fault. Callers restore the fault-time
+        context and PC before dispatch, so the recorded ``ErrorInfo`` keeps the
+        original type, PC, address, access type and instruction.
+
+        The engine must not resume on the faulting instruction here: resuming a
+        protected fetch can execute the non-executable page (Unicorn does not
+        re-check the fetch when the resume happens from a handled
+        fetch-protection callback), and the resulting write/read fault would
+        replace this error. Page protections are left untouched.
+        """
+        self._seh_deferred_fault = None
         error = self.get_error_info(fault.error_type, fault.address, access_type=fault.access_type)
         self.curr_run.error = error  # type: ignore[union-attr]
-        self.on_run_complete()
         logger.debug(
-            "deferred fault unhandled: recorded %s pc=0x%x; run_complete=%s emu_complete=%s queue=%d",
+            "deferred %s fault unhandled: recorded %s pc=0x%x addr=0x%x; run_complete=%s emu_complete=%s queue=%d",
+            fault.access_type,
             fault.error_type,
-            self.get_pc(),
+            fault.fault_pc,
+            fault.address,
             self.run_complete,
             self.emu_complete,
             len(self.run_queue),
         )
-
-        # The run is terminating. Make the faulting instruction fetchable (a
-        # protected fetch may point into a non-executable page) so the enabled
-        # transient code hook sees run_complete at that PC and stops the engine
-        # instead of re-entering the protection-fault path with a new error.
-        if fault.access_type == "fetch":
-            page = fault.fault_pc & 0xFFFFFFFFFFFFF000
-            try:
-                self.mem_protect(page, self.page_size, common.PERM_MEM_RX)
-            except Exception:
-                pass
-        self.set_pc(fault.fault_pc)
-        return True
+        self.on_run_complete()
 
     def restart_run(self, run):
         """
@@ -2807,6 +2820,7 @@ class WindowsEmulator(BinaryEmulator):
         run.instr_cnt = 0
         self._veh_dispatch_state = None
         self._deferred_protected_fault = None
+        self._seh_deferred_fault = None
         self.set_pc(run.start_addr)
 
     def get_symbol_from_address(self, address):
@@ -3758,7 +3772,7 @@ class WindowsEmulator(BinaryEmulator):
 
     _SEH_MAX_REPEAT = 4
 
-    def dispatch_seh(self, except_code, faulting_address=None):
+    def dispatch_seh(self, except_code, faulting_address=None, *, deferred_fault=None):
         """Deliver a CPU exception to the guest exception chain.
 
         Windows order is VEH (First-chance handlers, then last-chance), then
@@ -3775,6 +3789,11 @@ class WindowsEmulator(BinaryEmulator):
                 ``ddk.STATUS_ILLEGAL_INSTRUCTION``).
             faulting_address: Faulting memory address for access violations,
                 or None for CPU exceptions without an address.
+            deferred_fault: Original protected read/fetch fault snapshot when
+                this dispatch was deferred from a UC_MEM_READ_PROT or
+                UC_MEM_FETCH_PROT callback. When set and every handler
+                declines, the emulator records this fault instead of resuming
+                the faulting instruction.
 
         Returns:
             True only when control was transferred to a guest handler (VEH,
@@ -3787,6 +3806,11 @@ class WindowsEmulator(BinaryEmulator):
         architectures keep the previous behaviour (no VEH/SEH dispatch, UEF
         only).
         """
+        # Track the deferred fault across the guest handler so continue_seh can
+        # tell a handler that resolved the access from one that declined
+        # without advancing Eip. A new dispatch supersedes an older snapshot.
+        self._seh_deferred_fault = deferred_fault
+
         fault_key = (self.get_pc(), faulting_address)
         if fault_key == self._seh_last_fault:
             self._seh_repeat_count += 1
@@ -3801,7 +3825,11 @@ class WindowsEmulator(BinaryEmulator):
             and self.veh_registry
             and self._veh_dispatch_state is None
         ):
-            if self._start_veh_dispatch(except_code, faulting_address):
+            if self._start_veh_dispatch(
+                except_code,
+                faulting_address,
+                deferred_fault=deferred_fault,
+            ):
                 return True
 
         rv = False
@@ -3858,21 +3886,26 @@ class WindowsEmulator(BinaryEmulator):
         self.unhandled_exception_filter = 0
         return True
 
-    def _start_veh_dispatch(self, except_code, faulting_address):
+    def _start_veh_dispatch(self, except_code, faulting_address, deferred_fault=None):
         """Build the EXCEPTION_POINTERS and invoke the first VEH handler.
 
         The caller must have checked that the registry is non-empty and that no
-        VEH dispatch is already active. Returns True when a handler call was
-        started; the guest return through ``VEH_RETURN_ADDR`` drives the
-        continuation.
+        VEH dispatch is already active. ``deferred_fault`` carries the original
+        protected-fault snapshot for deferred dispatches (see
+        ``dispatch_seh``). Returns True when a handler call was started; the
+        guest return through ``VEH_RETURN_ADDR`` drives the continuation.
         """
-        state = self._build_veh_dispatch_state(except_code, faulting_address)
+        state = self._build_veh_dispatch_state(
+            except_code,
+            faulting_address,
+            deferred_fault=deferred_fault,
+        )
         if state is None:
             return False
         self._veh_dispatch_state = state
         return self._invoke_next_veh_handler(state)
 
-    def _build_veh_dispatch_state(self, except_code, faulting_address):
+    def _build_veh_dispatch_state(self, except_code, faulting_address, deferred_fault=None):
         """Create the per-fault VEH state and guest exception structures."""
         handlers = self.veh_registry.dispatch_order()
         if not handlers:
@@ -3908,6 +3941,7 @@ class WindowsEmulator(BinaryEmulator):
             exception_ptrs=p_exp_ptrs,
             record_address=prec,
             handlers=tuple(handlers),
+            deferred_fault=deferred_fault,
         )
 
     def _invoke_next_veh_handler(self, state):
@@ -3995,6 +4029,9 @@ class WindowsEmulator(BinaryEmulator):
         self.prev_pc = state.fault_pc
 
         if self.get_arch() == _arch.ARCH_X86:
+            # Track the deferred fault across the SEH fallback as well. A new
+            # dispatch supersedes any snapshot from an earlier episode.
+            self._seh_deferred_fault = state.deferred_fault
             if self._dispatch_seh_x86(state.except_code):
                 if state.faulting_address is not None:
                     self._map_faulting_page_for_exception(state.faulting_address)
@@ -4005,12 +4042,28 @@ class WindowsEmulator(BinaryEmulator):
                 self._map_faulting_page_for_exception(state.faulting_address)
             return True
 
+        if state.deferred_fault is not None:
+            # A deferred protected read/fetch fault must not be resumed on the
+            # faulting instruction: a protected fetch can execute the
+            # non-executable page and replace the original error. Record the
+            # preserved fault instead and stop the run.
+            self._finalize_unhandled_deferred_fault(state.deferred_fault)
+            return True
+
         # No handler anywhere. Re-execute the faulting instruction so the
         # normal memory-error path records the original error; dispatch_seh's
         # repeat guard stops the retry after _SEH_MAX_REPEAT attempts.
         return True
 
     def continue_seh(self):
+        """Resume the guest after a guest SEH handler returns.
+
+        A deferred protected read/fetch fault whose handler returns without
+        advancing Eip is complete only if the handler restored the protection
+        the access needs. Otherwise the handler declined and the original
+        fatal error is recorded instead of resuming the faulting instruction
+        (see ``_finalize_unhandled_deferred_fault``).
+        """
         self._seh_last_fault = None
         self._seh_repeat_count = 0
         if self.get_arch() == _arch.ARCH_X86:
@@ -4020,6 +4073,46 @@ class WindowsEmulator(BinaryEmulator):
             # later fault at that PC is a new episode, not a runaway retry.
             self._invalid_insn_fault_pc = None
             self._invalid_insn_repeat_count = 0
+
+        deferred = self._seh_deferred_fault
+        if deferred is not None and self.get_pc() == deferred.fault_pc:
+            self._seh_deferred_fault = None
+            if self._protected_access_still_faults(deferred):
+                # The handler left Eip on the faulting instruction and did not
+                # restore the protection the access needs: the exception is
+                # unhandled. Resuming would execute (fetch) or retry the
+                # faulting instruction and replace the original error.
+                self._finalize_unhandled_deferred_fault(deferred)
+
+    def _protected_access_still_faults(self, fault: DeferredProtectedFault) -> bool:
+        """Return True if the faulted access would fault again right now.
+
+        Called after a guest SEH handler returns while leaving ``CONTEXT.Eip``
+        on the faulting instruction. A handler that restored enough page
+        protection (for example PAGE_READWRITE for a write) can retry the
+        instruction, while a handler that changed nothing has declined and the
+        exception is unhandled. A fetch fault needs execute permission, so a
+        handler that only makes the page writable has not resolved it.
+
+        Args:
+            fault: Deferred protected-fault snapshot being dispatched.
+
+        Returns:
+            True when the access still lacks the required permission (or the
+            page is unmapped / the access type is unknown); False only when the
+            page now grants the permission the access needs.
+        """
+        required = {
+            "read": common.PERM_MEM_READ,
+            "write": common.PERM_MEM_WRITE,
+            "fetch": common.PERM_MEM_EXEC,
+        }.get(fault.access_type)
+        if required is None:
+            return True
+        perms = self.get_address_perms(fault.address)
+        if perms is None:
+            return True
+        return (perms & required) == 0
 
     def _hook_invalid_instruction(self, emu):
         """Deliver a CPU #UD (UC_ERR_INSN_INVALID) to the guest exception chain.
