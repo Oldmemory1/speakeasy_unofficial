@@ -127,18 +127,20 @@ class Win32Emulator(WindowsEmulator):
         return self.sessman
 
     def add_vectored_exception_handler(self, first, handler):
+        """Register a guest vectored exception handler.
+
+        Mirrors ``AddVectoredExceptionHandler``: a nonzero ``first`` selects a
+        First-chance handler (inserted at the front of dispatch order); zero
+        registers a last-chance handler (appended). ``dispatch_seh`` consumes
+        the registry before the SEH chain.
         """
-        Add a vectored exception handler that will be executed on an exception
-        """
-        if handler not in self.veh_handlers:
-            self.veh_handlers.append(handler)
+        self.veh_registry.add(bool(first), handler)
 
     def remove_vectored_exception_handler(self, handler):
         """
-        Remove a vectored exception handler
+        Remove a vectored exception handler that will be executed on an exception
         """
-        if handler in self.veh_handlers:
-            self.veh_handlers.remove(handler)
+        self.veh_registry.remove(handler)
 
     def get_processes(self):
         if len(self.processes) <= 1:

@@ -7,6 +7,7 @@ import shlex
 import traceback
 from abc import abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
@@ -53,6 +54,7 @@ from speakeasy.windows.netman import NetworkManager
 from speakeasy.windows.objman import HandleAllocator
 from speakeasy.windows.regman import RegistryManager
 from speakeasy.windows.tls import TlsManager
+from speakeasy.windows.veh import VectoredExceptionRegistry, VehDispatchState
 from speakeasy.windows.x86_interrupts import (
     OverflowTrapKind,
     classify_overflow_trap,
@@ -63,6 +65,40 @@ from speakeasy.winenv.api import sigdb, sigfmt
 # This number is arbitrary and just needs to be large enough to cover
 # the size of the current disasm target
 DISASM_SIZE = 0x20
+
+# Reserved non-executable return sentinel for guest VEH handler calls. The
+# sentinel page is part of the emulator's reserved range (unmapped while hooks
+# are armed), so a handler's ``ret`` traps in _hook_mem_unmapped and the
+# dispatcher can inspect the handler return value. It deliberately sits below
+# IMPORT_HOOK_ADDR (EMU_RETURN_ADDR + 12) so it cannot collide with the
+# sequential import sentinels allocated from that address.
+VEH_RETURN_ADDR = winemu.EMU_RETURN_ADDR + 6
+
+# Trampoline used to defer UC_MEM_READ_PROT / UC_MEM_FETCH_PROT dispatch.
+# Unicorn 2.1.4 crashes when uc_mem_map is called from those two callbacks, so
+# the callback only snapshots the fault and points EIP here; the resulting
+# invalid fetch builds the exception structures outside the PROT callback.
+DEFERRED_DISPATCH_ADDR = winemu.EMU_RETURN_ADDR + 2
+
+
+@dataclass
+class DeferredProtectedFault:
+    """Snapshot of a protected read/fetch fault awaiting exception dispatch.
+
+    Attributes:
+        error_type: Fatal error type used only when no guest handler accepts.
+        access_type: "read" or "fetch" for the recorded error.
+        fault_pc: PC of the faulting instruction at snapshot time.
+        address: Faulting memory address.
+        context: CPU context captured before the fault was resumed.
+    """
+
+    error_type: str
+    access_type: str
+    fault_pc: int
+    address: int
+    context: Any
+
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +230,9 @@ class WindowsEmulator(BinaryEmulator):
         self.virtual_mem_base: int = 0x50000
 
         self.tmp_code_hook: Any | None = None
-        self.veh_handlers: list[int] = []
+        self.veh_registry = VectoredExceptionRegistry()
+        self._veh_dispatch_state: VehDispatchState | None = None
+        self._deferred_protected_fault: DeferredProtectedFault | None = None
 
         self.run_complete: bool = False
         self.emu_complete: bool = False
@@ -239,6 +277,17 @@ class WindowsEmulator(BinaryEmulator):
         self.hammer: ApiHammer = ApiHammer(self)
         self._io_manager: Any | None = None
         self.child_execution = ChildExecutionRegistry(self)
+
+    @property
+    def veh_handlers(self) -> list[int]:
+        """Guest VEH addresses in Windows dispatch order (read-only view).
+
+        The registry is the source of truth; ``add_vectored_exception_handler``
+        (windows/win32.py) maintains it. This property keeps the historical
+        attribute name readable while the list is now actually consumed by
+        ``dispatch_seh``.
+        """
+        return self.veh_registry.dispatch_order()
 
     def _parse_config(self, config):
         """
@@ -500,6 +549,8 @@ class WindowsEmulator(BinaryEmulator):
         self._seh_repeat_count = 0
         self._invalid_insn_fault_pc = None
         self._invalid_insn_repeat_count = 0
+        self._veh_dispatch_state = None
+        self._deferred_protected_fault = None
         self.reset_stack(self.stack_base)
         self.reset_cpu_context()
         mm = self.get_address_map(self.stack_base - 1)
@@ -1895,6 +1946,11 @@ class WindowsEmulator(BinaryEmulator):
             _complete_pending_api_callback(self)
             return True
 
+        if pc == VEH_RETURN_ADDR:
+            # A guest VEH handler implemented as an intercepted API returns
+            # directly through do_call_return instead of executing a ``ret``.
+            return self._continue_veh_dispatch(self.get_return_val())
+
         return False
 
     def _complete_api_callback(self) -> None:
@@ -2568,6 +2624,19 @@ class WindowsEmulator(BinaryEmulator):
                         self._complete_api_callback()
                         self._unset_emu_hooks()
                     return True
+                elif address == VEH_RETURN_ADDR:
+                    if self._continue_veh_dispatch(self.get_return_val()):
+                        self._unset_emu_hooks()
+                        return True
+                    return self._handle_invalid_fetch(emu, address, size, value)
+                elif address == DEFERRED_DISPATCH_ADDR:
+                    if self._run_deferred_protected_fault():
+                        # Map the reserved sentinel page before returning, as
+                        # the SEH/VEH return branches do; otherwise Unicorn
+                        # retries the handled fetch and raises UC_ERR_MAP.
+                        self._unset_emu_hooks()
+                        return True
+                    return self._handle_invalid_fetch(emu, address, size, value)
                 return self._handle_invalid_fetch(emu, address, size, value)
 
             elif access == common.INVALID_MEM_READ:
@@ -2575,6 +2644,8 @@ class WindowsEmulator(BinaryEmulator):
 
             elif access == common.INVAL_PERM_MEM_EXEC:
                 return self._handle_prot_fetch(emu, address, size, value)
+            elif access == common.INVAL_PERM_MEM_READ:
+                return self._handle_prot_read(emu, address, size, value)
             elif access == common.INVALID_MEM_WRITE:
                 fakeout = address & 0xFFFFFFFFFFFFF000
                 self.mem_map(self.page_size, base=fakeout)
@@ -2591,6 +2662,19 @@ class WindowsEmulator(BinaryEmulator):
             return False
 
     def _handle_prot_write(self, emu, address, size, value):
+        """Deliver a write to a mapped read-only page to the guest chain.
+
+        Windows/Wine raise ``STATUS_ACCESS_VIOLATION`` for a protection fault
+        just like an unmapped access, so VEH/SEH/UEF handlers get a chance to
+        change the page protection, skip the instruction, or terminate
+        normally. Only when no guest handler takes over is the original
+        ``invalid_protect_write`` error recorded (with PC/address/instruction
+        and access_type preserved).
+        """
+        if self.config.exceptions.dispatch_handlers:
+            if self.dispatch_seh(ddk.STATUS_ACCESS_VIOLATION, address):
+                return True
+
         fakeout = address & 0xFFFFFFFFFFFFF000
         # The page is typically already mapped (this handler fires on a write to
         # a read-only page); mapping it again cannot succeed and used to rely on
@@ -2609,11 +2693,120 @@ class WindowsEmulator(BinaryEmulator):
         self.on_run_complete()
         return True
 
+    def _handle_prot_read(self, emu, address, size, value):
+        """Deliver a read from a mapped no-access page to the guest chain.
+
+        The exception dispatch is deferred through ``DEFERRED_DISPATCH_ADDR``
+        because Unicorn 2.1.4 crashes when exception structures are mapped from
+        inside a ``UC_MEM_READ_PROT`` callback. Only an unhandled fault becomes
+        ``invalid_prot_read``, with PC/address/instruction/access_type kept.
+        """
+        if self.config.exceptions.dispatch_handlers:
+            return self._defer_protected_fault("invalid_prot_read", "read", address)
+
+        error = self.get_error_info("invalid_prot_read", address, access_type="read")
+        self.curr_run.error = error  # type: ignore[union-attr]
+        self.on_run_complete()
+        return True
+
+    def _defer_protected_fault(self, error_type, access_type, address):
+        """Snapshot a protected read/fetch fault and defer its dispatch.
+
+        Unicorn 2.1.4 segfaults when ``uc_mem_map`` is invoked from a
+        UC_MEM_READ_PROT or UC_MEM_FETCH_PROT callback. Redirect EIP to the
+        reserved trampoline; the resulting invalid fetch runs the normal
+        exception dispatch outside the PROT callback.
+
+        Side effects: stores ``_deferred_protected_fault`` and changes EIP.
+        Returns True so the memory hook treats the fault as handled.
+        """
+        if self._deferred_protected_fault is not None:
+            # A UC_MEM_FETCH_PROT episode can invoke the hook repeatedly while
+            # the engine finishes decoding the non-executable page. Keep the
+            # first (real) fault snapshot and re-point EIP at the trampoline.
+            self.set_pc(DEFERRED_DISPATCH_ADDR)
+            return True
+
+        self._deferred_protected_fault = DeferredProtectedFault(
+            error_type=error_type,
+            access_type=access_type,
+            fault_pc=self.get_pc(),
+            address=address,
+            context=self.get_thread_context(),
+        )
+        logger.debug(
+            "deferring protected %s fault: pc=0x%x addr=0x%x hooks_set=%s",
+            access_type,
+            self.get_pc(),
+            address,
+            self.emu_hooks_set,
+        )
+        self.set_pc(DEFERRED_DISPATCH_ADDR)
+        return True
+
+    def _run_deferred_protected_fault(self):
+        """Dispatch a protected read/fetch fault captured by _defer_protected_fault.
+
+        Restores the fault-time context, then delivers STATUS_ACCESS_VIOLATION
+        to VEH/SEH/UEF. When no guest handler accepts, the caller's original
+        fatal error is recorded with the preserved PC/address/access_type.
+
+        Returns:
+            True when the deferred sentinel was consumed; False when no
+            deferred fault is pending (defensive path).
+        """
+        fault = self._deferred_protected_fault
+        if fault is None:
+            logger.warning("deferred protected-fault sentinel hit with no pending fault")
+            return False
+        self._deferred_protected_fault = None
+        logger.debug(
+            "dispatching deferred protected %s fault: fault_pc=0x%x addr=0x%x current_pc=0x%x",
+            fault.access_type,
+            fault.fault_pc,
+            fault.address,
+            self.get_pc(),
+        )
+
+        self.load_thread_context(fault.context)
+        self.set_pc(fault.fault_pc)
+        self.prev_pc = fault.fault_pc
+
+        if self.dispatch_seh(ddk.STATUS_ACCESS_VIOLATION, fault.address):
+            return True
+
+        error = self.get_error_info(fault.error_type, fault.address, access_type=fault.access_type)
+        self.curr_run.error = error  # type: ignore[union-attr]
+        self.on_run_complete()
+        logger.debug(
+            "deferred fault unhandled: recorded %s pc=0x%x; run_complete=%s emu_complete=%s queue=%d",
+            fault.error_type,
+            self.get_pc(),
+            self.run_complete,
+            self.emu_complete,
+            len(self.run_queue),
+        )
+
+        # The run is terminating. Make the faulting instruction fetchable (a
+        # protected fetch may point into a non-executable page) so the enabled
+        # transient code hook sees run_complete at that PC and stops the engine
+        # instead of re-entering the protection-fault path with a new error.
+        if fault.access_type == "fetch":
+            page = fault.fault_pc & 0xFFFFFFFFFFFFF000
+            try:
+                self.mem_protect(page, self.page_size, common.PERM_MEM_RX)
+            except Exception:
+                pass
+        self.set_pc(fault.fault_pc)
+        return True
+
     def restart_run(self, run):
         """
         Restart the current run
         """
         run.instr_cnt = 0
+        self._veh_dispatch_state = None
+        self._deferred_protected_fault = None
         self.set_pc(run.start_addr)
 
     def get_symbol_from_address(self, address):
@@ -2803,6 +2996,17 @@ class WindowsEmulator(BinaryEmulator):
         # Get the symbol that the sample was trying to execute
         symbol = self.get_symbol_from_address(address)
         if not symbol:
+            # A fetch from a mapped but non-executable page is an access
+            # violation, not a silent success: deliver it to VEH/SEH/UEF and
+            # only record the protected-fetch error when nobody handles it.
+            # Dispatch is deferred because Unicorn 2.1.4 crashes when
+            # exception structures are mapped from inside UC_MEM_FETCH_PROT.
+            if self.config.exceptions.dispatch_handlers:
+                return self._defer_protected_fault("invalid_protect_fetch", "fetch", address)
+
+            error = self.get_error_info("invalid_protect_fetch", address, access_type="fetch")
+            self.curr_run.error = error  # type: ignore[union-attr]
+            self.on_run_complete()
             return True
 
         mac = self.curr_run.sym_access.get(address)  # type: ignore[union-attr]
@@ -3555,6 +3759,34 @@ class WindowsEmulator(BinaryEmulator):
     _SEH_MAX_REPEAT = 4
 
     def dispatch_seh(self, except_code, faulting_address=None):
+        """Deliver a CPU exception to the guest exception chain.
+
+        Windows order is VEH (First-chance handlers, then last-chance), then
+        the SEH chain, then the unhandled-exception filter. The x86 SEH chain
+        and UEF path already existed; this method now also consumes the VEH
+        registrations. A guest VEH handler runs as normal guest code and
+        returns through ``VEH_RETURN_ADDR``; the continuation decides whether
+        to resume with the handler-edited CONTEXT, invoke the next handler, or
+        fall back to SEH/UEF.
+
+        Args:
+            except_code: NTSTATUS exception code (for example
+                ``ddk.STATUS_ACCESS_VIOLATION`` or
+                ``ddk.STATUS_ILLEGAL_INSTRUCTION``).
+            faulting_address: Faulting memory address for access violations,
+                or None for CPU exceptions without an address.
+
+        Returns:
+            True only when control was transferred to a guest handler (VEH,
+            SEH or UEF) or when a VEH call was started. False means no guest
+            handler exists, so the caller keeps its original fatal error.
+            The ``_SEH_MAX_REPEAT`` guard bounds handlers that return without
+            making progress.
+
+        Applicable architecture: x86 uses the VEH -> SEH -> UEF path; other
+        architectures keep the previous behaviour (no VEH/SEH dispatch, UEF
+        only).
+        """
         fault_key = (self.get_pc(), faulting_address)
         if fault_key == self._seh_last_fault:
             self._seh_repeat_count += 1
@@ -3564,40 +3796,219 @@ class WindowsEmulator(BinaryEmulator):
             self._seh_last_fault = fault_key
             self._seh_repeat_count = 1
 
+        if (
+            self.get_arch() == _arch.ARCH_X86
+            and self.veh_registry
+            and self._veh_dispatch_state is None
+        ):
+            if self._start_veh_dispatch(except_code, faulting_address):
+                return True
+
         rv = False
         if self.get_arch() == _arch.ARCH_X86:
             rv = self._dispatch_seh_x86(except_code)
-        if not rv and self.unhandled_exception_filter:
-            record = self.wintypes.EXCEPTION_RECORD(self.get_ptr_size())
-            record.ExceptionCode = except_code
-            record.ExceptionFlags = 0
-            record.ExceptionAddress = self.get_pc()
-            record.NumberParameters = 0
-
-            exp_ptrs = self.wintypes.EXCEPTION_POINTERS(self.get_ptr_size())
-            p_exp_ptrs = self.mem_map(exp_ptrs.sizeof(), tag="emu.struct.EXCEPTION_POINTERS")
-            prec = self.mem_map(record.sizeof(), tag="emu.struct.EXCEPTION_RECORD")
-            ctx = self.get_thread_context()
-            pctx = self.mem_map(ctx.sizeof(), tag="emu.struct.EXCEPTION_CONTEXT")
-
-            exp_ptrs.ExceptionRecord = prec
-            exp_ptrs.ContextRecord = pctx
-
-            self.mem_write(p_exp_ptrs, exp_ptrs.get_bytes())
-            self.mem_write(prec, record.get_bytes())
-            self.mem_write(pctx, ctx.get_bytes())
-
-            sp = self.get_stack_ptr()
-            args = [p_exp_ptrs]
-            self.set_func_args(sp, winemu.EMU_RETURN_ADDR, *args, conv=_arch.CALL_CONV_STDCALL)
-            self.set_pc(self.unhandled_exception_filter)
-            self.unhandled_exception_filter = 0
-            rv = True
+        if not rv:
+            rv = self._dispatch_unhandled_exception_filter(except_code)
 
         if rv and faulting_address is not None:
             self._map_faulting_page_for_exception(faulting_address)
 
         return rv
+
+    def _dispatch_unhandled_exception_filter(self, except_code, fault_pc=None):
+        """Invoke the guest ``UnhandledExceptionFilter`` if one is registered.
+
+        Args:
+            except_code: NTSTATUS exception code.
+            fault_pc: PC of the faulting instruction. Defaults to the current
+                PC (used by the direct dispatch path; the VEH continuation
+                passes the saved fault PC because the current PC is the
+                handler return sentinel).
+
+        Returns:
+            True after transferring control to the guest filter; False when no
+            filter is registered.
+        """
+        if not self.unhandled_exception_filter:
+            return False
+
+        record = self.wintypes.EXCEPTION_RECORD(self.get_ptr_size())
+        record.ExceptionCode = except_code
+        record.ExceptionFlags = 0
+        record.ExceptionAddress = self.get_pc() if fault_pc is None else fault_pc
+        record.NumberParameters = 0
+
+        exp_ptrs = self.wintypes.EXCEPTION_POINTERS(self.get_ptr_size())
+        p_exp_ptrs = self.mem_map(exp_ptrs.sizeof(), tag="emu.struct.EXCEPTION_POINTERS")
+        prec = self.mem_map(record.sizeof(), tag="emu.struct.EXCEPTION_RECORD")
+        ctx = self.get_thread_context()
+        pctx = self.mem_map(ctx.sizeof(), tag="emu.struct.EXCEPTION_CONTEXT")
+
+        exp_ptrs.ExceptionRecord = prec
+        exp_ptrs.ContextRecord = pctx
+
+        self.mem_write(p_exp_ptrs, exp_ptrs.get_bytes())
+        self.mem_write(prec, record.get_bytes())
+        self.mem_write(pctx, ctx.get_bytes())
+
+        sp = self.get_stack_ptr()
+        args = [p_exp_ptrs]
+        self.set_func_args(sp, winemu.EMU_RETURN_ADDR, *args, conv=_arch.CALL_CONV_STDCALL)
+        self.set_pc(self.unhandled_exception_filter)
+        self.unhandled_exception_filter = 0
+        return True
+
+    def _start_veh_dispatch(self, except_code, faulting_address):
+        """Build the EXCEPTION_POINTERS and invoke the first VEH handler.
+
+        The caller must have checked that the registry is non-empty and that no
+        VEH dispatch is already active. Returns True when a handler call was
+        started; the guest return through ``VEH_RETURN_ADDR`` drives the
+        continuation.
+        """
+        state = self._build_veh_dispatch_state(except_code, faulting_address)
+        if state is None:
+            return False
+        self._veh_dispatch_state = state
+        return self._invoke_next_veh_handler(state)
+
+    def _build_veh_dispatch_state(self, except_code, faulting_address):
+        """Create the per-fault VEH state and guest exception structures."""
+        handlers = self.veh_registry.dispatch_order()
+        if not handlers:
+            return None
+
+        ptr_size = self.get_ptr_size()
+        record = self.wintypes.EXCEPTION_RECORD(ptr_size)
+        record.ExceptionCode = except_code
+        record.ExceptionFlags = 0
+        record.ExceptionAddress = self.get_pc()
+        record.NumberParameters = 0
+
+        exp_ptrs = self.wintypes.EXCEPTION_POINTERS(ptr_size)
+        p_exp_ptrs = self.mem_map(exp_ptrs.sizeof(), tag="emu.struct.EXCEPTION_POINTERS")
+        prec = self.mem_map(record.sizeof(), tag="emu.struct.EXCEPTION_RECORD")
+        ctx = self.get_thread_context()
+        pctx = self.mem_map(ctx.sizeof(), tag="emu.struct.EXCEPTION_CONTEXT")
+
+        exp_ptrs.ExceptionRecord = prec
+        exp_ptrs.ContextRecord = pctx
+
+        self.mem_write(p_exp_ptrs, exp_ptrs.get_bytes())
+        self.mem_write(prec, record.get_bytes())
+        self.mem_write(pctx, ctx.get_bytes())
+
+        return VehDispatchState(
+            except_code=except_code,
+            fault_pc=self.get_pc(),
+            faulting_address=faulting_address,
+            stack_ptr=self.get_stack_ptr(),
+            context=ctx,
+            context_address=pctx,
+            exception_ptrs=p_exp_ptrs,
+            record_address=prec,
+            handlers=tuple(handlers),
+        )
+
+    def _invoke_next_veh_handler(self, state):
+        """Invoke the next handler in dispatch order.
+
+        The original CONTEXT is restored before every call, so handlers that
+        return CONTINUE_SEARCH cannot leak register or CONTEXT edits into the
+        next handler. Each call rebuilds its stack frame from the fault-time
+        stack pointer, avoiding residue from handlers that do not pop their
+        argument.
+        """
+        if state.next_index >= len(state.handlers):
+            return self._veh_handlers_exhausted(state)
+
+        handler = state.handlers[state.next_index]
+        state.next_index += 1
+
+        logger.info(
+            "0x%x: Vectored exception handler 0x%x (code=0x%x, faulting_address=%s)",
+            state.fault_pc,
+            handler,
+            state.except_code,
+            f"0x{state.faulting_address:x}" if state.faulting_address is not None else "None",
+        )
+
+        self.load_thread_context(state.context)
+        self.mem_write(state.context_address, state.context.get_bytes())
+        self.set_func_args(
+            state.stack_ptr,
+            VEH_RETURN_ADDR,
+            state.exception_ptrs,
+            conv=_arch.CALL_CONV_STDCALL,
+        )
+        self.set_pc(handler)
+        return True
+
+    def _continue_veh_dispatch(self, return_value):
+        """Handle the guest VEH handler return at ``VEH_RETURN_ADDR``.
+
+        ``EXCEPTION_CONTINUE_EXECUTION`` resumes at the handler-edited
+        ``CONTEXT.Eip``; any other value (including
+        ``EXCEPTION_CONTINUE_SEARCH``) moves to the next handler. When the
+        chain is exhausted, control falls back to SEH/UEF; if nothing accepts,
+        execution returns to the faulting instruction so the caller's repeat
+        guard eventually records the original fatal error.
+
+        Returns:
+            True when the sentinel fetch was consumed; False when there is no
+            active VEH dispatch (defensive path).
+        """
+        state = self._veh_dispatch_state
+        if state is None:
+            logger.warning("VEH return sentinel hit without an active dispatch")
+            return False
+
+        if return_value == windef.EXCEPTION_CONTINUE_EXECUTION:
+            ctx = self.mem_cast(self.wintypes.CONTEXT(self.get_ptr_size()), state.context_address)
+            self.load_thread_context(ctx)
+            self.set_pc(ctx.Eip)
+            self._veh_dispatch_state = None
+
+            if ctx.Eip != state.fault_pc:
+                # The handler resumed somewhere else; a later fault at the
+                # original PC is a new episode, not a runaway retry.
+                self._seh_last_fault = None
+                self._seh_repeat_count = 0
+                if (
+                    self._invalid_insn_fault_pc is not None
+                    and self.get_pc() != self._invalid_insn_fault_pc
+                ):
+                    self._invalid_insn_fault_pc = None
+                    self._invalid_insn_repeat_count = 0
+            return True
+
+        return self._invoke_next_veh_handler(state)
+
+    def _veh_handlers_exhausted(self, state):
+        """Continue with SEH/UEF, or return to the faulting instruction."""
+        self._veh_dispatch_state = None
+
+        # Restore the fault-time context: CONTINUE_SEARCH handlers must not
+        # leak register/CONTEXT edits into SEH.
+        self.load_thread_context(state.context)
+        self.set_pc(state.fault_pc)
+        self.prev_pc = state.fault_pc
+
+        if self.get_arch() == _arch.ARCH_X86:
+            if self._dispatch_seh_x86(state.except_code):
+                if state.faulting_address is not None:
+                    self._map_faulting_page_for_exception(state.faulting_address)
+                return True
+
+        if self._dispatch_unhandled_exception_filter(state.except_code, fault_pc=state.fault_pc):
+            if state.faulting_address is not None:
+                self._map_faulting_page_for_exception(state.faulting_address)
+            return True
+
+        # No handler anywhere. Re-execute the faulting instruction so the
+        # normal memory-error path records the original error; dispatch_seh's
+        # repeat guard stops the retry after _SEH_MAX_REPEAT attempts.
+        return True
 
     def continue_seh(self):
         self._seh_last_fault = None
