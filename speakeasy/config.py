@@ -68,6 +68,19 @@ WINDOWS_UI_PROFILES = {
     },
 }
 
+# System DLLs that ship with Windows/Wine but have no Speakeasy API handler.
+# LoadLibrary synthesizes an export-table decoy for these names instead of
+# returning NULL (FX-014). Patterns are fnmatch-style and matched against the
+# lowercase DLL stem (``msvcr*`` covers msvcr71/msvcr80/...).
+DEFAULT_SYNTHESIZED_SYSTEM_MODULES = (
+    "msjava",
+    "msvcr*",
+    "version",
+    "sechost",
+    "kernelbase",
+    "mpr",
+)
+
 DEFAULT_CONFIG_DATA = {
     "config_version": 0.2,
     "description": "Default emulation profile to use when not overridden by user",
@@ -231,6 +244,7 @@ DEFAULT_CONFIG_DATA = {
     "modules": {
         "modules_always_exist": False,
         "functions_always_exist": False,
+        "synthesized_system_modules": list(DEFAULT_SYNTHESIZED_SYSTEM_MODULES),
         "module_directory_x86": "$ROOT$/winenv/decoys/x86",
         "module_directory_x64": "$ROOT$/winenv/decoys/amd64",
         "system_modules": [
@@ -610,6 +624,14 @@ class ModulesConfig(BaseModel):
         default=False, description="Synthesize unknown modules instead of failing loads."
     )
     functions_always_exist: bool = Field(default=False, description="Treat unresolved imports as existing stubs.")
+    synthesized_system_modules: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_SYNTHESIZED_SYSTEM_MODULES),
+        description=(
+            "Known system DLL name patterns (fnmatch, case-insensitive) for which LoadLibrary "
+            "synthesizes an export-table decoy when no native image or API handler exists. "
+            "Unknown DLL names are never synthesized."
+        ),
+    )
     module_directory_x86: str | None = Field(default=None, description="Search path for x86 decoy modules.")
     module_directory_x64: str | None = Field(default=None, description="Search path for x64 decoy modules.")
     user_modules: list[UserModuleConfig] = Field(

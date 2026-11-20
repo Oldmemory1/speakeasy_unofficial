@@ -56,6 +56,10 @@ from speakeasy.windows.netman import NetworkManager
 from speakeasy.windows.objman import HandleAllocator
 from speakeasy.windows.page_protection import image_protection_for_emu_perms
 from speakeasy.windows.regman import RegistryManager
+from speakeasy.windows.system_modules import (
+    SystemModuleDecoyLoader,
+    is_synthesizable_system_module,
+)
 from speakeasy.windows.tls import TlsManager
 from speakeasy.windows.veh import VectoredExceptionRegistry, VehDispatchState
 from speakeasy.windows.x86_interrupts import (
@@ -3343,7 +3347,13 @@ class WindowsEmulator(BinaryEmulator):
             # "hostile/incomplete environment", call GetProcAddress(NULL, ...)
             # and exit before unpacking (measured: 129 of 543 zero-buffer
             # samples, 91 of them asking for MPR.dll).
-            if self.api is None or self.api.load_api_handler(lib) is None:
+            # FX-014: a handler is not the only way the engine can know a
+            # module -- the explicit synthesized_system_modules list covers
+            # known-but-unmodelled system DLLs (msjava, sechost, ...).
+            has_handler = self.api is not None and self.api.load_api_handler(lib) is not None
+            if not has_handler and not is_synthesizable_system_module(
+                lib, self.config.modules.synthesized_system_modules
+            ):
                 return 0
 
         mod = self.load_module_by_name(lib)
@@ -3371,7 +3381,7 @@ class WindowsEmulator(BinaryEmulator):
 
         def _make_image(load_base):
             """Build the module image at ``load_base`` (loader selection kept as-is)."""
-            loader: PeLoader | ApiModuleLoader | DecoyLoader
+            loader: PeLoader | ApiModuleLoader | DecoyLoader | SystemModuleDecoyLoader
             if native_path:
                 loader = PeLoader(path=native_path, base_override=load_base, emu_path=emu_path)
             else:
@@ -3384,6 +3394,16 @@ class WindowsEmulator(BinaryEmulator):
                     loader = ApiModuleLoader(
                         name=name,
                         api=handler,
+                        arch=self.get_arch(),
+                        base=load_base,
+                        emu_path=emu_path,
+                    )
+                elif is_synthesizable_system_module(name, self.config.modules.synthesized_system_modules):
+                    # FX-014: known system DLL without an API handler gets a
+                    # decoy PE with an export table instead of the generic
+                    # default_exe/placeholder stub.
+                    loader = SystemModuleDecoyLoader(
+                        name=name,
                         arch=self.get_arch(),
                         base=load_base,
                         emu_path=emu_path,

@@ -2,6 +2,7 @@
 
 import ctypes as ct
 import datetime
+import logging
 import ntpath
 import os
 import string
@@ -40,6 +41,8 @@ from speakeasy.windows.page_protection import (
 
 from .. import api
 from .pseudo_handles import is_current_process_pseudo_handle
+
+logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 0x1000
 LANG_EN_US = 0x409
@@ -2141,13 +2144,23 @@ class Kernel32(api.ApiHandler):
             argv[0] = lib
             sname, _ = os.path.splitext(lib)
             sname = winemu.normalize_dll_name(sname)
-            mods = emu.get_peb_modules()
-            for mod in mods:
-                img = ntpath.basename(mod.emu_path)
-                fname, _ = os.path.splitext(img)
-                if fname.lower() == sname.lower():
-                    rv = mod.base
-                    break
+
+            # FX-014: query every loaded module first (get_mod_by_name matches
+            # both the emulated path and the loaded module name), then fall
+            # back to the PEB-visible walk that Windows exposes to the guest.
+            mod = emu.get_mod_by_name(sname)
+            if mod is not None:
+                rv = mod.base
+            else:
+                for mod in emu.get_peb_modules():
+                    img = ntpath.basename(mod.emu_path)
+                    fname, _ = os.path.splitext(img)
+                    if fname.lower() == sname.lower():
+                        rv = mod.base
+                        break
+
+            if not rv:
+                logger.info("GetModuleHandle: module %r is not loaded", lib)
 
         return rv
 
