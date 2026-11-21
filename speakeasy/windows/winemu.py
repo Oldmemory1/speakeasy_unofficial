@@ -26,7 +26,7 @@ from speakeasy.profiler import ApiCallbackFrame, MemAccess, Run
 from speakeasy.profiler_events import TracePosition
 from speakeasy.report import ErrorInfo, RegionInfo
 from speakeasy.struct import EmuStruct
-from speakeasy.windows import bool_semantics, handle_semantics
+from speakeasy.windows import api_trace_diagnostics, bool_semantics, handle_semantics
 from speakeasy.windows.child_execution import (
     ChildExecutionDispatcher,
     ChildExecutionRegistry,
@@ -624,6 +624,10 @@ class WindowsEmulator(BinaryEmulator):
 
         self.curr_run = run
         self.curr_mod = self.get_module_from_addr(run.start_addr)
+        # FX-016 diagnostics: keep the last-API trace scoped to one run so an
+        # error report never cites an API call from a previous run.
+        self._api_trace_tail = []
+        self._last_api_trace = None
         if self.profiler:
             self.profiler.add_run(run)
 
@@ -2214,6 +2218,34 @@ class WindowsEmulator(BinaryEmulator):
 
         summary = self._build_context_summary(desc, pc, address, access_type, pc_module, address_region, nearby_regions)
 
+        # FX-016 diagnostics: record the fakeout-page marker and the last API
+        # call's caller/return context alongside the fault registers. Failure
+        # to collect diagnostics must not affect error reporting or dispatch.
+        diagnostics = None
+        try:
+            last_api = getattr(self, "_last_api_trace", None)
+            api_tail = getattr(self, "_api_trace_tail", None)
+            diagnostics = api_trace_diagnostics.error_diagnostics(
+                self,
+                description=desc,
+                address=address,
+                access_type=access_type,
+                pc=pc,
+                pc_module=pc_module,
+                last_api=last_api if isinstance(last_api, dict) else None,
+                api_tail=list(api_tail) if isinstance(api_tail, list) else None,
+            )
+            marker = api_trace_diagnostics.summary_marker(
+                desc,
+                address,
+                last_api if isinstance(last_api, dict) else None,
+            )
+            if marker:
+                summary = f"{summary}; {marker}"
+        except Exception:
+            logger.debug("api trace diagnostic: error diagnostics failed", exc_info=True)
+            diagnostics = None
+
         logger.error(
             "0x%x: %s: Caught error: %s\n  summary: %s\n  instr: %s\n  regs: %s",
             pc,
@@ -2239,6 +2271,7 @@ class WindowsEmulator(BinaryEmulator):
             process_id=pid,
             context_summary=summary,
             traceback=traceback,
+            diagnostics=diagnostics,
         )
 
     def normalize_import_miss(self, dll, name):
@@ -2328,6 +2361,34 @@ class WindowsEmulator(BinaryEmulator):
 
         rv_str = hex(rv) if rv is not None else None
         logger.info("%s: %s -> %s", hex(pc), repr(call_str), rv_str)
+
+        # FX-016 diagnostics: persist the caller/return address, API-return
+        # registers, calling module, bounded stack window and pointer mappings.
+        # A diagnostic failure must never affect API handling or reporting.
+        provenance = None
+        try:
+            provenance = api_trace_diagnostics.api_provenance(
+                self,
+                api_name=imp_api,
+                argv=argv,
+                ret=rv,
+                call_pc=pc,
+                display=display,
+            )
+            compact = api_trace_diagnostics.compact_trace(provenance)
+            if compact is not None:
+                tail = getattr(self, "_api_trace_tail", None)
+                if not isinstance(tail, list):
+                    tail = []
+                    self._api_trace_tail = tail
+                tail.append(compact)
+                if len(tail) > api_trace_diagnostics.MAX_TAIL_ENTRIES:
+                    del tail[: -api_trace_diagnostics.MAX_TAIL_ENTRIES]
+                self._last_api_trace = compact
+        except Exception:
+            logger.debug("api trace diagnostic: provenance failed for %s", imp_api, exc_info=True)
+            provenance = None
+
         if self.profiler and self.curr_run:
             tick = self.curr_run.instr_cnt
             tid = self.curr_thread.tid if self.curr_thread else 0
@@ -2342,6 +2403,7 @@ class WindowsEmulator(BinaryEmulator):
                 argv,
                 display=display,
                 observation=observation if isinstance(observation, dict) else None,
+                provenance=provenance,
             )
 
     def get_signature_db(self) -> sigdb.SignatureDatabase:

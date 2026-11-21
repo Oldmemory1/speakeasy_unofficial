@@ -505,9 +505,18 @@ def attach_observation(
         return
     if not isinstance(observation, dict):
         return
-    ctx["_api_observation"] = observation
-    if logger.isEnabledFor(logging.INFO):
-        logger.info("scatter-diagnostic %s", json.dumps(observation, ensure_ascii=False, sort_keys=True))
+    try:
+        ctx["_api_observation"] = observation
+        if logger.isEnabledFor(logging.INFO):
+            try:
+                logger.info(
+                    "scatter-diagnostic %s",
+                    json.dumps(observation, ensure_ascii=False, sort_keys=True),
+                )
+            except Exception:
+                logger.debug("scatter diagnostic: observation not JSON-serializable", exc_info=True)
+    except Exception:
+        logger.debug("scatter diagnostic: observation attachment failed", exc_info=True)
 
 
 __all__ = [

@@ -252,13 +252,16 @@ class Profiler:
         argv: list[Any],
         display: list[str] | None = None,
         observation: dict[str, Any] | None = None,
+        provenance: dict[str, Any] | None = None,
     ) -> None:
         """
         Log a call to an OS API. This includes arguments, return address, and return value.
 
         ``display``, when given, is a pre-rendered human readable representation of
         each argument (e.g. ``"lpFileName: \\"C:\\\\x\\""``) that is recorded verbatim in
-        place of the raw ``argv`` formatting.
+        place of the raw ``argv`` formatting.  ``provenance`` is an optional
+        read-only FX-016 trace record (caller/return address, registers, module,
+        bounded stack window and pointer mappings).
         """
         run.num_apis += 1
 
@@ -282,6 +285,7 @@ class Profiler:
             args=args,
             ret_val=ret_str,
             observation=observation,
+            provenance=provenance,
         )
 
         recent_events = [e for e in run.events[-3:] if isinstance(e, ApiEvent)]

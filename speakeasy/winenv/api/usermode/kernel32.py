@@ -28,7 +28,7 @@ from speakeasy.profiler_events import (
     THREAD_CREATE,
     THREAD_INJECT,
 )
-from speakeasy.windows import api_diagnostics
+from speakeasy.windows import api_diagnostics, api_trace_diagnostics
 from speakeasy.windows.child_execution import ChildTargetResolver
 from speakeasy.windows.os_capabilities import (
     WindowsOsVersion,
@@ -1708,6 +1708,14 @@ class Kernel32(api.ApiHandler):
         );
         """
         (dwErrCode,) = argv
+
+        # FX-016 diagnostics: record guest control-flow provenance (set value,
+        # previous LastError, call site, return address, registers, stack).
+        # The handler still returns None and does not write EAX.
+        api_trace_diagnostics.attach_observation(
+            ctx,
+            lambda: api_trace_diagnostics.observe_set_last_error(emu, argv),
+        )
 
         emu.set_last_error(dwErrCode)
 
@@ -5074,6 +5082,13 @@ class Kernel32(api.ApiHandler):
             rv = windefs.WAIT_TIMEOUT
         else:
             rv = windefs.WAIT_OBJECT_0
+
+        # FX-016 diagnostics: record stack and handle provenance around the
+        # wait without changing the wait-code policy above.
+        api_trace_diagnostics.attach_observation(
+            ctx,
+            lambda: api_trace_diagnostics.observe_wait_for_single_object(emu, argv, rv),
+        )
 
         return rv
 

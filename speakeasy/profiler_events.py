@@ -129,6 +129,16 @@ class ApiEvent(Event):
             "profile, and whether the selector was known."
         ),
     )
+    provenance: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional read-only API-trace provenance.\n\n"
+            "Records the caller/return address, calling module, API-return "
+            "general registers, bounded stack window, argument pointers and "
+            "their mappings. Added by the FX-016 diagnostic work item; purely "
+            "observational and omitted when diagnostics are unavailable."
+        ),
+    )
 
 
 class ProcessCreateEvent(Event):

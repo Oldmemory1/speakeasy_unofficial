@@ -197,6 +197,15 @@ class ErrorInfo(BaseModel):
         default=None,
         description="Human-readable one-line triage summary of the error.",
     )
+    diagnostics: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional read-only fault diagnostics (FX-016).\n\n"
+            "When present, records the fakeout-page marker, the last API call "
+            "with its call-site/return address, a bounded API tail, and the "
+            "fault-time register/stack snapshot. Purely observational."
+        ),
+    )
     traceback: str | None = Field(
         default=None,
         description="Python traceback when the error originated from an internal exception.",
