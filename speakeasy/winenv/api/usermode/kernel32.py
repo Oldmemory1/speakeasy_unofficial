@@ -21,6 +21,7 @@ from speakeasy.profiler_events import (
     FILE_READ,
     FILE_WRITE,
     MEM_ALLOC,
+    MEM_FREE,
     MEM_PROTECT,
     MEM_READ,
     MEM_WRITE,
@@ -1732,6 +1733,56 @@ class Kernel32(api.ApiHandler):
         rv = 1
 
         return rv
+
+    @apihook("VirtualFreeEx", argc=4)
+    def VirtualFreeEx(self, emu, argv, ctx: api.ApiContext = None):
+        """
+        BOOL VirtualFreeEx(
+          HANDLE hProcess,
+          LPVOID lpAddress,
+          SIZE_T dwSize,
+          DWORD  dwFreeType
+        );
+        """
+        hProcess, lpAddress, dwSize, dwFreeType = argv
+
+        if is_current_process_pseudo_handle(hProcess, self.get_ptr_size()):
+            obj = emu.get_current_process()
+        else:
+            obj = self.get_object_from_handle(hProcess)
+
+        if not isinstance(obj, Process):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+
+        if not lpAddress:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return False
+
+        argv[0] = obj.path or ""
+
+        # FX-012-extended: a non-current process owns its shadow view. Release
+        # or decommit the range there; the caller's global mappings and the
+        # existing same-process VirtualFree behavior are untouched.
+        try:
+            space = emu.get_process_address_space(obj)
+        except ProcessMemoryError as err:
+            emu.set_last_error(err.win_error)
+            return False
+
+        if space is None:
+            return self.VirtualFree(emu, [lpAddress, dwSize, dwFreeType], ctx)
+
+        try:
+            freed_base, freed_size = space.unmap(lpAddress, dwSize, dwFreeType)
+        except ProcessMemoryError as err:
+            emu.set_last_error(err.win_error)
+            self.record_process_event(obj, MEM_FREE, base=lpAddress, size=dwSize)
+            return False
+
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        self.record_process_event(obj, MEM_FREE, base=freed_base, size=freed_size)
+        return True
 
     @apihook("GetCurrentProcess", argc=0)
     def GetCurrentProcess(self, emu, argv, ctx: api.ApiContext = None):

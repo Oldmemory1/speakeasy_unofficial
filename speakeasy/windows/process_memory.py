@@ -21,11 +21,27 @@ whose base is already occupied in the target process with
 writes the target process's pages and temporarily relaxes their protection,
 restoring it afterwards.  The page-protection conversions are shared with
 :mod:`speakeasy.windows.page_protection` (FX-004/FX-009).
+
+Phase 3 (FX-012-extended) adds three explicit model paths on top of the
+shadow view:
+
+* :meth:`ProcessAddressSpace.capture_runtime_write` /
+  :meth:`ProcessAddressSpace.sync_runtime_region` project bytes observed in a
+  child process's own runtime memory back into its shadow overlay; the parent
+  view is never touched;
+* :meth:`ProcessAddressSpace.map_loaded_image` seeds a view from an already
+  memory-mapped PE image plus explicit per-page protections (pe-only children
+  that have ``process.pe`` but no ``process.pe_data``);
+* :meth:`ProcessAddressSpace.unmap` implements ``VirtualFreeEx``
+  ``MEM_RELEASE``/``MEM_DECOMMIT`` bookkeeping.
+
+Child execution is still ``model_only`` in the engine, so no code here claims
+that a child executed; the runtime paths are driven by explicit callers.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -52,8 +68,11 @@ MAX_SHADOW_REGION_SIZE = 0x10000000
 
 MEM_COMMIT = windefs.MEM_COMMIT
 MEM_RESERVE = windefs.MEM_RESERVE
+MEM_DECOMMIT = 0x4000
+MEM_RELEASE = 0x8000
 MEM_TOP_DOWN = 0x100000
 _SUPPORTED_ALLOC_TYPES = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN
+_FREE_TYPES = frozenset({MEM_DECOMMIT, MEM_RELEASE})
 
 ERROR_INVALID_PARAMETER = windefs.ERROR_INVALID_PARAMETER
 ERROR_NOACCESS = 998
@@ -200,6 +219,29 @@ class ProcessAddressSpace:
                 return False
         return True
 
+    def _range_occupied(self, start: int, size: int) -> bool:
+        """True when every page is inside a region (committed or reserved)."""
+        if size <= 0:
+            return False
+        for page in range(start, start + size, self.page_size):
+            if self._region_for(page) is None:
+                return False
+        return True
+
+    def _commit_range(self, start: int, size: int, protect: int) -> None:
+        """Commit reserved pages, zero-filling pages that were decommitted."""
+        for page in range(start, start + size, self.page_size):
+            region = self._region_for(page)
+            if region is None:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_ADDRESS, f"page 0x{page:x} is not reserved in target"
+                )
+            if page not in self._page_protect:
+                offset = page - region.base
+                end = min(offset + self.page_size, len(region.data))
+                region.data[offset:end] = b"\x00" * (end - offset)
+            self._page_protect[page] = protect
+
     def _set_protect_range(self, base: int, size: int, protect: int) -> None:
         start, end = self._span(base, size)
         for page in range(start, end, self.page_size):
@@ -267,7 +309,15 @@ class ProcessAddressSpace:
                     f"address 0x{address:x} is not mapped in process {self.pid}",
                 )
             page = address & ~(self.page_size - 1)
-            protect = self._page_protect.get(page, windefs.PAGE_NOACCESS)
+            protect = self._page_protect.get(page)
+            if protect is None:
+                # Reserved but not committed (after VirtualFreeEx
+                # MEM_DECOMMIT): inaccessible even through WriteProcessMemory,
+                # which only bypasses page *protection*, not commit state.
+                raise ProcessMemoryError(
+                    ERROR_PARTIAL_COPY if need_write else ERROR_NOACCESS,
+                    f"page 0x{page:x} is not committed in process {self.pid}",
+                )
             if need_write and not bypass_protection:
                 perms = win_protect_to_emu_perms(protect)
                 if not perms & common.PERM_MEM_WRITE:
@@ -420,11 +470,11 @@ class ProcessAddressSpace:
             if reserve:
                 self._add_region(start, region_size, protect)
                 return start
-            if not self._range_mapped(start, region_size):
+            if not self._range_occupied(start, region_size):
                 raise ProcessMemoryError(
                     ERROR_INVALID_ADDRESS, "MEM_COMMIT range is not reserved in target"
                 )
-            self._set_protect_range(start, region_size, protect)
+            self._commit_range(start, region_size, protect)
             return start
 
         base = self._find_free(size, top_down=bool(alloc_type & MEM_TOP_DOWN))
@@ -473,18 +523,22 @@ class ProcessAddressSpace:
 
         Raises:
             ProcessMemoryError: ``ERROR_PARTIAL_COPY`` when any page is
-            unmapped, ``ERROR_NOACCESS`` when protection denies a non-bypass
-            write.  Validation happens before mutation, so a failure never
-            leaves a partial write behind.
+            unmapped or reserved-but-decommitted, ``ERROR_NOACCESS`` when
+            protection denies a non-bypass write.  Validation happens before
+            mutation, so a failure never leaves a partial write behind.
         """
         self._validate_access(base, len(data), need_write=True, bypass_protection=bypass_protection)
+        return self._write_overlay(base, data)
+
+    def _write_overlay(self, base: int, data: bytes) -> int:
+        """Copy validated bytes into region overlays."""
         if not data:
             return 0
         offset = 0
         while offset < len(data):
             address = base + offset
             region = self._region_for(address)
-            assert region is not None  # validated above
+            assert region is not None  # callers validate first
             page_end = (address & ~(self.page_size - 1)) + self.page_size
             chunk = min(len(data) - offset, region.end - address, page_end - address)
             data_offset = address - region.base
@@ -517,6 +571,7 @@ class ProcessAddressSpace:
         if region is None:
             return None
         page = base & ~(self.page_size - 1)
+        committed = page in self._page_protect
         return {
             "base": region.base,
             "size": region.size,
@@ -524,8 +579,223 @@ class ProcessAddressSpace:
             "allocation_protect": region.protect,
             "tag": region.tag,
             "is_image": region.is_image,
-            "state": MEM_COMMIT,
+            "state": MEM_COMMIT if committed else MEM_RESERVE,
         }
+
+    def map_loaded_image(
+        self,
+        image_base: int,
+        image_size: int,
+        data: bytes,
+        page_protections: Mapping[int, int],
+    ) -> int:
+        """Seed this view from an already memory-mapped PE image.
+
+        Used for pe-only child processes: ``Process.pe`` holds a loaded
+        ``RuntimeModule`` but ``Process.pe_data`` is ``None``, so there are no
+        raw file bytes to parse.  The caller supplies the mapped image bytes
+        (for example read from the emulator's image mapping) and the Win32
+        protection of every page.
+
+        Args:
+            image_base: Page-aligned image base in this view.
+            image_size: PE ``SizeOfImage`` in bytes.
+            data: Memory-mapped image bytes; at least ``image_size`` long.
+            page_protections: Mapping of every page in the page-aligned image
+                span to its Win32 ``PAGE_*`` protection.  Missing pages,
+                unknown protections and out-of-range keys are rejected.
+
+        Returns:
+            The page-aligned image base.
+
+        Raises:
+            ProcessMemoryError: ``ERROR_INVALID_PARAMETER`` for an empty/short
+            image or an incomplete protection map; ``ERROR_INVALID_ADDRESS``
+            for a misaligned/out-of-range base or an overlap with an existing
+            region.  A failure never leaves a partial image region behind.
+
+        Side effects:
+            Adds one ``is_image`` region holding the supplied bytes and page
+            protections.  No emulator mapping is created.
+        """
+        if image_size <= 0 or image_size > MAX_SHADOW_REGION_SIZE:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "unsupported image size")
+        if not isinstance(data, (bytes, bytearray, memoryview)) or len(data) < image_size:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "image bytes shorter than image size")
+        if not isinstance(page_protections, Mapping) or not page_protections:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "missing page protection map")
+        if image_base < 0 or image_base % self.page_size:
+            raise ProcessMemoryError(ERROR_INVALID_ADDRESS, "image base is not page aligned")
+
+        start, end = self._span(image_base, image_size)
+        pages = list(range(start, end, self.page_size))
+        for page in page_protections:
+            if page not in pages:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_PARAMETER, f"protection page 0x{page:x} is outside the image"
+                )
+        for page in pages:
+            protect = page_protections.get(page)
+            if protect is None or int(protect) & 0xFF not in _BASE_PROTECTIONS:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_PARAMETER, f"invalid image protection for page 0x{page:x}"
+                )
+
+        region = self._add_region(
+            start,
+            end - start,
+            windefs.PAGE_NOACCESS,
+            tag=f"image.pid{self.pid}.0x{start:x}",
+            is_image=True,
+        )
+        region.data[:image_size] = bytes(data[:image_size])
+        for page in pages:
+            self._page_protect[page] = int(page_protections[page])
+        return start
+
+    def capture_runtime_write(self, base: int, data: bytes, *, bypass_protection: bool = True) -> int:
+        """Project a write observed in the child's own runtime memory.
+
+        Model path (child execution remains ``model_only`` in the engine): an
+        execution backend that runs a child in the emulator's shared memory
+        reports each observed write here so the child's shadow overlay reflects
+        the runtime bytes.  The parent's global mappings are never touched.
+        Tests drive this method with controlled bytes; no child execution is
+        claimed or required.
+
+        Args:
+            base: Address in the child's own address view.
+            data: Bytes the child wrote at ``base``.
+            bypass_protection: When True (default), the runtime already enforced
+                the child's page protection, so stale shadow protections do not
+                reject the observed write.  When False, the page must also be
+                writable in this view.
+
+        Returns:
+            Number of bytes written to the shadow overlay.
+
+        Raises:
+            ProcessMemoryError: ``ERROR_PARTIAL_COPY`` when a page is unmapped
+            or reserved-but-decommitted, ``ERROR_NOACCESS`` when
+            ``bypass_protection=False`` and protection denies the write.
+            Validation happens before mutation.
+        """
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "runtime write data must be bytes")
+        self._validate_access(base, len(data), need_write=True, bypass_protection=bypass_protection)
+        return self._write_overlay(base, bytes(data))
+
+    def sync_runtime_region(
+        self,
+        base: int,
+        data: bytes,
+        *,
+        page_protections: Sequence[int] | None = None,
+    ) -> int:
+        """Backfill an authoritative runtime snapshot for a region.
+
+        This is the range form of :meth:`capture_runtime_write` for executors
+        that do not intercept individual writes: they read the child's runtime
+        bytes after execution and supply them here, optionally with the child's
+        current per-page Win32 protections (for example after a guest
+        ``VirtualProtect``).
+
+        Args:
+            base: Address in the child's own address view.
+            data: Runtime bytes for ``[base, base + len(data))``.
+            page_protections: Optional Win32 protection for each page covering
+                the range, in ascending page order.  The number of entries must
+                match the page count exactly.
+
+        Returns:
+            Number of bytes written to the shadow overlay.
+
+        Raises:
+            ProcessMemoryError: ``ERROR_INVALID_PARAMETER`` for empty/non-bytes
+            input or a malformed protection list, ``ERROR_PARTIAL_COPY`` when a
+            page is unmapped or not committed.  Validation happens before
+            mutation.
+        """
+        if not isinstance(data, (bytes, bytearray, memoryview)) or not data:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "runtime snapshot must be non-empty bytes")
+        payload = bytes(data)
+        self._validate_access(base, len(payload), need_write=True, bypass_protection=True)
+
+        pages: list[int] = []
+        if page_protections is not None:
+            start, end = self._span(base, len(payload))
+            pages = list(range(start, end, self.page_size))
+            if len(page_protections) != len(pages):
+                raise ProcessMemoryError(
+                    ERROR_INVALID_PARAMETER, "one protection per page is required"
+                )
+            for protect in page_protections:
+                if int(protect) & 0xFF not in _BASE_PROTECTIONS:
+                    raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "invalid page protection")
+
+        self._write_overlay(base, payload)
+        if page_protections is not None:
+            for page, protect in zip(pages, page_protections):
+                self._page_protect[page] = int(protect)
+        return len(payload)
+
+    def unmap(self, base: int, size: int, free_type: int) -> tuple[int, int]:
+        """Emulate ``VirtualFreeEx`` inside this view.
+
+        ``MEM_RELEASE`` removes the whole region (``size`` must be 0 and
+        ``base`` must be the region base).  ``MEM_DECOMMIT`` makes the pages
+        inaccessible but keeps the reservation, so the range stays occupied
+        and can be committed again with ``VirtualAllocEx(MEM_COMMIT)``.
+
+        Args:
+            base: Address in the target view.
+            size: 0 for ``MEM_RELEASE``; nonzero for ``MEM_DECOMMIT``.
+            free_type: Exactly ``MEM_RELEASE`` or ``MEM_DECOMMIT``.
+
+        Returns:
+            Page-aligned ``(base, size)`` of the affected range.
+
+        Raises:
+            ProcessMemoryError: ``ERROR_INVALID_PARAMETER`` for an unknown free
+            type or ``MEM_RELEASE`` with nonzero size; ``ERROR_INVALID_ADDRESS``
+            when the address is not a region base / not committed.  All
+            validation happens before mutation.
+        """
+        free_type = int(free_type)
+        if free_type not in _FREE_TYPES:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "invalid free type")
+
+        if free_type == MEM_RELEASE:
+            if size != 0:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_PARAMETER, "MEM_RELEASE requires dwSize == 0"
+                )
+            region = self._region_for(base)
+            if region is None or region.base != base:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_ADDRESS, "MEM_RELEASE address is not a region base"
+                )
+            del self._regions[region.base]
+            for page in range(region.base, region.end, self.page_size):
+                self._page_protect.pop(page, None)
+            return region.base, region.size
+
+        if size <= 0:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "MEM_DECOMMIT requires a size")
+        start, end = self._span(base, size)
+        for page in range(start, end, self.page_size):
+            if page not in self._page_protect or self._region_for(page) is None:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_ADDRESS, f"page 0x{page:x} is not committed"
+                )
+        for page in range(start, end, self.page_size):
+            region = self._region_for(page)
+            assert region is not None  # validated above
+            offset = page - region.base
+            length = min(self.page_size, len(region.data) - offset)
+            region.data[offset : offset + length] = b"\x00" * length
+            self._page_protect.pop(page, None)
+        return start, end - start
 
 
 def write_current_process_memory(

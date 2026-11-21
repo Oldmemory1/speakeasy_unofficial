@@ -63,7 +63,12 @@ from speakeasy.windows.page_protection import (
     image_protection_for_emu_perms,
     is_virtual_alloc_view,
 )
-from speakeasy.windows.process_memory import ProcessAddressSpace
+from speakeasy.windows.process_memory import (
+    ERROR_INVALID_ADDRESS,
+    ERROR_INVALID_PARAMETER,
+    ProcessAddressSpace,
+    ProcessMemoryError,
+)
 from speakeasy.windows.regman import RegistryManager
 from speakeasy.windows.system_modules import (
     SystemModuleDecoyLoader,
@@ -942,19 +947,22 @@ class WindowsEmulator(BinaryEmulator):
             must keep using the existing global ``mem_read``/``mem_write``/
             ``mem_map`` APIs. For any other process a lazily created
             :class:`ProcessAddressSpace` is returned and cached on the process
-            object. A raw-byte ``process.pe_data`` PE image is registered in
-            that view on first use; ``pe_data`` that is not a PE (for example a
-            shellcode child) leaves the view empty because there is no initial
-            image layout to model.
+            object. The view is seeded from ``process.pe_data`` (raw PE file
+            bytes) when present; otherwise a loaded ``process.pe`` module is
+            projected from the emulator's mapped image bytes and section
+            protections (FX-012-extended). A process with neither field keeps
+            an empty view because there is no initial image layout to model.
 
         Raises:
             ProcessMemoryError: if ``process.pe_data`` starts with ``MZ`` but
-                cannot be parsed as a PE (explicit failure; no empty view is
-                silently substituted for a corrupt image).
+                cannot be parsed as a PE, or if ``process.pe`` exists but has no
+                loadable image (missing base/size/sections) or its mapped bytes
+                cannot be read. The error is explicit; a failed seed is never
+                cached as an empty view.
 
         Side effects:
-            Creates and caches ``process.address_space``. Never maps or
-            changes Unicorn memory; model-only children stay non-executable.
+            Creates and caches ``process.address_space`` on success. Never maps
+            or changes Unicorn memory; model-only children stay non-executable.
         """
         if process is None or process is self.curr_process:
             return None
@@ -966,11 +974,121 @@ class WindowsEmulator(BinaryEmulator):
                 pointer_bits=self.get_ptr_size() * 8,
                 page_size=self.page_size,
             )
+            self._seed_process_shadow(space, process)
             process.address_space = space
-            data = getattr(process, "pe_data", None)
-            if isinstance(data, (bytes, bytearray)) and data and bytes(data[:2]) == b"MZ":
-                space.map_pe_image(bytes(data))
         return space
+
+    def _seed_process_shadow(self, space: ProcessAddressSpace, process: Any) -> None:
+        """Initialize ``space`` from the process's initial image.
+
+        ``pe_data`` (raw file bytes) is parsed with the PE section table. A
+        pe-only process (``pe`` set, ``pe_data`` unset) is seeded from the
+        already mapped image bytes plus per-section Win32 protections, because
+        the loader has no raw file bytes attached to that process object.
+
+        Raises:
+            ProcessMemoryError: explicit failure instead of leaving the view
+                empty when the process has a module that cannot be projected.
+        """
+        data = getattr(process, "pe_data", None)
+        if isinstance(data, (bytes, bytearray, memoryview)) and data and bytes(data[:2]) == b"MZ":
+            space.map_pe_image(bytes(data))
+            return
+
+        module = getattr(process, "pe", None)
+        if module is None:
+            return
+
+        image_base = int(getattr(module, "base", 0) or 0)
+        image_size = int(getattr(module, "image_size", 0) or 0)
+        sections = tuple(getattr(module, "sections", ()) or ())
+        if image_base <= 0 or image_size <= 0 or not sections:
+            raise ProcessMemoryError(
+                ERROR_INVALID_PARAMETER, "process module has no loadable image layout"
+            )
+
+        try:
+            image_bytes = self.mem_read(image_base, image_size)
+        except Exception as err:  # engine read failure: report it, never fake zeros
+            raise ProcessMemoryError(
+                ERROR_INVALID_ADDRESS,
+                f"process image at 0x{image_base:x} is not readable in the emulator: {err}",
+            ) from err
+
+        protections = self._image_page_protections(image_base, image_size, sections)
+        space.map_loaded_image(image_base, image_size, image_bytes, protections)
+
+    def _image_page_protections(self, image_base: int, image_size: int, sections: Any) -> dict[int, int]:
+        """Return the Win32 protection of every page in a loaded image span.
+
+        Headers are ``PAGE_READONLY``; sections use
+        :func:`image_protection_for_emu_perms` (writable image sections become
+        write-copy); pages not covered by a header/section are ``PAGE_NOACCESS``,
+        matching the image view that :meth:`ProcessAddressSpace.map_pe_image`
+        builds from raw bytes.
+
+        Args:
+            image_base: Page-aligned runtime image base.
+            image_size: PE ``SizeOfImage``.
+            sections: Loader ``SectionEntry`` objects with ``virtual_address``,
+                ``virtual_size`` and emulator ``perms``.
+        """
+        page_size = self.page_size
+        start = image_base & ~(page_size - 1)
+        end = (image_base + image_size + page_size - 1) & ~(page_size - 1)
+        protections = {page: windef.PAGE_NOACCESS for page in range(start, end, page_size)}
+
+        first_section_rva = min(int(section.virtual_address) for section in sections)
+        headers_end = min(image_base + first_section_rva, image_base + image_size)
+        for page in range(start, headers_end, page_size):
+            protections[page] = windef.PAGE_READONLY
+
+        image_end = image_base + image_size
+        for section in sections:
+            section_start = image_base + int(section.virtual_address)
+            section_end = min(section_start + int(section.virtual_size), image_end)
+            if section_end <= section_start:
+                continue
+            protect = image_protection_for_emu_perms(int(section.perms))
+            aligned_start = section_start & ~(page_size - 1)
+            aligned_end = (section_end + page_size - 1) & ~(page_size - 1)
+            for page in range(aligned_start, aligned_end, page_size):
+                if page in protections:
+                    protections[page] = protect
+        return protections
+
+    def capture_process_runtime_write(self, process: Any, base: int, data: bytes) -> int:
+        """Project bytes observed in a process's own runtime memory.
+
+        Model path for :class:`ProcessAddressSpace`: child execution is
+        ``model_only`` in the current engine, so production code does not call
+        this yet. A future child execution backend that runs a child in the
+        shared emulator reports each observed write here; the target process's
+        shadow overlay then reflects the runtime bytes while the parent's
+        global mappings stay unchanged. Tests drive this interface with
+        controlled writes and never claim a child executed.
+
+        Args:
+            process: Non-current process that owns the write.
+            base: Address in that process's own view.
+            data: Bytes observed at ``base``.
+
+        Returns:
+            Number of bytes written to the shadow overlay.
+
+        Raises:
+            ProcessMemoryError: ``ERROR_INVALID_PARAMETER`` when no process is
+            supplied or the target is the current/global process; page errors
+            from :meth:`ProcessAddressSpace.capture_runtime_write`.
+        """
+        if process is None:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "no process supplied")
+        space = self.get_process_address_space(process)
+        if space is None:
+            raise ProcessMemoryError(
+                ERROR_INVALID_PARAMETER, "current process memory is the global emulator view"
+            )
+        return space.capture_runtime_write(base, data)
 
     def kill_process(self, proc):
         """
