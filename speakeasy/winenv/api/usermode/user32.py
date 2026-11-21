@@ -7,7 +7,7 @@ import speakeasy.windows.sessman as sessman
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.windows.user32 as windefs
 import speakeasy.winenv.defs.windows.windef as windef
-from speakeasy.windows import window_placement
+from speakeasy.windows import api_diagnostics, window_placement
 from speakeasy.windows.gui_messages import QueuedWindowMessage
 from speakeasy.windows.window_state import (
     GWL_WNDPROC,
@@ -1559,10 +1559,35 @@ class User32(api.ApiHandler):
         contract instead of the old unconditional TRUE signature fallback.
         """
         hWnd = argv[0]
-        if self.sessman.get_window(hWnd) is None:
+        window = self.sessman.get_window(hWnd)
+        ctx = ctx or {}
+        if window is None:
             emu.set_last_error(ERROR_INVALID_WINDOW_HANDLE)
+            api_diagnostics.attach_observation(
+                ctx,
+                lambda: api_diagnostics.observe_is_zoomed(
+                    emu,
+                    hWnd,
+                    0,
+                    emu.get_last_error(),
+                    window_known=False,
+                    api_name=ctx.get("func_name"),
+                ),
+            )
             return 0
-        return 1 if self.window_placement.is_maximized(hWnd) else 0
+        rv = 1 if self.window_placement.is_maximized(hWnd) else 0
+        api_diagnostics.attach_observation(
+            ctx,
+            lambda: api_diagnostics.observe_is_zoomed(
+                emu,
+                hWnd,
+                rv,
+                emu.get_last_error(),
+                window_known=True,
+                api_name=ctx.get("func_name"),
+            ),
+        )
+        return rv
 
     @apihook("BeginPaint", argc=2)
     def BeginPaint(self, emu, argv, ctx: api.ApiContext = None):

@@ -28,6 +28,7 @@ from speakeasy.profiler_events import (
     THREAD_CREATE,
     THREAD_INJECT,
 )
+from speakeasy.windows import api_diagnostics
 from speakeasy.windows.child_execution import ChildTargetResolver
 from speakeasy.windows.os_capabilities import (
     WindowsOsVersion,
@@ -2360,6 +2361,18 @@ class Kernel32(api.ApiHandler):
         if chunk:
             emu.set_last_error(windefs.ERROR_SUCCESS)
 
+        ctx = ctx or {}
+        api_diagnostics.attach_observation(
+            ctx,
+            lambda: api_diagnostics.observe_heap_alloc(
+                emu,
+                hHeap,
+                dwFlags,
+                dwBytes,
+                chunk,
+                api_name=ctx.get("func_name"),
+            ),
+        )
         return chunk
 
     @apihook("HeapSize", argc=3)
@@ -4215,12 +4228,24 @@ class Kernel32(api.ApiHandler):
         );
         """
         ctx = ctx or {}
+        raw_argv = tuple(argv)
         fname, access, share, sec_attr, disp, flags, template = argv
         hnd = windefs.INVALID_HANDLE_VALUE
 
         cw = self.get_char_width(ctx)
 
         if not fname:
+            api_diagnostics.attach_observation(
+                ctx,
+                lambda: api_diagnostics.observe_create_file(
+                    emu,
+                    raw_argv,
+                    hnd,
+                    char_width=cw,
+                    decoded_path=None,
+                    api_name=ctx.get("func_name"),
+                ),
+            )
             return hnd
 
         target = self.read_mem_string(fname, cw)
@@ -4279,6 +4304,17 @@ class Kernel32(api.ApiHandler):
                     emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
 
             self.record_file_access_event(target, op, disposition=[cd], access=ad)
+        api_diagnostics.attach_observation(
+            ctx,
+            lambda: api_diagnostics.observe_create_file(
+                emu,
+                raw_argv,
+                hnd,
+                char_width=cw,
+                decoded_path=target,
+                api_name=ctx.get("func_name"),
+            ),
+        )
         return hnd
 
     @apihook("DeleteFile", argc=1)
@@ -5011,6 +5047,16 @@ class Kernel32(api.ApiHandler):
         );
         """
 
+        ctx = ctx or {}
+        api_diagnostics.attach_observation(
+            ctx,
+            lambda: api_diagnostics.observe_free_library(
+                emu,
+                tuple(argv),
+                True,
+                api_name=ctx.get("func_name"),
+            ),
+        )
         return True
 
     @apihook("WaitForSingleObject", argc=2)

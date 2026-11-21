@@ -1,5 +1,7 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+from speakeasy.windows import api_diagnostics
+
 from .. import api
 
 
@@ -108,7 +110,20 @@ class GDI32(api.ApiHandler):
             int i
         );
         """
-        return self.get_stock_object_handle(argv[0])
+        ctx = ctx or {}
+        stock_object = argv[0]
+        handle = self.get_stock_object_handle(stock_object)
+        api_diagnostics.attach_observation(
+            ctx,
+            lambda: api_diagnostics.observe_get_stock_object(
+                stock_object,
+                handle,
+                valid=stock_object in self.STOCK_OBJECT_TYPES,
+                api_name=ctx.get("func_name"),
+                handle_base=self.STOCK_OBJECT_HANDLE_BASE,
+            ),
+        )
+        return handle
 
     @apihook("GetMapMode", argc=1)
     def GetMapMode(self, emu, argv, ctx: api.ApiContext = None):
