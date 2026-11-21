@@ -39,6 +39,7 @@ from speakeasy.windows.child_execution import (
     ProcessLaunchSpec,
 )
 from speakeasy.windows.cryptman import CryptoManager
+from speakeasy.windows.dep_policy import ImageDepPolicy, dep_opt_out
 from speakeasy.windows.driveman import DriveManager
 from speakeasy.windows.fast_fail import (
     FAST_FAIL_INTERRUPT_VECTOR,
@@ -56,7 +57,10 @@ from speakeasy.windows.import_sentinel import (
 from speakeasy.windows.loaders import PeLoader, RuntimeModule, get_prot_string
 from speakeasy.windows.netman import NetworkManager
 from speakeasy.windows.objman import HandleAllocator
-from speakeasy.windows.page_protection import image_protection_for_emu_perms
+from speakeasy.windows.page_protection import (
+    emu_perms_to_win_protect,
+    image_protection_for_emu_perms,
+)
 from speakeasy.windows.regman import RegistryManager
 from speakeasy.windows.system_modules import (
     SystemModuleDecoyLoader,
@@ -100,6 +104,10 @@ class DeferredProtectedFault:
         fault_pc: PC of the faulting instruction at snapshot time.
         address: Faulting memory address.
         context: CPU context captured before the fault was resumed.
+        dep_exec_allowed: True when the process image opted out of DEP and the
+            faulting page is writable.  Such a fault is not delivered to the
+            guest exception chain; the deferred handler grants execution to
+            the page and resumes the faulting instruction instead.
     """
 
     error_type: str
@@ -107,6 +115,7 @@ class DeferredProtectedFault:
     fault_pc: int
     address: int
     context: Any
+    dep_exec_allowed: bool = False
 
 
 logger = logging.getLogger(__name__)
@@ -2816,13 +2825,18 @@ class WindowsEmulator(BinaryEmulator):
         self.on_run_complete()
         return True
 
-    def _defer_protected_fault(self, error_type, access_type, address):
+    def _defer_protected_fault(self, error_type, access_type, address, *, dep_exec_allowed: bool = False):
         """Snapshot a protected read/fetch fault and defer its dispatch.
 
         Unicorn 2.1.4 segfaults when ``uc_mem_map`` is invoked from a
         UC_MEM_READ_PROT or UC_MEM_FETCH_PROT callback. Redirect EIP to the
         reserved trampoline; the resulting invalid fetch runs the normal
         exception dispatch outside the PROT callback.
+
+        ``dep_exec_allowed`` marks a fault that the process DEP opt-out
+        permits: instead of delivering STATUS_ACCESS_VIOLATION, the deferred
+        handler grants execute permission to the writable faulting page and
+        resumes the instruction.
 
         Side effects: stores ``_deferred_protected_fault`` and changes EIP.
         Returns True so the memory hook treats the fault as handled.
@@ -2840,6 +2854,7 @@ class WindowsEmulator(BinaryEmulator):
             fault_pc=self.get_pc(),
             address=address,
             context=self.get_thread_context(),
+            dep_exec_allowed=dep_exec_allowed,
         )
         logger.debug(
             "deferring protected %s fault: pc=0x%x addr=0x%x hooks_set=%s",
@@ -2857,6 +2872,10 @@ class WindowsEmulator(BinaryEmulator):
         Restores the fault-time context, then delivers STATUS_ACCESS_VIOLATION
         to VEH/SEH/UEF. When no guest handler accepts, the caller's original
         fatal error is recorded with the preserved PC/address/access_type.
+
+        A fault marked ``dep_exec_allowed`` (process image opted out of DEP and
+        the page is writable) is not an exception: grant execute permission to
+        the page and resume the faulting instruction.
 
         Returns:
             True when the deferred sentinel was consumed; False when no
@@ -2879,6 +2898,22 @@ class WindowsEmulator(BinaryEmulator):
         self.set_pc(fault.fault_pc)
         self.prev_pc = fault.fault_pc
 
+        if fault.dep_exec_allowed:
+            if self._grant_dep_exec_fetch(fault.address):
+                logger.debug(
+                    "DEP opt-out: granted execute on writable page 0x%x, resuming pc=0x%x",
+                    fault.address,
+                    fault.fault_pc,
+                )
+                return True
+            # The page is no longer writable/mapped (the guest may have
+            # changed it between the fault and this deferred handler); fall
+            # back to the normal guest exception chain.
+            logger.debug(
+                "DEP opt-out grant no longer applies to 0x%x; dispatching the fault",
+                fault.address,
+            )
+
         if self.dispatch_seh(
             ddk.STATUS_ACCESS_VIOLATION,
             fault.address,
@@ -2887,6 +2922,92 @@ class WindowsEmulator(BinaryEmulator):
             return True
 
         self._finalize_unhandled_deferred_fault(fault)
+        return True
+
+    def _process_image_dep_policy(self) -> ImageDepPolicy | None:
+        """Return the current process image's DEP/NXCOMPAT policy.
+
+        Windows/Wine derive process DEP from the main image's Optional Header
+        ``DllCharacteristics`` (Wine ``loader.c:1585-1591``).  The policy is
+        read from ``Process.pe`` (the module loaded as the process image), not
+        from whichever module happens to be executing: DEP is process-wide.
+
+        Returns:
+            The image policy, or ``None`` when there is no current process, the
+            process has no PE image, or the image loader has no PE header
+            (shellcode/synthesized/decoy modules).  ``None`` keeps DEP enabled.
+        """
+        process = self.get_current_process()
+        image_module = getattr(process, "pe", None) if process is not None else None
+        if image_module is None:
+            return None
+        getter = getattr(image_module, "get_dep_policy", None)
+        if getter is None:
+            return None
+        return getter()
+
+    def _dep_exec_fetch_allowed(self, address: int) -> bool:
+        """Return True when the image DEP opt-out permits fetching ``address``.
+
+        Applicable only when the process image explicitly cleared NXCOMPAT and
+        the faulting page's effective permissions include write access.  The
+        write requirement keeps read-only image sections (``.rdata`` and
+        resources) non-executable even under DEP opt-out; the emulator never
+        changes those section protections.
+
+        Args:
+            address: Faulting fetch address.
+
+        Returns:
+            True when the deferred DEP grant should run; False for DEP-enabled
+            images, unknown images, unmapped pages and read-only pages.
+        """
+        if not dep_opt_out(self._process_image_dep_policy()):
+            return False
+        perms = self.get_address_perms(address)
+        if perms is None:
+            return False
+        return bool(perms & common.PERM_MEM_WRITE)
+
+    def _grant_dep_exec_fetch(self, address: int) -> bool:
+        """Add execute permission to the writable page containing ``address``.
+
+        Called outside the Unicorn UC_MEM_FETCH_PROT callback (through the
+        deferred trampoline).  Only the faulting page is changed; the Win32
+        protection the guest observes is preserved (a VirtualAlloc
+        PAGE_READWRITE page stays PAGE_READWRITE), matching Wine's model where
+        force-exec affects the host protection but not the recorded ``VPROT``.
+
+        Args:
+            address: Faulting fetch address.
+
+        Returns:
+            True when the page now allows execution; False when the page is
+            unmapped or no longer writable (the caller then falls back to the
+            guest exception chain).  A failed protection update is logged and
+            reported as False; the original fault is never swallowed.
+        """
+        page_size = self.page_size or 0x1000
+        page = address & ~(page_size - 1)
+        perms = self.get_address_perms(page)
+        if perms is None or not (perms & common.PERM_MEM_WRITE):
+            return False
+        if perms & common.PERM_MEM_EXEC:
+            return True
+
+        win_protect = self.get_address_win_protection(page)
+        if win_protect is None:
+            win_protect = emu_perms_to_win_protect(perms)
+        try:
+            self.mem_protect(
+                page,
+                page_size,
+                perms | common.PERM_MEM_EXEC,
+                win_protect=win_protect,
+            )
+        except Exception:
+            logger.exception("DEP opt-out: failed to grant execute on page 0x%x", page)
+            return False
         return True
 
     def _finalize_unhandled_deferred_fault(self, fault: DeferredProtectedFault) -> None:
@@ -3115,6 +3236,20 @@ class WindowsEmulator(BinaryEmulator):
         # Get the symbol that the sample was trying to execute
         symbol = self.get_symbol_from_address(address)
         if not symbol:
+            # A process image that explicitly opted out of DEP (NXCOMPAT
+            # clear) runs with no-exec enforcement disabled; Wine forces
+            # PROT_EXEC on readable views in that case
+            # (dlls/ntdll/unix/virtual.c:1647-1659, loader.c:1585-1591).
+            # Executing a writable page is therefore allowed and is not a
+            # guest exception.  Read-only pages keep their protection.
+            if self._dep_exec_fetch_allowed(address):
+                return self._defer_protected_fault(
+                    "invalid_protect_fetch",
+                    "fetch",
+                    address,
+                    dep_exec_allowed=True,
+                )
+
             # A fetch from a mapped but non-executable page is an access
             # violation, not a silent success: deliver it to VEH/SEH/UEF and
             # only record the protected-fetch error when nobody handles it.

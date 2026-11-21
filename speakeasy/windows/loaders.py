@@ -7,6 +7,7 @@ from typing import Any, Protocol
 
 import speakeasy.common as common
 import speakeasy.winenv.arch as _arch
+from speakeasy.windows.dep_policy import ImageDepPolicy, policy_from_dll_characteristics
 from speakeasy.windows.tls import TlsDirectory
 
 
@@ -102,6 +103,10 @@ class LoadedImage:
     loader: Loader | None = None
     sections: list[SectionEntry] = field(default_factory=list)
     pe_metadata: PeMetadata | None = None
+    #: DEP/NXCOMPAT policy from the PE Optional Header; None for non-PE
+    #: loaders (shellcode, synthesized API modules, decoys).  ``None`` means
+    #: "unknown" and keeps the emulator's DEP-enabled behaviour.
+    dep_policy: ImageDepPolicy | None = None
 
 
 class Loader(Protocol):
@@ -123,6 +128,7 @@ class RuntimeModule:
         self.loader = image.loader
         self.name = image.name
         self.sections = image.sections
+        self.dep_policy = image.dep_policy
 
     def __repr__(self) -> str:
         loader_type = type(self.loader).__name__ if self.loader is not None else "None"
@@ -172,6 +178,16 @@ class RuntimeModule:
 
     def get_pe_metadata(self) -> PeMetadata | None:
         return self._image.pe_metadata
+
+    def get_dep_policy(self) -> ImageDepPolicy | None:
+        """Return the image's DEP/NXCOMPAT policy.
+
+        Returns:
+            The policy parsed from a PE Optional Header, or ``None`` for
+            shellcode/synthesized/decoy modules that have no PE header.  A
+            ``None`` policy means "unknown" and keeps DEP enabled.
+        """
+        return self._image.dep_policy
 
 
 class PeLoader:
@@ -296,6 +312,10 @@ class PeLoader:
             machine=pe.FILE_HEADER.Machine,
             magic=pe.OPTIONAL_HEADER.Magic,
         )
+        # Explicit DEP policy from the image header.  The NXCOMPAT bit is the
+        # only field that controls executable-page permission; a zero value is
+        # an explicit opt-out (Wine loader.c:1585-1591).
+        dep_policy = policy_from_dll_characteristics(pe.OPTIONAL_HEADER.DllCharacteristics)
 
         if hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
             for resource_type in pe.DIRECTORY_ENTRY_RESOURCE.entries:
@@ -371,6 +391,7 @@ class PeLoader:
             loader=self,
             sections=sections,
             pe_metadata=pe_metadata,
+            dep_policy=dep_policy,
         )
 
 
