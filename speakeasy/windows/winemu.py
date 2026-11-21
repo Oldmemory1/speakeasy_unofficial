@@ -60,6 +60,7 @@ from speakeasy.windows.objman import HandleAllocator
 from speakeasy.windows.page_protection import (
     emu_perms_to_win_protect,
     image_protection_for_emu_perms,
+    is_virtual_alloc_view,
 )
 from speakeasy.windows.regman import RegistryManager
 from speakeasy.windows.system_modules import (
@@ -2950,19 +2951,25 @@ class WindowsEmulator(BinaryEmulator):
         """Return True when the image DEP opt-out permits fetching ``address``.
 
         Applicable only when the process image explicitly cleared NXCOMPAT and
-        the faulting page's effective permissions include write access.  The
-        write requirement keeps read-only image sections (``.rdata`` and
-        resources) non-executable even under DEP opt-out; the emulator never
-        changes those section protections.
+        the faulting page belongs to a private ``VirtualAlloc`` view.  That is
+        the page class the DEP opt-out model covers: a page returned by
+        ``VirtualAlloc(..., PAGE_READWRITE)`` that the guest then executes.
+        Image-section pages, stack pages and other private mappings keep their
+        existing protections, so this fix cannot change ``.rdata``/resource
+        permissions or the execution semantics of non-VirtualAlloc memory.
 
         Args:
             address: Faulting fetch address.
 
         Returns:
             True when the deferred DEP grant should run; False for DEP-enabled
-            images, unknown images, unmapped pages and read-only pages.
+            images, unknown images, image sections, non-VirtualAlloc mappings,
+            unmapped pages and read-only pages.
         """
         if not dep_opt_out(self._process_image_dep_policy()):
+            return False
+        mm = self.get_address_map(address)
+        if not is_virtual_alloc_view(mm):
             return False
         perms = self.get_address_perms(address)
         if perms is None:
@@ -2970,25 +2977,30 @@ class WindowsEmulator(BinaryEmulator):
         return bool(perms & common.PERM_MEM_WRITE)
 
     def _grant_dep_exec_fetch(self, address: int) -> bool:
-        """Add execute permission to the writable page containing ``address``.
+        """Add execute permission to the private VirtualAlloc page at ``address``.
 
         Called outside the Unicorn UC_MEM_FETCH_PROT callback (through the
-        deferred trampoline).  Only the faulting page is changed; the Win32
-        protection the guest observes is preserved (a VirtualAlloc
-        PAGE_READWRITE page stays PAGE_READWRITE), matching Wine's model where
-        force-exec affects the host protection but not the recorded ``VPROT``.
+        deferred trampoline).  Only the faulting VirtualAlloc page is changed;
+        the Win32 protection the guest observes is preserved (a PAGE_READWRITE
+        page stays PAGE_READWRITE), matching Wine's model where force-exec
+        affects the host protection but not the recorded ``VPROT``.  Image
+        sections and other private mappings are rejected, so their permissions
+        are never modified.
 
         Args:
             address: Faulting fetch address.
 
         Returns:
-            True when the page now allows execution; False when the page is
-            unmapped or no longer writable (the caller then falls back to the
+            True when the page now allows execution; False when the page is not
+            a writable VirtualAlloc view (the caller then falls back to the
             guest exception chain).  A failed protection update is logged and
             reported as False; the original fault is never swallowed.
         """
         page_size = self.page_size or 0x1000
         page = address & ~(page_size - 1)
+        mm = self.get_address_map(page)
+        if not is_virtual_alloc_view(mm):
+            return False
         perms = self.get_address_perms(page)
         if perms is None or not (perms & common.PERM_MEM_WRITE):
             return False

@@ -21,7 +21,7 @@ carry the write-copy Win32 protection value for VirtualQuery/VirtualProtect.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import speakeasy.common as common
 import speakeasy.winenv.defs.windows.windows as windefs
@@ -175,6 +175,22 @@ def current_win_protection(emu: MemoryManager, address: int) -> int:
         mm = emu.get_address_map(address)
         perms = mm.prot if mm is not None else common.PERM_MEM_NONE
     return emu_perms_to_win_protect(perms)
+
+
+def is_virtual_alloc_view(mm: Any) -> bool:
+    """Return True for a private ``VirtualAlloc`` mapping.
+
+    ``MemMap.flags`` is non-zero exactly for VirtualAlloc mappings in this
+    emulator (see ``_resolve_new_protection``); image views carry write-copy
+    semantics instead and are never treated as private allocations.
+
+    Args:
+        mm: ``MemMap`` instance or ``None``.
+
+    Returns:
+        True only for a non-image mapping with non-zero ``flags``.
+    """
+    return mm is not None and not mm.is_image and bool(mm.flags)
 
 
 def _resolve_new_protection(base_protect: int, mm) -> int | None:

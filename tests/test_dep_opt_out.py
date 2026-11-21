@@ -220,6 +220,40 @@ def _emit_x64(protect: int, *, write_code: bool) -> tuple[bytes, list[tuple[str,
     return bytes(buf), patches
 
 
+def _emit_image_data_x86() -> tuple[bytes, list[tuple[str, int, int]]]:
+    """x86 entry: write ret into the image's own writable .data and call it."""
+    buf = bytearray()
+    patches: list[tuple[str, int, int]] = []
+    buf += b"\xB8"
+    patches.append(("image_data", len(buf), 4))
+    buf += b"\x00\x00\x00\x00"  # mov eax, image .data address
+    buf += b"\xC6\x00\xC3"  # mov byte ptr [eax], 0xC3 (ret)
+    buf += b"\xFF\xD0"  # call eax
+    buf += b"\xC7\x05"
+    patches.append(("out_marker", len(buf), 4))
+    buf += b"\x00\x00\x00\x00"
+    buf += struct.pack("<I", EXEC_MARKER)  # mov dword ptr [out_marker], marker
+    buf += b"\xC3"
+    return bytes(buf), patches
+
+
+def _emit_image_data_x64() -> tuple[bytes, list[tuple[str, int, int]]]:
+    """x64 entry: write ret into the image's own writable .data and call it."""
+    buf = bytearray()
+    patches: list[tuple[str, int, int]] = []
+    buf += b"\x48\xB8"
+    patches.append(("image_data", len(buf), 8))
+    buf += b"\x00" * 8  # mov rax, image .data address
+    buf += b"\xC6\x00\xC3"  # mov byte ptr [rax], 0xC3 (ret)
+    buf += b"\xFF\xD0"  # call rax
+    buf += b"\x48\xB8"
+    patches.append(("out_marker", len(buf), 8))
+    buf += b"\x00" * 8  # mov rax, out_marker
+    buf += b"\xC7\x00" + struct.pack("<I", EXEC_MARKER)  # mov dword ptr [rax], marker
+    buf += b"\xC3"
+    return bytes(buf), patches
+
+
 # ---------------------------------------------------------------------------
 # Execution harness
 # ---------------------------------------------------------------------------
@@ -268,6 +302,38 @@ def _run_pe(config, arch: int, *, dll_characteristics: int, protect: int, write_
             "win_protect": win_protect,
             "policy": module_policy,
         }
+    finally:
+        se.shutdown()
+
+
+def _run_image_data_pe(config, arch: int):
+    """Execute a ret written into the image's own writable .data page."""
+    is_64 = arch == e_arch.ARCH_AMD64
+    code, patches = (_emit_image_data_x64 if is_64 else _emit_image_data_x86)()
+    pe = _build_pe(arch, dll_characteristics=OPT_OUT_DLL_CHARACTERISTICS, code=code)
+
+    se = Speakeasy(config=config, argv=[])
+    try:
+        module = se.load_module(data=pe)
+        emu = se.emu
+        image_data = module.base + DATA_RVA + 0x100
+        values = {
+            "image_data": image_data,
+            "out_marker": module.base + DATA_RVA + DATA_OUT_MARKER,
+        }
+        for key, offset, size in patches:
+            emu.mem_write(
+                module.base + TEXT_RVA + offset,
+                (values[key] & ((1 << (size * 8)) - 1)).to_bytes(size, "little"),
+            )
+
+        se.run_module(module)
+        report = se.get_report()
+        run = report.entry_points[0] if report.entry_points else None
+        error = getattr(run, "error", None) if run is not None else "no entry point"
+        marker = int.from_bytes(emu.mem_read(module.base + DATA_RVA + DATA_OUT_MARKER, 4), "little")
+        perms = emu.get_address_perms(image_data)
+        return {"error": error, "image_data": image_data, "marker": marker, "perms": perms}
     finally:
         se.shutdown()
 
@@ -377,6 +443,26 @@ def test_opt_out_readonly_allocation_still_faults(config, arch):
     assert error.access_type == "fetch"
     assert result["marker"] == 0
     assert result["win_protect"] == PAGE_READONLY
+
+
+# ---------------------------------------------------------------------------
+# Negative: opt-out never promotes image-section pages (.data/.rdata/resources)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("arch", [e_arch.ARCH_X86, e_arch.ARCH_AMD64], ids=["x86", "x64"])
+def test_opt_out_image_data_page_still_faults(config, arch):
+    result = _run_image_data_pe(config, arch)
+
+    error = result["error"]
+    assert error is not None
+    assert error.type == "invalid_protect_fetch"
+    assert error.address == result["image_data"]
+    assert error.access_type == "fetch"
+    assert result["marker"] == 0
+    # The image-page protections are untouched: writable, but never executable.
+    assert result["perms"] is not None and result["perms"] & common.PERM_MEM_WRITE
+    assert not (result["perms"] & common.PERM_MEM_EXEC)
 
 
 # ---------------------------------------------------------------------------
