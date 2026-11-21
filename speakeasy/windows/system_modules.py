@@ -14,9 +14,13 @@ sample data: matching never depends on a sample name, hash or address.  Names
 outside the list are not synthesized and callers keep returning NULL for them,
 matching Windows semantics for genuinely unknown DLLs.
 
-The decoy has no API handlers.  ``GetProcAddress`` on it resolves through the
-engine's existing non-EXE sentinel path, so this module does not change export
-semantics (that work belongs to FX-013).
+The decoy defaults to a single structural export named after the DLL stem.
+Modules with a known standard export surface (``kernelbase``) expose that
+surface instead, and declare the engine handler module that implements it
+(``kernelbase`` -> ``kernel32``) so a guest that resolves an export by hand
+and calls its address reaches the existing handler through the intercepted
+stub.  This module still implements no APIs of its own; general export and
+``GetProcAddress`` semantics remain FX-013's domain.
 """
 
 from __future__ import annotations
@@ -50,6 +54,58 @@ def module_basename(name: str) -> str:
     return stem.lower()
 
 
+# Standard export surface for the synthesized ``kernelbase`` decoy.  Windows
+# 7+ ``kernelbase.dll`` implements the kernel32 API surface and exports these
+# entry points (kernel32 forwards to it).  Guest loaders still resolve
+# ``GetProcAddress`` and friends by walking the PE export table by hand; a
+# one-entry decoy makes that walk fail even though the module exists.  The
+# list is generic Windows kernelbase API surface -- it is selected by module
+# name, never by sample SHA/address -- and the JIT stubs remain intercepted
+# placeholders, not real API implementations.
+_KERNELBASE_DECOY_EXPORTS: tuple[str, ...] = (
+    "GetProcAddress",
+    "GetModuleHandleA",
+    "GetModuleHandleW",
+    "GetModuleFileNameA",
+    "GetModuleFileNameW",
+    "LoadLibraryA",
+    "LoadLibraryW",
+    "LoadLibraryExA",
+    "LoadLibraryExW",
+    "VirtualAlloc",
+    "VirtualFree",
+    "VirtualProtect",
+    "VirtualQuery",
+    "HeapAlloc",
+    "HeapFree",
+    "HeapReAlloc",
+    "GetProcessHeap",
+    "GetLastError",
+    "SetLastError",
+    "CloseHandle",
+    "Sleep",
+    "GetTickCount",
+)
+
+# Lowercase DLL stem -> explicit decoy export names added after the structural
+# module-name placeholder.  Only modules with a documented standard surface
+# are listed; every other stem keeps the historical single-export decoy.
+_DECOY_EXPORT_NAMES_BY_MODULE: dict[str, tuple[str, ...]] = {
+    "kernelbase": _KERNELBASE_DECOY_EXPORTS,
+}
+
+# Lowercase DLL stem -> engine API-handler module that implements the decoy's
+# standard exports.  Windows 7+ kernelbase implements the kernel32 API
+# surface (kernel32 forwards to it), so guest calls that resolve a kernelbase
+# export by hand must reach the existing kernel32 handlers through the
+# intercepted-export dispatch instead of executing the placeholder stub.
+# Modules without a modelled implementation keep ``None`` and their exports
+# stay pure structural placeholders.
+_DECOY_API_HANDLER_MODULES: dict[str, str] = {
+    "kernelbase": "kernel32",
+}
+
+
 def is_synthesizable_system_module(name: str, patterns: Iterable[str]) -> bool:
     """Return True when *name* matches a configured known-system-module pattern.
 
@@ -67,12 +123,28 @@ def default_decoy_exports(name: str) -> tuple[str, ...]:
     """Return the synthetic export names for a decoy module.
 
     A decoy must be a structurally valid DLL, which requires an export table.
-    The single export is named after the DLL stem; it is a structural
-    placeholder, not an impersonated real API.  Callers that need a different
-    export set can pass ``export_names`` to :class:`SystemModuleDecoyLoader`.
+    Every decoy exports the DLL stem as a structural placeholder.  Modules
+    with a known standard export surface (``kernelbase``) additionally expose
+    those standard names, so guest code that walks the export directory by
+    hand resolves them as it would on a Windows/Wine host.  The exported
+    addresses stay intercepted placeholder stubs: this function does not
+    implement or impersonate the listed APIs.
+
+    Unknown modules keep the historical ``(stem,)`` export set (an empty or
+    separator-only name yields ``()``).  Callers that need a different export
+    set can pass ``export_names`` to :class:`SystemModuleDecoyLoader`.
+
+    Raises:
+        None.  Unknown names are not rejected here; synthesis policy is
+        ``is_synthesizable_system_module`` and remains the caller's decision.
     """
     base = module_basename(name)
-    return (base,) if base else ()
+    if not base:
+        return ()
+    standard_exports = _DECOY_EXPORT_NAMES_BY_MODULE.get(base)
+    if standard_exports is None:
+        return (base,)
+    return (base,) + standard_exports
 
 
 class SystemModuleDecoyLoader:
@@ -110,6 +182,18 @@ class SystemModuleDecoyLoader:
         self._base = base
         self._emu_path = emu_path
         self._export_names = tuple(export_names) if export_names else default_decoy_exports(name)
+        self._api_handler_module = _DECOY_API_HANDLER_MODULES.get(module_basename(name))
+
+    @property
+    def api_handler_module(self) -> str | None:
+        """Engine API-handler module backing this decoy's standard exports.
+
+        ``"kernelbase"`` decoys expose the kernel32 API surface, so their
+        intercepted export stubs must dispatch to the ``kernel32`` handlers.
+        Modules without a modelled implementation return ``None``; their
+        exports remain structural placeholders.
+        """
+        return self._api_handler_module
 
     def make_image(self) -> LoadedImage:
         jit = JitPeFile(self._arch, base=self._base, mod_name=self._name, exports=list(self._export_names))

@@ -1415,16 +1415,25 @@ class WindowsEmulator(BinaryEmulator):
         mod_base_name = ntpath.basename(image.emu_path)
         mod_base_name_no_ext = _normalize_mod_name(mod_base_name)
 
+        # FX-013-extended: a synthesized decoy may declare which engine
+        # handler module implements its standard exports (kernelbase ->
+        # kernel32).  Register those exports under the handler module so the
+        # intercepted stub dispatches to the real handler when the guest
+        # resolves the export by hand and calls its address.
+        handler_module_name = mod_base_name_no_ext
+        if isinstance(image.loader, SystemModuleDecoyLoader):
+            handler_module_name = image.loader.api_handler_module or handler_module_name
+
         has_api_exports = False
         if self.api:
             for exp in image.exports:
                 if not exp.name:
                     continue
-                _api_mod, func_attrs = self.api.get_export_func_handler(mod_base_name_no_ext, exp.name)
+                _api_mod, func_attrs = self.api.get_export_func_handler(handler_module_name, exp.name)
                 if not func_attrs:
-                    _api_mod, func_attrs = self.normalize_import_miss(mod_base_name_no_ext, exp.name)
+                    _api_mod, func_attrs = self.normalize_import_miss(handler_module_name, exp.name)
                 if func_attrs:
-                    self.symbols[exp.address] = (mod_base_name_no_ext, exp.name)
+                    self.symbols[exp.address] = (handler_module_name, exp.name)
                     has_api_exports = True
                 if not is_primary:
                     _api_mod, data_hndlr = self.api.get_data_export_handler(mod_base_name_no_ext, exp.name)
@@ -3625,10 +3634,17 @@ class WindowsEmulator(BinaryEmulator):
         if entry is None:
             raise KeyError(f"{mod.get_base_name()}!{func_name} is not exported")
 
-        if isinstance(getattr(mod, "loader", None), PeLoader):
+        loader = getattr(mod, "loader", None)
+        if isinstance(loader, PeLoader):
             return entry.address
 
         module_name, _ = os.path.splitext(mod.get_base_name())
+        if isinstance(loader, SystemModuleDecoyLoader) and loader.api_handler_module:
+            # FX-013-extended: the decoy's standard exports are implemented
+            # by the declared handler module (kernelbase -> kernel32).  Key
+            # the dispatch sentinel to that module so calling it reaches the
+            # handler instead of an unbacked "kernelbase" miss.
+            module_name = loader.api_handler_module
         return self.get_proc(module_name, func_name)
 
     def load_library(self, mod_name):
