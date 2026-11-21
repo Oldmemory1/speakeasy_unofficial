@@ -23,6 +23,7 @@ The tests call the real handlers through the engine; no batch sample runs.
 
 from __future__ import annotations
 
+import io
 import logging
 import lzma
 from pathlib import Path
@@ -55,6 +56,7 @@ BAD_PE_PATH = r"C:\Windows\temp\fx013_bad.dll"
 EMPTY_PATH = r"C:\Windows\temp\fx013_empty.dll"
 
 DROPPED_EXPORT_ONE_RVA = 0x1030
+MID_FILE_OFFSET = 100
 
 
 def _bin(name: str) -> bytes:
@@ -109,6 +111,13 @@ def _primary_exe(emu):
         if mod.is_exe():
             return mod
     raise AssertionError("primary EXE module is not loaded")
+
+
+def _guest_file(emu, path: str):
+    for guest_file in emu.fileman.get_all_files():
+        if guest_file.path.lower() == path.lower():
+            return guest_file
+    raise AssertionError(f"guest file {path!r} is not registered")
 
 
 def test_get_proc_address_null_hmod_returns_zero_and_records_parameters(engine, caplog):
@@ -196,6 +205,71 @@ def test_load_library_loads_guest_dropped_pe_file(engine, caplog):
     assert not mod.is_exe()
 
 
+def test_get_guest_module_file_data_reads_full_image_from_mid_file_pointer(engine):
+    """A guest that seeks before LoadLibrary must still yield the whole image.
+
+    ``File.get_data`` only rewinds when the pointer already sits at EOF, so a
+    mid-file pointer used to expose just the tail (9216-byte image at offset
+    100 -> 9116 bytes) and advance the guest-visible pointer. The loader must
+    read the complete on-disk image without moving that pointer.
+    """
+    emu = engine.emu
+    image = _bin(TEST_DLL)
+    emu.fileman.add_existing_file(DROP_PATH, image)
+    guest_file = _guest_file(emu, DROP_PATH)
+    guest_file.seek(MID_FILE_OFFSET, io.SEEK_SET)
+
+    data = emu.get_guest_module_file_data(DROP_PATH)
+
+    assert data == image
+    assert guest_file.tell() == MID_FILE_OFFSET
+
+
+def test_load_library_loads_guest_pe_from_mid_file_pointer_and_restores_pointer(engine):
+    emu = engine.emu
+    image = _bin(TEST_DLL)
+    emu.fileman.add_existing_file(DROP_PATH, image)
+    guest_file = _guest_file(emu, DROP_PATH)
+    guest_file.seek(MID_FILE_OFFSET, io.SEEK_SET)
+
+    hmod = _load_library(emu, DROP_PATH)
+
+    assert hmod != 0
+    mod = emu.get_mod_by_name("fx013_dropped")
+    assert mod is not None
+    assert mod.base == hmod
+    assert not mod.is_exe()
+    assert guest_file.tell() == MID_FILE_OFFSET
+    # The module must be the full image, so real exports stay resolvable.
+    assert _get_proc_address(emu, hmod, "emu_test_one") == hmod + DROPPED_EXPORT_ONE_RVA
+
+
+def test_load_library_preserves_guest_file_pointer_at_start(engine):
+    emu = engine.emu
+    image = _bin(TEST_DLL)
+    emu.fileman.add_existing_file(DROP_PATH, image)
+    guest_file = _guest_file(emu, DROP_PATH)
+    assert guest_file.tell() == 0
+
+    hmod = _load_library(emu, DROP_PATH)
+
+    assert hmod != 0
+    assert guest_file.tell() == 0
+
+
+def test_load_library_loads_guest_pe_from_eof_pointer(engine):
+    emu = engine.emu
+    image = _bin(TEST_DLL)
+    emu.fileman.add_existing_file(DROP_PATH, image)
+    guest_file = _guest_file(emu, DROP_PATH)
+    guest_file.seek(0, io.SEEK_END)
+
+    hmod = _load_library(emu, DROP_PATH)
+
+    assert hmod != 0
+    assert guest_file.tell() == len(image)
+
+
 def test_get_proc_address_returns_real_export_address_for_pe_module(engine):
     emu = engine.emu
     emu.fileman.add_existing_file(DROP_PATH, _bin(TEST_DLL))
@@ -235,6 +309,22 @@ def test_load_library_guest_non_pe_file_returns_zero_and_records_reason(engine, 
     text = _log_text(caplog)
     assert BAD_PE_PATH in text or "fx013_bad" in text
     assert "not a loadable PE" in text
+
+
+def test_load_library_guest_non_pe_from_mid_file_pointer_stays_zero_and_restores(engine, caplog):
+    """Reading a non-PE module candidate must not fake success or move the pointer."""
+    emu = engine.emu
+    emu.fileman.add_existing_file(BAD_PE_PATH, b"MZ" + b"\x00" * 0x40)
+    guest_file = _guest_file(emu, BAD_PE_PATH)
+    guest_file.seek(4, io.SEEK_SET)
+
+    with caplog.at_level(logging.INFO):
+        rv = _load_library(emu, BAD_PE_PATH)
+
+    assert rv == 0
+    assert emu.get_mod_by_name("fx013_bad") is None
+    assert "not a loadable PE" in _log_text(caplog)
+    assert guest_file.tell() == 4
 
 
 def test_load_library_guest_empty_file_returns_zero(engine):

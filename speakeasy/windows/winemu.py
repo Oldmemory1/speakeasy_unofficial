@@ -1,5 +1,6 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+import io
 import logging
 import ntpath
 import os
@@ -3572,6 +3573,13 @@ class WindowsEmulator(BinaryEmulator):
         files: they are I/O decoys, not images. The emulated-input-image alias
         used by file I/O is also not reused here because loading the sample
         itself as a module would be wrong.
+
+        LoadLibrary reads the whole on-disk image regardless of where the
+        guest's shared ``File`` pointer currently sits, and the pointer is
+        restored before returning: loading a module must not move a
+        guest-observable file position. ``File.get_data`` only rewinds when
+        the pointer is already at EOF, so the read is performed from offset 0
+        explicitly.
         """
         if not guest_path:
             return None
@@ -3587,7 +3595,12 @@ class WindowsEmulator(BinaryEmulator):
                 continue
             if ntpath.normpath(guest_file.path).lower() != target:
                 continue
-            data = guest_file.get_data(reset_pointer=True)
+            pointer = guest_file.tell()
+            try:
+                guest_file.seek(0, io.SEEK_SET)
+                data = guest_file.get_data()
+            finally:
+                guest_file.seek(0 if pointer is None else pointer, io.SEEK_SET)
             if not data:
                 return b""
             return bytes(data)
