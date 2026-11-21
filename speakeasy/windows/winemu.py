@@ -63,6 +63,7 @@ from speakeasy.windows.page_protection import (
     image_protection_for_emu_perms,
     is_virtual_alloc_view,
 )
+from speakeasy.windows.process_memory import ProcessAddressSpace
 from speakeasy.windows.regman import RegistryManager
 from speakeasy.windows.system_modules import (
     SystemModuleDecoyLoader,
@@ -927,6 +928,49 @@ class WindowsEmulator(BinaryEmulator):
         if not self.processes:
             self.init_processes(self.config.processes)
         return self.processes
+
+    def get_process_address_space(self, process: Any) -> ProcessAddressSpace | None:
+        """Return the shadow VA view for a non-current process.
+
+        Args:
+            process: Process object from ``get_current_process`` or
+                ``get_object_from_handle``.
+
+        Returns:
+            ``None`` when *process* is ``None`` or is the current process: its
+            memory lives in the emulator's global address space and callers
+            must keep using the existing global ``mem_read``/``mem_write``/
+            ``mem_map`` APIs. For any other process a lazily created
+            :class:`ProcessAddressSpace` is returned and cached on the process
+            object. A raw-byte ``process.pe_data`` PE image is registered in
+            that view on first use; ``pe_data`` that is not a PE (for example a
+            shellcode child) leaves the view empty because there is no initial
+            image layout to model.
+
+        Raises:
+            ProcessMemoryError: if ``process.pe_data`` starts with ``MZ`` but
+                cannot be parsed as a PE (explicit failure; no empty view is
+                silently substituted for a corrupt image).
+
+        Side effects:
+            Creates and caches ``process.address_space``. Never maps or
+            changes Unicorn memory; model-only children stay non-executable.
+        """
+        if process is None or process is self.curr_process:
+            return None
+
+        space = getattr(process, "address_space", None)
+        if space is None:
+            space = ProcessAddressSpace(
+                pid=int(getattr(process, "pid", getattr(process, "id", 0))),
+                pointer_bits=self.get_ptr_size() * 8,
+                page_size=self.page_size,
+            )
+            process.address_space = space
+            data = getattr(process, "pe_data", None)
+            if isinstance(data, (bytes, bytearray)) and data and bytes(data[:2]) == b"MZ":
+                space.map_pe_image(bytes(data))
+        return space
 
     def kill_process(self, proc):
         """

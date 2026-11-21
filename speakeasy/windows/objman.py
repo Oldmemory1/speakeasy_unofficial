@@ -9,6 +9,7 @@ import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.nt.ntoskrnl as ntoskrnl
 import speakeasy.winenv.defs.windows.windows as windef
 from speakeasy.windows.gui_messages import WindowsMessageQueue
+from speakeasy.windows.process_memory import ProcessAddressSpace
 
 
 class HandleAllocator:
@@ -521,6 +522,12 @@ class Process(KernelObject):
         emu.add_object(self.token)
         self.pe: Any | None = pe
         self.pe_data: bytes | None = None
+        # Shadow virtual-address view used by cross-process memory APIs when
+        # this process is not the executing process (see
+        # ``WindowsEmulator.get_process_address_space``). ``None`` means the
+        # view has not been created yet; the current process always uses the
+        # emulator's global memory and leaves this field untouched.
+        self.address_space: ProcessAddressSpace | None = None
 
         self.stdin = (0xF000) + 1
         self.stdout = (0xF000) + 2

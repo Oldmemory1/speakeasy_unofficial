@@ -30,6 +30,7 @@ from speakeasy.profiler_events import (
 )
 from speakeasy.windows import api_diagnostics, api_trace_diagnostics
 from speakeasy.windows.child_execution import ChildTargetResolver
+from speakeasy.windows.objman import Process
 from speakeasy.windows.os_capabilities import (
     WindowsOsVersion,
     processor_feature_override,
@@ -38,6 +39,12 @@ from speakeasy.windows.page_protection import (
     apply_page_protection,
     emu_perms_to_win_protect,
     win_protect_to_emu_perms,
+)
+from speakeasy.windows.process_memory import (
+    ERROR_NOACCESS,
+    ERROR_PARTIAL_COPY,
+    ProcessMemoryError,
+    write_current_process_memory,
 )
 
 from .. import api
@@ -1227,15 +1234,16 @@ class Kernel32(api.ApiHandler):
         hProcess, lpAddress, dwSize, flAllocationType, flProtect = argv
         buf = 0
 
-        if hProcess == self.get_max_int():
+        if is_current_process_pseudo_handle(hProcess, self.get_ptr_size()):
             obj = emu.get_current_process()
         else:
             obj = self.get_object_from_handle(hProcess)
 
-        if not obj:
+        if not isinstance(obj, Process):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return windefs.NULL
 
-        proc_path = obj.path
+        proc_path = obj.path or ""
         argv[0] = proc_path
         proc_path = ntpath.basename(proc_path)
         proc_path = proc_path.replace(".", "_")
@@ -1246,6 +1254,27 @@ class Kernel32(api.ApiHandler):
         if prot_def:
             prot_def = "|".join(prot_def)
             argv[4] = prot_def
+
+        # FX-012: a non-current process has its own address view. The
+        # requested base is judged in that view; it is never relocated around
+        # the caller's mappings.
+        try:
+            space = emu.get_process_address_space(obj)
+        except ProcessMemoryError as err:
+            emu.set_last_error(err.win_error)
+            return windefs.NULL
+
+        if space is not None:
+            try:
+                buf = space.virtual_alloc(lpAddress, dwSize, flAllocationType, flProtect)
+            except ProcessMemoryError as err:
+                emu.set_last_error(err.win_error)
+                return windefs.NULL
+
+            self.record_process_event(
+                obj, MEM_ALLOC, base=buf, size=dwSize, type=flAllocationType, protect=argv[4]
+            )
+            return buf
 
         # Was this address already commited?
         mm = emu.get_address_map(lpAddress)
@@ -1289,18 +1318,45 @@ class Kernel32(api.ApiHandler):
         hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesWritten = argv
         rv = False
 
-        if hProcess == self.get_max_int():
+        if is_current_process_pseudo_handle(hProcess, self.get_ptr_size()):
             obj = emu.get_current_process()
         else:
             obj = self.get_object_from_handle(hProcess)
 
-        proc_path = obj.path
+        if not isinstance(obj, Process):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+
+        proc_path = obj.path or ""
         argv[0] = proc_path
 
         data = b""
         if lpBuffer and lpBaseAddress:
-            data = self.mem_read(lpBuffer, nSize)
-            self.mem_write(lpBaseAddress, data)
+            try:
+                data = self.mem_read(lpBuffer, nSize)
+            except Exception:
+                emu.set_last_error(ERROR_NOACCESS)
+                self.record_process_event(obj, MEM_WRITE, base=lpBaseAddress, size=nSize, data=b"")
+                return False
+
+            try:
+                space = emu.get_process_address_space(obj)
+                if space is None:
+                    written = write_current_process_memory(
+                        emu, lpBaseAddress, data, writer=self.mem_write
+                    )
+                else:
+                    written = space.write(lpBaseAddress, data)
+            except ProcessMemoryError as err:
+                emu.set_last_error(err.win_error)
+                self.record_process_event(obj, MEM_WRITE, base=lpBaseAddress, size=nSize, data=b"")
+                return False
+
+            if written != len(data):
+                emu.set_last_error(ERROR_PARTIAL_COPY)
+                self.record_process_event(obj, MEM_WRITE, base=lpBaseAddress, size=nSize, data=b"")
+                return False
+
             if lpNumberOfBytesWritten:
                 bw = (len(data)).to_bytes(self.get_ptr_size(), "little")
                 self.mem_write(lpNumberOfBytesWritten, bw)
@@ -1327,18 +1383,29 @@ class Kernel32(api.ApiHandler):
         hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead = argv
         rv = False
 
-        if hProcess == self.get_max_int():
+        if is_current_process_pseudo_handle(hProcess, self.get_ptr_size()):
             obj = emu.get_current_process()
         else:
             obj = self.get_object_from_handle(hProcess)
 
-        proc_path = obj.path
+        if not isinstance(obj, Process):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+
+        proc_path = obj.path or ""
         argv[0] = proc_path
 
         data = b""
         if lpBuffer and lpBaseAddress:
             try:
-                data = self.mem_read(lpBaseAddress, nSize)
+                space = emu.get_process_address_space(obj)
+                if space is None:
+                    data = self.mem_read(lpBaseAddress, nSize)
+                else:
+                    data = space.read(lpBaseAddress, nSize)
+            except ProcessMemoryError as err:
+                emu.set_last_error(err.win_error)
+                return rv
             except Exception:
                 emu.set_last_error(windefs.ERROR_ACCESS_DENIED)
                 return rv
