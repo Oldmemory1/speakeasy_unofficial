@@ -10,7 +10,7 @@ import speakeasy.common as common
 import speakeasy.windows.objman as objman
 import speakeasy.winenv.arch as _arch
 from speakeasy.errors import Win32EmuError
-from speakeasy.profiler import Run
+from speakeasy.profiler import ProcessEntryContext, Run
 from speakeasy.windows.child_execution import (
     BudgetUsage,
     ExecutionBudget,
@@ -242,6 +242,13 @@ class Win32Emulator(WindowsEmulator):
         self.profiler.add_input_metadata(self.input)
 
     def prepare_module_for_emulation(self, module, all_entrypoints, entry_point=None):
+        """Queue the runs for *module* and return its module-entry run.
+
+        Returns:
+            The ``Run`` whose start address is the module entry point (EXE) or
+            the ``dll_entry.DLL_PROCESS_ATTACH`` entry (DLL), after it has been
+            added to the run queue.
+        """
         if not module:
             self.stop()
             raise Win32EmuError("Module not found")
@@ -277,6 +284,7 @@ class Win32Emulator(WindowsEmulator):
             run.args = [self.mem_map(8, tag=f"emu.module_arg_{i}") for i in range(4)]
 
         self.add_run(run)
+        module_entry_run = run
 
         if all_entrypoints:
             # Only emulate a subset of all the exported functions
@@ -309,7 +317,7 @@ class Win32Emulator(WindowsEmulator):
                     # be called yet
                     self.add_run(run)
 
-        return
+        return module_entry_run
 
     def run_module(self, module, all_entrypoints=False, emulate_children=False, entry_point=None):
         """
@@ -318,7 +326,7 @@ class Win32Emulator(WindowsEmulator):
         Arguments:
             module: Module to emulate
         """
-        self.prepare_module_for_emulation(module, all_entrypoints, entry_point=entry_point)
+        entry_run = self.prepare_module_for_emulation(module, all_entrypoints, entry_point=entry_point)
 
         # Create an empty process object for the module if none is
         # supplied, only do this for the main module
@@ -343,6 +351,16 @@ class Win32Emulator(WindowsEmulator):
 
         # Set the TEB
         self.init_teb(t, peb)
+
+        # A top-level EXE enters its entry point with the Windows loader
+        # convention (x86 EAX/EBX, x64 RCX/RDX). Only this run carries the
+        # entry context; TLS callbacks, exports, DLL entry, shellcode and
+        # child runs keep their existing state.
+        if module.is_exe() and entry_run is not None and isinstance(entry_run.start_addr, int):
+            entry_run.entry_context = ProcessEntryContext(
+                entry=entry_run.start_addr,
+                peb=self.curr_process.peb.address,
+            )
 
         # Begin emulation of main module
         self.start()

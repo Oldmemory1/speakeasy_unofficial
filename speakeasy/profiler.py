@@ -107,6 +107,19 @@ class ApiCallbackFrame:
         return self.return_value
 
 
+@dataclass(frozen=True)
+class ProcessEntryContext:
+    """Initial register context for a top-level process entry run.
+
+    Attributes:
+        entry: Guest virtual address the process starts executing at.
+        peb: Guest virtual address of the process environment block (PEB).
+    """
+
+    entry: int
+    peb: int
+
+
 class Run:
     """
     This class represents the basic execution primative for the emulation engine
@@ -136,6 +149,7 @@ class Run:
         self.args: list[Any] | tuple[Any, ...] | None = None
         self.start_addr: int | None = None
         self.type: str | int | None = None
+        self.entry_context: ProcessEntryContext | None = None
         self.error: ErrorInfo | None = None
         self.num_apis: int = 0
         self.coverage: set[int] = set()

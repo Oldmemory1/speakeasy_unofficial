@@ -23,7 +23,7 @@ import speakeasy.winenv.defs.windows.windows as windef
 from speakeasy.binemu import BinaryEmulator
 from speakeasy.errors import WindowsEmuError
 from speakeasy.gdb import GdbServer, ResumeAction, StopReason
-from speakeasy.profiler import ApiCallbackFrame, MemAccess, Run
+from speakeasy.profiler import ApiCallbackFrame, MemAccess, ProcessEntryContext, Run
 from speakeasy.profiler_events import TracePosition
 from speakeasy.report import ErrorInfo, RegionInfo
 from speakeasy.struct import EmuStruct
@@ -161,6 +161,16 @@ def _module_type_from_path(path: str, default: str = "dll") -> str:
     if ext == ".dll":
         return "dll"
     return default
+
+
+# Windows loader entry-register convention for a process's first thread:
+# x86 passes the entry address in EAX and the PEB in EBX; x64 uses RCX/RDX.
+# Each value is an (architecture register id, saved CONTEXT field name) pair,
+# ordered as (entry, PEB).
+_PROCESS_ENTRY_CONTEXT_REGS: dict[int, tuple[tuple[int, str], tuple[int, str]]] = {
+    _arch.ARCH_X86: ((_arch.X86_REG_EAX, "Eax"), (_arch.X86_REG_EBX, "Ebx")),
+    _arch.ARCH_AMD64: ((_arch.AMD64_REG_RCX, "Rcx"), (_arch.AMD64_REG_RDX, "Rdx")),
+}
 
 
 class BootstrapPhase(IntEnum):
@@ -699,6 +709,9 @@ class WindowsEmulator(BinaryEmulator):
             self.emu_hooks_set = True
 
         self.set_pc(run.start_addr)
+        if run.entry_context is not None:
+            self.apply_process_entry_context(run.entry_context)
+            self.set_thread_entry_context(self.get_current_thread(), run.entry_context)
         return run
 
     def mem_cast(self, obj, addr):
@@ -2002,6 +2015,45 @@ class WindowsEmulator(BinaryEmulator):
         self.validate_object_services("object creation")
         return self.om.new_object(otype)  # type: ignore[union-attr]
 
+    def set_thread_entry_context(self, thread: Any, context: ProcessEntryContext) -> None:
+        """Write process-entry values into a thread's saved CPU context.
+
+        Applies the Windows loader convention for a process's first thread:
+        x86 ``EAX=entry``/``EBX=PEB``; x64 ``RCX=entry``/``RDX=PEB``. Only
+        ``thread.ctx`` is modified; the live guest CPU and the program counter
+        are untouched. No-op when *thread* has no saved context or when the
+        emulator architecture has no process-entry convention.
+
+        Args:
+            thread: Thread object whose saved ``CONTEXT`` should be updated.
+            context: Entry address and PEB address for the process.
+        """
+        rules = _PROCESS_ENTRY_CONTEXT_REGS.get(self.get_arch())
+        if rules is None or thread is None or thread.ctx is None:
+            return
+        (_, entry_field), (_, peb_field) = rules
+        setattr(thread.ctx, entry_field, context.entry)
+        setattr(thread.ctx, peb_field, context.peb)
+
+    def apply_process_entry_context(self, context: ProcessEntryContext) -> None:
+        """Write process-entry values to the live guest CPU registers.
+
+        Applies the same architecture rule as
+        :meth:`set_thread_entry_context`: x86 ``EAX=entry``/``EBX=PEB``;
+        x64 ``RCX=entry``/``RDX=PEB``. The program counter and stack pointer
+        are not modified. No-op when the emulator architecture has no
+        process-entry convention.
+
+        Args:
+            context: Entry address and PEB address for the process.
+        """
+        rules = _PROCESS_ENTRY_CONTEXT_REGS.get(self.get_arch())
+        if rules is None:
+            return
+        (entry_reg, _), (peb_reg, _) = rules
+        self.reg_write(entry_reg, context.entry)
+        self.reg_write(peb_reg, context.peb)
+
     def create_process(self, path=None, cmdline=None, image=None, child=False):
         """
         Create a process object that will exist in the emulator
@@ -2051,14 +2103,12 @@ class WindowsEmulator(BinaryEmulator):
         if p.pe:
             ep_addr = (getattr(p.pe, "base", 0) or 0) + (getattr(p.pe, "ep", 0) or 0)
 
-        if t.ctx and self.get_arch() == _arch.ARCH_AMD64:
-            t.ctx.Rip = 0
-            t.ctx.Rcx = ep_addr
-            t.ctx.Rdx = peb_addr
-        elif t.ctx and self.get_arch() == _arch.ARCH_X86:
-            t.ctx.Eip = 0
-            t.ctx.Eax = ep_addr
-            t.ctx.Ebx = peb_addr
+        if t.ctx:
+            if self.get_arch() == _arch.ARCH_AMD64:
+                t.ctx.Rip = 0
+            elif self.get_arch() == _arch.ARCH_X86:
+                t.ctx.Eip = 0
+            self.set_thread_entry_context(t, ProcessEntryContext(entry=ep_addr, peb=peb_addr))
 
         p.threads.append(t)
 
