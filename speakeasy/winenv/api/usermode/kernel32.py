@@ -1266,8 +1266,29 @@ class Kernel32(api.ApiHandler):
             return windefs.NULL
 
         if space is not None:
+            # FX12-extended-rv2: a base-less reservation must not pick a VA that
+            # is already occupied in the shared emulator, otherwise its
+            # materialization would collide during the child run.  Explicit
+            # lpAddress requests keep target-view semantics.
+            avoid: tuple[tuple[int, int], ...] = ()
+            if not lpAddress:
+                avoid = tuple(
+                    (int(m.base), int(m.size))
+                    for m in emu.get_mem_maps()
+                    if isinstance(getattr(m, "base", None), int)
+                    and isinstance(getattr(m, "size", None), int)
+                    and int(m.size) > 0
+                ) + tuple(
+                    (int(r.base), int(r.size))
+                    for r in getattr(emu, "mem_reserves", ())
+                    if isinstance(getattr(r, "base", None), int)
+                    and isinstance(getattr(r, "size", None), int)
+                    and int(r.size) > 0
+                )
             try:
-                buf = space.virtual_alloc(lpAddress, dwSize, flAllocationType, flProtect)
+                buf = space.virtual_alloc(
+                    lpAddress, dwSize, flAllocationType, flProtect, avoid=avoid
+                )
             except ProcessMemoryError as err:
                 emu.set_last_error(err.win_error)
                 return windefs.NULL
@@ -1696,11 +1717,43 @@ class Kernel32(api.ApiHandler):
         ctx = ctx or {}
         hProcess, lpAddress, dwSize, flNewProtect, lpflOldProtect = argv
 
-        proc_obj = self.get_object_from_handle(hProcess)
-        if 0xFFFFFFFF == (0xFFFFFFFF & hProcess):
+        # A pseudo-handle (or the legacy 0xFFFFFFFF fallback) always denotes the
+        # current process and keeps the global VirtualProtect behavior.
+        is_current = is_current_process_pseudo_handle(hProcess, self.get_ptr_size())
+        if not is_current and 0xFFFFFFFF == (0xFFFFFFFF & hProcess):
+            is_current = True
+        if is_current:
             proc_obj = emu.get_current_process()
-
-        rv = self.VirtualProtect(emu, argv[1:], ctx)
+            rv = self.VirtualProtect(emu, argv[1:], ctx)
+        else:
+            proc_obj = self.get_object_from_handle(hProcess)
+            if not isinstance(proc_obj, Process):
+                emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+                return 0
+            # FX12-extended-rv2: a non-current process owns a shadow view. Never
+            # run the caller/global VirtualProtect path for it; the probe
+            # evidence shows that changed the parent image page 0x20 -> 0x1.
+            try:
+                space = emu.get_process_address_space(proc_obj)
+            except ProcessMemoryError as err:
+                emu.set_last_error(err.win_error)
+                return 0
+            if space is None:  # defensive: non-current processes have a view
+                rv = self.VirtualProtect(emu, argv[1:], ctx)
+            else:
+                if not lpflOldProtect:
+                    emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+                    return 0
+                try:
+                    _start, _size, old_protect = space.protect(
+                        lpAddress, dwSize, flNewProtect
+                    )
+                except ProcessMemoryError as err:
+                    emu.set_last_error(err.win_error)
+                    return 0
+                self.mem_write(lpflOldProtect, old_protect.to_bytes(4, "little"))
+                emu.set_last_error(windefs.ERROR_SUCCESS)
+                rv = 1
 
         prot_def = windefs.get_page_rights(flNewProtect)
         if prot_def:

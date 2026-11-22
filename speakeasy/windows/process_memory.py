@@ -65,6 +65,10 @@ ALLOCATION_GRANULARITY = 0x10000
 #: than allocating unbounded host memory (the shadow view is not a real
 #: mapping and only needs to describe model-only processes).
 MAX_SHADOW_REGION_SIZE = 0x10000000
+#: Tag prefix for emulator mappings created when an executor materializes a
+#: non-image shadow region for one child run.  Release only frees mappings that
+#: still carry this prefix.
+SHADOW_MATERIALIZED_TAG_PREFIX = "emu.child_shadow."
 
 MEM_COMMIT = windefs.MEM_COMMIT
 MEM_RESERVE = windefs.MEM_RESERVE
@@ -257,6 +261,7 @@ class ProcessAddressSpace:
         data: bytes | None = None,
         tag: str = "",
         is_image: bool = False,
+        commit: bool = True,
     ) -> ShadowRegion:
         if size <= 0 or size > MAX_SHADOW_REGION_SIZE:
             raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "unsupported region size")
@@ -282,8 +287,9 @@ class ProcessAddressSpace:
             is_image=is_image,
         )
         self._regions[start] = region
-        for page in range(start, end, self.page_size):
-            self._page_protect[page] = protect
+        if commit:
+            for page in range(start, end, self.page_size):
+                self._page_protect[page] = protect
         return region
 
     def _validate_access(
@@ -417,24 +423,54 @@ class ProcessAddressSpace:
                 return False
         return True
 
-    def _find_free(self, size: int, *, top_down: bool) -> int | None:
+    def _find_free(
+        self,
+        size: int,
+        *,
+        top_down: bool,
+        avoid: Sequence[tuple[int, int]] = (),
+    ) -> int | None:
         span_start, span_end = self._span(0, size)
         span = span_end - span_start
+
+        def _allowed(candidate: int) -> bool:
+            if not self.is_free(candidate, span):
+                return False
+            end = candidate + span
+            try:
+                overlaps = any(
+                    candidate < int(a_base) + int(a_size) and int(a_base) < end
+                    for a_base, a_size in avoid
+                )
+            except (TypeError, ValueError) as err:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_PARAMETER, "invalid avoid range"
+                ) from err
+            return not overlaps
+
         if top_down:
             base = (self.address_limit - span) & ~(ALLOCATION_GRANULARITY - 1)
             while base >= ALLOCATION_GRANULARITY:
-                if self.is_free(base, span):
+                if _allowed(base):
                     return base
                 base -= ALLOCATION_GRANULARITY
             return None
         base = ALLOCATION_GRANULARITY
         while base + span <= self.address_limit:
-            if self.is_free(base, span):
+            if _allowed(base):
                 return base
             base += ALLOCATION_GRANULARITY
         return None
 
-    def virtual_alloc(self, lp_address: int, size: int, alloc_type: int, protect: int) -> int:
+    def virtual_alloc(
+        self,
+        lp_address: int,
+        size: int,
+        alloc_type: int,
+        protect: int,
+        *,
+        avoid: Sequence[tuple[int, int]] = (),
+    ) -> int:
         """Emulate ``VirtualAllocEx`` inside this process view.
 
         Args:
@@ -442,6 +478,12 @@ class ProcessAddressSpace:
             size: Requested size in bytes; rounded up to the page size.
             alloc_type: MEM_COMMIT / MEM_RESERVE bit mask.
             protect: Win32 ``PAGE_*`` base protection.
+            avoid: Optional ``(base, size)`` intervals that a base-less
+                allocation must not overlap.  The caller supplies emulator
+                ranges occupied by other components so a shadow reservation
+                does not pick a VA that is already mapped globally.  Explicit
+                ``lp_address`` requests keep target-view semantics and ignore
+                this hint.
 
         Returns:
             Page-aligned allocation base.
@@ -452,6 +494,12 @@ class ProcessAddressSpace:
             ``ERROR_INVALID_ADDRESS`` when the requested base is occupied in
             this view or no free range exists.  A requested base is never
             relocated around another process's mappings.
+
+        Side effects:
+            ``MEM_RESERVE`` without ``MEM_COMMIT`` creates a reserved region
+            whose pages stay uncommitted (``PAGE_NOACCESS``, read/write fail);
+            ``MEM_COMMIT`` commits and zero-fills pages.  A reserve-only
+            region occupies the range in this view (``is_free`` is False).
         """
         if size <= 0 or size > MAX_SHADOW_REGION_SIZE:
             raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "unsupported allocation size")
@@ -468,7 +516,7 @@ class ProcessAddressSpace:
             start, end = self._span(lp_address, size)
             region_size = end - start
             if reserve:
-                self._add_region(start, region_size, protect)
+                self._add_region(start, region_size, protect, commit=commit)
                 return start
             if not self._range_occupied(start, region_size):
                 raise ProcessMemoryError(
@@ -477,11 +525,11 @@ class ProcessAddressSpace:
             self._commit_range(start, region_size, protect)
             return start
 
-        base = self._find_free(size, top_down=bool(alloc_type & MEM_TOP_DOWN))
+        base = self._find_free(size, top_down=bool(alloc_type & MEM_TOP_DOWN), avoid=avoid)
         if base is None:
             raise ProcessMemoryError(ERROR_INVALID_ADDRESS, "no free range in target view")
         start, end = self._span(base, size)
-        self._add_region(start, end - start, protect)
+        self._add_region(start, end - start, protect, commit=commit)
         return start
 
     def read(self, base: int, size: int) -> bytes:
@@ -738,6 +786,197 @@ class ProcessAddressSpace:
             for page, protect in zip(pages, page_protections):
                 self._page_protect[page] = int(protect)
         return len(payload)
+
+    def adopt_runtime_region(
+        self,
+        base: int,
+        size: int,
+        data: bytes,
+        *,
+        page_protections: Sequence[int],
+        allocation_protect: int,
+        tag: str = "",
+    ) -> ShadowRegion:
+        """Project a child-owned runtime mapping into this shadow view.
+
+        Used by the opt-in child execution backend for mappings the executing
+        child owns outside its mapped image (``VirtualAlloc``/heap).  The
+        method either updates an existing region with the same base and size
+        (the "runtime mapping already reserved by the parent" case, for
+        example ``VirtualAllocEx`` followed by execution) or creates a new
+        non-image region when the range is free.
+
+        Args:
+            base: Page-aligned runtime mapping base in this view.
+            size: Page-aligned mapping size in bytes.
+            data: Runtime bytes for the whole mapping; ``len(data)`` must equal
+                ``size``.
+            page_protections: One valid base ``PAGE_*`` value per page, in
+                ascending page order.
+            allocation_protect: Win32 ``PAGE_*`` value of the allocation, used
+                for the new region's ``allocation_protect`` and reported by
+                :meth:`query`.
+            tag: Diagnostic label copied into a newly created region.
+
+        Returns:
+            The existing or newly created :class:`ShadowRegion`.
+
+        Raises:
+            ProcessMemoryError: ``ERROR_INVALID_PARAMETER`` for non-bytes data,
+                a length/size mismatch, or a malformed protection list;
+                ``ERROR_INVALID_ADDRESS`` for a misaligned base/size, an
+                oversized region, an address beyond the modeled space, or a
+                partial overlap (including a different size at the same base).
+                All validation happens before mutation, so a failure leaves the
+                view unchanged.
+
+        Side effects:
+            Copies ``data`` into the shadow overlay and writes the per-page
+            protection table.  Never touches emulator/global memory.
+        """
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "runtime data must be bytes")
+        payload = bytes(data)
+        if size <= 0 or size > MAX_SHADOW_REGION_SIZE:
+            raise ProcessMemoryError(ERROR_INVALID_ADDRESS, "unsupported runtime region size")
+        if base < 0 or base % self.page_size or size % self.page_size:
+            raise ProcessMemoryError(
+                ERROR_INVALID_ADDRESS, "runtime region base/size is not page aligned"
+            )
+        if len(payload) != size:
+            raise ProcessMemoryError(
+                ERROR_INVALID_PARAMETER, "runtime data length does not match region size"
+            )
+        try:
+            start, end = self._span(base, size)
+        except ProcessMemoryError as err:
+            raise ProcessMemoryError(ERROR_INVALID_ADDRESS, str(err)) from err
+        if end - start != size:
+            raise ProcessMemoryError(ERROR_INVALID_ADDRESS, "runtime region exceeds address space")
+        pages = list(range(start, end, self.page_size))
+        if not isinstance(page_protections, Sequence) or isinstance(
+            page_protections, (bytes, bytearray, memoryview)
+        ):
+            raise ProcessMemoryError(
+                ERROR_INVALID_PARAMETER, "one protection per page is required"
+            )
+        if len(page_protections) != len(pages):
+            raise ProcessMemoryError(
+                ERROR_INVALID_PARAMETER, "one protection per page is required"
+            )
+        protections: list[int] = []
+        for protect in page_protections:
+            try:
+                value = int(protect)
+            except (TypeError, ValueError) as err:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_PARAMETER, "invalid page protection"
+                ) from err
+            if value & 0xFF not in _BASE_PROTECTIONS:
+                raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "invalid page protection")
+            protections.append(value)
+        try:
+            alloc = int(allocation_protect)
+        except (TypeError, ValueError) as err:
+            raise ProcessMemoryError(
+                ERROR_INVALID_PARAMETER, "invalid allocation protection"
+            ) from err
+        if alloc & 0xFF not in _BASE_PROTECTIONS:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "invalid allocation protection")
+
+        existing = self._regions.get(start)
+        if existing is not None:
+            if existing.size != size:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_ADDRESS,
+                    f"runtime mapping size 0x{size:x} does not match shadow region "
+                    f"size 0x{existing.size:x}",
+                )
+            existing.data[:] = payload
+            for page, protect in zip(pages, protections):
+                self._page_protect[page] = protect
+            return existing
+
+        if not self.is_free(start, size):
+            raise ProcessMemoryError(
+                ERROR_INVALID_ADDRESS, "runtime mapping overlaps an existing shadow region"
+            )
+        region = self._add_region(
+            start,
+            size,
+            alloc,
+            data=payload,
+            tag=tag,
+            commit=True,
+        )
+        for page, protect in zip(pages, protections):
+            self._page_protect[page] = protect
+        return region
+
+    def sync_runtime_protections(self, base: int, page_protections: Sequence[int]) -> int:
+        """Synchronize runtime Win32 protections into this shadow view.
+
+        This is the protection-only companion of
+        :meth:`sync_runtime_region`: an executor that observed a guest
+        ``VirtualProtect`` without any byte change calls this so the shadow
+        protection table matches the runtime.  Bytes are never modified.
+
+        Args:
+            base: Page-aligned start of the protected span.
+            page_protections: One valid base ``PAGE_*`` value per page, in
+                ascending page order.  The span is
+                ``[base, base + len(page_protections) * page_size)``.
+
+        Returns:
+            Number of pages whose protection was written.
+
+        Raises:
+            ProcessMemoryError: ``ERROR_INVALID_PARAMETER`` for an empty or
+                malformed protection list or a misaligned/out-of-range span;
+                ``ERROR_INVALID_ADDRESS`` when a page is unmapped;
+                ``ERROR_PARTIAL_COPY`` when a page is reserved but not
+                committed.  Validation happens before mutation.
+
+        Side effects:
+            Updates the page-protection table for committed pages only.
+        """
+        if not isinstance(page_protections, Sequence) or isinstance(
+            page_protections, (bytes, bytearray, memoryview)
+        ):
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "protection list is required")
+        if len(page_protections) == 0:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "protection list is empty")
+        if base < 0 or base % self.page_size:
+            raise ProcessMemoryError(ERROR_INVALID_ADDRESS, "protect base is not page aligned")
+        end = base + len(page_protections) * self.page_size
+        if end > self.address_limit:
+            raise ProcessMemoryError(ERROR_INVALID_ADDRESS, "protect range exceeds address space")
+        pages = list(range(base, end, self.page_size))
+        protections: list[int] = []
+        for protect in page_protections:
+            try:
+                value = int(protect)
+            except (TypeError, ValueError) as err:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_PARAMETER, "invalid page protection"
+                ) from err
+            if value & 0xFF not in _BASE_PROTECTIONS:
+                raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "invalid page protection")
+            protections.append(value)
+        for page in pages:
+            if self._region_for(page) is None:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_ADDRESS,
+                    f"page 0x{page:x} is not mapped in process {self.pid}",
+                )
+            if page not in self._page_protect:
+                raise ProcessMemoryError(
+                    ERROR_PARTIAL_COPY,
+                    f"page 0x{page:x} is not committed in process {self.pid}",
+                )
+        for page, protect in zip(pages, protections):
+            self._page_protect[page] = protect
+        return len(pages)
 
     def unmap(self, base: int, size: int, free_type: int) -> tuple[int, int]:
         """Emulate ``VirtualFreeEx`` inside this view.

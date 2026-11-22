@@ -13,7 +13,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from speakeasy.profiler import Run
-from speakeasy.windows.process_memory import ProcessAddressSpace, ProcessMemoryError
+from speakeasy.windows.page_protection import (
+    emulator_page_win_protection,
+    is_virtual_alloc_view,
+)
+from speakeasy.windows.process_memory import (
+    MAX_SHADOW_REGION_SIZE,
+    MEM_RELEASE,
+    SHADOW_MATERIALIZED_TAG_PREFIX,
+    ProcessAddressSpace,
+    ProcessMemoryError,
+)
 
 from .budget import ExecutionBudgetFactory
 from .models import (
@@ -237,24 +247,73 @@ class EngineChildEntrypointHookBackend:
 
 
 @dataclass(frozen=True)
-class _RuntimeImageBackfill:
-    """Prepared projection of one executing child's runtime image pages.
+class _ChildMapSpan:
+    """One page-aligned span of child-attributed runtime mappings.
+
+    Attributes:
+        base: Page-aligned span base.
+        size: Page-aligned span size.
+        tag: Diagnostic tag of the first mapping in the span.
+        sample_addresses: ``(page, address)`` pairs where ``address`` is mapped
+            inside ``page``.  Used to sample the effective Win32 protection even
+            when a heap mapping starts mid-page.
+        allocation_protect: Win32 allocation protection for adoption: the
+            private ``VirtualAlloc`` ``flProtect`` when present, otherwise the
+            first page's effective protection.
+    """
+
+    base: int
+    size: int
+    tag: str
+    sample_addresses: tuple[tuple[int, int], ...]
+    allocation_protect: int
+
+
+@dataclass(frozen=True)
+class _RuntimeRangeSnapshot:
+    """Prepared projection source for one runtime range.
+
+    Attributes:
+        base: Runtime address of the range in the shared emulator.
+        size: Range size in bytes.
+        page_size: Emulator page size used to slice the snapshot.
+        before: Pre-run runtime bytes; ``None`` means the range did not exist.
+        kind: ``"image"``, ``"child_mapping"`` or ``"shadow_materialized"``.
+        shadow_base: Shadow-view address the range projects onto.
+        tag: Diagnostic label of the runtime mapping/region.
+    """
+
+    base: int
+    size: int
+    page_size: int
+    before: bytes | None
+    kind: str
+    shadow_base: int
+    tag: str
+
+
+@dataclass(frozen=True)
+class _RuntimeBackfill:
+    """Prepared projection and materialization state for one child run.
 
     Attributes:
         address_space: The child process's per-process shadow view.
-        runtime_base: Address where the child image is mapped in the shared
-            emulator memory. It may differ from the shadow image base because
-            the loader relocates the child image away from its preferred base.
-        image_size: Child PE ``SizeOfImage`` in bytes.
-        page_size: Emulator page size used to slice the runtime snapshot.
-        before: Runtime image bytes captured before the child run.
+        process: Child process that owns the runtime mappings.
+        image_base: Runtime base of the child's mapped image.
+        image_size: Runtime PE ``SizeOfImage``.
+        page_size: Emulator page size.
+        ranges: Runtime ranges snapshotted before the run.
+        materialized: Mappings created by ``materialize_process_shadow`` that
+            must be released after the run.
     """
 
     address_space: ProcessAddressSpace
-    runtime_base: int
+    process: Any
+    image_base: int
     image_size: int
     page_size: int
-    before: bytes
+    ranges: tuple[_RuntimeRangeSnapshot, ...]
+    materialized: tuple[Any, ...]
 
 
 class EngineChildExecutionBackend:
@@ -267,10 +326,13 @@ class EngineChildExecutionBackend:
 
     The backend executes exactly the run prepared by the context manager.  It
     restores the parent instruction-budget flag after the child and never
-    changes parent process or run history.  After the child runs, pages of its
-    mapped image whose runtime bytes changed are projected into the child's
-    per-process shadow view (``AddressSpace / per_process_isolation``); the
-    parent's global view is never modified (FX12-extended-rv1).
+    changes parent process or run history.  Before the run it snapshots the
+    child's mapped image, every child-attributed runtime mapping outside the
+    image, and (phase B) materializes non-image shadow reservations at their
+    exact bases.  After the run it projects changed bytes and runtime ``PAGE_*``
+    protections into the child's per-process shadow view and releases every
+    materialized mapping; the parent's global view is never modified
+    (FX12-extended-rv2, following FX12-extended-rv1).
     """
 
     def __init__(self, emulator: Any) -> None:
@@ -349,12 +411,14 @@ class EngineChildExecutionBackend:
                 termination_reason=ChildTerminationReason.INTERNAL_ERROR,
             )
 
-        # FX12-extended-rv1: the child executes in the emulator's shared
+        # FX12-extended-rv2: the child executes in the emulator's shared
         # memory, so the per-process shadow view is the projection target for
-        # its runtime writes.  Preparing the snapshot before the run and
-        # diffing afterwards captures CPU writes and engine/API-handler writes
-        # without intercepting unrelated memory traffic.
-        backfill = self._prepare_runtime_image_backfill(context.process, image)
+        # its runtime writes.  Preparation snapshots the runtime image, every
+        # child-attributed mapping outside it, and materializes non-image
+        # shadow reservations for the duration of the run.  Post-run diffing
+        # captures CPU and API-handler writes without intercepting unrelated
+        # memory traffic; materialized mappings are always released.
+        backfill = self._prepare_runtime_backfill(context.process, image)
 
         start_index = len(self._emulator.runs)
         parent_budget_exhausted = bool(getattr(self._emulator, "instruction_budget_exhausted", False))
@@ -375,26 +439,42 @@ class EngineChildExecutionBackend:
             self._emulator.stop()
             return False
 
-        instruction_hook = self._emulator.add_code_hook(
-            observe_instruction,
-            begin=image.image_base,
-            end=image.image_base + image.module.image_size,
-        )
+        instruction_hook: Any | None = None
         try:
+            instruction_hook = self._emulator.add_code_hook(
+                observe_instruction,
+                begin=image.image_base,
+                end=image.image_base + image.module.image_size,
+            )
             self._emulator.add_run(context.run)
             self._emulator.start()
         finally:
-            instruction_hook.disable()
+            if instruction_hook is not None:
+                instruction_hook.disable()
             child_budget_exhausted = bool(getattr(self._emulator, "instruction_budget_exhausted", False))
             self._emulator.instruction_budget_exhausted = parent_budget_exhausted
             backfill_error: ChildExecutionRuntimeError | None = None
             try:
-                self._backfill_runtime_image(backfill)
+                self._backfill_runtime_memory(backfill)
             except ChildExecutionRuntimeError as exc:
                 # A failed projection must never mask an execution error that
                 # is already propagating; it is reported below when the run
                 # itself completed.
                 backfill_error = exc
+            finally:
+                if backfill.materialized:
+                    try:
+                        self._emulator.release_materialized_process_shadow(
+                            backfill.materialized
+                        )
+                    except ProcessMemoryError as exc:
+                        if backfill_error is None:
+                            backfill_error = ChildExecutionRuntimeError(
+                                f"cannot release materialized child shadow: "
+                                f"Win32 error {exc.win_error}: {exc}",
+                                kind=ChildFailureKind.RUNTIME,
+                                termination_reason=ChildTerminationReason.INVALID_MEMORY,
+                            )
 
         try:
             api_count = max(0, int(getattr(context.run, "num_apis", 0)))
@@ -486,30 +566,45 @@ class EngineChildExecutionBackend:
             return ChildTerminationReason.INVALID_FETCH
         return ChildTerminationReason.INTERNAL_ERROR
 
-    def _prepare_runtime_image_backfill(
+    def _prepare_runtime_backfill(
         self,
         process: Any,
         image: LoadedChildImage,
-    ) -> _RuntimeImageBackfill:
-        """Ensure the child's shadow view and snapshot its runtime image.
+    ) -> _RuntimeBackfill:
+        """Ensure the child's shadow view and snapshot every runtime range.
+
+        Preparation covers three kinds of runtime state:
+
+        * the mapped child image (``kind="image"``), projected at the shadow
+          image base so relocated children map by page offset;
+        * every child-attributed runtime mapping outside the image span
+          (``kind="child_mapping"``), including ``VirtualAlloc`` and heap maps;
+        * each non-image shadow region materialized for this run
+          (``kind="shadow_materialized"``).
+
+        Image regions are never materialized.  The parent's mappings and the
+        global stack/PEB are excluded (their ``MemMap.process`` is not the
+        child), so engine bookkeeping is never projected as child writes.
 
         Args:
             process: Child process installed as the emulator's current process.
             image: Mapped non-primary child image about to execute.
 
         Returns:
-            The projection target and the pre-execution runtime image bytes.
+            The projection target, pre-execution snapshots, and materialized
+            mappings that must be released after the run.
 
         Raises:
-            ChildExecutionRuntimeError: If the child shadow view cannot be
-                seeded (``ProcessMemoryError``) or the runtime image cannot be
-                read.  Both are explicit failures; no bytes are fabricated.
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` when the shadow view
+                cannot be seeded, a range cannot be read, a range is oversized,
+                the aggregate snapshot exceeds ``MAX_SHADOW_REGION_SIZE``, or
+                materialization fails explicitly (for example a Win32 487
+                collision).  No bytes are fabricated.
 
         Side effects:
             Creates and caches the child's shadow view when it does not exist
-            yet.  This is the same bookkeeping view ``ReadProcessMemory``
-            would create; it never maps Unicorn memory and never executes
-            code.
+            yet, and creates temporary emulator mappings for non-image shadow
+            regions.  Those mappings are released by the caller in ``finally``.
         """
 
         try:
@@ -521,7 +616,7 @@ class EngineChildExecutionBackend:
                 termination_reason=ChildTerminationReason.INVALID_MEMORY,
             ) from exc
 
-        runtime_base = int(image.image_base)
+        image_base = int(image.image_base)
         image_size = int(image.module.image_size)
         page_size = int(self._emulator.page_size or 0)
         if page_size <= 0:
@@ -530,13 +625,264 @@ class EngineChildExecutionBackend:
                 kind=ChildFailureKind.RUNTIME,
                 termination_reason=ChildTerminationReason.INTERNAL_ERROR,
             )
-        return _RuntimeImageBackfill(
+        if image_size <= 0:
+            raise self._memory_error("child runtime image has no size")
+
+        shadow_base = self._shadow_image_base(space, image_size)
+        image_before = self._read_runtime_bytes(image_base, image_size, "runtime image")
+        ranges: list[_RuntimeRangeSnapshot] = [
+            _RuntimeRangeSnapshot(
+                base=image_base,
+                size=image_size,
+                page_size=page_size,
+                before=image_before,
+                kind="image",
+                shadow_base=shadow_base,
+                tag=str(getattr(image.module, "emu_path", "")),
+            )
+        ]
+
+        total_size = image_size
+        spans = self._child_map_spans(process, image_base, image_size, page_size)
+        for span in spans:
+            total_size += span.size
+            if total_size > MAX_SHADOW_REGION_SIZE:
+                raise self._memory_error(
+                    "child runtime snapshot exceeds the maximum shadow region size"
+                )
+            before = self._read_runtime_bytes(
+                span.base, span.size, f"child runtime mapping at 0x{span.base:x}"
+            )
+            ranges.append(
+                _RuntimeRangeSnapshot(
+                    base=span.base,
+                    size=span.size,
+                    page_size=page_size,
+                    before=before,
+                    kind="child_mapping",
+                    shadow_base=span.base,
+                    tag=span.tag,
+                )
+            )
+
+        materialized: tuple[Any, ...] = ()
+        if any(not region.is_image and int(region.size) > 0 for region in space.regions):
+            try:
+                materialized = tuple(self._emulator.materialize_process_shadow(process))
+            except ProcessMemoryError as exc:
+                raise ChildExecutionRuntimeError(
+                    f"cannot materialize child shadow: Win32 error {exc.win_error}: {exc}",
+                    kind=ChildFailureKind.RUNTIME,
+                    termination_reason=ChildTerminationReason.INVALID_MEMORY,
+                ) from exc
+
+        try:
+            for region in materialized:
+                base = int(region.base)
+                size = int(region.size)
+                if size <= 0 or size > MAX_SHADOW_REGION_SIZE:
+                    raise self._memory_error(
+                        f"materialized child shadow region at 0x{base:x} "
+                        "has an invalid size"
+                    )
+                shadow_region = self._shadow_region_at(space, base, size)
+                ranges.append(
+                    _RuntimeRangeSnapshot(
+                        base=base,
+                        size=size,
+                        page_size=page_size,
+                        before=bytes(shadow_region.data),
+                        kind="shadow_materialized",
+                        shadow_base=base,
+                        tag=str(region.tag),
+                    )
+                )
+        except Exception:
+            # A failure after physical backing was created must not leak it.
+            self._release_materialized(materialized)
+            raise
+
+        return _RuntimeBackfill(
             address_space=space,
-            runtime_base=runtime_base,
+            process=process,
+            image_base=image_base,
             image_size=image_size,
             page_size=page_size,
-            before=self._read_runtime_image_bytes(runtime_base, image_size),
+            ranges=tuple(ranges),
+            materialized=materialized,
         )
+
+    def _child_map_spans(
+        self,
+        process: Any,
+        image_base: int,
+        image_size: int,
+        page_size: int,
+    ) -> tuple[_ChildMapSpan, ...]:
+        """Return page-aligned spans of child-attributed runtime mappings.
+
+        Selection: ``MemMap.process is process``, not free, integer base/size,
+        positive and bounded size, no overlap with the runtime image span, and
+        not a materialized child-shadow mapping (those are tracked separately).
+        Mappings whose page envelopes overlap (for example sub-page heap
+        allocations in one emulator block) merge into one page-aligned span;
+        merely adjacent mappings stay separate so an unchanged mapping is never
+        adopted because its neighbour changed.
+
+        Args:
+            process: Child process owning the mappings.
+            image_base: Runtime image base.
+            image_size: Runtime PE ``SizeOfImage``.
+            page_size: Emulator page size.
+
+        Returns:
+            Spans in ascending address order with one in-page sample address per
+            page and a Win32 allocation protection.
+
+        Raises:
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` for a mapping larger
+                than ``MAX_SHADOW_REGION_SIZE`` or a page not backed by a map.
+        """
+
+        image_start = image_base & ~(page_size - 1)
+        image_end = (image_base + image_size + page_size - 1) & ~(page_size - 1)
+
+        entries: list[tuple[int, int, Any]] = []
+        for mm in self._emulator.get_mem_maps():
+            if getattr(mm, "process", None) is not process:
+                continue
+            if bool(getattr(mm, "free", False)):
+                continue
+            base = getattr(mm, "base", None)
+            size = getattr(mm, "size", None)
+            if not isinstance(base, int) or not isinstance(size, int):
+                continue
+            if size <= 0:
+                continue
+            if str(getattr(mm, "tag", "")).startswith(SHADOW_MATERIALIZED_TAG_PREFIX):
+                continue
+            if size > MAX_SHADOW_REGION_SIZE:
+                raise self._memory_error(
+                    f"child runtime mapping at 0x{base:x} is too large to snapshot"
+                )
+            start = base & ~(page_size - 1)
+            end = (base + size + page_size - 1) & ~(page_size - 1)
+            if end <= start:
+                continue
+            if start < image_end and image_start < end:
+                continue
+            entries.append((start, end, mm))
+
+        entries.sort(key=lambda entry: (entry[0], entry[1]))
+        merged: list[list[Any]] = []
+        for start, end, mm in entries:
+            if merged and start < merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+                merged[-1][2].append(mm)
+            else:
+                merged.append([start, end, [mm]])
+
+        spans: list[_ChildMapSpan] = []
+        for start, end, mm_list in merged:
+            size = end - start
+            if size > MAX_SHADOW_REGION_SIZE:
+                raise self._memory_error(
+                    f"merged child runtime span at 0x{start:x} is too large to snapshot"
+                )
+            samples: dict[int, int] = {}
+            for mm in mm_list:
+                mstart = int(mm.base) & ~(page_size - 1)
+                mend = (int(mm.base) + int(mm.size) + page_size - 1) & ~(page_size - 1)
+                for page in range(mstart, mend, page_size):
+                    samples.setdefault(page, max(page, int(mm.base)))
+            sample_addresses: list[tuple[int, int]] = []
+            for page in range(start, end, page_size):
+                sample = samples.get(page)
+                if sample is None:
+                    raise self._memory_error(
+                        f"child runtime page 0x{page:x} is not backed by a mapping"
+                    )
+                sample_addresses.append((page, sample))
+            first = mm_list[0]
+            allocation_protect = 0
+            if is_virtual_alloc_view(first):
+                allocation_protect = int(first.flags) & 0xFF
+            if not allocation_protect:
+                protect = emulator_page_win_protection(
+                    self._emulator, sample_addresses[0][1]
+                )
+                if protect is None:
+                    raise self._memory_error(
+                        f"child runtime page 0x{sample_addresses[0][0]:x} has no protection"
+                    )
+                allocation_protect = int(protect)
+            spans.append(
+                _ChildMapSpan(
+                    base=start,
+                    size=size,
+                    tag=str(getattr(first, "tag", "")),
+                    sample_addresses=tuple(sample_addresses),
+                    allocation_protect=allocation_protect,
+                )
+            )
+        return tuple(spans)
+
+    @staticmethod
+    def _find_shadow_region(space: ProcessAddressSpace, base: int) -> Any | None:
+        """Return the shadow region whose base equals ``base``, if any."""
+
+        for region in space.regions:
+            if int(region.base) == int(base):
+                return region
+        return None
+
+    def _shadow_region_at(
+        self, space: ProcessAddressSpace, base: int, size: int
+    ) -> Any:
+        """Return the exact-base shadow region or fail explicitly."""
+
+        region = self._find_shadow_region(space, base)
+        if region is None:
+            raise self._memory_error(
+                f"materialized child shadow region at 0x{base:x} is missing"
+            )
+        if int(region.size) != int(size):
+            raise self._memory_error(
+                f"materialized child shadow region size 0x{int(region.size):x} "
+                f"does not match 0x{int(size):x}"
+            )
+        return region
+
+    @staticmethod
+    def _memory_error(message: str) -> ChildExecutionRuntimeError:
+        """Build one explicit child ``INVALID_MEMORY`` failure."""
+
+        return ChildExecutionRuntimeError(
+            message,
+            kind=ChildFailureKind.RUNTIME,
+            termination_reason=ChildTerminationReason.INVALID_MEMORY,
+        )
+
+    def _release_materialized(self, materialized: tuple[Any, ...]) -> None:
+        """Release materialized mappings after a preparation failure.
+
+        Args:
+            materialized: Tuple returned by ``materialize_process_shadow``.
+
+        Raises:
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` when the emulator
+                refuses to release a mapping it created.
+        """
+
+        if not materialized:
+            return
+        try:
+            self._emulator.release_materialized_process_shadow(materialized)
+        except ProcessMemoryError as exc:
+            raise self._memory_error(
+                f"cannot release materialized child shadow during preparation: "
+                f"Win32 error {exc.win_error}: {exc}"
+            ) from exc
 
     def _read_runtime_image_bytes(self, base: int, size: int) -> bytes:
         """Read exactly ``size`` runtime image bytes from shared memory.
@@ -553,76 +899,298 @@ class EngineChildExecutionBackend:
                 is not positive or the engine cannot read the mapped image.
         """
 
+        return self._read_runtime_bytes(base, size, "runtime image")
+
+    def _read_runtime_bytes(self, base: int, size: int, label: str) -> bytes:
+        """Read exactly ``size`` runtime bytes from the shared emulator.
+
+        Args:
+            base: Runtime address.
+            size: Number of bytes to read.
+            label: Diagnostic label used in explicit failures.
+
+        Returns:
+            The current runtime bytes.
+
+        Raises:
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` when ``size`` is not
+                positive, the engine read fails, or the read is short.
+        """
+
         if size <= 0:
-            raise ChildExecutionRuntimeError(
-                "child runtime image has no size",
-                kind=ChildFailureKind.RUNTIME,
-                termination_reason=ChildTerminationReason.INVALID_MEMORY,
-            )
+            raise self._memory_error(f"{label} has no size")
         try:
             data = bytes(self._emulator.mem_read(base, size))
         except Exception as exc:
             raise ChildExecutionRuntimeError(
-                f"cannot read child runtime image at 0x{base:x}: "
-                f"{type(exc).__name__}: {exc}",
+                f"cannot read {label} at 0x{base:x}: {type(exc).__name__}: {exc}",
                 kind=ChildFailureKind.RUNTIME,
                 termination_reason=ChildTerminationReason.INVALID_MEMORY,
             ) from exc
         if len(data) != size:
-            raise ChildExecutionRuntimeError(
-                f"short child runtime image read at 0x{base:x}: "
-                f"{len(data)} of {size} bytes",
-                kind=ChildFailureKind.RUNTIME,
-                termination_reason=ChildTerminationReason.INVALID_MEMORY,
+            raise self._memory_error(
+                f"short {label} read at 0x{base:x}: {len(data)} of {size} bytes"
             )
         return data
 
-    def _backfill_runtime_image(self, backfill: _RuntimeImageBackfill) -> int:
-        """Project changed runtime image pages into the child shadow view.
+    def _backfill_runtime_memory(self, backfill: _RuntimeBackfill) -> int:
+        """Project runtime bytes and protections into the child shadow view.
 
-        Only pages whose runtime bytes changed between the pre-run snapshot
-        and the post-run image are projected, so a child run that performs no
-        writes backfills nothing.  If the shadow view exists but cannot
-        describe the runtime image (no/duplicate image region or a size
-        mismatch), or a changed page is unmapped/decommitted in the shadow, the
-        failure is explicit instead of silently succeeding.
+        The post-run state is reconciled per range:
+
+        * image pages are diffed by offset against the shadow image base;
+        * child-attributed mappings that still exist are diffed at their own
+          addresses; maps that disappeared were freed by the child and release
+          any exact-base shadow region;
+        * materialized shadow regions are diffed while their mapping exists;
+        * mappings created during the run are adopted with their complete
+          post-run bytes and per-page protections.
+
+        A pre-existing child mapping without a shadow region is adopted only
+        when its bytes changed; an unchanged mapping is not re-adopted.  Pages
+        whose protection changed without byte changes are synchronized through
+        ``sync_runtime_protections``.  An unmapped runtime page or a refused
+        shadow page is an explicit ``INVALID_MEMORY`` failure.
 
         Args:
-            backfill: Prepared projection target and pre-run image snapshot.
+            backfill: Prepared projection target, snapshots, and materialized
+                mappings from :meth:`_prepare_runtime_backfill`.
 
         Returns:
-            Number of pages projected.
+            Number of pages projected or adopted.
 
         Raises:
-            ChildExecutionRuntimeError: ``INVALID_MEMORY`` for a shadow view
-                that cannot describe the runtime image or a page that the
-                shadow refuses (``ProcessMemoryError``).
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` for an unreadable
+                runtime range or a shadow view that refuses the projection.
         """
 
-        after = self._read_runtime_image_bytes(backfill.runtime_base, backfill.image_size)
-        changed: list[tuple[int, bytes]] = []
-        for offset in range(0, backfill.image_size, backfill.page_size):
-            page_before = backfill.before[offset : offset + backfill.page_size]
-            page_after = after[offset : offset + backfill.page_size]
-            if page_before != page_after:
-                changed.append((offset, page_after))
-        if not changed:
-            return 0
-
-        shadow_base = self._shadow_image_base(backfill.address_space, backfill.image_size)
+        current_spans = self._child_map_spans(
+            backfill.process,
+            backfill.image_base,
+            backfill.image_size,
+            backfill.page_size,
+        )
+        current_by_base = {span.base: span for span in current_spans}
         projected = 0
-        for offset, data in changed:
+
+        for snap in backfill.ranges:
+            if snap.kind == "image":
+                after = self._read_runtime_bytes(snap.base, snap.size, "runtime image")
+                projected += self._project_range(
+                    backfill.address_space, snap, after, span=None
+                )
+                continue
+            if snap.kind == "shadow_materialized":
+                mm = self._emulator.get_address_map(snap.base)
+                if mm is None or bool(getattr(mm, "free", False)):
+                    # The child freed the materialized reservation.  MEM_RELEASE
+                    # and MEM_DECOMMIT are indistinguishable after the fact;
+                    # both leave the shadow reservation accessible only through
+                    # a fresh MEM_COMMIT, so release the modeled region.
+                    self._release_shadow_region(backfill.address_space, snap.base)
+                    continue
+                after = self._read_runtime_bytes(
+                    snap.base, snap.size, f"child runtime mapping at 0x{snap.base:x}"
+                )
+                projected += self._project_range(
+                    backfill.address_space, snap, after, span=None
+                )
+                continue
+
+            span = current_by_base.get(snap.base)
+            if span is None or span.size != snap.size:
+                self._release_shadow_region(backfill.address_space, snap.base)
+                continue
+            after = self._read_runtime_bytes(
+                snap.base, snap.size, f"child runtime mapping at 0x{snap.base:x}"
+            )
+            projected += self._project_range(
+                backfill.address_space, snap, after, span=span
+            )
+
+        pre_existing = {
+            (snap.base, snap.size)
+            for snap in backfill.ranges
+            if snap.kind == "child_mapping"
+        }
+        for span in current_spans:
+            if (span.base, span.size) in pre_existing:
+                continue
+            payload = self._read_runtime_bytes(
+                span.base, span.size, f"child runtime mapping at 0x{span.base:x}"
+            )
+            projected += self._adopt_span(
+                backfill.address_space, span, payload, backfill.page_size
+            )
+        return projected
+
+    def _project_range(
+        self,
+        space: ProcessAddressSpace,
+        snap: _RuntimeRangeSnapshot,
+        after: bytes,
+        *,
+        span: _ChildMapSpan | None,
+    ) -> int:
+        """Project one runtime range's changed bytes and protections.
+
+        Args:
+            space: Child shadow view.
+            snap: Pre-run snapshot for the range.
+            after: Post-run runtime bytes of the same length.
+            span: Runtime span description for child mappings; ``None`` for the
+                image and page-aligned materialized ranges.
+
+        Returns:
+            Number of pages with changed bytes that were projected.
+
+        Raises:
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` when the shadow
+                region is missing/size-mismatched, a runtime page is unmapped,
+                or the shadow refuses the projection.
+        """
+
+        before = snap.before
+        if before is None or len(before) != len(after):
+            raise self._memory_error(
+                f"runtime range at 0x{snap.base:x} changed size during the run"
+            )
+        if span is not None:
+            samples = dict(span.sample_addresses)
+        else:
+            samples = {
+                snap.base + offset: snap.base + offset
+                for offset in range(0, len(after), snap.page_size)
+            }
+
+        existing = self._find_shadow_region(space, snap.shadow_base)
+        if existing is None:
+            if snap.kind != "child_mapping":
+                raise self._memory_error(
+                    f"shadow region for {snap.kind} at 0x{snap.shadow_base:x} is missing"
+                )
+            if before == after:
+                return 0
+            if span is None:
+                raise self._memory_error(
+                    f"cannot adopt child runtime mapping at 0x{snap.base:x}"
+                )
+            return self._adopt_span(space, span, after, snap.page_size)
+        if int(existing.size) != len(after):
+            raise self._memory_error(
+                f"shadow region at 0x{snap.shadow_base:x} has size "
+                f"0x{int(existing.size):x}; runtime range is 0x{len(after):x}"
+            )
+
+        projected = 0
+        for offset in range(0, len(after), snap.page_size):
+            page_before = before[offset : offset + snap.page_size]
+            page_after = after[offset : offset + snap.page_size]
+            runtime_page = snap.base + offset
+            sample = samples.get(runtime_page)
+            if sample is None:
+                raise self._memory_error(
+                    f"runtime page 0x{runtime_page:x} is not backed by a mapping"
+                )
+            protect = emulator_page_win_protection(self._emulator, sample)
+            if protect is None:
+                raise self._memory_error(f"runtime page 0x{runtime_page:x} is not mapped")
+            shadow_page = snap.shadow_base + offset
+            snapshot = space.query(shadow_page)
+            if snapshot is None:
+                raise self._memory_error(
+                    f"shadow page 0x{shadow_page:x} is not mapped in process {space.pid}"
+                )
             try:
-                backfill.address_space.capture_runtime_write(shadow_base + offset, data)
+                if page_before != page_after:
+                    space.sync_runtime_region(
+                        shadow_page, page_after, page_protections=[int(protect)]
+                    )
+                    projected += 1
+                elif int(snapshot["protect"]) != int(protect):
+                    space.sync_runtime_protections(shadow_page, [int(protect)])
             except ProcessMemoryError as exc:
                 raise ChildExecutionRuntimeError(
-                    f"cannot backfill child runtime write at shadow address "
-                    f"0x{shadow_base + offset:x}: Win32 error {exc.win_error}: {exc}",
+                    f"cannot backfill child runtime state at shadow address "
+                    f"0x{shadow_page:x}: Win32 error {exc.win_error}: {exc}",
                     kind=ChildFailureKind.RUNTIME,
                     termination_reason=ChildTerminationReason.INVALID_MEMORY,
                 ) from exc
-            projected += 1
         return projected
+
+    def _adopt_span(
+        self,
+        space: ProcessAddressSpace,
+        span: _ChildMapSpan,
+        payload: bytes,
+        page_size: int,
+    ) -> int:
+        """Adopt one child-attributed runtime span into the shadow view.
+
+        Args:
+            space: Child shadow view.
+            span: Runtime span description with one sample address per page.
+            payload: Complete post-run bytes of the span.
+            page_size: Emulator page size.
+
+        Returns:
+            Number of pages adopted.
+
+        Raises:
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` when a page has no
+                runtime protection or the shadow refuses the region.
+        """
+
+        protections: list[int] = []
+        for page, sample in span.sample_addresses:
+            protect = emulator_page_win_protection(self._emulator, sample)
+            if protect is None:
+                raise self._memory_error(
+                    f"runtime page 0x{page:x} is not mapped for child adoption"
+                )
+            protections.append(int(protect))
+        try:
+            space.adopt_runtime_region(
+                span.base,
+                span.size,
+                payload,
+                page_protections=protections,
+                allocation_protect=span.allocation_protect,
+                tag=span.tag,
+            )
+        except ProcessMemoryError as exc:
+            raise ChildExecutionRuntimeError(
+                f"cannot adopt child runtime mapping at 0x{span.base:x}: "
+                f"Win32 error {exc.win_error}: {exc}",
+                kind=ChildFailureKind.RUNTIME,
+                termination_reason=ChildTerminationReason.INVALID_MEMORY,
+            ) from exc
+        return span.size // page_size
+
+    def _release_shadow_region(self, space: ProcessAddressSpace, base: int) -> None:
+        """Release the exact-base shadow region for a runtime map the child freed.
+
+        Args:
+            space: Child shadow view.
+            base: Runtime mapping base.
+
+        Raises:
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` when the shadow view
+                refuses the release.
+        """
+
+        region = self._find_shadow_region(space, base)
+        if region is None:
+            return
+        try:
+            space.unmap(base, 0, MEM_RELEASE)
+        except ProcessMemoryError as exc:
+            raise ChildExecutionRuntimeError(
+                f"cannot release child shadow region at 0x{base:x}: "
+                f"Win32 error {exc.win_error}: {exc}",
+                kind=ChildFailureKind.RUNTIME,
+                termination_reason=ChildTerminationReason.INVALID_MEMORY,
+            ) from exc
 
     @staticmethod
     def _shadow_image_base(space: ProcessAddressSpace, image_size: int) -> int:

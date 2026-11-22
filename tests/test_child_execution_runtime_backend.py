@@ -238,6 +238,28 @@ class NoProjectionShadow:
 
         raise AssertionError("a failed synthetic run must not project writes")
 
+    def query(self, _address: int) -> dict[str, object]:
+        """Report a stable committed image page for protection comparisons."""
+
+        return {
+            "base": 0x270000,
+            "size": 0x2000,
+            "protect": 0x02,
+            "allocation_protect": 0x02,
+            "tag": "image",
+            "is_image": True,
+            "state": 0x1000,
+        }
+
+    def adopt_runtime_region(self, *_args, **_kwargs):
+        raise AssertionError("a failed synthetic run must not adopt mappings")
+
+    def sync_runtime_region(self, *_args, **_kwargs):
+        raise AssertionError("a failed synthetic run must not project writes")
+
+    def sync_runtime_protections(self, *_args, **_kwargs):
+        raise AssertionError("a failed synthetic run must not sync protections")
+
 
 class FailingExecutionEmulator:
     """Set one child run error after recording its run and API count."""
@@ -265,6 +287,37 @@ class FailingExecutionEmulator:
         assert address == 0x270000
         assert size == 0x2000
         return b"\x00" * size
+
+    def get_mem_maps(self) -> list[object]:
+        """Report no child-attributed runtime mappings."""
+
+        return []
+
+    def get_address_map(self, address: int):
+        """Expose the synthetic image mapping for protection sampling."""
+
+        if 0x270000 <= address < 0x272000:
+            return SimpleNamespace(
+                base=0x270000,
+                size=0x2000,
+                tag="emu.module.child",
+                prot=0x16,
+                flags=0,
+                free=False,
+                process=None,
+                is_image=True,
+            )
+        return None
+
+    def get_address_win_protection(self, _address: int) -> int:
+        """Match the synthetic shadow's stable page protection."""
+
+        return 0x02
+
+    def get_address_perms(self, _address: int) -> int:
+        """Return synthetic read/write/execute permissions."""
+
+        return 0x16
 
     def add_code_hook(self, _callback: object, *, begin: int, end: int) -> FailingExecutionHook:
         """Return a no-op hook for the requested child image range."""

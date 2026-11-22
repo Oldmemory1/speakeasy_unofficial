@@ -404,7 +404,7 @@ class _NoOpHook:
 
 
 class _RecordingShadow:
-    """Image-shaped shadow view that records any capture attempt."""
+    """Image-shaped shadow view that records any projection attempt."""
 
     def __init__(self, image_base: int, image_size: int) -> None:
         self.image_base = image_base
@@ -419,6 +419,31 @@ class _RecordingShadow:
 
         self.capture_calls.append((base, bytes(data)))
         return len(data)
+
+    def query(self, address: int) -> dict[str, object]:
+        """Report a stable committed image page for protection comparisons."""
+
+        return {
+            "base": self.image_base,
+            "size": self.image_size,
+            "protect": 0x02,
+            "allocation_protect": 0x02,
+            "tag": "image",
+            "is_image": True,
+            "state": 0x1000,
+        }
+
+    def adaptor_guard(self, name: str) -> None:
+        raise AssertionError(f"no-execution child must not call {name}")
+
+    def adopt_runtime_region(self, *_args, **_kwargs):
+        self.adaptor_guard("adopt_runtime_region")
+
+    def sync_runtime_region(self, *_args, **_kwargs):
+        self.adaptor_guard("sync_runtime_region")
+
+    def sync_runtime_protections(self, *_args, **_kwargs):
+        self.adaptor_guard("sync_runtime_protections")
 
 
 class _NoExecutionEmulator:
@@ -440,6 +465,37 @@ class _NoExecutionEmulator:
         assert address == self._image_base
         assert size == self._image_size
         return b"\x00" * size
+
+    def get_mem_maps(self) -> list[object]:
+        """Report no child-attributed runtime mappings."""
+
+        return []
+
+    def get_address_map(self, address: int):
+        """Expose the synthetic image mapping for protection sampling."""
+
+        if self._image_base <= address < self._image_base + self._image_size:
+            return SimpleNamespace(
+                base=self._image_base,
+                size=self._image_size,
+                tag="emu.module.child",
+                prot=common.PERM_MEM_RWX,
+                flags=0,
+                free=False,
+                process=None,
+                is_image=True,
+            )
+        return None
+
+    def get_address_win_protection(self, _address: int) -> int:
+        """Match the recording shadow's stable page protection."""
+
+        return 0x02
+
+    def get_address_perms(self, _address: int) -> int:
+        """Return synthetic read/write/execute permissions."""
+
+        return common.PERM_MEM_RWX
 
     def get_executing_process_address_space(self, process) -> _RecordingShadow:
         """Return the explicit shadow view owned by the synthetic process."""

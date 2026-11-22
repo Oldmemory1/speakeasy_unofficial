@@ -7,7 +7,7 @@ import os
 import shlex
 import traceback
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
@@ -62,10 +62,13 @@ from speakeasy.windows.page_protection import (
     emu_perms_to_win_protect,
     image_protection_for_emu_perms,
     is_virtual_alloc_view,
+    win_protect_to_emu_perms,
 )
 from speakeasy.windows.process_memory import (
     ERROR_INVALID_ADDRESS,
     ERROR_INVALID_PARAMETER,
+    MAX_SHADOW_REGION_SIZE,
+    SHADOW_MATERIALIZED_TAG_PREFIX,
     ProcessAddressSpace,
     ProcessMemoryError,
 )
@@ -124,6 +127,22 @@ class DeferredProtectedFault:
     address: int
     context: Any
     dep_exec_allowed: bool = False
+
+
+@dataclass(frozen=True)
+class MaterializedShadowRegion:
+    """One per-process shadow region that was given physical backing.
+
+    Attributes:
+        base: Page-aligned mapping base (equal to the shadow region base).
+        size: Mapping size in bytes.
+        tag: Tag prefix used for the created emulator mapping.  Release only
+            frees mappings whose tag still starts with this value.
+    """
+
+    base: int
+    size: int
+    tag: str
 
 
 logger = logging.getLogger(__name__)
@@ -1103,6 +1122,207 @@ class WindowsEmulator(BinaryEmulator):
                 if page in protections:
                     protections[page] = protect
         return protections
+
+    @staticmethod
+    def _shadow_materialized_tag(pid: int) -> str:
+        """Return the tag prefix for one process's materialized shadow maps."""
+
+        return f"{SHADOW_MATERIALIZED_TAG_PREFIX}pid{int(pid)}"
+
+    def materialize_process_shadow(
+        self, process: Any
+    ) -> tuple[MaterializedShadowRegion, ...]:
+        """Give a non-current process's shadow regions physical backing.
+
+        A model-only child has a bookkeeping :class:`ProcessAddressSpace` but no
+        emulator mappings, so an executing child cannot write to a
+        ``VirtualAllocEx`` reservation.  This executor-only operation maps each
+        non-image shadow region at its exact base for the duration of one child
+        run, seeds it with the shadow bytes, and applies the shadow's committed
+        and reserved page protections (reserved/decommitted pages become
+        ``PERM_MEM_NONE`` + ``PAGE_NOACCESS``, so a guest write faults exactly
+        like Windows).
+
+        Image regions are never materialized: the executing child already has
+        its own (possibly relocated) runtime image mapping and the shadow image
+        lives at the preferred ``ImageBase`` where another image may reside.
+
+        Args:
+            process: Process owning the shadow view.  It must expose
+                ``address_space`` (:class:`ProcessAddressSpace`).
+
+        Returns:
+            One :class:`MaterializedShadowRegion` per created mapping, in shadow
+            region order.  The caller must pass this tuple to
+            :meth:`release_materialized_process_shadow` in a ``finally`` block.
+
+        Raises:
+            ProcessMemoryError: ``ERROR_INVALID_PARAMETER`` when the process has
+                no usable shadow view or a region page is missing;
+                ``ERROR_INVALID_ADDRESS`` for an oversized/misaligned region, an
+                occupied base, or a relocation by the allocator.  Any failure
+                releases every mapping created by this call; no global mapping
+                leaks and no bytes are fabricated.
+
+        Side effects:
+            Creates emulator mappings tagged ``emu.child_shadow.pid<pid>`` with
+            ``process=process`` and writes shadow bytes/protections into them.
+            Image mappings and other components' memory are never modified.
+        """
+
+        space = getattr(process, "address_space", None)
+        if not isinstance(space, ProcessAddressSpace):
+            raise ProcessMemoryError(
+                ERROR_INVALID_PARAMETER, "process has no shadow address space to materialize"
+            )
+        page_size = int(self.page_size or 0)
+        if page_size <= 0:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "emulator page size is unavailable")
+        pid = int(getattr(process, "pid", getattr(process, "id", 0)))
+        tag = self._shadow_materialized_tag(pid)
+
+        created: list[MaterializedShadowRegion] = []
+        try:
+            for region in space.regions:
+                if region.is_image or int(region.size) <= 0:
+                    continue
+                base = int(region.base)
+                size = int(region.size)
+                if size > MAX_SHADOW_REGION_SIZE:
+                    raise ProcessMemoryError(
+                        ERROR_INVALID_ADDRESS,
+                        f"shadow region at 0x{base:x} is too large to materialize",
+                    )
+                if base % page_size or size % page_size:
+                    raise ProcessMemoryError(
+                        ERROR_INVALID_ADDRESS,
+                        f"shadow region at 0x{base:x} is not page aligned",
+                    )
+                if self.get_address_map(base) is not None:
+                    raise ProcessMemoryError(
+                        ERROR_INVALID_ADDRESS,
+                        f"address 0x{base:x} is already mapped in the emulator",
+                    )
+                mapped = self.mem_map(
+                    size,
+                    base=base,
+                    tag=tag,
+                    flags=int(region.protect),
+                    perms=common.PERM_MEM_RW,
+                    process=process,
+                )
+                if int(mapped) != base:
+                    # get_valid_ranges searches forward when the exact base is
+                    # occupied.  Never relocate a shadow reservation silently.
+                    try:
+                        self.mem_free(int(mapped))
+                    except Exception:
+                        pass
+                    raise ProcessMemoryError(
+                        ERROR_INVALID_ADDRESS,
+                        f"materialization relocated 0x{base:x} to 0x{int(mapped):x}",
+                    )
+                created.append(MaterializedShadowRegion(base=base, size=size, tag=tag))
+                self.mem_write(base, bytes(region.data))
+                self._apply_materialized_shadow_protections(space, base, size, page_size)
+        except Exception as exc:
+            try:
+                self.release_materialized_process_shadow(tuple(created))
+            except Exception:
+                pass
+            if isinstance(exc, ProcessMemoryError):
+                raise
+            raise ProcessMemoryError(
+                ERROR_INVALID_ADDRESS,
+                f"cannot materialize child shadow: {type(exc).__name__}: {exc}",
+            ) from exc
+        return tuple(created)
+
+    def _apply_materialized_shadow_protections(
+        self,
+        space: ProcessAddressSpace,
+        base: int,
+        size: int,
+        page_size: int,
+    ) -> None:
+        """Apply shadow committed/reserved page protections to one mapping."""
+
+        plan: list[tuple[int, int, int]] = []
+        for page in range(base, base + size, page_size):
+            snapshot = space.query(page)
+            if snapshot is None:
+                raise ProcessMemoryError(
+                    ERROR_INVALID_PARAMETER,
+                    f"shadow page 0x{page:x} disappeared during materialization",
+                )
+            if snapshot["state"] == windef.MEM_COMMIT:
+                protect = int(snapshot["protect"])
+                plan.append((page, win_protect_to_emu_perms(protect), protect))
+            else:
+                plan.append((page, common.PERM_MEM_NONE, windef.PAGE_NOACCESS))
+
+        runs: list[list[int]] = []
+        for page, perms, protect in plan:
+            if runs and runs[-1][1] == page and runs[-1][2] == perms and runs[-1][3] == protect:
+                runs[-1][1] = page + page_size
+            else:
+                runs.append([page, page + page_size, perms, protect])
+        for run_start, run_end, perms, protect in runs:
+            self.mem_protect(run_start, run_end - run_start, perms, win_protect=protect)
+
+    def release_materialized_process_shadow(
+        self, regions: Sequence[MaterializedShadowRegion]
+    ) -> None:
+        """Remove every mapping created by :meth:`materialize_process_shadow`.
+
+        A missing mapping is normal: the executing child may have freed it (or
+        the engine may already have unmapped it).  A mapping at the recorded
+        base whose tag no longer starts with ``region.tag`` belongs to another
+        component and is never freed; that is an explicit error.
+
+        Args:
+            regions: Tuple returned by :meth:`materialize_process_shadow`.
+
+        Raises:
+            ProcessMemoryError: ``ERROR_INVALID_ADDRESS`` when a base is owned
+                by a different mapping or a release did not remove our mapping.
+                All supplied regions are still visited so one failure does not
+                leak the remaining mappings.
+        """
+
+        errors: list[ProcessMemoryError] = []
+        for region in regions:
+            base = int(region.base)
+            mm = self.get_address_map(base)
+            if mm is None:
+                continue
+            if not str(getattr(mm, "tag", "")).startswith(region.tag):
+                errors.append(
+                    ProcessMemoryError(
+                        ERROR_INVALID_ADDRESS,
+                        f"mapping at 0x{base:x} is not owned by child shadow {region.tag}",
+                    )
+                )
+                continue
+            try:
+                self.mem_free(base)
+            except Exception as exc:
+                errors.append(
+                    ProcessMemoryError(
+                        ERROR_INVALID_ADDRESS,
+                        f"cannot release child shadow mapping at 0x{base:x}: {exc}",
+                    )
+                )
+                continue
+            if self.get_address_map(base) is not None:
+                errors.append(
+                    ProcessMemoryError(
+                        ERROR_INVALID_ADDRESS,
+                        f"child shadow mapping at 0x{base:x} survived release",
+                    )
+                )
+        if errors:
+            raise errors[0]
 
     def capture_process_runtime_write(self, process: Any, base: int, data: bytes) -> int:
         """Project bytes observed in a process's own runtime memory.

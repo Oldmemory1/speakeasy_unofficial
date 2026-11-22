@@ -193,6 +193,47 @@ def is_virtual_alloc_view(mm: Any) -> bool:
     return mm is not None and not mm.is_image and bool(mm.flags)
 
 
+def emulator_page_win_protection(emu: MemoryManager, address: int) -> int | None:
+    """Return the effective runtime Win32 protection for one emulator page.
+
+    This is the projection source for the child-runtime shadow synchronization
+    (FX12-extended-rv2).  Unlike :func:`current_win_protection`, which always
+    returns a value, an unmapped address reports ``None`` so an executor can
+    fail explicitly instead of inventing a protection.
+
+    Precedence:
+
+    1. the exact per-page ``PAGE_*`` value recorded by image load or
+       ``VirtualProtect`` (``MemoryManager.get_address_win_protection``);
+    2. a private ``VirtualAlloc`` map's ``flProtect`` (``MemMap.flags & 0xFF``);
+    3. the value derived from the effective emulator permissions.
+
+    Args:
+        emu: Emulator memory manager.
+        address: Any address inside the page to inspect.
+
+    Returns:
+        A base ``PAGE_*`` value, or ``None`` when ``address`` is not mapped.
+
+    Side effects:
+        None.  Protection tables are read, not changed.
+    """
+    mm = emu.get_address_map(address)
+    if mm is None:
+        return None
+    protect = emu.get_address_win_protection(address)
+    if protect is not None:
+        return int(protect)
+    if is_virtual_alloc_view(mm):
+        flags = int(mm.flags) & 0xFF
+        if flags:
+            return flags
+    perms = emu.get_address_perms(address)
+    if perms is None:
+        perms = mm.prot
+    return emu_perms_to_win_protect(int(perms))
+
+
 def _resolve_new_protection(base_protect: int, mm) -> int | None:
     """Map a requested base protection to the page's resulting Win32 value.
 
