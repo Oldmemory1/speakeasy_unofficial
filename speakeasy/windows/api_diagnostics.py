@@ -19,6 +19,12 @@ Observation contract
   not alter emulation behaviour.
 * No address, sample SHA or family special cases; no guest memory writes; no
   configuration switches and no environment variables.
+* FX015-extended-rv1 adds two additive read-only fields without changing the
+  schema version: ``return_chain`` on CreateFile observations (ESP-relative
+  words with mapping and loaded-module resolution) and ``release_dispatch`` on
+  COM interfaces (the real ``IUnknown::Release`` slot plus what the guest's
+  ``[interface]`` dereference would target).  Neither changes handler
+  behaviour.
 
 Applicable architecture: pointer-size driven x86/AMD64.  Unknown inputs produce
 explicit fields (``available=False``, ``mapped=False``, ``status="unknown"``)
@@ -113,6 +119,13 @@ def _read_memory(emu: Any, address: int, size: int) -> dict[str, Any]:
         return {"available": False, "error": type(exc).__name__}
 
 
+def _pointer_view(read: dict[str, Any]) -> dict[str, Any]:
+    """Render one ``_read_pointer`` result with a JSON-safe hex value."""
+    if read["available"]:
+        return {"available": True, "value": hex_value(read["value"])}
+    return {"available": False, "error": read["error"]}
+
+
 def _register_names(emu: Any) -> tuple[str, ...]:
     try:
         arch = emu.get_arch()
@@ -191,6 +204,40 @@ def stack_words(emu: Any, count: int = 8) -> list[dict[str, Any]]:
     return words
 
 
+def return_chain(emu: Any, count: int = 8) -> list[dict[str, Any]]:
+    """Describe the ESP-relative return chain at the current handler entry.
+
+    Entry 0 is the caller's return address (the first stack word).  Each
+    readable word carries its mapping and, when it points into a loaded image,
+    the module name and offset, so a stack/return-chain malformation can be
+    re-checked from the report alone.  Bounded, read-only and exception-safe;
+    unreadable words are reported as ``available=False`` instead of raising.
+    """
+    ptr_size = _safe_ptr_size(emu)
+    if ptr_size <= 0:
+        return []
+    try:
+        sp = int(emu.get_stack_ptr())
+    except Exception:
+        logger.debug("scatter diagnostic: stack pointer unavailable", exc_info=True)
+        return []
+    chain: list[dict[str, Any]] = []
+    for index in range(max(0, count)):
+        address = sp + index * ptr_size
+        entry: dict[str, Any] = {"index": index, "address": hex_value(address)}
+        read = _read_pointer(emu, address, ptr_size)
+        if read["available"]:
+            value = read["value"]
+            entry["value"] = hex_value(value)
+            entry["mapping"] = address_map_info(emu, value)
+            entry.update(_module_info(emu, value))
+        else:
+            entry["available"] = False
+            entry["error"] = read["error"]
+        chain.append(entry)
+    return chain
+
+
 def address_map_info(emu: Any, address: Any) -> dict[str, Any]:
     """Describe the emulator mapping that contains ``address`` (read-only)."""
     if not isinstance(address, int):
@@ -215,6 +262,83 @@ def address_map_info(emu: Any, address: Any) -> dict[str, Any]:
         "is_image": bool(getattr(mapping, "is_image", False)),
         "free": bool(getattr(mapping, "free", False)),
     }
+
+
+def _module_info(emu: Any, address: Any) -> dict[str, Any]:
+    """Resolve ``address`` to a loaded module (read-only, best effort).
+
+    Unknown or non-image addresses yield ``module=None`` and ``None`` offsets
+    rather than a guess.  A module-lookup failure is logged at debug level.
+    """
+    info: dict[str, Any] = {
+        "module": None,
+        "module_base": None,
+        "module_size": None,
+        "module_offset": None,
+    }
+    if not isinstance(address, int) or address <= 0:
+        return info
+    get_module = getattr(emu, "get_module_from_addr", None)
+    if not callable(get_module):
+        return info
+    try:
+        module = get_module(address)
+    except Exception:
+        logger.debug("scatter diagnostic: module lookup failed", exc_info=True)
+        return info
+    if module is None:
+        return info
+    name = getattr(module, "name", None) or getattr(module, "mod_name", None)
+    base = getattr(module, "base", None)
+    size = getattr(module, "image_size", None)
+    if isinstance(name, str):
+        info["module"] = name
+    elif name is not None:
+        info["module"] = str(name)
+    info["module_base"] = hex_value(base)
+    info["module_size"] = hex_value(size)
+    if isinstance(base, int):
+        info["module_offset"] = hex_value(address - base)
+    return info
+
+
+def _release_dispatch(emu: Any, base: Any, ptr_size: int) -> dict[str, Any]:
+    """Describe ``IUnknown::Release`` (vtable slot 2) for one interface base.
+
+    COM contract: an interface pointer's first word is its vtable pointer, and
+    slot 2 of that vtable is ``Release``.  Speakeasy maps ``emu.COM.*``
+    interfaces as the vtable itself, so this records both the real emulator
+    slot at ``base + 2 * ptr_size`` and the target the guest would reach by
+    dereferencing ``[base]`` first.  The two disagree when the guest (or the
+    emulator layout) treats the vtable address as the interface pointer; the
+    fields make that observable without changing any COM semantics.
+    """
+    release_offset = 2 * ptr_size
+    first_word = _read_pointer(emu, base, ptr_size)
+    release_address = base + release_offset if isinstance(base, int) else base
+    release_slot = _read_pointer(emu, release_address, ptr_size)
+    dispatch: dict[str, Any] = {
+        "method": "IUnknown::Release",
+        "method_index": 2,
+        "slot_offset": hex_value(release_offset),
+        "interface_pointer": hex_value(base),
+        "release_slot": _pointer_view(release_slot),
+        "release_slot_nonzero": (
+            bool(release_slot["value"]) if release_slot["available"] else None
+        ),
+        "guest_vtable_pointer": _pointer_view(first_word),
+        "guest_release_target_address": None,
+        "guest_release_target": None,
+        "guest_release_target_mapping": None,
+    }
+    if first_word["available"]:
+        target_address = first_word["value"] + release_offset
+        dispatch["guest_release_target_address"] = hex_value(target_address)
+        dispatch["guest_release_target"] = _pointer_view(
+            _read_pointer(emu, target_address, ptr_size)
+        )
+        dispatch["guest_release_target_mapping"] = address_map_info(emu, target_address)
+    return dispatch
 
 
 def com_interface_snapshot(
@@ -275,6 +399,7 @@ def com_interface_snapshot(
                 "size": hex_value(size),
                 "slots": slots,
                 "slots_truncated": bool(isinstance(size, int) and size > max_slots * ptr_size),
+                "release_dispatch": _release_dispatch(emu, base, ptr_size),
             }
         )
     return {
@@ -331,6 +456,7 @@ def observe_create_file(
             "last_error": hex_value(_safe_last_error(emu)),
             "guest": guest_context(emu),
             "stack_words": stack_words(emu, stack_word_count),
+            "return_chain": return_chain(emu, stack_word_count),
         }
     )
     return observation
@@ -532,5 +658,6 @@ __all__ = [
     "observe_get_stock_object",
     "observe_heap_alloc",
     "observe_is_zoomed",
+    "return_chain",
     "stack_words",
 ]
