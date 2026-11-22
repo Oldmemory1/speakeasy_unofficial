@@ -225,6 +225,20 @@ class FailingExecutionHook:
         """Disable the hook without changing synthetic execution state."""
 
 
+class NoProjectionShadow:
+    """Image-shaped shadow view that rejects any runtime-write projection."""
+
+    def __init__(self, base: int, size: int) -> None:
+        """Expose one image region at the synthetic child image base."""
+
+        self.regions = (SimpleNamespace(base=base, size=size, is_image=True),)
+
+    def capture_runtime_write(self, _base: int, _data: bytes) -> int:
+        """Fail if the failed synthetic run is ever projected."""
+
+        raise AssertionError("a failed synthetic run must not project writes")
+
+
 class FailingExecutionEmulator:
     """Set one child run error after recording its run and API count."""
 
@@ -236,6 +250,21 @@ class FailingExecutionEmulator:
         self.run_queue: list[object] = []
         self.runs: list[object] = []
         self.instruction_budget_exhausted = False
+        self.page_size = 0x1000
+        process.address_space = NoProjectionShadow(0x270000, 0x2000)
+
+    def get_executing_process_address_space(self, process: ProcessStub) -> NoProjectionShadow:
+        """Return the synthetic child's explicit shadow view."""
+
+        assert process is self.curr_process
+        return process.address_space  # type: ignore[attr-defined]
+
+    def mem_read(self, address: int, size: int) -> bytes:
+        """Return a stable synthetic runtime image with no byte changes."""
+
+        assert address == 0x270000
+        assert size == 0x2000
+        return b"\x00" * size
 
     def add_code_hook(self, _callback: object, *, begin: int, end: int) -> FailingExecutionHook:
         """Return a no-op hook for the requested child image range."""

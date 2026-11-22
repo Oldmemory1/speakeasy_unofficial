@@ -966,7 +966,54 @@ class WindowsEmulator(BinaryEmulator):
         """
         if process is None or process is self.curr_process:
             return None
+        return self._ensure_process_address_space(process)
 
+    def get_executing_process_address_space(self, process: Any) -> ProcessAddressSpace:
+        """Return the shadow VA view used to project an executing child's writes.
+
+        This is the executor-only companion of
+        :meth:`get_process_address_space`. API handlers must keep treating the
+        current process as the global emulator view, but a child execution
+        backend runs the child in that same shared memory and therefore needs
+        the child's per-process view as the projection target for observed
+        runtime writes (FX12-extended-rv1). The view is seeded by exactly the
+        same rules as :meth:`get_process_address_space`.
+
+        Args:
+            process: Non-``None`` process that is currently executing in the
+                shared emulator memory. The caller is responsible for having
+                installed it as the emulator's current process.
+
+        Returns:
+            The cached or newly seeded :class:`ProcessAddressSpace`.
+
+        Raises:
+            ProcessMemoryError: ``ERROR_INVALID_PARAMETER`` when no process is
+                supplied; otherwise the same explicit seeding failures as
+                :meth:`get_process_address_space`.
+
+        Side effects:
+            Creates and caches ``process.address_space`` on first use. Never
+            maps or changes Unicorn memory and never changes the current
+            process.
+        """
+        if process is None:
+            raise ProcessMemoryError(ERROR_INVALID_PARAMETER, "no process supplied")
+        return self._ensure_process_address_space(process)
+
+    def _ensure_process_address_space(self, process: Any) -> ProcessAddressSpace:
+        """Return the cached process view, seeding it on first use.
+
+        Args:
+            process: Non-``None`` process owning the view.
+
+        Returns:
+            The existing or newly seeded :class:`ProcessAddressSpace`.
+
+        Raises:
+            ProcessMemoryError: Propagated from :meth:`_seed_process_shadow`.
+                A failed seed is never cached.
+        """
         space = getattr(process, "address_space", None)
         if space is None:
             space = ProcessAddressSpace(

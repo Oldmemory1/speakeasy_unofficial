@@ -9,9 +9,11 @@ hooks or alter detector behavior.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from speakeasy.profiler import Run
+from speakeasy.windows.process_memory import ProcessAddressSpace, ProcessMemoryError
 
 from .budget import ExecutionBudgetFactory
 from .models import (
@@ -234,16 +236,41 @@ class EngineChildEntrypointHookBackend:
         return self._emulator.add_code_hook(callback, begin=begin, end=end)
 
 
+@dataclass(frozen=True)
+class _RuntimeImageBackfill:
+    """Prepared projection of one executing child's runtime image pages.
+
+    Attributes:
+        address_space: The child process's per-process shadow view.
+        runtime_base: Address where the child image is mapped in the shared
+            emulator memory. It may differ from the shadow image base because
+            the loader relocates the child image away from its preferred base.
+        image_size: Child PE ``SizeOfImage`` in bytes.
+        page_size: Emulator page size used to slice the runtime snapshot.
+        before: Runtime image bytes captured before the child run.
+    """
+
+    address_space: ProcessAddressSpace
+    runtime_base: int
+    image_size: int
+    page_size: int
+    before: bytes
+
+
 class EngineChildExecutionBackend:
     """Execute one prepared child run through the emulator run queue.
 
     Args:
         emulator: Windows emulator exposing run-queue, start, run history,
-            current-context, and instruction-budget state.
+            current-context, instruction-budget state, page size, and the
+            executor-only ``get_executing_process_address_space`` view.
 
     The backend executes exactly the run prepared by the context manager.  It
     restores the parent instruction-budget flag after the child and never
-    changes parent process or run history.
+    changes parent process or run history.  After the child runs, pages of its
+    mapped image whose runtime bytes changed are projected into the child's
+    per-process shadow view (``AddressSpace / per_process_isolation``); the
+    parent's global view is never modified (FX12-extended-rv1).
     """
 
     def __init__(self, emulator: Any) -> None:
@@ -273,12 +300,15 @@ class EngineChildExecutionBackend:
             Appends the prepared run to the emulator queue and executes it.
             The child's API and instruction counts are observed only through
             ``budget_hooks``.  The parent's instruction-budget flag is restored
-            before returning.
+            before returning.  When a shadow view is available, pages of the
+            child's runtime image that changed during the run are projected
+            into that view; the parent's global memory is never modified.
 
         Raises:
             ChildExecutionRuntimeError: If the run cannot be queued, the
-                emulator reports an execution error, or budget accounting is
-                rejected.
+                emulator reports an execution error, budget accounting is
+                rejected, or an observed runtime write cannot be projected into
+                the child's shadow view.
         """
 
         del target
@@ -319,6 +349,13 @@ class EngineChildExecutionBackend:
                 termination_reason=ChildTerminationReason.INTERNAL_ERROR,
             )
 
+        # FX12-extended-rv1: the child executes in the emulator's shared
+        # memory, so the per-process shadow view is the projection target for
+        # its runtime writes.  Preparing the snapshot before the run and
+        # diffing afterwards captures CPU writes and engine/API-handler writes
+        # without intercepting unrelated memory traffic.
+        backfill = self._prepare_runtime_image_backfill(context.process, image)
+
         start_index = len(self._emulator.runs)
         parent_budget_exhausted = bool(getattr(self._emulator, "instruction_budget_exhausted", False))
         self._emulator.instruction_budget_exhausted = False
@@ -350,6 +387,14 @@ class EngineChildExecutionBackend:
             instruction_hook.disable()
             child_budget_exhausted = bool(getattr(self._emulator, "instruction_budget_exhausted", False))
             self._emulator.instruction_budget_exhausted = parent_budget_exhausted
+            backfill_error: ChildExecutionRuntimeError | None = None
+            try:
+                self._backfill_runtime_image(backfill)
+            except ChildExecutionRuntimeError as exc:
+                # A failed projection must never mask an execution error that
+                # is already propagating; it is reported below when the run
+                # itself completed.
+                backfill_error = exc
 
         try:
             api_count = max(0, int(getattr(context.run, "num_apis", 0)))
@@ -397,6 +442,13 @@ class EngineChildExecutionBackend:
                 kind=ChildFailureKind.RUNTIME,
                 termination_reason=ChildTerminationReason.INVALID_FETCH,
             )
+        if backfill_error is not None:
+            raise ChildExecutionRuntimeError(
+                str(backfill_error),
+                kind=backfill_error.kind,
+                termination_reason=backfill_error.termination_reason,
+                run_indexes=run_indexes,
+            ) from backfill_error
         return ChildExecutionBackendResult(run_indexes=run_indexes)
 
     @staticmethod
@@ -433,6 +485,180 @@ class EngineChildExecutionBackend:
         if "invalid fetch" in error_type or "invalid_fetch" in error_type:
             return ChildTerminationReason.INVALID_FETCH
         return ChildTerminationReason.INTERNAL_ERROR
+
+    def _prepare_runtime_image_backfill(
+        self,
+        process: Any,
+        image: LoadedChildImage,
+    ) -> _RuntimeImageBackfill:
+        """Ensure the child's shadow view and snapshot its runtime image.
+
+        Args:
+            process: Child process installed as the emulator's current process.
+            image: Mapped non-primary child image about to execute.
+
+        Returns:
+            The projection target and the pre-execution runtime image bytes.
+
+        Raises:
+            ChildExecutionRuntimeError: If the child shadow view cannot be
+                seeded (``ProcessMemoryError``) or the runtime image cannot be
+                read.  Both are explicit failures; no bytes are fabricated.
+
+        Side effects:
+            Creates and caches the child's shadow view when it does not exist
+            yet.  This is the same bookkeeping view ``ReadProcessMemory``
+            would create; it never maps Unicorn memory and never executes
+            code.
+        """
+
+        try:
+            space = self._emulator.get_executing_process_address_space(process)
+        except ProcessMemoryError as exc:
+            raise ChildExecutionRuntimeError(
+                f"cannot prepare child shadow view: Win32 error {exc.win_error}: {exc}",
+                kind=ChildFailureKind.RUNTIME,
+                termination_reason=ChildTerminationReason.INVALID_MEMORY,
+            ) from exc
+
+        runtime_base = int(image.image_base)
+        image_size = int(image.module.image_size)
+        page_size = int(self._emulator.page_size or 0)
+        if page_size <= 0:
+            raise ChildExecutionRuntimeError(
+                "child runtime page size is unavailable",
+                kind=ChildFailureKind.RUNTIME,
+                termination_reason=ChildTerminationReason.INTERNAL_ERROR,
+            )
+        return _RuntimeImageBackfill(
+            address_space=space,
+            runtime_base=runtime_base,
+            image_size=image_size,
+            page_size=page_size,
+            before=self._read_runtime_image_bytes(runtime_base, image_size),
+        )
+
+    def _read_runtime_image_bytes(self, base: int, size: int) -> bytes:
+        """Read exactly ``size`` runtime image bytes from shared memory.
+
+        Args:
+            base: Runtime image base in the emulator's shared memory.
+            size: Child PE ``SizeOfImage``.
+
+        Returns:
+            The current runtime image bytes.
+
+        Raises:
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` when the image size
+                is not positive or the engine cannot read the mapped image.
+        """
+
+        if size <= 0:
+            raise ChildExecutionRuntimeError(
+                "child runtime image has no size",
+                kind=ChildFailureKind.RUNTIME,
+                termination_reason=ChildTerminationReason.INVALID_MEMORY,
+            )
+        try:
+            data = bytes(self._emulator.mem_read(base, size))
+        except Exception as exc:
+            raise ChildExecutionRuntimeError(
+                f"cannot read child runtime image at 0x{base:x}: "
+                f"{type(exc).__name__}: {exc}",
+                kind=ChildFailureKind.RUNTIME,
+                termination_reason=ChildTerminationReason.INVALID_MEMORY,
+            ) from exc
+        if len(data) != size:
+            raise ChildExecutionRuntimeError(
+                f"short child runtime image read at 0x{base:x}: "
+                f"{len(data)} of {size} bytes",
+                kind=ChildFailureKind.RUNTIME,
+                termination_reason=ChildTerminationReason.INVALID_MEMORY,
+            )
+        return data
+
+    def _backfill_runtime_image(self, backfill: _RuntimeImageBackfill) -> int:
+        """Project changed runtime image pages into the child shadow view.
+
+        Only pages whose runtime bytes changed between the pre-run snapshot
+        and the post-run image are projected, so a child run that performs no
+        writes backfills nothing.  If the shadow view exists but cannot
+        describe the runtime image (no/duplicate image region or a size
+        mismatch), or a changed page is unmapped/decommitted in the shadow, the
+        failure is explicit instead of silently succeeding.
+
+        Args:
+            backfill: Prepared projection target and pre-run image snapshot.
+
+        Returns:
+            Number of pages projected.
+
+        Raises:
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` for a shadow view
+                that cannot describe the runtime image or a page that the
+                shadow refuses (``ProcessMemoryError``).
+        """
+
+        after = self._read_runtime_image_bytes(backfill.runtime_base, backfill.image_size)
+        changed: list[tuple[int, bytes]] = []
+        for offset in range(0, backfill.image_size, backfill.page_size):
+            page_before = backfill.before[offset : offset + backfill.page_size]
+            page_after = after[offset : offset + backfill.page_size]
+            if page_before != page_after:
+                changed.append((offset, page_after))
+        if not changed:
+            return 0
+
+        shadow_base = self._shadow_image_base(backfill.address_space, backfill.image_size)
+        projected = 0
+        for offset, data in changed:
+            try:
+                backfill.address_space.capture_runtime_write(shadow_base + offset, data)
+            except ProcessMemoryError as exc:
+                raise ChildExecutionRuntimeError(
+                    f"cannot backfill child runtime write at shadow address "
+                    f"0x{shadow_base + offset:x}: Win32 error {exc.win_error}: {exc}",
+                    kind=ChildFailureKind.RUNTIME,
+                    termination_reason=ChildTerminationReason.INVALID_MEMORY,
+                ) from exc
+            projected += 1
+        return projected
+
+    @staticmethod
+    def _shadow_image_base(space: ProcessAddressSpace, image_size: int) -> int:
+        """Return the shadow image-region base matching one runtime image.
+
+        Args:
+            space: Child process's per-process shadow view.
+            image_size: Runtime PE ``SizeOfImage``.
+
+        Returns:
+            The base of the single image region in the shadow view.
+
+        Raises:
+            ChildExecutionRuntimeError: ``INVALID_MEMORY`` when the view holds
+                no image region, more than one image region, or an image region
+                whose size differs from the runtime image.  Runtime page
+                offsets cannot be projected unambiguously in those cases.
+        """
+
+        image_regions = [region for region in space.regions if region.is_image]
+        if len(image_regions) != 1:
+            raise ChildExecutionRuntimeError(
+                f"child shadow view has {len(image_regions)} image regions; "
+                "exactly one is required for runtime backfill",
+                kind=ChildFailureKind.RUNTIME,
+                termination_reason=ChildTerminationReason.INVALID_MEMORY,
+            )
+        region = image_regions[0]
+        if int(region.size) != image_size:
+            raise ChildExecutionRuntimeError(
+                f"child shadow image size 0x{int(region.size):x} does not match "
+                f"runtime image size 0x{image_size:x}",
+                kind=ChildFailureKind.RUNTIME,
+                termination_reason=ChildTerminationReason.INVALID_MEMORY,
+            )
+        return int(region.base)
 
 
 def create_engine_child_scheduler(
