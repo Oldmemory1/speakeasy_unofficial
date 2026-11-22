@@ -865,7 +865,7 @@ class Kernel32(api.ApiHandler):
 
         access, inherit, pid = argv
 
-        proc = next((p for p in emu.get_processes() if p.pid == pid), None)
+        proc = emu.get_process_by_id(pid)
         if not proc:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return 0

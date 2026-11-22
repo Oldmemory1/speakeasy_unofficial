@@ -966,6 +966,36 @@ class WindowsEmulator(BinaryEmulator):
             self.init_processes(self.config.processes)
         return self.processes
 
+    def get_process_by_id(self, pid: int) -> Any | None:
+        """Resolve a PID in the emulated Windows process namespace.
+
+        Search order: configured/modeled processes from :meth:`get_processes`,
+        then the currently executing process installed by
+        :meth:`set_current_process`. The executing process is addressable by
+        PID even though the top-level ``Process`` created by ``run_module()``
+        is not materialized in the configured table.
+
+        Args:
+            pid: Process identifier to resolve.
+
+        Returns:
+            The matching ``Process`` object, or ``None`` when *pid* is neither
+            the current process nor present in ``get_processes()``. Callers map
+            ``None`` to their API-specific failure code; this method never
+            allocates, clones or fabricates a process.
+
+        Side effects:
+            Calls ``get_processes()``, which lazily initializes the configured
+            process table exactly as the existing enumeration APIs do.
+        """
+        for proc in self.get_processes():
+            if proc.pid == pid:
+                return proc
+        current = self.get_current_process()
+        if current is not None and current.pid == pid:
+            return current
+        return None
+
     def get_process_address_space(self, process: Any) -> ProcessAddressSpace | None:
         """Return the shadow VA view for a non-current process.
 
