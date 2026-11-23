@@ -136,6 +136,34 @@
           "description": "Number of calls that the event stands for: this call and the repeats that the profiler leaves out. The event has the ``pos`` and the raw argument values of the first call.",
           "title": "Calls",
           "type": "integer"
+        },
+        "observation": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional semantic interpretation of this API result.\n\nFor environment APIs, may include the selector, resolved value, profile, and whether the selector was known.",
+          "title": "Observation"
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional read-only API-trace provenance.\n\nRecords the caller/return address, calling module, API-return general registers, bounded stack window, argument pointers and their mappings. Added by the FX-016 diagnostic work item; purely observational and omitted when diagnostics are unavailable.",
+          "title": "Provenance"
         }
       },
       "required": [
@@ -234,6 +262,602 @@
       ],
       "title": "ArtifactEncoding",
       "type": "string"
+    },
+    "ChildExecutionBudgetReport": {
+      "additionalProperties": false,
+      "description": "Execution limits inherited from the parent configuration.",
+      "properties": {
+        "source": {
+          "default": "parent_config",
+          "description": "Budget limit source.",
+          "title": "Source",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "description": "Per-run wall-clock limit.",
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "max_api_count": {
+          "description": "Per-run API-call limit.",
+          "title": "Max Api Count",
+          "type": "integer"
+        },
+        "max_instructions": {
+          "description": "Per-run instruction limit; -1 means unlimited.",
+          "title": "Max Instructions",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "timeout_seconds",
+        "max_api_count",
+        "max_instructions"
+      ],
+      "title": "ChildExecutionBudgetReport",
+      "type": "object"
+    },
+    "ChildExecutionBudgetUsageReport": {
+      "additionalProperties": false,
+      "description": "Consumption counters owned by one child run.",
+      "properties": {
+        "timeout_seconds_used": {
+          "default": 0.0,
+          "description": "Elapsed child wall-clock time.",
+          "title": "Timeout Seconds Used",
+          "type": "number"
+        },
+        "api_count_used": {
+          "default": 0,
+          "description": "Emulated API calls consumed.",
+          "title": "Api Count Used",
+          "type": "integer"
+        },
+        "instructions_used": {
+          "default": 0,
+          "description": "Emulated instructions consumed.",
+          "title": "Instructions Used",
+          "type": "integer"
+        }
+      },
+      "title": "ChildExecutionBudgetUsageReport",
+      "type": "object"
+    },
+    "ChildExecutionFailureReport": {
+      "additionalProperties": false,
+      "description": "Structured child-local failure information.",
+      "properties": {
+        "kind": {
+          "description": "Failure boundary classification.",
+          "title": "Kind",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable failure detail.",
+          "title": "Message",
+          "type": "string"
+        },
+        "pc": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Program counter associated with the failure.",
+          "title": "Pc"
+        },
+        "fault_address": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Memory address that faulted, when distinct from the program counter.",
+          "title": "Fault Address"
+        },
+        "access_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Memory access type that faulted: read, write, or fetch.",
+          "title": "Access Type"
+        },
+        "api_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "API active at the failure, when known.",
+          "title": "Api Name"
+        }
+      },
+      "required": [
+        "kind",
+        "message"
+      ],
+      "title": "ChildExecutionFailureReport",
+      "type": "object"
+    },
+    "ChildExecutionOwnership": {
+      "additionalProperties": false,
+      "description": "Correlation metadata for one child execution lineage.",
+      "properties": {
+        "launch_id": {
+          "description": "Stable engine-generated child launch identifier.",
+          "title": "Launch Id",
+          "type": "string"
+        },
+        "root_sample_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SHA-256 of the root input, which remains the report's primary sample identity.",
+          "title": "Root Sample Sha256"
+        },
+        "parent_pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Emulated process that requested the child.",
+          "title": "Parent Pid"
+        },
+        "child_pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Emulated child process identifier.",
+          "title": "Child Pid"
+        },
+        "depth": {
+          "default": 1,
+          "description": "One-based child execution depth.",
+          "title": "Depth",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "launch_id"
+      ],
+      "title": "ChildExecutionOwnership",
+      "type": "object"
+    },
+    "ChildExecutionReport": {
+      "additionalProperties": true,
+      "description": "Stage-one child request summary attached to the root emulation report.",
+      "properties": {
+        "mode": {
+          "default": "model_only",
+          "description": "Child execution integration mode.",
+          "title": "Mode",
+          "type": "string"
+        },
+        "policy": {
+          "additionalProperties": true,
+          "description": "Model-only admission and future execution limits.",
+          "title": "Policy",
+          "type": "object"
+        },
+        "execution_enabled": {
+          "default": false,
+          "description": "Whether child entrypoints were executed.",
+          "title": "Execution Enabled",
+          "type": "boolean"
+        },
+        "request_count": {
+          "default": 0,
+          "description": "Number of recorded launch requests.",
+          "title": "Request Count",
+          "type": "integer"
+        },
+        "eligible_count": {
+          "default": 0,
+          "description": "Number accepted by model-only admission.",
+          "title": "Eligible Count",
+          "type": "integer"
+        },
+        "target_resolved_count": {
+          "default": 0,
+          "description": "Number with trusted target bytes.",
+          "title": "Target Resolved Count",
+          "type": "integer"
+        },
+        "process_object_created_count": {
+          "default": 0,
+          "description": "Number with Process objects.",
+          "title": "Process Object Created Count",
+          "type": "integer"
+        },
+        "thread_queued_count": {
+          "default": 0,
+          "description": "Must remain zero in stage one.",
+          "title": "Thread Queued Count",
+          "type": "integer"
+        },
+        "entrypoint_reached_count": {
+          "default": 0,
+          "description": "Must remain zero in stage one.",
+          "title": "Entrypoint Reached Count",
+          "type": "integer"
+        },
+        "states": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "description": "Counts by request state.",
+          "title": "States",
+          "type": "object"
+        },
+        "requests": {
+          "description": "Recorded process-launch requests in deterministic order.",
+          "items": {
+            "$ref": "#/$defs/ChildExecutionRequestReport"
+          },
+          "title": "Requests",
+          "type": "array"
+        },
+        "results": {
+          "description": "Completed or failed child execution results in launch order.",
+          "items": {
+            "$ref": "#/$defs/ChildExecutionResultReport"
+          },
+          "title": "Results",
+          "type": "array"
+        }
+      },
+      "title": "ChildExecutionReport",
+      "type": "object"
+    },
+    "ChildExecutionRequestReport": {
+      "additionalProperties": true,
+      "description": "Serializable process-launch request and its model-only resolution state.",
+      "properties": {
+        "launch_id": {
+          "description": "Stable engine-generated launch identifier.",
+          "title": "Launch Id",
+          "type": "string"
+        },
+        "source_api": {
+          "description": "Process-launch API that produced this request.",
+          "title": "Source Api",
+          "type": "string"
+        },
+        "parent_pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Requesting emulated process.",
+          "title": "Parent Pid"
+        },
+        "parent_tid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Requesting emulated thread.",
+          "title": "Parent Tid"
+        },
+        "parent_launch_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Parent child launch, if nested.",
+          "title": "Parent Launch Id"
+        },
+        "root_sample_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Root sample identity.",
+          "title": "Root Sample Sha256"
+        },
+        "depth": {
+          "description": "One-based child depth.",
+          "title": "Depth",
+          "type": "integer"
+        },
+        "requested_target": {
+          "description": "Target text captured from the API request.",
+          "title": "Requested Target",
+          "type": "string"
+        },
+        "normalized_target": {
+          "description": "Normalized emulated target path.",
+          "title": "Normalized Target",
+          "type": "string"
+        },
+        "working_directory": {
+          "default": "",
+          "description": "Working directory used for resolution.",
+          "title": "Working Directory",
+          "type": "string"
+        },
+        "command_line": {
+          "default": "",
+          "description": "Complete requested command line.",
+          "title": "Command Line",
+          "type": "string"
+        },
+        "command_sha256": {
+          "description": "SHA-256 of the canonical command line used for duplicate admission.",
+          "title": "Command Sha256",
+          "type": "string"
+        },
+        "target_source": {
+          "description": "self, dropped_file, fixture, or unavailable.",
+          "title": "Target Source",
+          "type": "string"
+        },
+        "target_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SHA-256 of resolved target bytes.",
+          "title": "Target Sha256"
+        },
+        "target_size": {
+          "default": 0,
+          "description": "Resolved target byte count.",
+          "title": "Target Size",
+          "type": "integer"
+        },
+        "target_format": {
+          "default": "unknown",
+          "description": "Resolved file format.",
+          "title": "Target Format",
+          "type": "string"
+        },
+        "target_format_detail": {
+          "default": "unknown",
+          "description": "Detailed target format.",
+          "title": "Target Format Detail",
+          "type": "string"
+        },
+        "target_arch": {
+          "default": "unknown",
+          "description": "Resolved PE architecture.",
+          "title": "Target Arch",
+          "type": "string"
+        },
+        "target_module_type": {
+          "default": "unknown",
+          "description": "Resolved PE module type.",
+          "title": "Target Module Type",
+          "type": "string"
+        },
+        "target_entrypoint_rva": {
+          "default": 0,
+          "description": "Resolved PE entry point RVA.",
+          "title": "Target Entrypoint Rva",
+          "type": "integer"
+        },
+        "target_resolved": {
+          "description": "Whether allowed target bytes were found and parsed.",
+          "title": "Target Resolved",
+          "type": "boolean"
+        },
+        "eligible": {
+          "description": "Whether the model-only admission policy accepted the target.",
+          "title": "Eligible",
+          "type": "boolean"
+        },
+        "state": {
+          "description": "Current model-only request state.",
+          "title": "State",
+          "type": "string"
+        },
+        "process_object_created": {
+          "default": false,
+          "description": "Whether a Process object was created.",
+          "title": "Process Object Created",
+          "type": "boolean"
+        },
+        "created_child_pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "PID assigned by the created object.",
+          "title": "Created Child Pid"
+        },
+        "thread_queued": {
+          "default": false,
+          "description": "Reserved for stage-two execution scheduling.",
+          "title": "Thread Queued",
+          "type": "boolean"
+        },
+        "entrypoint_reached": {
+          "default": false,
+          "description": "Reserved for execution hook evidence.",
+          "title": "Entrypoint Reached",
+          "type": "boolean"
+        },
+        "skip_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Policy or target skip reason.",
+          "title": "Skip Reason"
+        },
+        "rejection_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Admission rejection reason.",
+          "title": "Rejection Reason"
+        }
+      },
+      "required": [
+        "launch_id",
+        "source_api",
+        "depth",
+        "requested_target",
+        "normalized_target",
+        "command_sha256",
+        "target_source",
+        "target_resolved",
+        "eligible",
+        "state"
+      ],
+      "title": "ChildExecutionRequestReport",
+      "type": "object"
+    },
+    "ChildExecutionResultReport": {
+      "additionalProperties": false,
+      "description": "Final result for one controlled child execution.",
+      "properties": {
+        "launch_id": {
+          "description": "Stable engine-generated launch identifier.",
+          "title": "Launch Id",
+          "type": "string"
+        },
+        "ownership": {
+          "$ref": "#/$defs/ChildExecutionOwnership",
+          "description": "Parent/child lineage for the result."
+        },
+        "state": {
+          "description": "Terminal child execution state.",
+          "title": "State",
+          "type": "string"
+        },
+        "outcome": {
+          "description": "High-level child outcome.",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "termination_reason": {
+          "description": "Machine-readable child termination reason.",
+          "title": "Termination Reason",
+          "type": "string"
+        },
+        "budget": {
+          "$ref": "#/$defs/ChildExecutionBudgetReport",
+          "description": "Limits inherited from the parent."
+        },
+        "usage": {
+          "$ref": "#/$defs/ChildExecutionBudgetUsageReport",
+          "description": "Counters consumed by this child."
+        },
+        "run_indexes": {
+          "description": "Report entry-point indexes owned by the child.",
+          "items": {
+            "type": "integer"
+          },
+          "title": "Run Indexes",
+          "type": "array"
+        },
+        "entrypoint_reached": {
+          "default": false,
+          "description": "One-shot entry hook evidence retained independently of terminal state.",
+          "title": "Entrypoint Reached",
+          "type": "boolean"
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChildExecutionFailureReport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Child-local failure; never a substitute for parent outcome."
+        }
+      },
+      "required": [
+        "launch_id",
+        "ownership",
+        "state",
+        "outcome",
+        "termination_reason",
+        "budget",
+        "usage"
+      ],
+      "title": "ChildExecutionResultReport",
+      "type": "object"
     },
     "DataArtifact": {
       "description": "One payload of the report.\n\nThe top-level ``data`` of the report keys each payload by the SHA-256 of its bytes. A ``data_ref``\nfield elsewhere in the report holds such a key.",
@@ -727,6 +1351,74 @@
           "default": null,
           "description": "Interrupt number, for ``unhandled_interrupt``.",
           "title": "Interrupt Num"
+        },
+        "diagnostics": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional read-only fault diagnostics (FX-016).\n\nWhen present, records the fakeout-page marker, the last API call with its call-site/return address, a bounded API tail, and the fault-time register/stack snapshot. Purely observational.",
+          "title": "Diagnostics"
+        },
+        "termination_kind": {
+          "anyOf": [
+            {
+              "const": "process_terminated",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit guest process-termination category, when applicable.",
+          "title": "Termination Kind"
+        },
+        "status_code": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Windows status or exception code associated with the termination.",
+          "title": "Status Code"
+        },
+        "fast_fail_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Windows __fastfail code captured from ECX/RCX.",
+          "title": "Fast Fail Code"
+        },
+        "fast_fail_data": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional Windows __fastfail payload captured from EDX/RDX.",
+          "title": "Fast Fail Data"
         }
       },
       "required": [
@@ -2953,7 +3645,8 @@
         "driver_entry",
         "driver_unload",
         "driver_reinit",
-        "irp"
+        "irp",
+        "child.module_entry"
       ],
       "title": "RunType",
       "type": "string"
@@ -3444,6 +4137,18 @@
       "description": "Payloads of the report, keyed by SHA-256. Each ``data_ref`` field holds a key of this mapping.",
       "title": "Data",
       "type": "object"
+    },
+    "child_execution": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ChildExecutionReport"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Model-only child launch requests and their resolution/admission state."
     },
     "processes": {
       "description": "Processes of the runs and of the events, in the order of ``pid``. A kernel-mode run has no process, so in kernel mode the list has only the targets of memory events.",

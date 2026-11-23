@@ -144,11 +144,17 @@ def test_process_list_has_each_configured_process_one_time(emulator, config):
         return [p.name for p in emu.get_processes() if p is not emu.curr_process]
 
     assert get_names() == configured
-    assert emu.get_processes().count(emu.curr_process) == 1
+    # FX-020 process namespace (authoritative): the top-level current process is
+    # resolvable by pid but is deliberately absent from the enumeration table,
+    # so its count there is 0 rather than 1.
+    assert emu.get_processes().count(emu.curr_process) == 0
+    assert emu.get_process_by_id(emu.curr_process.pid) is emu.curr_process
 
     child = emu.create_process(path="C:\\Windows\\system32\\notepad.exe")
     assert get_names() == [*configured, child.name]
-    assert emu.get_processes().count(emu.curr_process) == 1
+    # Same FX-020 rule after a child exists: still not enumerated twice.
+    assert emu.get_processes().count(emu.curr_process) == 0
+    assert emu.get_process_by_id(emu.curr_process.pid) is emu.curr_process
 
 
 def test_no_other_object_has_the_id_of_a_configured_pid(config):

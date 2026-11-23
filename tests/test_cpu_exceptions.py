@@ -189,7 +189,15 @@ def test_unhandled_interrupt_reports_the_interrupt_instruction(config, arch, dis
         run = se.get_report().runs[0]
         start = code + 1 + len(setup)
         assert run.error is not None
-        assert run.error.type == "unhandled_interrupt"
+        if insn == b"\xcd\x29":
+            # Local __fastfail contract (winemu._hook_interrupt): int 0x29 is a
+            # process-termination fast fail, reported with the local "fast_fail"
+            # error value and the FAST_FAIL_* code, not as a recoverable
+            # unhandled interrupt.
+            assert run.error.type == "fast_fail"
+            assert run.error.fast_fail_code == 7  # FAST_FAIL_FATAL_APP_EXIT
+        else:
+            assert run.error.type == "unhandled_interrupt"
         assert (run.error.pc, run.error.address, run.error.instruction.strip()) == (start, start, instruction)
 
 

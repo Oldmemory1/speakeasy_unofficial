@@ -12,7 +12,7 @@ The tests freeze that contract with a synthetic PE32:
   applied on continuation and the instruction after the illegal opcode runs;
 * negative: the same illegal opcode without a handler, and with
   ``dispatch_handlers`` disabled, still terminates with the original
-  ``Invalid instruction (UC_ERR_INSN_INVALID)`` error;
+  ``ErrorType.INVALID_INSTRUCTION`` (``invalid_instruction``) error;
 * safety: a handler that does not advance Eip terminates via
   ``_SEH_MAX_REPEAT`` instead of re-executing forever.
 """
@@ -22,6 +22,7 @@ from __future__ import annotations
 import struct
 
 from speakeasy import Speakeasy
+from speakeasy.report import ErrorType
 
 IMAGE_BASE = 0x400000
 TEXT_RVA = 0x1000
@@ -234,7 +235,9 @@ def test_illegal_instruction_without_seh_keeps_original_error(config):
 
     entry = report.entry_points[0]
     assert entry.error is not None
-    assert entry.error.type == "Invalid instruction (UC_ERR_INSN_INVALID)"
+    # v2.1.0 ErrorType: the descriptive Unicorn text is replaced by the enum
+    # member (value ``invalid_instruction``).
+    assert entry.error.type == ErrorType.INVALID_INSTRUCTION
     assert entry.error.pc == ILLEGAL_VA_NO_SEH
     assert entry.error.address == ILLEGAL_VA_NO_SEH
     # The instruction after the illegal opcode must not have executed.
@@ -250,7 +253,7 @@ def test_illegal_instruction_dispatch_disabled_keeps_original_error(config):
 
     entry = report.entry_points[0]
     assert entry.error is not None
-    assert entry.error.type == "Invalid instruction (UC_ERR_INSN_INVALID)"
+    assert entry.error.type == ErrorType.INVALID_INSTRUCTION
     assert entry.error.pc == ILLEGAL_VA_WITH_SEH
     assert values["code"] == 0
     assert values["exec"] == 0
@@ -277,7 +280,7 @@ def test_handler_that_does_not_advance_eip_stops_after_repeat_guard(config):
 
     entry = report.entry_points[0]
     assert entry.error is not None
-    assert entry.error.type == "Invalid instruction (UC_ERR_INSN_INVALID)"
+    assert entry.error.type == ErrorType.INVALID_INSTRUCTION
     # The handler ran, but the repeated fault tripped _SEH_MAX_REPEAT (4).
     assert values["count"] == 1 + (4 - 1)
     assert values["exec"] == 0

@@ -498,12 +498,12 @@ def test_free_library_keeps_true_and_records_imalloc_slots(config) -> None:
     imalloc = [item for item in interfaces if item["tag"].startswith("emu.COM.IMalloc")]
     assert imalloc, f"no IMalloc interface in {interfaces}"
     slots = imalloc[0]["slots"]
-    # IUnknown.QueryInterface / AddRef / Release are hooked and non-zero;
-    # the unimplemented IMalloc methods stay zero.
-    assert slots[0]["nonzero"] is True
-    assert slots[1]["nonzero"] is True
-    assert slots[2]["nonzero"] is True
-    assert slots[3]["value"] == "0x0"
+    # IUnknown.QueryInterface / AddRef / Release are hooked and non-zero.
+    # v2.1.0 also implements IMalloc.Alloc/Realloc/Free/GetSize/DidAlloc/
+    # HeapMinimize (com_api), so the whole 9-entry vtable is filled; the slots
+    # past the vtable stay zero.
+    assert all(slots[index]["nonzero"] is True for index in range(9))
+    assert slots[9]["value"] == "0x0"
 
 
 def test_heap_alloc_keeps_mapped_chunk_contract_and_reports_size(config) -> None:
@@ -539,7 +539,9 @@ def test_create_filea_keeps_handle_contract_and_reports(config) -> None:
         buffers={"path": path},
     )
 
-    assert rv == 0x80
+    # v2.1.0 C4 handle allocator: assert the valid-handle contract, not the
+    # old first-handle value 0x80; the observation must report the same handle.
+    assert rv not in (0, INVALID_HANDLE_VALUE)
     observation = _api_event(report, "kernel32.CreateFileA").observation
     assert observation["kind"] == api_diagnostics.OBSERVATION_KIND
     assert observation["diagnostic"] == "create_file"

@@ -176,6 +176,16 @@ def is_same_res_identifier(a: int | str, b: int | str) -> bool:
     return a == b if isinstance(a, int) else isinstance(b, str) and a.upper() == b.upper()
 
 
+# Windows never maps the first 64 KB, and that is what lets a resource API read
+# a low LPCTSTR value as a MAKEINTRESOURCE identifier instead of a pointer (see
+# ApiHandler.normalize_res_identifier). The base-less allocations of this
+# emulator start at the first page, below the boundary, so resource-name
+# strings that handlers hand to guest callbacks are allocated at or above this
+# address instead: a guest then sees the same pointer/identifier split as on
+# Windows.
+RESOURCE_STRING_MIN_ADDRESS = 0x10000
+
+
 # CRITICAL_SECTION contract (winnt.h RTL_CRITICAL_SECTION). LockCount == -1
 # means the structure is unlocked. SpinCount is ULONG_PTR sized.
 CRITICAL_SECTION_UNLOCKED = -1
@@ -258,6 +268,14 @@ def _char_width(handler: Any, ctx: Any) -> int:
     The context name decides the width for an ``ApiContext`` and for the plain
     dict context that the handler contract tests pass; an unnamed context
     falls back to the handler's own ``get_char_width`` (ANSI on error).
+
+    This is the lenient width selection for handlers whose guest-visible
+    spelling is the generic handler name (for example ``MoveFileEx``): an
+    undecorated request keeps ANSI width and does not raise. The FX-005
+    character-width policy, where an undecorated spelling of an A/W API is a
+    resolution failure with its read-only observation, is applied by the
+    handlers that model those names (``GetModuleFileName``,
+    ``GetSystemDirectory``) through ``ApiHandler.get_char_width``.
     """
     name = _ctx_func_name(ctx)
     if name is not None:
@@ -266,6 +284,38 @@ def _char_width(handler: Any, ctx: Any) -> int:
         return handler.get_char_width(ctx)
     except Exception:
         return 1
+
+
+def _export_sentinel_module(emu: Any, mname: str, proc: str) -> Any:
+    """Return the loaded handler module that implements ``mname!proc``.
+
+    A synthetic module can expose an export whose implementation belongs to a
+    different handler module: the ``kernelbase`` facade exposes the ``kernel32``
+    API surface. The dispatch sentinel that ``GetProcAddress`` returns must be
+    keyed to the implementing module, so that the guest call reaches its
+    handler instead of an unbacked ``mname`` miss.
+
+    Returns ``None`` when the module is its own implementer, has no handler for
+    the name, or the implementing module does not expose the export. This is a
+    read-only lookup; it never allocates the sentinel itself.
+    """
+    getter = getattr(emu, "get_api_handler", None)
+    if not callable(getter) or not isinstance(proc, str) or not proc:
+        return None
+    try:
+        handler, func = getter(mname, proc)
+    except Exception:
+        logger.debug("kernel32: handler module lookup failed for %s!%s", mname, proc, exc_info=True)
+        return None
+    if handler is None or func is None:
+        return None
+    handler_module = getattr(handler, "name", None)
+    if not isinstance(handler_module, str) or not handler_module or handler_module.lower() == mname.lower():
+        return None
+    target = emu.get_mod_by_name(handler_module)
+    if target is None or target.get_export_by_name(proc) is None:
+        return None
+    return target
 
 
 def _set_arg_display(ctx: Any, key: int | str, value: Any) -> None:
@@ -340,6 +390,23 @@ def _file_mapping(emu: Any, handle: Any):
     if not callable(getter):
         return None
     return getter(handle)
+
+
+def _windows_visible_processes(emu: Any) -> list[Any]:
+    """Return the processes of the Windows-visible process namespace.
+
+    ``get_processes()`` is the configured process table. Since FX-020 the
+    executing process (the container or the top-level input process) is not
+    materialized there, but the Windows process namespace that the APIs
+    observe still contains it. Append it once, deduplicated by PID, without
+    changing the configured table. The table order stays first, so an existing
+    lookup keeps the same result when a configured process shares the name.
+    """
+    processes = list(emu.get_processes())
+    current = emu.get_current_process()
+    if current is not None and all(p.pid != current.pid for p in processes):
+        processes.append(current)
+    return processes
 
 
 class Snapshot:
@@ -794,7 +861,9 @@ class Kernel32(ExceptionApis, api.ApiHandler):
             if th32ProcessID in [0, emu.get_current_process().pid]:
                 proc = emu.get_current_process()
             else:
-                proc = next((p for p in emu.get_processes() if p.pid == th32ProcessID), None)
+                # Resolve the executing process too: it is absent from the
+                # configured table but still has a Windows-visible PID.
+                proc = emu.get_process_by_id(th32ProcessID)
             if proc is None:
                 # Windows ignores the PID of a snapshot without a module list
                 if dwFlags & CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE:
@@ -807,7 +876,7 @@ class Kernel32(ExceptionApis, api.ApiHandler):
             if dwFlags & CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE:
                 modules = emu.get_peb_modules()
         if dwFlags & CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS:
-            processes = emu.get_processes()
+            processes = _windows_visible_processes(emu)
 
         # TH32CS_SNAPHEAPLIST is not emulated, so a snapshot never has a heap list
         hnd = emu.get_handle_table().new_handle(
@@ -838,7 +907,7 @@ class Kernel32(ExceptionApis, api.ApiHandler):
         if proc.pid == 4:
             return 0
         parent = parents.get(proc.name.lower(), "explorer")
-        return next((p.pid for p in emu.get_processes() if p.name.lower() == parent), 0)
+        return next((p.pid for p in _windows_visible_processes(emu) if p.name.lower() == parent), 0)
 
     def _write_process_entry(self, emu, ctx, pe32, proc):
         cw = _char_width(self, ctx)
@@ -2076,8 +2145,10 @@ class Kernel32(ExceptionApis, api.ApiHandler):
             emu.set_guard_pages(result.start, size, new)
         # A protection that covers a whole private allocation is its allocation
         # protection; a partial range stays per-page so neighbours keep theirs.
+        # Only a map that lies completely inside the changed range takes the
+        # new protection.
         for m in emu.get_mem_maps():
-            if m.base <= result.start and result.end >= m.base + m.size:
+            if m.base >= result.start and result.end >= m.base + m.size:
                 m.prot = new
 
         # The event needs the run that the call belongs to; a handler invoked
@@ -3152,21 +3223,28 @@ class Kernel32(ExceptionApis, api.ApiHandler):
                     rv = emu.resolve_export(mod, reference)
                 else:
                     # FX-013: handler-backed and decoy modules dispatch through
-                    # an import sentinel; a decoy's standard exports are keyed
-                    # to the handler module that implements them.
-                    rv = (
-                        emu.resolve_export(mod, reference)
-                        if ordinal is not None
-                        else emu.resolve_module_export(mod, proc)
-                    )
+                    # an import sentinel. When the export is implemented by a
+                    # different handler module (kernelbase -> kernel32 surface),
+                    # key the sentinel to the implementing module.
+                    sentinel_mod = _export_sentinel_module(emu, mname, proc) if ordinal is None else None
+                    if sentinel_mod is not None:
+                        rv = emu.resolve_module_export(sentinel_mod, proc)
+                    elif ordinal is not None:
+                        rv = emu.resolve_export(mod, reference)
+                    else:
+                        rv = emu.resolve_module_export(mod, proc)
             elif not mod.is_exe() and mod is not getattr(emu, "container_image", None):
-                # fixF: a dynamically loaded guest DLL or a decoy keeps a
-                # dispatch sentinel for a missing export so packer stubs do not
-                # treat the import as unresolved and call ExitProcess. A
-                # synthetic handler module keeps strict Windows NULL semantics
-                # because its export table is the engine's API surface; an
-                # empty synthetic stub module uses its dynamic entries instead.
-                if (
+                # FX-013: a missing export of a loaded non-EXE module is an
+                # engine coverage gap, not a Windows NULL. Every such module
+                # (a guest-loaded PE, a decoy, or the handler-backed synthetic
+                # module such as kernel32) keeps a dispatch sentinel for the
+                # requested name so packer stubs do not treat the import as
+                # unresolved and call ExitProcess. The sentinel routes the
+                # eventual guest call through the handler/signature path.
+                # A NULL handle and the primary EXE keep strict Windows NULL
+                # semantics; an ordinal keeps the previous policy because the
+                # task models undecorated/missing *names*, not missing ordinals.
+                if ordinal is None or (
                     emu.config.modules.functions_always_exist
                     or isinstance(loader, PeLoader)
                     or hasattr(loader, "api_handler_module")
@@ -4612,12 +4690,20 @@ class Kernel32(ExceptionApis, api.ApiHandler):
         """
         hModule, lpFilename, nSize = argv
         size = 0
-        cw = _char_width(self, ctx)
+
+        # FX-005: the width follows the requested A/W spelling through
+        # ``ApiHandler.get_char_width``, which records the read-only
+        # api_name_resolution_diagnostics observation. An undecorated spelling
+        # (for example the runtime ``GetProcAddress`` sentinel target) is not a
+        # valid character-width request; the existing ApiEmuError must be
+        # raised before any process or module state is touched.
+        cw = self.get_char_width(ctx)
 
         filename = ""
         if hModule == 0:
             proc = emu.get_current_process()
-            filename = proc.path
+            if proc is not None:
+                filename = proc.path
         else:
             mods = emu.get_peb_modules()
             cm = emu.get_current_module()
@@ -4629,7 +4715,7 @@ class Kernel32(ExceptionApis, api.ApiHandler):
                         filename = mod.emu_path
 
         if filename:
-            ctx.args["lpFilename"].display = filename
+            _set_arg_display(ctx, "lpFilename", filename)
             out = self.encode_string(filename, cw)
 
             size = int(len(out) / cw)
@@ -4724,14 +4810,16 @@ class Kernel32(ExceptionApis, api.ApiHandler):
         rv = 0
         lpBuffer, uSize = argv
 
-        cw = _char_width(self, ctx)
-        fn = ctx.func_name
+        # FX-005: the width and its observation come from the requested A/W
+        # spelling; an undecorated spelling raises the existing ApiEmuError.
+        cw = self.get_char_width(ctx)
+        fn = _ctx_func_name(ctx) or ""
         if "WindowsDirectory" in fn:
             sysroot = "C:\\Windows"
         else:
             sysroot = "C:\\Windows\\system32"
 
-        ctx.args["lpBuffer"].display = sysroot
+        _set_arg_display(ctx, "lpBuffer", sysroot)
         sysroot += "\x00"
         out = self.encode_string(sysroot, cw)
 
@@ -6079,11 +6167,12 @@ class Kernel32(ExceptionApis, api.ApiHandler):
         """
         dwProcessId, pSessionId = argv
 
-        if pSessionId:
-            for p in emu.get_processes():
-                if p.id == dwProcessId:
-                    self.write_dword(pSessionId, p.session)
-                    return True
+        # The container process is the executing process and is not in the
+        # configured process table; the resolver still finds it by PID.
+        proc = emu.get_process_by_id(dwProcessId)
+        if proc is not None and pSessionId:
+            self.write_dword(pSessionId, proc.session)
+            return True
 
         emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
         return False
@@ -6222,7 +6311,16 @@ class Kernel32(ExceptionApis, api.ApiHandler):
             obj = emu.get_handle_table().get(hHandle)
             if obj is None:
                 emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
-                return windefs.WAIT_FAILED
+                rv = windefs.WAIT_FAILED
+                # FX-016 diagnostics: an unknown handle takes the WAIT_FAILED
+                # path, which is still a wait the guest can examine, so record
+                # its stack and handle provenance before the early return.
+                _scatter_observation(
+                    ctx,
+                    api_trace_diagnostics.attach_observation,
+                    lambda: api_trace_diagnostics.observe_wait_for_single_object(emu, argv, rv),
+                )
+                return rv
         if isinstance(obj, objman.Event):
             return self.wait_for_events(emu, [obj], False, dwMilliseconds)
 
@@ -7154,12 +7252,16 @@ class Kernel32(ExceptionApis, api.ApiHandler):
         """
         Call func once for each ID, with the ID in place of None in args. A string ID is
         passed in a buffer that is valid only during the call.
+
+        The buffer is allocated at or above ``RESOURCE_STRING_MIN_ADDRESS`` so that its
+        address stays out of the MAKEINTRESOURCE range: a callback that passes the name
+        to a resource API (e.g. FindResourceW) gets it decoded as the string it is.
         """
         for id_ in dict.fromkeys(ids):
             buf = 0
             if isinstance(id_, str):
                 data = self.encode_string(id_ + "\0", cw)
-                buf = self.mem_alloc(len(data), tag="api.enum_resource")
+                buf = self.mem_alloc(len(data), base=RESOURCE_STRING_MIN_ADDRESS, tag="api.enum_resource")
                 self.mem_write(buf, data)
             try:
                 rv = yield GuestCall(func, tuple(buf or id_ if a is None else a for a in args))

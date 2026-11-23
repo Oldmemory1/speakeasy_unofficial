@@ -17,6 +17,12 @@ operations:
 
 The manager never changes section protections and never writes the template;
 callers only pass emulator objects that expose the small ``TlsMemory`` surface.
+
+A directory whose template and zero-fill are both empty (a callback-only TLS
+directory) keeps a null per-thread slot by default, matching Wine's
+``alloc_thread_tls``. ``init_thread(..., allocate_empty=True)`` opts a caller
+into the v2.1.0 emulator policy instead: map a minimal non-NULL block so the
+module's TLS callbacks and entry point can use valid per-thread storage.
 """
 
 from __future__ import annotations
@@ -28,6 +34,11 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
+
+# Minimal per-thread block mapped for a data-less (callback-only) TLS directory
+# when ``init_thread(..., allocate_empty=True)`` opts into the v2.1.0 policy.
+# Upstream's ``Thread.init_tls`` maps ``max(len(data), 1)`` for the same reason.
+_EMPTY_TLS_BLOCK_SIZE = 1
 
 
 class TlsError(Exception):
@@ -107,6 +118,7 @@ class _RegisteredDirectory:
 class _ThreadTlsState:
     array: int
     blocks: list[int]
+    allocate_empty: bool = False
 
 
 def _thread_tag(thread: TlsThread) -> str:
@@ -131,6 +143,10 @@ class TlsManager:
           a warning; the caller may still use the returned index.
         * A directory with no template bytes, no zero-fill and no callbacks
           consumes no index (Wine returns FALSE from ``alloc_tls_slot``).
+        * A directory with no template bytes and no zero-fill but with callbacks
+          keeps a null per-thread slot by default (Wine's rule); an explicit
+          ``init_thread(..., allocate_empty=True)`` maps a minimal block instead
+          (the v2.1.0 emulator policy).
         * Memory faults while copying a template propagate from the emulator.
     """
 
@@ -197,20 +213,37 @@ class TlsManager:
         )
         return index
 
-    def init_thread(self, emu: TlsMemory, thread: TlsThread) -> int | None:
+    def init_thread(
+        self,
+        emu: TlsMemory,
+        thread: TlsThread,
+        *,
+        allocate_empty: bool = False,
+    ) -> int | None:
         """Create or refresh one thread's TLS pointer array and blocks.
 
         Returns the address of the ``(module_count * pointer_size)`` array to
         store in ``TEB->ThreadLocalStoragePointer``, or ``None`` when no module
         registered TLS state (the caller must then leave the TEB untouched).
 
+        Args:
+            emu: The emulator memory surface.
+            thread: The thread whose per-thread state is initialised.
+            allocate_empty: Opt into the v2.1.0 emulator policy for a directory
+                whose template and zero-fill are both empty but which publishes
+                callbacks: map a minimal non-NULL block so the callbacks and the
+                entry point use valid per-thread storage. The default ``False``
+                keeps Wine's rule that such a directory gets a null slot.
+
         Repeated calls for the same thread are idempotent unless new modules were
         registered in between; then the array is reallocated with room for the
         new indices while existing slot pointers are preserved (the running
         thread is extended the way Wine extends threads in ``alloc_tls_slot``).
         Each per-module block is a fresh writable emulator mapping; the template
-        itself is only read.  Modules with neither template nor zero-fill keep a
-        null slot, matching Wine's ``alloc_thread_tls``.
+        itself is only read. Modules with neither template nor zero-fill keep a
+        null slot unless ``allocate_empty`` is set. Once a thread has been
+        initialised or upgraded with ``allocate_empty=True`` the policy is
+        sticky for that thread's later empty slots; it is never downgraded.
         """
 
         if not self._entries:
@@ -220,7 +253,12 @@ class TlsManager:
         entry_count = len(self._entries)
         state = self._thread_states.get(thread)
         if state is not None and len(state.blocks) == entry_count:
+            if allocate_empty and not state.allocate_empty:
+                self._fill_empty_blocks(emu, thread, state)
             return state.array
+
+        if state is not None and state.allocate_empty:
+            allocate_empty = True
 
         if state is None:
             blocks: list[int] = []
@@ -241,27 +279,63 @@ class TlsManager:
             emu.mem_write(array, previous + b"\x00" * (array_size - len(previous)))
 
         for entry in self._entries[start_index:]:
-            block = self._allocate_block(emu, thread, entry)
+            block = self._allocate_block(
+                emu, thread, entry, allocate_empty=allocate_empty
+            )
             slot = array + entry.index * ptr_size
             emu.mem_write(slot, block.to_bytes(ptr_size, "little"))
             blocks.append(block)
 
-        self._thread_states[thread] = _ThreadTlsState(array=array, blocks=blocks)
+        self._thread_states[thread] = _ThreadTlsState(
+            array=array, blocks=blocks, allocate_empty=allocate_empty
+        )
         return array
+
+    def _fill_empty_blocks(
+        self,
+        emu: TlsMemory,
+        thread: TlsThread,
+        state: _ThreadTlsState,
+    ) -> None:
+        """Map blocks for slots a previous call left null (opt-in upgrade).
+
+        Only ``init_thread(..., allocate_empty=True)`` reaches here. The array
+        already holds a slot for every registered module, so the slots are
+        patched in place; entries that already have a block are untouched.
+        """
+
+        ptr_size = emu.get_ptr_size()
+        for position, entry in enumerate(self._entries):
+            if state.blocks[position]:
+                continue
+            block = self._allocate_block(emu, thread, entry, allocate_empty=True)
+            slot = state.array + entry.index * ptr_size
+            emu.mem_write(slot, block.to_bytes(ptr_size, "little"))
+            state.blocks[position] = block
+        state.allocate_empty = True
 
     def _allocate_block(
         self,
         emu: TlsMemory,
         thread: TlsThread,
         entry: _RegisteredDirectory,
+        *,
+        allocate_empty: bool = False,
     ) -> int:
-        """Map and populate one module's block for one thread; 0 means no block."""
+        """Map and populate one module's block for one thread; 0 means no block.
+
+        A directory with no template bytes and no zero-fill returns 0 (Wine's
+        ``alloc_thread_tls`` rule) unless ``allocate_empty`` is set, which maps
+        a minimal block for a callback-only directory (the v2.1.0 policy).
+        """
 
         directory = entry.directory
         template_size = directory.template_size
         total_size = template_size + directory.zero_fill
         if total_size == 0:
-            return 0
+            if not allocate_empty:
+                return 0
+            total_size = _EMPTY_TLS_BLOCK_SIZE
 
         block = emu.mem_map(
             total_size,

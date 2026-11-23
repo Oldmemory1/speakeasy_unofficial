@@ -39,11 +39,15 @@ def native_perms(se: Speakeasy, address: int) -> int:
 def test_the_input_exe_decides_if_the_header_and_a_data_section_can_run_code(
     arch: int, nxcompat: bool, dep: bool
 ) -> None:
-    exec_perm = 0 if dep else EXEC
     with load(arch, nxcompat) as se:
         base = se.emu.modules[0].base
-        assert native_perms(se, base) == READ_ONLY | exec_perm
-        assert native_perms(se, base + 0x2000) == READ_WRITE | exec_perm
+        # Local FX-001 is authoritative: image pages are mapped without EXEC even
+        # for a no-DEP process. The deferred protected-fault path grants EXEC to
+        # a readable+writable image page only when code is fetched from it
+        # (tests/test_fx001_image_dep_policy.py); the read-only headers never get
+        # it. The VirtualAlloc view test below keeps the no-DEP exec contract.
+        assert native_perms(se, base) == READ_ONLY
+        assert native_perms(se, base + 0x2000) == READ_WRITE
 
 
 @pytest.mark.parametrize("nxcompat, expected", [(False, READ_WRITE | EXEC), (True, READ_WRITE)])

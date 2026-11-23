@@ -1,5 +1,6 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+import inspect
 import io
 import logging
 import multiprocessing.synchronize
@@ -193,6 +194,29 @@ class DeferredProtectedFault:
     dep_exec_allowed: bool = False
 
 
+class _DeferredFaultError(guest_callbacks.CallbackError):
+    """The unhandled error of a deferred protected fault, with the fault's original error value.
+
+    ``get_error_info`` accepts the local error values as strings, and the
+    protected-read value (``invalid_prot_read``) predates the ``ErrorType``
+    enum, so the error of a declined handler chain keeps the value that the
+    non-dispatched path records.
+    """
+
+    def __init__(self, kind: str | ErrorType, address: int, access_type: str | None, pc: int | None):
+        Exception.__init__(self, f"{kind} at 0x{address:x}")
+        if isinstance(kind, str):
+            try:
+                kind = ErrorType(kind)
+            except ValueError:
+                pass
+        self.kind = kind
+        self.address = address
+        self.access_type = access_type
+        self.pc = pc
+        self.details: dict[str, Any] = {}
+
+
 @dataclass(frozen=True)
 class MaterializedShadowRegion:
     """One per-process shadow region that was given physical backing.
@@ -224,8 +248,24 @@ _PROCESS_ENTRY_CONTEXT_REGS: dict[int, tuple[tuple[int, str], tuple[int, str]]] 
 
 
 def _complete_pending_api_callback(emu: Any) -> None:
-    """Complete a pending callback transition on ``emu``."""
+    """Complete a pending callback transition on ``emu``.
+
+    The local API callback frames (``run.api_callbacks``) come first. A v2.1.0
+    generator guest callback (``run.guest_callbacks``) returns to the same
+    reserved sentinel (``API_CALLBACK_HANDLER_ADDR`` is
+    ``GUEST_CALLBACK_RETURN_ADDR``); when no local frame is pending, continue
+    that guest callback instead of reporting a missing callback. Continuing it
+    resumes the handler generator, so the intercepted API call completes with
+    the callback's ``complete``/return value, as ``setup_callback`` implements
+    it.
+    """
     run = emu.get_current_run()
+    if run is not None and not run.api_callbacks:
+        guest_frames = getattr(run, "guest_callbacks", None)
+        continue_guest_callback = getattr(emu, "_continue_guest_callback", None)
+        if guest_frames and callable(continue_guest_callback):
+            continue_guest_callback()
+            return
     if not run or not run.api_callbacks:
         error = emu.get_error_info(
             "callback_return_without_callback",
@@ -482,8 +522,9 @@ class _SehRepeat:
     """
     The last fault that the guest SEH handlers took, and how many times in a row it occurred.
 
-    A handler that does not fix a fault can make an infinite loop, so the emulator stops the dispatch after the same
-    fault occurs ``MAX_REPEAT`` times in a row.
+    A handler that does not fix a fault can make an infinite loop, so the emulator dispatches the same fault at most
+    ``MAX_REPEAT`` times in a row. The illegal-instruction replay uses the full limit; the memory-fault replay passes
+    one less, as the local FX-002 accounting does.
     """
 
     MAX_REPEAT: ClassVar[int] = 4
@@ -499,12 +540,15 @@ class _SehRepeat:
         self.count = 0
         self.resume_pc = None
 
-    def record(self, fault: tuple[int, int | None]) -> bool:
-        """Count the fault. Return False if it occurred ``MAX_REPEAT`` times in a row."""
+    def record(self, fault: tuple[int, int | None], limit: int | None = None) -> bool:
+        """Count the fault. Return False after ``limit`` dispatches of the same fault in a row.
+
+        The limit defaults to ``MAX_REPEAT``.
+        """
         self.resume_pc = None
         if fault == self.fault:
             self.count += 1
-            return self.count < self.MAX_REPEAT
+            return self.count <= (self.MAX_REPEAT if limit is None else limit)
         self.fault = fault
         self.count = 1
         return True
@@ -668,6 +712,8 @@ class WindowsEmulator(BinaryEmulator):
         # The API entry that the last block jumped to, and the start and size of that block.
         self._api_call_site: tuple[int, tuple[int, int]] | None = None
         self._last_block: tuple[int, int] | None = None
+        # A capstone engine with operand details, for the instruction that a memory fault names.
+        self._fault_disasm_eng: cs.Cs | None = None
         self.call_site_hook: Any | None = None
         # Maps each guard page to the protection that its first access restores. Guard pages have no access.
         self.guard_pages: dict[int, int] = {}
@@ -1359,9 +1405,13 @@ class WindowsEmulator(BinaryEmulator):
                     self.init_teb(thread, self.curr_process.peb)
                 self.init_tls(thread)
 
-        if winemu.EMU_RESERVED <= run.start_addr <= winemu.EMU_RESERVED_END:
-            # A run that starts in the reserved range must fault at its first fetch.
-            self._unmap_reserved_range()
+        # Every run starts with the reserved range unmapped: a fetch from it must fault, so
+        # that an import sentinel dispatches and a return to the return hook ends the run.
+        # The range is mapped only to complete an access that the emulator is handling, and
+        # a run that ends during that handling (for example a handler that exits a thread)
+        # leaves it mapped. Unmap it here so that the next run cannot execute the mapped
+        # sentinel page, including a run that does not start in the reserved range.
+        self._unmap_reserved_range()
 
         self.set_pc(run.start_addr)
         if run.entry_context is not None:
@@ -2715,7 +2765,21 @@ class WindowsEmulator(BinaryEmulator):
         published through ``TEB->ThreadLocalStoragePointer``; the read-only image
         template itself is never written.
         """
-        tls_array = self.tls.init_thread(self, thread)
+        init_thread = self.tls.init_thread
+        # v2.1.0 gives every registered module a writable block, even when its
+        # template and zero fill are empty (a callback-only TLS directory). The
+        # TLS manager keeps the Wine zero-size rule as its default and exposes
+        # the v2.1.0 policy as an explicit ``allocate_empty`` keyword; pass it
+        # only when the installed manager declares the keyword, so this file
+        # works with both TLS manager interfaces.
+        try:
+            parameters = inspect.signature(init_thread).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "allocate_empty" in parameters:
+            tls_array = init_thread(self, thread, allocate_empty=True)
+        else:
+            tls_array = init_thread(self, thread)
         if tls_array is None:
             return
         if thread.teb is None:
@@ -2996,31 +3060,54 @@ class WindowsEmulator(BinaryEmulator):
                     old_sentinel = int.from_bytes(self.mem_read(imp.iat_address, ptr_size), "little")
                 except uc.UcError:
                     continue
-                data_ptr = self.handle_import_data(dll_name, imp.func_name)
+                entry = self._synthetic_data_export_entry(_api_mod, imp.func_name)
+                if entry is not None:
+                    # The handler module gives the export its own storage slot in the
+                    # synthetic image's .data section. Initialize that slot and bind the
+                    # IAT to it, as v2.1.0 does through get_proc/resolve_export, so a
+                    # data initializer never writes through a null storage pointer.
+                    self._initialize_api_data(entry)
+                    data_ptr = entry.address
+                else:
+                    # No synthetic data export: keep the local cell allocation of the
+                    # data handler (B03 _wcmdln/_environ identity contract).
+                    data_ptr = self.handle_import_data(dll_name, imp.func_name)
                 sym = f"{dll_name}.{imp.func_name}"
                 self.global_data[imp.iat_address] = [sym, data_ptr]
                 if data_ptr is not None:
                     self.mem_write(imp.iat_address, data_ptr.to_bytes(ptr_size, "little"))
                 self.import_table.pop(old_sentinel, None)
 
-        # FX-013-extended: a synthesized decoy may declare which engine handler
-        # module implements its standard exports (kernelbase -> kernel32).
-        # Register those exports under the handler module so a guest that
-        # resolves the export by hand and calls its address reaches the real
-        # handler through the intercepted stub.
+        # FX-013-extended: a synthesized module may expose the API surface that
+        # another handler module implements (kernelbase -> kernel32). Register
+        # each handler-backed export under the implementing handler module, so
+        # a guest that resolves the export by hand and calls its address
+        # dispatches through that module's handler.
         if self.api:
             mod_base_name_no_ext = _normalize_mod_name(ntpath.basename(image.emu_path))
             handler_module_name = mod_base_name_no_ext
             if isinstance(getattr(image, "loader", None), SystemModuleDecoyLoader):
                 handler_module_name = image.loader.api_handler_module or handler_module_name
+            is_synthesized = image.source == "synthetic" or isinstance(
+                getattr(image, "loader", None), SystemModuleDecoyLoader
+            )
             for exp in image.exports:
                 if not exp.name:
                     continue
                 _api_mod, func_attrs = self.api.get_export_func_handler(handler_module_name, exp.name)
                 if not func_attrs:
                     _api_mod, func_attrs = self.normalize_import_miss(handler_module_name, exp.name)
+                symbol_module_name = handler_module_name
+                if not func_attrs and is_synthesized:
+                    # The module's own handler does not implement the export:
+                    # resolve it through the same alias/host chain as an API
+                    # call (kernelbase facade -> kernel32 handler).
+                    _api_mod, func_attrs = self.get_api_handler(handler_module_name, exp.name)
+                    handler_name = getattr(_api_mod, "name", None)
+                    if func_attrs and isinstance(handler_name, str) and handler_name:
+                        symbol_module_name = handler_name
                 if func_attrs:
-                    self.symbols[exp.address] = (handler_module_name, exp.name)
+                    self.symbols[exp.address] = (symbol_module_name, exp.name)
 
         for entry in tuple(self.api_registry.entries.values()):
             if entry.export.kind == "data":
@@ -3534,6 +3621,30 @@ class WindowsEmulator(BinaryEmulator):
         entry.binding_name = func_name
         return entry.address
 
+    def _synthetic_data_export_entry(self, handler: Any, func_name: str) -> ApiEntry | None:
+        """Get the registry entry that holds the storage of an imported data export.
+
+        A synthetic handler module gives each data export a slot of its image's
+        ``.data`` section. That slot is the variable's storage: the data initializer
+        writes at it, and the importer and the matching ``__p__*`` accessor must see
+        the same address. Return None when the handler module has no such export, so
+        the caller keeps the local allocation path of the handler.
+
+        Args:
+            handler: The API handler module that implements the data initializer.
+            func_name: Name of the imported variable.
+        """
+        module_name = getattr(handler, "name", None)
+        if not isinstance(module_name, str) or not module_name:
+            return None
+        module = self.get_mod_by_name(module_name)
+        if module is None or module._image.source != "synthetic":
+            return None
+        entry = self.api_registry.lookup(module, func_name)
+        if entry is None or entry.export.kind != "data":
+            return None
+        return entry
+
     def _initialize_api_data(self, entry):
         if not self.is_machine_ready:
             return
@@ -3635,18 +3746,35 @@ class WindowsEmulator(BinaryEmulator):
         return hosts[0]
 
     def _alloc_sentinel(self) -> int:
-        """Allocate the next import-dispatch sentinel address in the reserved range."""
+        """Allocate the next import-dispatch sentinel address in the reserved range.
+
+        A sentinel is a guest-visible pointer, so its whole pointer-sized slot
+        must stay inside ``[EMU_RESERVED, EMU_RESERVED_END)``. The reserved
+        range has a fixed capacity; when it is exhausted this returns 0 and the
+        allocation state does not change, so the sentinels that were already
+        handed out keep their addresses.
+        """
+        ptr_size = self.get_ptr_size()
         addr = self._next_sentinel
-        self._next_sentinel += self.get_ptr_size()
+        if addr < winemu.EMU_RESERVED or addr + ptr_size > winemu.EMU_RESERVED_END:
+            return 0
+        self._next_sentinel = addr + ptr_size
         return addr
 
     def _alloc_import_sentinel(self, mod_name: str, func_name: str) -> int:
-        """Get or create the import sentinel that dispatches ``mod_name!func_name``."""
+        """Get or create the import sentinel that dispatches ``mod_name!func_name``.
+
+        Returns 0 when the reserved sentinel range is exhausted. An entry that
+        already exists for the same symbol keeps its address and is still
+        returned, so exhaustion never moves an earlier sentinel.
+        """
         mod_name = _normalize_mod_name(mod_name)
         for addr, (mod, fn) in self.import_table.items():
             if mod_name == mod and func_name == fn:
                 return addr
         sentinel = self._alloc_sentinel()
+        if not sentinel:
+            return 0
         self.import_table[sentinel] = (mod_name, func_name)
         return sentinel
 
@@ -3660,7 +3788,8 @@ class WindowsEmulator(BinaryEmulator):
         module does not export resolves to an import sentinel in the reserved range;
         the invalid fetch of the sentinel dispatches through the handler/signature
         path. An unknown module that ``modules.stubs`` allows keeps an empty API
-        module, whose dynamic entries live in the module image.
+        module, whose dynamic entries live in the module image; that fixed-size
+        arena refuses with 0 once it is exhausted.
         """
         if isinstance(func_name, int):
             if not 0 < func_name <= 0xFFFF:
@@ -3671,30 +3800,56 @@ class WindowsEmulator(BinaryEmulator):
         if module is None:
             module = self.load_module_by_name(host)
         if module is not None:
+            if (
+                module._image.source == "synthetic"
+                and not module.get_exports()
+                and module is not getattr(self, "container_image", None)
+            ):
+                # A synthetic module without exports has no export table to
+                # extend: each name becomes a dynamic entry of the module's
+                # ``.dyn`` arena, as in upstream. When that arena is exhausted
+                # the lookup refuses with 0 instead of falling back to an
+                # import sentinel, which would report a callable address for an
+                # entry that could not be allocated and defer the failure from
+                # lookup time to call time.
+                return self.resolve_export(module, func_name, allow_dynamic=True)
             address = self.resolve_export(module, func_name, allow_dynamic=False)
             if address:
                 return address
-            if module._image.source == "synthetic" and not module.get_exports() and self.config.modules.stubs:
-                address = self.resolve_export(module, func_name, allow_dynamic=True)
-                if address:
-                    return address
         return self._alloc_import_sentinel(host, func_name)
 
     def _resolve_import_target(self, dll_name: str, func_name: str) -> int:
         """Resolve one import of an image to the address that the IAT receives.
 
         A real PE target executes its own code, so the IAT gets the export's mapped
-        address. A handler/signature target (synthetic module or decoy) has no real
-        code; the IAT gets an import sentinel that dispatches through the engine.
+        address, and a missing export leaves the slot unbound (0) as the Windows
+        loader does. A handler/signature target (synthetic module or decoy) has no
+        real code; a name import of it gets an import sentinel that dispatches
+        through the engine (the FX-013 name contract), while an ordinal import
+        follows the module's mapped export table exactly as
+        ``GetProcAddress(ordinal)`` does.
         """
         host = self.get_import_host(dll_name, func_name)
         module = self.get_mod_by_name(host)
         if module is None:
             module = self.load_module_by_name(host)
         if module is not None:
-            entry = module.get_export_by_name(func_name)
-            if entry is not None and isinstance(getattr(module, "loader", None), PeLoader):
-                return entry.address
+            if isinstance(getattr(module, "loader", None), PeLoader):
+                # A real guest PE executes its own code: bind the export's
+                # mapped address, and leave the IAT slot untouched when the
+                # export is missing (0), as the Windows loader does. Never
+                # invent a handler sentinel for a guest PE.
+                return self.resolve_export(module, func_name, strict=True)
+            # FX-013 keeps name imports of handler-backed modules on dispatch
+            # sentinels, but an ordinal import follows the mapped export table
+            # exactly as GetProcAddress(ordinal) does.
+            if (
+                isinstance(func_name, str)
+                and func_name.startswith("ordinal_")
+                and func_name[8:].isdigit()
+                and any(exp.ordinal == int(func_name[8:]) for exp in module.get_exports())
+            ):
+                return self.resolve_export(module, int(func_name[8:]))
         return self._alloc_import_sentinel(host, func_name)
 
     def handle_import_data(self, mod_name, sym, data_ptr=0):
@@ -3791,6 +3946,11 @@ class WindowsEmulator(BinaryEmulator):
         guest_file = self.fileman.get_file_from_path(guest_path)
         if guest_file is None or getattr(guest_file, "is_dir", False):
             return None
+        # A configured by_ext/default filesystem stub is an I/O decoy, not an
+        # image. get_module_data_from_emu_file() registers such a File on the
+        # first lookup, so a later lookup must still reject it.
+        if getattr(guest_file, "config", None) and getattr(guest_file.config, "mode", None):
+            return None
         pointer = guest_file.tell()
         try:
             data = guest_file.get_contents()
@@ -3817,7 +3977,7 @@ class WindowsEmulator(BinaryEmulator):
                 return mod
         return None
 
-    def resolve_module_export(self, mod: RuntimeModule, func_name: str) -> int:
+    def resolve_module_export(self, mod: RuntimeModule, func_name: str, *, _seen: set | None = None) -> int:
         """Return the guest-callable address of an export in *mod*.
 
         Modules loaded from a real PE image (``PeLoader``: native path,
@@ -3829,13 +3989,50 @@ class WindowsEmulator(BinaryEmulator):
         JIT stubs, so their exports resolve to an import sentinel that
         dispatches through the API implementation.
 
+        A forwarder export is followed to the module that implements its
+        destination, as Windows ``GetProcAddress`` does: a synthetic module can
+        forward to a handler-backed module (``kernel32.GetTickCount``) or to a
+        loaded PE. A cycle, a destination module that cannot be loaded, a
+        destination export that is absent, or a chain longer than 32 hops
+        resolves to 0, which is what Windows returns for a broken forwarder.
+
+        Args:
+            mod: the loaded module whose export table is queried.
+            func_name: the exported name.
+            _seen: the ``(id(module), reference)`` pairs already followed in
+                this resolution chain, for cycle detection.
+
         Raises:
-            KeyError: if *func_name* is not present in the module's export
-                table; callers must use their missing-export policy first.
+            KeyError: if *func_name* is not present in *mod*'s export table;
+                callers must use their missing-export policy first. A missing
+                destination export of a forwarder returns 0 instead.
         """
         entry = mod.get_export_by_name(func_name)
         if entry is None:
             raise KeyError(f"{mod.get_base_name()}!{func_name} is not exported")
+
+        # Windows finds a forwarder by the export directory range in the mapped
+        # header of a real image; a synthetic image records it in the entry.
+        forwarder = entry.forwarder
+        if mod._image.source != "synthetic":
+            directory = self._get_export_directory(mod)
+            if directory is not None:
+                rva, size = directory
+                forwarder = (forwarder or "") if rva <= entry.address - mod.base < rva + size else None
+        if forwarder is not None:
+            seen = set() if _seen is None else _seen
+            key = (id(mod), func_name)
+            if key in seen or len(seen) >= 32:
+                return 0
+            seen.add(key)
+            target = forwarder
+            if mod._image.source != "synthetic":
+                # Windows reads the forwarder from the mapped image when it resolves it.
+                try:
+                    target = self.read_mem_string(entry.address, 1, max_chars=4096)
+                except (uc.UcError, ValueError):
+                    return 0
+            return self._resolve_forwarded_export(target, seen)
 
         loader = getattr(mod, "loader", None)
         if isinstance(loader, PeLoader):
@@ -3850,6 +4047,73 @@ class WindowsEmulator(BinaryEmulator):
             module_name = loader.api_handler_module
         return self._alloc_import_sentinel(module_name, func_name)
 
+    def _resolve_forwarded_export(self, forwarder: str, seen: set) -> int:
+        """Resolve one forwarder target of ``resolve_module_export``.
+
+        ``forwarder`` is the ``dll.export`` (or ``dll.#ordinal``) string of the
+        export directory and ``seen`` holds the ``(id(module), reference)``
+        pairs that the chain already followed. Returns 0 for a malformed
+        string, a destination module or export that cannot be resolved, and for
+        a cycle; those are the Windows ``GetProcAddress`` failure cases of a
+        broken forwarder.
+        """
+        if not isinstance(forwarder, str) or "\x00" in forwarder or "." not in forwarder:
+            return 0
+        dll, name = forwarder.rsplit(".", 1)
+        if not dll or not name:
+            return 0
+        target_name = winemu.normalize_dll_name(module_name(dll))
+        target_module = self.get_mod_by_name(target_name)
+        if target_module is None:
+            try:
+                target_module = self.load_module_by_name(target_name)
+            except (OSError, ValueError, struct.error, uc.UcError, WindowsEmuError) as error:
+                logger.debug("cannot load forwarder target %r: %s", forwarder, error, exc_info=True)
+                return 0
+        if target_module is None:
+            return 0
+
+        reference = int(name[1:]) if name.startswith("#") and name[1:].isdigit() else name
+        if not isinstance(reference, str):
+            # An ordinal target keeps GetProcAddress's ordinal policy: the
+            # mapped export address, or 0 when the module has no such ordinal.
+            return self.resolve_export(target_module, reference, _seen=seen, strict=True)
+        if not isinstance(getattr(target_module, "loader", None), PeLoader):
+            # GetProcAddress keys a handler-backed export's dispatch sentinel to
+            # the module that implements it through the API-alias chain
+            # (kernelbase facade -> kernel32 surface). The forwarded export must
+            # resolve through the same module, or the guest's call would miss as
+            # an unbacked export of the forwarding module.
+            target_module = self._handler_sentinel_module(target_module, reference)
+        try:
+            return self.resolve_module_export(target_module, reference, _seen=seen)
+        except KeyError:
+            logger.debug("forwarder %r names an export the target module does not have", forwarder)
+            return 0
+
+    def _handler_sentinel_module(self, mod: RuntimeModule, func_name: str) -> RuntimeModule:
+        """Return the module whose API handler implements ``mod!func_name``.
+
+        Mirrors the handler-module lookup that ``kernel32.GetProcAddress`` uses
+        for its non-``PeLoader`` branch: a synthesized module can expose an API
+        surface that another handler module implements (kernelbase -> kernel32),
+        and the dispatch sentinel must be keyed to that implementing module.
+        This read-only lookup returns *mod* when *mod* has no handler, the
+        handler is *mod* itself, or the implementing module does not expose the
+        name.
+        """
+        base_name, _ = os.path.splitext(mod.get_base_name())
+        handler, func_attrs = self.get_api_handler(base_name, func_name)
+        handler_name = getattr(handler, "name", None)
+        if handler is None or func_attrs is None or not isinstance(handler_name, str) or not handler_name:
+            return mod
+        if handler_name.lower() == base_name.lower():
+            return mod
+        handler_module = self.get_mod_by_name(handler_name)
+        if handler_module is None or handler_module.get_export_by_name(func_name) is None:
+            return mod
+        return handler_module
+
     def handle_import_func(self, dll, name):
         """Dispatch an API import call intercepted at its sentinel address.
 
@@ -3859,9 +4123,14 @@ class WindowsEmulator(BinaryEmulator):
         """
         self.curr_mod = self.get_mod_from_addr(self.get_pc()) or self.curr_mod
         site, self._api_call_site = self._api_call_site, None
+        call_pc = 0
         if site is not None and site[0] == self.get_pc() and self._last_block is not None:
             call_pc = self._get_last_instruction(*site[1])
-        else:
+        if not call_pc:
+            # The sentinel fetch faults before a block hook runs at its address,
+            # so use the block that transferred control to the sentinel.
+            call_pc = self._get_sentinel_call_site()
+        if not call_pc:
             call_pc = self.prev_pc
         if not call_pc:
             call_pc = self.get_ret_address()
@@ -3897,7 +4166,7 @@ class WindowsEmulator(BinaryEmulator):
 
     def _raise_memory_fault(self, address, access_type):
         """From a Unicorn hook: raise the access violation of an access to unmapped memory."""
-        pc = address if access_type == "fetch" else self.get_pc()
+        pc = address if access_type == "fetch" else self._get_faulting_instruction_pc(address, access_type)
         exception = cpu_exceptions.memory_fault(pc, address, access_type)
         self.raise_cpu_exception(exception, ErrorType(f"invalid_{access_type}"), access_type=access_type)
         return False
@@ -3926,7 +4195,7 @@ class WindowsEmulator(BinaryEmulator):
             interrupt_num=raised.interrupt_num,
         )
         if self._exceptions_dispatch_enabled() and self.dispatch_seh(
-            exception.code, faulting_address, exception=exception
+            exception.code, faulting_address, exception=exception, error=error
         ):
             return
         guest_callbacks.fail(self, error)
@@ -3982,7 +4251,7 @@ class WindowsEmulator(BinaryEmulator):
     def _raise_protection_fault(self, address, access_type):
         """From a Unicorn hook: raise the exception for an access that page protections deny."""
         page = address & ~(self.page_size - 1)
-        pc = address if access_type == "fetch" else self.get_pc()
+        pc = address if access_type == "fetch" else self._get_faulting_instruction_pc(address, access_type)
         perms = self.guard_pages.pop(page, None)
         if perms is not None:
             exception = cpu_exceptions.memory_fault(
@@ -4108,6 +4377,13 @@ class WindowsEmulator(BinaryEmulator):
         impfunc = self.import_table.get(address)
         if impfunc:
             dll_name, func_name = impfunc
+            # The sentinel lives in the reserved range, which stays unmapped so
+            # that a return to the return/exit hooks faults. Unicorn 2.1.4 only
+            # accepts a handled UC_MEM_FETCH_UNMAPPED callback (return True)
+            # when the faulting range is mapped afterwards; otherwise
+            # uc_emu_start raises UC_ERR_MAP. Map it for the dispatch and let
+            # the deferred-work hook unmap it again at the return address.
+            self._map_reserved_range()
             self.handle_import_func(dll_name, func_name)
             return True
 
@@ -5316,11 +5592,15 @@ class WindowsEmulator(BinaryEmulator):
     def _handle_prot_read(self, emu, address, size, value):
         """Deliver a read from a mapped no-access page to the guest chain.
 
-        The exception dispatch is deferred through ``DEFERRED_DISPATCH_ADDR``
-        because Unicorn 2.1.4 crashes when exception structures are mapped from
-        inside a ``UC_MEM_READ_PROT`` callback. Only an unhandled fault becomes
-        ``invalid_prot_read``, with PC/address/instruction/access_type kept.
+        A guard page raises its own exception on the first read, like the
+        execute and write paths. The exception dispatch is deferred through
+        ``DEFERRED_DISPATCH_ADDR`` because Unicorn 2.1.4 crashes when exception
+        structures are mapped from inside a ``UC_MEM_READ_PROT`` callback. Only
+        an unhandled fault becomes ``invalid_prot_read``, with
+        PC/address/instruction/access_type kept.
         """
+        if not self.is_kernel_mode and (address & ~(self.page_size - 1)) in self.guard_pages:
+            return self._raise_protection_fault(address, "read")
         if self._exceptions_dispatch_enabled():
             return self._defer_protected_fault("invalid_prot_read", "read", address)
 
@@ -5355,7 +5635,9 @@ class WindowsEmulator(BinaryEmulator):
         self._deferred_protected_fault = DeferredProtectedFault(
             error_type=error_type,
             access_type=access_type,
-            fault_pc=self.get_pc(),
+            fault_pc=(
+                address if access_type == "fetch" else self._get_faulting_instruction_pc(address, access_type)
+            ),
             address=address,
             context=self.get_thread_context(),
             dep_exec_allowed=dep_exec_allowed,
@@ -5418,11 +5700,15 @@ class WindowsEmulator(BinaryEmulator):
             )
 
         exception = cpu_exceptions.memory_fault(fault.fault_pc, fault.address, fault.access_type)
+        # A declining handler chain keeps the original protected-fault error,
+        # as the non-dispatched path records it.
+        error = _DeferredFaultError(fault.error_type, fault.address, fault.access_type, fault.fault_pc)
         if self.dispatch_seh(
             ddk.STATUS_ACCESS_VIOLATION,
             fault.address,
             deferred_fault=fault,
             exception=exception,
+            error=error,
         ):
             return True
 
@@ -5586,8 +5872,14 @@ class WindowsEmulator(BinaryEmulator):
         faulting_address: int | None,
         *,
         deferred_fault: DeferredProtectedFault | None = None,
+        error: guest_callbacks.CallbackError | None = None,
     ) -> bool:
         """Offer a CPU exception to the guest VEH, SEH and top-level filter.
+
+        ``error`` is the error to end the run with when no handler takes the
+        exception, so a declining VEH/SEH chain keeps the identity of the
+        original fault (its type, pc, address and interrupt number) instead of
+        a generic ``unhandled_exception``.
 
         Returns True when control was transferred to guest code, or when a
         deferred protected access may be retried after its handler restored the
@@ -5596,10 +5888,16 @@ class WindowsEmulator(BinaryEmulator):
         """
         if not self._exceptions_dispatch_enabled():
             return False
-        if not self._seh_repeat.record((self.get_pc(), faulting_address)):
+        # Local FX-002 accounting: the illegal-instruction replay allowed
+        # ``MAX_REPEAT`` handler runs (its own counter stopped the next trap),
+        # while the memory-fault replay stopped on the fourth dispatch.
+        replay_limit = self._seh_repeat.MAX_REPEAT
+        if exception.code != ddk.STATUS_ILLEGAL_INSTRUCTION:
+            replay_limit -= 1
+        if not self._seh_repeat.record((self.get_pc(), faulting_address), replay_limit):
             return False
         try:
-            rv = self.exception_dispatcher().dispatch_fault(self, exception, None)
+            rv = self.exception_dispatcher().dispatch_fault(self, exception, error)
         except guest_callbacks.CallbackError:
             rv = False
         if rv:
@@ -5610,13 +5908,22 @@ class WindowsEmulator(BinaryEmulator):
             return True
         return False
 
-    def dispatch_seh(self, except_code, faulting_address=None, *, deferred_fault=None, exception=None):
+    def dispatch_seh(
+        self,
+        except_code,
+        faulting_address=None,
+        *,
+        deferred_fault=None,
+        exception=None,
+        error=None,
+    ):
         """Deliver a CPU exception to the guest exception chain.
 
         Windows order is VEH, then the SEH chain, then the unhandled-exception
         filter. ``exception`` is the original ``cpu_exceptions.CpuException``
         when the caller has it; a protected-fault snapshot builds one from
-        ``faulting_address`` instead.
+        ``faulting_address`` instead. ``error`` is the error of the run when no
+        handler takes the exception.
 
         Returns:
             True only when a guest handler took the exception (or a deferred
@@ -5627,7 +5934,9 @@ class WindowsEmulator(BinaryEmulator):
             pc = self.get_pc()
             address = pc if faulting_address is None else faulting_address
             exception = cpu_exceptions.memory_fault(pc, address, "read")
-        return self._dispatch_guest_exception(exception, faulting_address, deferred_fault=deferred_fault)
+        return self._dispatch_guest_exception(
+            exception, faulting_address, deferred_fault=deferred_fault, error=error
+        )
 
     def continue_seh(self) -> None:
         """Reset the SEH repeat state after a legacy SEH return sentinel.
@@ -5661,6 +5970,13 @@ class WindowsEmulator(BinaryEmulator):
         return address is one of the reserved control sentinels, the mapped sentinel page
         would otherwise be fetched and its zero bytes executed. Complete the
         SEH/callback transition directly instead.
+
+        ``API_CALLBACK_HANDLER_ADDR`` is also the v2.1.0
+        ``GUEST_CALLBACK_RETURN_ADDR``. A pending local ``run.api_callbacks`` frame is
+        completed first; otherwise a live ``run.guest_callbacks`` frame is continued
+        (the API was tail-called from guest callback code, as user32 CallWindowProc ->
+        DefWindowProc does). With neither frame the run ends with
+        ``callback_return_without_callback``.
         """
         pc = self.get_pc()
         if pc == winemu.SEH_RETURN_ADDR:
@@ -5977,6 +6293,100 @@ class WindowsEmulator(BinaryEmulator):
                 return int(address)
         return 0
 
+    def _get_sentinel_call_site(self) -> int:
+        """Get the address of the call or jump that reached an import sentinel, or 0.
+
+        An import sentinel is unmapped, so its fetch faults before Unicorn translates a block at the sentinel and the
+        block hook records no API call site for it. The last executed block is then the caller, and its last
+        instruction is the call or jump. Return 0 when that instruction is not a control transfer.
+        """
+        if self._last_block is None:
+            return 0
+        address = self._get_last_instruction(*self._last_block)
+        if not address:
+            return 0
+        try:
+            mnemonic, _, _ = self.get_disasm(address, _arch.DISASM_SIZE)
+        except Exception:
+            return 0
+        return address if mnemonic.startswith(("call", "jmp", "lcall", "ljmp")) else 0
+
+    def _get_fault_disassembler(self) -> cs.Cs:
+        """Get the capstone engine with operand details, which decodes the instruction of a memory fault."""
+        if self._fault_disasm_eng is None:
+            engine = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64 if self.get_arch() == _arch.ARCH_AMD64 else cs.CS_MODE_32)
+            engine.detail = True
+            self._fault_disasm_eng = engine
+        return self._fault_disasm_eng
+
+    @staticmethod
+    def _operand_address(insn, operand, registers: dict[str, int], mask: int) -> int | None:
+        """Get the effective address of a memory operand, or None when a register is unknown."""
+        import capstone.x86_const as x86
+
+        base = operand.mem.base
+        index = operand.mem.index
+        try:
+            if base == x86.X86_REG_RIP:
+                value = insn.address + insn.size
+            elif base == x86.X86_REG_INVALID:
+                value = 0
+            else:
+                value = registers[insn.reg_name(base)]
+            if index != x86.X86_REG_INVALID:
+                value += registers[insn.reg_name(index)] * operand.mem.scale
+        except KeyError:
+            return None
+        return (value + operand.mem.disp) & mask
+
+    def _get_faulting_instruction_pc(self, address: int, access_type: str | None) -> int:
+        """Get the pc of the instruction that accesses ``address``, or the pc that Unicorn reports.
+
+        Unicorn reports the start of the translated block in a memory-fault hook when the block was translated
+        without a per-instruction hook. The faulting instruction is one of the instructions of that block, so find
+        the memory operand that covers the faulted address. Only the fault path calls this, so the disassembly does
+        not slow down normal execution.
+        """
+        pc = self.get_pc()
+        if access_type not in ("read", "write"):
+            return pc
+        page_left = self.page_size - (pc & (self.page_size - 1)) if self.page_size else 0x100
+        try:
+            code = bytes(self.mem_read(pc, min(0x100, page_left)))
+        except uc.UcError:
+            return pc
+        import capstone.x86_const as x86
+
+        required = cs.CS_AC_WRITE if access_type == "write" else cs.CS_AC_READ
+        mask = (1 << (self.get_ptr_size() * 8)) - 1
+        registers = self.get_register_state()
+        try:
+            for insn in self._get_fault_disassembler().disasm(code, pc):
+                for operand in insn.operands:
+                    if operand.type != cs.CS_OP_MEM:
+                        continue
+                    if operand.mem.segment in (x86.X86_REG_FS, x86.X86_REG_GS):
+                        # A segmented access needs the descriptor base, which the register state does not give.
+                        continue
+                    if not operand.access & required:
+                        continue
+                    ea = self._operand_address(insn, operand, registers, mask)
+                    if ea is None:
+                        continue
+                    if ea <= (address & mask) < ea + max(operand.size, 1):
+                        return int(insn.address)
+                if (
+                    insn.group(cs.CS_GRP_JUMP)
+                    or insn.group(cs.CS_GRP_CALL)
+                    or insn.group(cs.CS_GRP_RET)
+                    or insn.group(cs.CS_GRP_IRET)
+                    or insn.group(cs.CS_GRP_INT)
+                ):
+                    break
+        except (cs.CsError, KeyError, TypeError, ValueError):
+            return pc
+        return pc
+
     def _hook_code_tracing(self, emu, addr, size):
         """Count the instructions, and the executes of each symbol, section and memory map."""
         try:
@@ -6104,10 +6514,20 @@ class WindowsEmulator(BinaryEmulator):
             tracked = {process.id for process, _ in frame.peb_module_snapshot}
             frame.peb_module_snapshot.extend(item for item in original_peb_modules if item[0].id not in tracked)
             frame.created_modules.extend(new_modules)
-            handler = self.api.load_api_handler("kernel32")
+            # Queue the initializers on the API frame so that
+            # _continue_guest_callback() consults frame.initializers: a DllMain
+            # that returns FALSE then fails the LoadLibrary/LdrLoadDll call and
+            # rolls the load back (v2.1.0 frame model). A generator handler
+            # (setup_callback) drains frame.pending itself and never records an
+            # initializer result, so it cannot fail the load.
+            guests = self.get_current_run().guest_callbacks
             for routine in self.module_loader.collect_initializers():
-                handler.setup_callback(routine.address, routine.args)
                 frame.initializers[routine.address] = routine
+                if any(item is frame for item in guests):
+                    frame.pending.append((routine.address, tuple(routine.args)))
+                else:
+                    self.start_guest_callback(frame, routine.address, routine.args)
+                    guests.append(frame)
         return module.base
     def load_module_by_name(self, name, emu_path=None, base=None, native_path=None, data=None, image_data=None):
         """

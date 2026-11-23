@@ -6,8 +6,10 @@ import ntpath
 import os
 import re
 import subprocess
+import time
 from typing import Any
 
+import pefile
 from unicorn.x86_const import UC_X86_INS_IN, UC_X86_INS_OUT
 
 import speakeasy.windows.common as winemu
@@ -18,10 +20,13 @@ from speakeasy.binemu import BinaryEmulator
 from speakeasy.errors import ConfigError, Win32EmuError, WindowsEmuError
 from speakeasy.memmgr import MemMap
 from speakeasy.profiler import ProcessEntryContext, Run
-from speakeasy.report import FileType, RunType
+from speakeasy.report import ErrorInfo, ErrorType, FileType, RunType
 from speakeasy.windows import objman
 from speakeasy.windows.child_execution import (
     BudgetUsage,
+    ChildExecutionRegistry,
+    ChildTargetResolver,
+    ChildTargetSource,
     ExecutionBudget,
     ParentRunOutcome,
 )
@@ -34,6 +39,7 @@ from speakeasy.windows.loaders import (
     get_prot_string,
 )
 from speakeasy.windows.sessman import SessionManager
+from speakeasy.windows.veh import VectoredExceptionRegistry
 from speakeasy.windows.winemu import MAX_EXPORTS_TO_EMULATE, REPORT_ARCHES, WindowsEmulator, execution_scope
 from speakeasy.winenv.api.usermode.kernel32 import PROCESSOR_COUNT
 from speakeasy.winenv.api.usermode.shell32 import split_command_line
@@ -52,6 +58,76 @@ THISCALL_MEMBER = re.compile(r"^\?.*@@[ABEFIJMNQRUV][FI]*[ABCD]E")
 UNLIMITED_API_CALLS = (1 << 63) - 1
 
 
+class Win32ChildExecutionRegistry(ChildExecutionRegistry):
+    """Child request registry that reports when the v2.1.0 child loop runs children.
+
+    Stage two of the local child model keeps execution disabled, so the
+    ``allow_execution`` property of :class:`ChildExecutionRegistry` is always
+    false and the kernel32 guards refuse the API calls with which a parent
+    prepares a child process (``WriteProcessMemory``, ``ResumeThread``,
+    ``CreateRemoteThread``, ``QueueUserAPC``). The v2.1.0 default runs the
+    children of the input, so those guards must open when the emulator will
+    execute children: ``runs.children`` is set and no local
+    scheduler/dispatcher owns child execution.
+
+    The report summary keeps the stage-two ``execution_enabled`` value,
+    because the summary describes the model-only registry, not the v2.1.0
+    child loop.
+    """
+
+    @property
+    def allow_execution(self) -> bool:
+        """Return whether the v2.1.0 child loop executes the children of the input."""
+        return (
+            self.emu.config.runs.children
+            and self.emu.child_scheduler is None
+            and self.emu.child_dispatcher is None
+        )
+
+    def to_report_dict(self):
+        """Return the stage-two model report of the registry, without the v2.1.0 loop."""
+        data = super().to_report_dict()
+        data["execution_enabled"] = False
+        return data
+
+
+class Win32ChildTargetResolver(ChildTargetResolver):
+    """Resolve a child target from the emulated file system, as v2.1.0 did.
+
+    ``FileManager.add_existing_file`` stages a file that the guest did not
+    write (a configured file, or the child image that a test provides). The
+    model-only resolver classifies only files that the guest wrote as dropped
+    files, so a staged child image would be unavailable to child execution.
+    The v2.1.0 ``create_process`` read every target through the file manager,
+    so resolve the files that are already present there.
+
+    A path that the file manager does not hold stays unavailable: this
+    resolver never materializes a configuration entry, such as the default
+    placeholder file.
+    """
+
+    def resolve(self, path, command_line=None, cwd=None):
+        """Resolve the target, then fall back to a staged file of the file manager."""
+        target = super().resolve(path, command_line, cwd=cwd)
+        if target.resolved or target.reason == "non_pe_target":
+            return target
+        data = self._staged_file_bytes(target.normalized_path)
+        if data is None:
+            return target
+        return self._describe_bytes(ChildTargetSource.DROPPED_FILE, target.normalized_path, data)
+
+    def _staged_file_bytes(self, normalized):
+        """Get the contents of the file that the file manager already holds, or ``None``."""
+        fileman = getattr(self.emu, "fileman", None)
+        if fileman is None:
+            return None
+        staged = fileman.get_file_from_path(normalized)
+        if staged is None:
+            return None
+        data = staged.get_contents()
+        return data or None
+
+
 class Win32Emulator(WindowsEmulator):
     """Emulate a user mode Windows process."""
 
@@ -66,6 +142,102 @@ class Win32Emulator(WindowsEmulator):
         self.argv: list[str] = argv if argv is not None else []
         self.sessman: SessionManager = SessionManager(config, self.handle_allocator)
         self.com: COM = COM(config)
+        # The top-level process that runs the input (FX-020). It is in the
+        # emulator's ``processes`` list, but ``get_processes()`` returns only
+        # the configured process table, so this process stays out of it.
+        self._top_level_process = None
+        # Replace the stage-two registry with one that lets the kernel32
+        # guards prepare children for the v2.1.0 default child loop, and
+        # resolve staged child images from the emulated file system.
+        self.child_execution = Win32ChildExecutionRegistry(
+            self, resolver=Win32ChildTargetResolver(self)
+        )
+
+    def request_process_execution(self, source_api, path, cmdline, cwd=None):
+        """Create a child process and keep the working directory of its launch.
+
+        The legacy model-only path of ``WindowsEmulator`` records ``cwd`` on
+        the child execution request but creates the process without it, so the
+        child PEB would report the directory of the parent. The v2.1.0
+        ``create_process(cd=...)`` call starts the child in ``cwd``, so apply
+        it to the created process.
+
+        A process that the guest launches is a v2.1.0 child: it lives in the
+        shared address space, not in a model-only shadow view (FX-012). See
+        ``get_process_address_space``.
+        """
+        process, request, creation = super().request_process_execution(
+            source_api, path, cmdline, cwd=cwd
+        )
+        if self.child_dispatcher is None and creation.created and process is not None:
+            process._v21_guest_child_process = True
+            if (
+                cwd
+                and getattr(process, "cd", None) != cwd
+                and hasattr(process, "set_process_parameters")
+            ):
+                process.cd = cwd
+                process.set_process_parameters(self)
+        return process, request, creation
+
+    def request_child_process(self, source_api, path, cmdline, cwd=None):
+        """Get the child process of a launch request, and mark the fallback process.
+
+        For a target that the model-only request path rejects, the base
+        implementation creates a compatibility process object. That object is
+        still a v2.1.0 child that lives in the shared address space, so mark it
+        like a created request process.
+        """
+        process, request = super().request_child_process(source_api, path, cmdline, cwd=cwd)
+        if self.child_dispatcher is None and process is not None:
+            process._v21_guest_child_process = True
+        return process, request
+
+    def get_process_address_space(self, process):
+        """Get the address space that the cross-process memory APIs use.
+
+        A child that the guest launched lives in the shared address space of
+        the v2.1.0 child model, as in upstream v2.1.0: ``None`` tells the API
+        handlers to use the global memory. Model-only processes, which the
+        local engine and tests create directly, keep the per-process shadow
+        view of FX-012.
+        """
+        if getattr(process, "_v21_guest_child_process", False):
+            return None
+        return super().get_process_address_space(process)
+
+    @property
+    def veh_registry(self) -> VectoredExceptionRegistry:
+        """Get the vectored exception handler registry of the current process.
+
+        The v2.1.0 child model gives each process its own handlers, so the
+        registry follows ``curr_process``: a new child starts with no handlers,
+        and switching back to a process restores its handlers.
+        """
+        process = self.curr_process
+        if process is None:
+            registry = getattr(self, "_emulator_veh_registry", None)
+            if registry is None:
+                registry = VectoredExceptionRegistry()
+                self._emulator_veh_registry = registry
+            return registry
+        registry = getattr(process, "_veh_registry", None)
+        if registry is None:
+            registry = VectoredExceptionRegistry()
+            process._veh_registry = registry
+        return registry
+
+    @veh_registry.setter
+    def veh_registry(self, registry: VectoredExceptionRegistry) -> None:
+        self._emulator_veh_registry = registry
+
+    def get_processes(self):
+        """Get the configured process table, without the top-level input process (FX-020)."""
+        processes = list(self.processes)
+        top = self._top_level_process
+        if top is not None:
+            processes = [proc for proc in processes if proc is not top]
+        return processes
 
     def get_command_line(self):
         """Get the command line of the current process, or an empty string if there is no process."""
@@ -318,8 +490,13 @@ class Win32Emulator(WindowsEmulator):
         Add the runs of a loaded module to the run queue, and run the queue.
 
         The runs include the TLS callbacks and the entry point of the module, and its exports when
-        ``runs.exports`` is true or ``all_entrypoints`` is set. ``emulate_children`` drains the child
-        execution scheduler installed on the emulator after the parent finishes.
+        ``runs.exports`` is true or ``all_entrypoints`` is set. With ``runs.children``, the child
+        processes that the module creates run after the parent.
+
+        A local child execution scheduler or dispatcher, when installed, owns child execution: its
+        drain runs after the parent when ``runs.children`` is true, and ``emulate_children`` drains
+        it explicitly. Without one, the v2.1.0 child loop of this module runs the child processes
+        when ``runs.children`` is true.
 
         Args:
             module: Module to emulate.
@@ -334,10 +511,17 @@ class Win32Emulator(WindowsEmulator):
         )
 
         # The main module gets a new process if there is no container process.
+        # The top-level process is the executing process, not a configured process:
+        # ``get_processes()`` is the enumeration namespace, and
+        # ``get_process_by_id()`` resolves the executing process through
+        # ``get_current_process()`` (FX-020). The child loop and the upstream
+        # tests find the process in ``processes``, so get_processes() filters
+        # this one process out of the enumeration.
         if self.curr_process is None:
             cmdline = self.get_main_command_line(module.emu_path)
             p = objman.Process(self, path=module.emu_path, base=module.base, pe=module, cmdline=cmdline)
             self.processes.append(p)
+            self._top_level_process = p
             self.curr_process = p
             self.init_crt_command_line()
             self.get_object_manager("process registration").add_object(p)
@@ -376,9 +560,123 @@ class Win32Emulator(WindowsEmulator):
         # Begin emulation of main module
         self.start()
 
-        if emulate_children:
-            self._drain_child_scheduler()
-        return
+        if self.child_scheduler is not None or self.child_dispatcher is not None:
+            # The local production scheduler/dispatcher owns the child queue.
+            # ``runs.children`` is the upstream contract for running the
+            # children after the parent; ``emulate_children`` is the explicit
+            # local override for the same drain.
+            if emulate_children or self.config.runs.children:
+                self._drain_child_scheduler()
+            return
+
+        # Without a local scheduler or dispatcher, the v2.1.0 default child
+        # execution runs the queued child processes.
+        if not self.config.runs.children or not self.child_processes:
+            return
+        self._run_child_processes()
+
+    def _run_child_processes(self) -> None:
+        """Run the child processes of the input in FIFO order, as v2.1.0 does.
+
+        All processes share one address space. Before a child loads, the
+        process that ran before gives up its image, PEB and heap, so that the
+        child loads at its preferred base and gets its own PEB and heap. It
+        also closes its handles, so a named object that only it had open, such
+        as a mutex, is gone when the child looks for it.
+
+        Side effects:
+            Pops each runnable child from ``child_processes``, loads its image,
+            records a skipped child as an error, and runs its runs. When
+            ``limits.total_time`` is exhausted, cancels the remaining runs and
+            reports how many children did not run.
+        """
+        budget = self._execution_budget
+        assert budget is not None
+        not_run = 0
+        finished = self.curr_process
+        while self.child_processes and not budget.exhausted:
+            child = self.child_processes.pop(0)
+            # The load of a child counts against limits.total_time. Each load maps and
+            # protects memory, and this gets slow when many children ran before.
+            started = time.monotonic()
+            try:
+                if not child.pe_data:
+                    self._skip_child_process(child, "no PE image in the emulated file system")
+                    continue
+
+                if finished is not None:
+                    self._free_process_memory(finished)
+                    finished.handles.close_all()
+                    finished = None
+
+                self.curr_process = child
+                self.curr_thread = child.threads[0]
+                self.init_crt_command_line()
+
+                try:
+                    image = PeLoader(data=child.pe_data).make_image()
+                    image.name = os.path.splitext(ntpath.basename(child.path))[0]
+                    image.emu_path = child.path
+                    child.pe = self.load_image(image)
+                except (WindowsEmuError, ValueError, pefile.PEFormatError) as error:
+                    self._skip_child_process(child, str(error))
+                    continue
+
+                child.base = child.pe.base
+                self.curr_thread.stack_base = self.stack_base
+                self.curr_thread.stack_commit = child.pe.stack_commit
+                self.alloc_peb(child)
+                self.init_peb([m for m in self.get_peb_modules() if m.is_dll()], proc=child)
+                for run in self.prepare_module_for_emulation(child.pe):
+                    run.thread = self.curr_thread
+            finally:
+                exhausted = budget.add(time.monotonic() - started)
+
+            if exhausted:
+                # The load used up the time, so the queued runs of this child do not start.
+                self._cancel_execution_runs()
+                not_run = 1
+                break
+            self.get_object_manager("thread registration").add_object(self.curr_thread)
+            self.start()
+            finished = child
+
+        not_run += len(self.child_processes)
+        if not_run and self.profiler:
+            noun = "process" if not_run == 1 else "processes"
+            self.profiler.record_error_event(
+                ErrorInfo(type=ErrorType.TOTAL_TIME_LIMIT, context_summary=f"{not_run} child {noun} did not run")
+            )
+
+    def _skip_child_process(self, child, reason):
+        """Log a warning and add a child_process_skipped error for a child process that does not run."""
+        path = getattr(child, "path", "") or ""
+        logger.warning("skipping child process %s: %s", path, reason)
+        if self.profiler:
+            self.profiler.record_error_event(
+                ErrorInfo(
+                    type=ErrorType.CHILD_PROCESS_SKIPPED,
+                    pid=getattr(child, "pid", None),
+                    context_summary=f"{path}: {reason}",
+                )
+            )
+
+    def _free_process_memory(self, process):
+        """
+        Unmap the image, PEB, loader list and heap blocks of a process that finished.
+
+        Memory that API handlers keep a pointer to stays mapped.
+        """
+        if process.pe in self.modules:
+            self.module_loader.discard_module(process.pe)
+        addresses = [process.peb.address, process.peb.object.ProcessParameters]
+        if process.is_peb_active:
+            addresses += [process.peb_ldr_data.address] + [entry.address for entry in process.ldr_entries]
+        addresses += [m.base for m in self.maps if m.process is process and (m.tag or "").startswith("api.heap")]
+        process.is_peb_active = False
+        process.remove_all_modules_from_peb()
+        for address in addresses:
+            self.mem_free(address)
 
     def _drain_child_scheduler(self) -> None:
         """Drain admitted children through the sole production scheduler.
@@ -537,9 +835,10 @@ class Win32Emulator(WindowsEmulator):
         self.add_run(run)
 
         # The shellcode gets a new process if there is no container process.
+        # As with ``run_module``, the top-level process that executes the input is
+        # not part of the configured process table (FX-020).
         if self.curr_process is None:
             p = objman.Process(self, cmdline=self.get_main_command_line(""))
-            self.processes.append(p)
             self.curr_process = p
             self.init_crt_command_line()
         if self.input is not None:
@@ -725,6 +1024,10 @@ class Win32Emulator(WindowsEmulator):
         The container image is the image of the entry in ``processes`` of the config that
         has ``is_main_exe`` set. If the config has no such entry, do nothing.
 
+        The container process becomes the current process, but it is not added to the
+        configured process table (``get_processes()``). ``get_process_by_id()`` resolves it
+        through ``get_current_process()``, so an API that opens the current PID still works.
+
         Raises:
             WindowsEmuError: if the machine is not initialized, or the container is already loaded.
             OutOfMemoryError: if, on x86, the container image does not fit below the TEB.
@@ -752,7 +1055,10 @@ class Win32Emulator(WindowsEmulator):
             cmdline=self.get_main_command_line(entry.path, entry.command_line),
             session=entry.session or 0,
         )
-        self.processes.append(process)
+        # The container process executes the input, but it is not a configured process:
+        # ``get_processes()`` is the enumeration namespace, and
+        # ``get_process_by_id()`` resolves the container through
+        # ``get_current_process()`` (FX-020).
         self.curr_process = process
         self.init_crt_command_line()
         return process

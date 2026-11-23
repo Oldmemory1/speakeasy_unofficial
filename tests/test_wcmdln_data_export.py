@@ -298,7 +298,9 @@ def _text_unmapped_read(is_64: bool) -> bytes:
 def _run_pe(config, pe: bytes, command_line: str | None = None):
     cfg = config
     if command_line is not None:
-        cfg["command_line"] = command_line
+        # v2.1.0 config schema: the command line is part of the process
+        # environment (``ProcessEnvironmentConfig``), not a top-level key.
+        cfg["process"]["command_line"] = command_line
     se = Speakeasy(config=cfg, argv=[])
     try:
         module = se.load_module(data=pe)

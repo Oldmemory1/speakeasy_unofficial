@@ -1,8 +1,36 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from speakeasy.windows.win32 import Win32Emulator
+
+
+class _EmuFile:
+    """File double with the ``File.get_contents()`` contract.
+
+    v2.1.0 resolves module data through ``FileManager.get_file_by_path()`` and
+    reads it with ``File.get_contents()``, which keeps the guest file pointer.
+    """
+
+    def __init__(self, data: object | None) -> None:
+        self.data = data
+
+    def get_contents(self):
+        if self.data is None:
+            return None
+        return self.data.getvalue()
+
+
+class _FileManagerStub:
+    """Minimal file manager: one emulated file, no host filesystem access."""
+
+    def __init__(self, data: object | None) -> None:
+        self.data = data
+
+    def get_file_from_path(self, _path: str):
+        return _EmuFile(self.data)
+
+    def get_file_by_path(self, path: str):
+        # Mirror FileManager.get_file_by_path: resolve the emulated file by path.
+        return self.get_file_from_path(path)
 
 
 class ModuleDataHarness(Win32Emulator):
@@ -11,9 +39,7 @@ class ModuleDataHarness(Win32Emulator):
     def __init__(self, data: object | None) -> None:
         """Create a file manager returning one emulated file."""
 
-        self.fileman = SimpleNamespace(
-            get_file_from_path=lambda _path: SimpleNamespace(data=data)
-        )
+        self.fileman = _FileManagerStub(data)
 
     def does_file_exist(self, path: str) -> bool:
         """Report the supplied path as present without host filesystem access."""

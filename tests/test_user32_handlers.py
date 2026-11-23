@@ -67,7 +67,11 @@ def test_timer_messages_rotate_and_stop_after_kill_timer(dll_emu: Speakeasy) -> 
     assert call(dll_emu, "user32", "KillTimer", [0, first])[0]
     assert [get_timer_message(dll_emu)[1] for _ in range(2)] == [second, second]
     call(dll_emu, "user32", "KillTimer", [0, second])
-    assert not call(dll_emu, "user32", "GetMessageA", [alloc(dll_emu, b"\x00" * 0x30), 0, 0, 0])[0]
+    # Local GUI pump (authoritative: test_gui_message_queue): an empty queue
+    # exposes one bounded WM_NULL idle wakeup (TRUE) instead of returning FALSE.
+    buf = alloc(dll_emu, b"\x00" * 0x30)
+    assert call(dll_emu, "user32", "GetMessageA", [buf, 0, 0, 0])[0]
+    assert read_msg(dll_emu, buf)[1] == u32defs.WM_NULL
 
 
 WM_QUIT = 0x12
@@ -94,14 +98,17 @@ def test_get_message_returns_a_posted_message(dll_emu: Speakeasy) -> None:
     assert call(dll_emu, "user32", "PostMessageW", [0, WM_USER + 1, 1, 2])[0]
     assert get_message(dll_emu) == (1, (hwnd, WM_USER, 0x64, 0x1F4))
     assert get_message(dll_emu) == (1, (0, WM_USER + 1, 1, 2))
-    assert get_message(dll_emu)[0] == 0
+    # Local GUI pump: the empty queue gives the bounded WM_NULL idle wakeup
+    # (TRUE, no posted message) instead of FALSE.
+    assert get_message(dll_emu) == (1, (0, u32defs.WM_NULL, 0, 0))
 
 
 def test_post_message_to_an_unknown_window_fails(dll_emu: Speakeasy) -> None:
     start_process(dll_emu)
     assert call(dll_emu, "user32", "PostMessageA", [0x41420000, WM_USER, 0, 0])[0] == 0
     assert dll_emu.emu.get_last_error() == 1400
-    assert get_message(dll_emu)[0] == 0
+    # Nothing was posted, so GetMessage returns the local WM_NULL idle wakeup.
+    assert get_message(dll_emu) == (1, (0, u32defs.WM_NULL, 0, 0))
 
 
 def test_post_thread_message_queues_a_message_without_a_window(dll_emu: Speakeasy) -> None:
@@ -111,7 +118,8 @@ def test_post_thread_message_queues_a_message_without_a_window(dll_emu: Speakeas
     assert call(dll_emu, "user32", "PostThreadMessageW", [tid + 0x1000, WM_USER, 5, 6])[0] == 0
     assert dll_emu.emu.get_last_error() == 1444
     assert get_message(dll_emu) == (1, (0, WM_USER, 3, 4))
-    assert get_message(dll_emu)[0] == 0
+    # After the posted message, the empty queue gives the WM_NULL idle wakeup.
+    assert get_message(dll_emu) == (1, (0, u32defs.WM_NULL, 0, 0))
 
 
 def test_post_thread_message_accepts_a_thread_from_create_thread(dll_emu: Speakeasy) -> None:
@@ -120,7 +128,9 @@ def test_post_thread_message_accepts_a_thread_from_create_thread(dll_emu: Speake
     assert call(dll_emu, "kernel32", "CreateThread", [0, 0, 0x1000, 0, 0, tid_ptr])[0]
     tid = int.from_bytes(dll_emu.mem_read(tid_ptr, 4), "little")
     assert call(dll_emu, "user32", "PostThreadMessageA", [tid, WM_USER, 3, 4])[0]
-    assert not get_message(dll_emu)[0]
+    # The message went to the new thread's queue; this thread's empty queue
+    # gives the local WM_NULL idle wakeup, not the other thread's message.
+    assert get_message(dll_emu) == (1, (0, u32defs.WM_NULL, 0, 0))
 
 
 def test_get_message_returns_zero_for_wm_quit(dll_emu: Speakeasy) -> None:
@@ -137,7 +147,10 @@ def test_get_message_takes_the_first_message_that_matches_the_filter(dll_emu: Sp
     call(dll_emu, "user32", "PostThreadMessageA", [call(dll_emu, "kernel32", "GetCurrentThreadId", [])[0], 0x10, 3, 0])
     assert get_message(dll_emu, hwnd=second) == (1, (second, WM_USER + 1, 2, 0))
     assert get_message(dll_emu, hwnd=0xFFFFFFFF) == (1, (0, 0x10, 3, 0))
-    assert get_message(dll_emu, low=WM_USER + 1, high=WM_USER + 2)[0] == 0
+    # No queued message matches the filter, so the local GUI pump returns the
+    # bounded WM_NULL idle wakeup (outside the filter) and leaves the queue
+    # untouched; the next call still gets the first posted message.
+    assert get_message(dll_emu, low=WM_USER + 1, high=WM_USER + 2) == (1, (0, u32defs.WM_NULL, 0, 0))
     assert get_message(dll_emu, low=WM_USER, high=WM_USER) == (1, (first, WM_USER, 1, 0))
 
 

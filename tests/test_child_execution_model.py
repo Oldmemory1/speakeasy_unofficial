@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 
 import speakeasy.winenv.arch as _arch
-from speakeasy.profiler_events import PROC_CREATE
+# v2.1.0 event model: the module-level PROC_CREATE constant is replaced by
+# ``EventType.PROCESS_CREATE``.
+from speakeasy.profiler_events import EventType
 from speakeasy.report import Report
 from speakeasy.windows.child_execution import (
     ChildExecutionPolicy,
@@ -96,6 +98,12 @@ class FakeEmu:
         self.child_creation_available = True
         self.child_creation_reason = "target_unavailable"
         self.child_creation_pid_override = None
+        # v2.1.0: handlers share the emulator-wide handle allocator (C4);
+        # Kernel32/Shell32/AdvApi32 build their handle tables from it.
+        self.handle_allocator = HandleAllocator()
+        # v2.1.0 ``Kernel32.__init__`` derives its boot time from the emulator
+        # start timestamp; this double does not emulate the clock.
+        self.start_time = 0
 
     def get_arch(self):
         return self._arch
@@ -319,7 +327,9 @@ def test_complete_dropped_file_is_modeled_as_resolved(load_test_bin):
 def test_dropped_file_mapping_uses_exact_path_and_full_bytes(load_test_bin):
     data = load_test_bin("argv_test_x86.exe.xz")
     target_path = r"C:\Windows\Temp\dropped.exe"
-    dropped = File(HandleAllocator(), target_path, data=data)
+    # v2.1.0 ``File(path, config=None, data=b"")``: the old leading allocator
+    # argument is gone.
+    dropped = File(target_path, data=data)
     dropped.bytes_written = len(data)
     dropped.seek(17, os.SEEK_SET)
     emu = FakeEmu(b"MZ")
@@ -661,7 +671,7 @@ def test_winexec_created_process_returns_success_with_created_pid():
     assert result == 32
     assert emu.last_error is None
     assert [process.pid for process in emu.child_processes] == [FakeProcess.pid]
-    assert events == [(FakeProcess.pid, PROC_CREATE)]
+    assert events == [(FakeProcess.pid, EventType.PROCESS_CREATE)]
 
 
 def test_winexec_rejects_creation_result_with_invalid_created_pid():
@@ -721,7 +731,11 @@ def test_stage_one_resume_thread_does_not_queue_child():
         get_context=lambda: SimpleNamespace(Eip=0x401000, Eax=0),
     )
     emu.child_processes.append(proc)
-    emu.get_object_from_handle = lambda handle: thread
+    # v2.1.0 checks Process.is_modified before the child-execution guard.
+    proc.is_modified = True
+    # v2.1.0 resolves handles through the process handle table
+    # (``get_handle_table().get(h, type)``) instead of ``get_object_from_handle``.
+    emu.get_handle_table = lambda: SimpleNamespace(get=lambda handle, *types: thread)
     emu.resume_thread = lambda obj: False
     emu.child_execution = SimpleNamespace(allow_execution=False)
     emu.create_thread = lambda *args, **kwargs: pytest.fail("child thread was queued")
@@ -740,6 +754,12 @@ def test_stage_one_thread_injection_does_not_queue_child():
     child_thread = SimpleNamespace(process=proc)
     emu.child_processes.append(proc)
     emu.child_execution = SimpleNamespace(allow_execution=False)
+    # Both handle-lookup APIs are exercised: CreateRemoteThread uses the
+    # process handle table (v2.1.0), QueueUserAPC still uses
+    # ``get_object_from_handle``.
+    emu.get_handle_table = lambda: SimpleNamespace(
+        get=lambda handle, *types: proc if handle == 0x400 else child_thread
+    )
     emu.get_object_from_handle = lambda handle: proc if handle == 0x400 else child_thread
     emu.set_last_error = lambda error: None
     emu.create_thread = lambda *args, **kwargs: pytest.fail("child thread was queued")

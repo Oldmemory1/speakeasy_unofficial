@@ -28,6 +28,7 @@ from speakeasy.windows import api_diagnostics, api_trace_diagnostics
 GET_TICK_COUNT = 0
 WAIT_OBJECT_0 = 0x00000000
 WAIT_TIMEOUT = 0x00000102
+WAIT_FAILED = 0xFFFFFFFF
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +497,8 @@ def test_set_last_error_keeps_none_return_and_records_provenance(config) -> None
     assert emu.get_last_error() == 0x5A
 
     event = _api_event(report, "kernel32.SetLastError")
-    assert event.ret_val is None
+    # v2.1.0 report model: ApiEvent.return_value replaces the local ret_val alias.
+    assert event.return_value is None
     observation = event.observation
     assert observation["kind"] == api_trace_diagnostics.PROVENANCE_KIND
     assert observation["diagnostic"] == "set_last_error"
@@ -509,7 +511,12 @@ def test_set_last_error_keeps_none_return_and_records_provenance(config) -> None
 
 
 def test_wait_for_single_object_keeps_wait_codes_and_records_provenance(config) -> None:
-    for timeout_ms, expected in ((0, WAIT_OBJECT_0), (1, WAIT_TIMEOUT)):
+    # v2.1.0 validates the handle before the timeout policy: 0x1234 is not a
+    # live handle, so both waits return WAIT_FAILED and set ERROR_INVALID_HANDLE.
+    # This test's contract is the unknown-handle provenance that the diagnostic
+    # records for that low-confidence scatter (the timeout codes of live handles
+    # are covered by the upstream WaitForSingleObject tests).
+    for timeout_ms, expected in ((0, WAIT_FAILED), (1, WAIT_FAILED)):
         asm = _X86Asm()
         api_calls = [("api0", "kernel32", "WaitForSingleObject")]
         asm.push_imm32(timeout_ms)
@@ -522,7 +529,8 @@ def test_wait_for_single_object_keeps_wait_codes_and_records_provenance(config) 
         assert entry.error is None, entry.error
         assert stored == expected
         event = _api_event(report, "kernel32.WaitForSingleObject")
-        assert event.ret_val == hex(expected)
+        # v2.1.0 report model: ApiEvent.return_value replaces the local ret_val alias.
+        assert event.return_value == expected
         observation = event.observation
         assert observation["diagnostic"] == "wait_for_single_object"
         assert observation["handle"] == "0x1234"

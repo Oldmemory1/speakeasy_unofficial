@@ -17,7 +17,8 @@ class _MemoryEmu:
         self.config = SimpleNamespace(
             user=SimpleNamespace(
                 sid="S-1-5-21-1111111111-2222222222-3333333333-1001",
-                is_admin=True,
+                # v2.1.0 ``UserConfig`` names the elevation flag ``admin``.
+                admin=True,
             )
         )
 

@@ -49,7 +49,10 @@ class _MessageUser32(User32):
 
 def _native_message(data: bytes):
     msg = user32_defs.MSG(4)
-    msg.cast(data)
+    # The handler writes the Windows MSG size (28 bytes on x86), while the
+    # local definition appends lPrivate (sizeof 32). Pad the tail so cast()
+    # can parse the native bytes; the message fields are unchanged.
+    msg.cast(data.ljust(msg.sizeof(), b"\x00"))
     return msg
 
 

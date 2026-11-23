@@ -981,7 +981,10 @@ def test_ntdll_protect_virtual_memory_changes_page_protection(request, fixture: 
     assert get_perms(se, page + PAGE) == next_perms
 
     rv, _, _, old = protect(se, page, PAGE, PAGE_PROTECTION_FLAGS.PAGE_EXECUTE_READ)
-    assert (rv, old) == (ddk.STATUS_SUCCESS, PAGE_PROTECTION_FLAGS.PAGE_READWRITE)
+    # Adapted to the local FX-004 Wine write-copy semantics: the writable image
+    # page reports PAGE_WRITECOPY (8), not PAGE_READWRITE (4); upstream expected
+    # the latter.
+    assert (rv, old) == (ddk.STATUS_SUCCESS, PAGE_PROTECTION_FLAGS.PAGE_WRITECOPY)
     assert get_perms(se, page) == se.emu.emu_eng.perms[RX]
 
 
@@ -1030,7 +1033,10 @@ def test_ntdll_protect_virtual_memory_fails_for_an_empty_or_unmapped_range(dll64
     rw = PAGE_PROTECTION_FLAGS.PAGE_READWRITE
 
     assert protect(se, page, 0, rw) == (ddk.STATUS_INVALID_PARAMETER, page, 0, 0xFFFFFFFF)
-    assert protect(se, 0, PAGE, rw)[0] == ddk.STATUS_CONFLICTING_ADDRESSES
+    # Adapted to the local FX-009 semantics: an unmapped NtProtectVirtualMemory
+    # range returns STATUS_ACCESS_VIOLATION (0xC0000005); upstream expected
+    # STATUS_CONFLICTING_ADDRESSES.
+    assert protect(se, 0, PAGE, rw)[0] == ddk.STATUS_ACCESS_VIOLATION
     assert get_perms(se, page) == se.emu.emu_eng.perms[RX]
 
 

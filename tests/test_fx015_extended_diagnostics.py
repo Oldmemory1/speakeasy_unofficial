@@ -437,7 +437,9 @@ def test_create_filea_keeps_handle_contract_and_reports_return_chain(config) -> 
         buffers={"path": path},
     )
 
-    assert rv == 0x80
+    # v2.1.0 C4 handle allocator: the first file handle is no longer 0x80.
+    # Assert the valid-handle contract; the observation must report the same handle.
+    assert rv not in (0, INVALID_HANDLE_VALUE)
     observation = _api_event(report, "kernel32.CreateFileA").observation
     assert observation["kind"] == api_diagnostics.OBSERVATION_KIND
     assert observation["decoded_path"] == "C:\\fx015extended\\requested.bin"

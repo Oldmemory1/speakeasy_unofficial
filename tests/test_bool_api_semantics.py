@@ -470,7 +470,8 @@ def test_adjust_token_groups_sample_shape_returns_false_and_last_error(config):
         "advapi32.AdjustTokenGroups",
         "kernel32.GetLastError",
     ]
-    assert events[0].ret_val == "0x0"
+    # v2.1.0 report model: ApiEvent.return_value replaces the local ret_val alias.
+    assert events[0].return_value == 0
     assert slots[0] == 0
     assert slots[4] == ERROR_INVALID_HANDLE
 
@@ -598,7 +599,7 @@ def test_is_zoomed_amd64(config):
 # ---------------------------------------------------------------------------
 
 
-def test_status_bool_signature_fallback_returns_false_with_error(config):
+def test_status_bool_handler_returns_false_with_error(config):
     asm = _X86Asm()
     asm.push_imm32(0)  # dwFlags
     asm.push_imm32(0)  # lpNewFileName
@@ -615,9 +616,14 @@ def test_status_bool_signature_fallback_returns_false_with_error(config):
     slots, report = _run_x86(config, asm, 0x10, (0, 4))
     events = _api_events(report)
     assert [e.api_name for e in events] == ["kernel32.MoveFileExW", "kernel32.GetLastError"]
-    assert events[0].ret_val == "0x0", "status BOOL must not fabricate TRUE"
+    # v2.1.0 report model: ApiEvent.return_value replaces the local ret_val alias.
+    assert events[0].return_value == 0, "status BOOL must not fabricate TRUE"
     assert slots[0] == 0
-    assert slots[4] == ERROR_CALL_NOT_IMPLEMENTED
+    # v2.1.0 added a real kernel32.MoveFileEx handler (decisions.md #6), so this
+    # is no longer a signature-fallback path: NULL names fail the handler with
+    # ERROR_INVALID_PARAMETER. Signature-fallback BOOL semantics stay covered by
+    # the CreateDirectoryExW test.
+    assert slots[4] == windefs.ERROR_INVALID_PARAMETER
 
 
 def test_predicate_bool_signature_fallback_returns_false_without_error(config):
@@ -642,6 +648,7 @@ def test_predicate_bool_signature_fallback_returns_false_without_error(config):
         "kernel32.IsThreadAFiber",
         "kernel32.GetLastError",
     ]
-    assert events[1].ret_val == "0x0", "predicate BOOL must not fabricate TRUE"
+    # v2.1.0 report model: ApiEvent.return_value replaces the local ret_val alias.
+    assert events[1].return_value == 0, "predicate BOOL must not fabricate TRUE"
     assert slots[0] == 0
     assert slots[4] == 0x1234, "a false predicate is not an error"

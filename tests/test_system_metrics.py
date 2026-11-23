@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from speakeasy.config import UiConfig, get_windows_ui_profile
 from speakeasy.profiler import Profiler, Run
-from speakeasy.profiler_events import TracePosition
+from speakeasy.profiler_events import ApiArg, ApiArgType, TracePosition
 from speakeasy.winenv.api.usermode.user32 import (
     SM_CLEANBOOT,
     SM_CMONITORS,
@@ -92,14 +92,16 @@ def test_api_report_preserves_metric_observation():
         position,
         "user32.GetSystemMetrics",
         0,
-        [SM_CLEANBOOT],
+        # v2.1.0 report model: ApiEvent.args holds ApiArg entries, not raw values.
+        [ApiArg(name="nIndex", type=ApiArgType.ENUM, value=SM_CLEANBOOT, display="SM_CLEANBOOT")],
         observation=observation,
     )
 
     event = run.events[0]
     assert event.pos.pc == 0x40D4A9
-    assert event.args == ["0x43"]
-    assert event.ret_val == "0x0"
+    assert [(a.name, a.value, a.display) for a in event.args] == [("nIndex", SM_CLEANBOOT, "SM_CLEANBOOT")]
+    # v2.1.0 report model: ApiEvent.return_value replaces the local ret_val alias.
+    assert event.return_value == 0
     assert event.observation == observation
 
 

@@ -35,6 +35,7 @@ import pytest
 
 from speakeasy import Speakeasy
 from speakeasy.errors import ApiEmuError
+from speakeasy.report import ErrorType
 from speakeasy.winenv.api import sigdb
 
 BINS = Path(__file__).resolve().parent / "bins"
@@ -153,12 +154,15 @@ def test_undecorated_get_module_file_name_records_resolution_and_keeps_error(eng
     assert resolution["exact_registered"] is True
     assert resolution["aw_folded_registered"] is False
 
-    # The synthetic module export table exposes the undecorated name plus the
-    # real Windows A/W spellings; signature lookup only knows the A/W variants.
+    # The v2.1.0 export manifest exposes only the real Windows A/W spellings,
+    # not the undecorated handler name; signature lookup knows only A/W too.
     membership = observation["module_export_membership"]
     assert membership["module_found"] is True
     assert membership["module_name"].lower().startswith("kernel32")
-    assert membership["exact_present"] is True
+    # FX-005 adaptation: generic handler names are not exported in v2.1.0, so
+    # the undecorated spelling is absent while its A/W aliases are present.
+    # (See test_export_manifests.test_generic_handler_names_are_not_exported.)
+    assert membership["exact_present"] is False
     assert membership["aliases_present"] == ["GetModuleFileNameA", "GetModuleFileNameW"]
     signatures = observation["signature_resolution"]
     assert "exact" in signatures and "aliases" in signatures
@@ -194,7 +198,9 @@ def test_undecorated_get_system_directory_records_error_without_role_change(engi
     assert observation["function"] == "GetSystemDirectory"
     assert observation["failure"] == UNDECORATED
     assert observation["handler_resolution"]["resolution_path"] == "exact_handler"
-    assert observation["module_export_membership"]["exact_present"] is True
+    # FX-005 adaptation: undecorated handler names are not module exports in
+    # v2.1.0; only the A/W alias spellings are.
+    assert observation["module_export_membership"]["exact_present"] is False
     assert set(observation["module_export_membership"]["aliases_present"]) == {
         "GetSystemDirectoryA",
         "GetSystemDirectoryW",
@@ -212,7 +218,9 @@ def test_undecorated_get_user_name_reports_advapi32_export_chain(engine):
 
     observation = _observation(ctx)
     assert observation["module"] == "advapi32"
-    assert observation["module_export_membership"]["exact_present"] is True
+    # FX-005 adaptation: the v2.1.0 export manifest omits undecorated handler
+    # names; the A/W aliases remain the exported spellings.
+    assert observation["module_export_membership"]["exact_present"] is False
     assert observation["handler_resolution"]["handler_registration"] == "undecorated"
     assert observation["windows_semantics"]["undecorated_name_with_aw_aliases"] is True
 
@@ -229,7 +237,9 @@ def test_decorated_get_system_directory_keeps_width_and_return(engine):
 
     ctx = {"func_name": "kernel32.GetSystemDirectoryA"}
     rv = kernel32.GetSystemDirectory(emu, [buf, 0x100], ctx)
-    assert rv == 20
+    # FX-005 adaptation: v2.1.0 returns the path length without the NUL, as
+    # Windows does, while the buffer still receives the NUL-terminated string.
+    assert rv == 19
     assert bytes(emu.mem_read(buf, 20)) == b"C:\\Windows\\system32\x00"
     observation = _observation(ctx)
     assert observation["char_width_selection"] == {
@@ -244,7 +254,8 @@ def test_decorated_get_system_directory_keeps_width_and_return(engine):
     buf_w = _scratch(emu, "fx005.test.wide")
     ctx_w = {"func_name": "kernel32.GetSystemDirectoryW"}
     rv_w = kernel32.GetSystemDirectory(emu, [buf_w, 0x100], ctx_w)
-    assert rv_w == 20
+    # Length without the NUL, same as the ANSI variant.
+    assert rv_w == 19
     wide = bytes(emu.mem_read(buf_w, 42)).decode("utf-16le")
     assert wide.split("\x00", 1)[0] == "C:\\Windows\\system32"
     observation_w = _observation(ctx_w)
@@ -322,7 +333,10 @@ def test_dynamic_get_proc_address_chain_records_sentinel_provenance(config):
     entry = report.entry_points[0]
     error = entry.error
     assert error is not None
-    assert "Failed to get character width" in str(error.type)
+    # FX-005 adaptation: v2.1.0 reports a handler Python exception as
+    # ErrorType.INTERNAL_ERROR and carries the ApiEmuError text in `message`.
+    assert error.type == ErrorType.INTERNAL_ERROR
+    assert "Failed to get character width" in error.message
 
     # GetProcAddress returned a non-NULL dispatch sentinel (the semantic gap:
     # Windows would return NULL for this undecorated spelling).
@@ -347,7 +361,8 @@ def test_dynamic_get_proc_address_chain_records_sentinel_provenance(config):
     assert dispatch["sentinel"] == sentinel_hex
     assert dispatch["sentinel_target"] == {"module": "kernel32", "function": "GetModuleFileName"}
 
-    assert observation["module_export_membership"]["exact_present"] is True
+    # FX-005 adaptation: undecorated handler names are not exported in v2.1.0.
+    assert observation["module_export_membership"]["exact_present"] is False
     assert observation["handler_resolution"]["resolution_path"] == "exact_handler"
     assert observation["handler_resolution"]["handler_registration"] == "undecorated"
     semantics = observation["windows_semantics"]

@@ -23,8 +23,10 @@ TARGET_NAME = "C:\\target"
 EXIT_CODE = 0x1234
 SYMBOLIC_LINK_FLAG_DIRECTORY = 0x1
 
-# Local FX-011 regression: MoveFileExW has no handler and returns a BOOL
-# status, so the signature fallback must report FALSE instead of success.
+# v2.1.0 ships a real kernel32.MoveFileEx handler, so the pre-merge FX-011
+# premise ("MoveFileExW is emulated from its signature and must report FALSE")
+# is obsolete. These tests now assert the handler result. Signature-fallback
+# BOOL-status (FX-011) coverage remains in the CreateDirectoryExW test.
 OLD_NAME = "C:\\old.txt"
 NEW_NAME = "C:\\new.txt"
 MOVEFILE_REPLACE_EXISTING = 0x1
@@ -286,8 +288,8 @@ def _run_movefile(config: dict[str, Any], arch: str) -> Report:
 
 
 @pytest.mark.parametrize("arch", ["x86", "amd64"])
-def test_unhooked_move_file_ex_import_is_emulated_from_signature(config: dict[str, Any], arch: str) -> None:
-    """The local FX-011 BOOL-status expectation: MoveFileExW reports FALSE."""
+def test_move_file_ex_import_is_served_by_the_handler(config: dict[str, Any], arch: str) -> None:
+    """v2.1.0 has a real kernel32.MoveFileEx handler; it reports TRUE here."""
     report = _run_movefile(config, arch)
     ep = report.runs[0]
     assert ep.error is None, ep.error
@@ -302,10 +304,9 @@ def test_unhooked_move_file_ex_import_is_emulated_from_signature(config: dict[st
         ("lpNewFileName", "str", NEW_NAME),
         ("dwFlags", "flags", "MOVEFILE_REPLACE_EXISTING"),
     ]
-    # BOOL status return: MoveFileExW sets LastError and reports failure.
-    # The file operation is not emulated by the signature fallback, so TRUE
-    # would fabricate a completed move (FX-011).
-    assert move.return_value == 0
+    # Adapted: the handler models the move through the file manager and reports
+    # success (TRUE) for these inputs; this is no longer signature fallback.
+    assert move.return_value == 1
 
     # The stack (x86) / registers (x64) were left exactly as the caller expects
     assert [a.display for a in events[1].args] == [f"{EXIT_CODE:#x}"]

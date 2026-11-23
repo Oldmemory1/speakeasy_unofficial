@@ -24,6 +24,7 @@ import pytest
 
 import speakeasy.winenv.arch as e_arch
 from speakeasy import Speakeasy
+from speakeasy.report import RunType
 from tests.synthetic_pe import (
     DATA_RVA,
     CodeBuffer,
@@ -158,18 +159,26 @@ def test_dll_entry_run_has_no_process_entry_context(config, load_test_bin, bin_f
         module = se.load_module(data=data)
         se.run_module(module)
         runs = list(se.emu.runs)
-        dll_runs = [r for r in runs if isinstance(r.type, str) and r.type.startswith("dll_entry.")]
+        # v2.1.0 report model: run kinds are ``RunType`` members, and a DLL
+        # entry run carries type ``RunType.DLL_ENTRY`` with the run name
+        # ``DLL_PROCESS_ATTACH`` (instead of the old dotted ``dll_entry.*`` name).
+        dll_runs = [r for r in runs if r.type == RunType.DLL_ENTRY]
     finally:
         se.shutdown()
 
     assert dll_runs, "expected a DLL entry run"
+    for run in dll_runs:
+        assert run.name == "DLL_PROCESS_ATTACH"
+    # The entry-context rule stays scoped to the top-level EXE: no run of a
+    # DLL-module execution may carry a ProcessEntryContext.
     for run in runs:
         assert getattr(run, "entry_context", None) is None
 
 
 def test_shellcode_run_has_no_process_entry_context(config):
     """Shellcode runs keep zeroed entry registers and no entry context."""
-    config["max_instructions"] = 2
+    # v2.1.0 config schema: instruction budgets live under ``limits``.
+    config["limits"]["instructions"] = 2
     se = Speakeasy(config=config, argv=[])
     observed: dict[str, int] = {}
     try:

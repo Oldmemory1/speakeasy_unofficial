@@ -7,6 +7,7 @@ import pydantic
 import pytest
 
 from speakeasy import Speakeasy
+from speakeasy.windows.common import EMU_RESERVED, EMU_RESERVED_END
 from speakeasy.windows.export_manifest import (
     MANIFEST_ROOT,
     ORDINAL_NAMES_ROOT,
@@ -188,7 +189,15 @@ def test_get_proc_address_resolves_declared_names_missing_from_the_manifest(conf
 @pytest.mark.parametrize("architecture", ["x86", "amd64"])
 def test_get_proc_address_reports_unknown_names(config, architecture):
     config["apis"]["stubs"] = False
-    assert call_get_proc_address(config, architecture, "kernel32", "SpeakeasyNoSuchExport")[:2] == (0, 127)
+    # Adapted to the authoritative FX-013 sentinel policy: a missing export of
+    # a loaded non-EXE module (kernel32) returns a nonzero dispatch sentinel in
+    # the EMU_RESERVED range instead of Windows' NULL/ERROR_PROC_NOT_FOUND
+    # (0, 127), so a packer stub does not treat the import as unresolved.
+    result, error, _ = call_get_proc_address(config, architecture, "kernel32", "SpeakeasyNoSuchExport")
+    assert result != 0
+    assert EMU_RESERVED <= result < EMU_RESERVED_END
+    # The sentinel path does not set ERROR_PROC_NOT_FOUND.
+    assert error == 0
 
 
 @pytest.mark.parametrize(("module", "export_name"), [("kernel32", "KERNEL32.dll"), ("ntdll", "ntdll.dll")])

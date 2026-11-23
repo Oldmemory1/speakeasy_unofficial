@@ -7,6 +7,7 @@ import pytest
 import unicorn as uc
 
 from speakeasy.windows.api_image import ApiExportSpec, build_api_image
+from speakeasy.windows.common import EMU_RESERVED, EMU_RESERVED_END
 from tests.handler_harness import alloc, call, load_emu
 
 TEST_BINS = {4: "dll_test_x86.dll.xz", 8: "dll_test_x64.dll.xz"}
@@ -54,7 +55,10 @@ def test_iat_slots_match_get_proc_address(api_emu, load_test_bin):
             slot = base + imp.address - pe.OPTIONAL_HEADER.ImageBase
             address = int.from_bytes(api_emu.mem_read(slot, ptr), "little")
             assert address == get_proc_address(api_emu, handle, imp.name.decode())
-            assert api_emu.mem_read(address, 1)
+            # FX-013 (authoritative): imports of handler-backed modules bind to
+            # unmapped dispatch sentinels in the reserved range. Dispatch happens
+            # on the guest fetch, so a data read at the sentinel is not valid.
+            assert EMU_RESERVED <= address < EMU_RESERVED_END
             checked += 1
     assert checked >= 26
 
@@ -64,7 +68,13 @@ def test_eat_and_resolvers_share_one_entry(api_emu):
     kernel32 = module_handle(api_emu, "kernel32.dll")
     export = next(e for e in mapped_pe(api_emu, kernel32).DIRECTORY_ENTRY_EXPORT.symbols if e.name == b"MoveFileExW")
     address = kernel32 + export.address
-    assert get_proc_address(api_emu, kernel32, "MoveFileExW") == address
+    # FX-013 sentinel model (authoritative): a name lookup in a handler-backed
+    # module returns an unmapped dispatch sentinel, not the mapped EAT stub.
+    sentinel = get_proc_address(api_emu, kernel32, "MoveFileExW")
+    assert EMU_RESERVED <= sentinel < EMU_RESERVED_END
+    assert api_emu.emu.get_address_map(sentinel) is None
+    # The ordinal lookup and the ntdll loader resolver keep the upstream
+    # mapped-entry behavior, so they still share the EAT entry with each other.
     by_ordinal, _ = call(api_emu, "kernel32", "GetProcAddress", [kernel32, export.ordinal])
     assert by_ordinal == address
     name = alloc(api_emu, b"MoveFileExW\0")
@@ -81,7 +91,13 @@ def test_eat_and_resolvers_share_one_entry(api_emu):
 
 def test_missing_known_export_fails_both_resolvers(dll_emu):
     kernel32 = module_handle(dll_emu, "kernel32.dll")
-    assert get_proc_address(dll_emu, kernel32, "NotARealKernel32Export") == 0
+    # Adapted to the authoritative FX-013 sentinel policy: a missing name in a
+    # loaded non-EXE module (kernel32) returns a nonzero dispatch sentinel in
+    # the EMU_RESERVED range, not Windows' NULL; only the ntdll loader resolver
+    # still fails. (The name keeps its upstream spelling for traceability.)
+    sentinel = get_proc_address(dll_emu, kernel32, "NotARealKernel32Export")
+    assert sentinel != 0
+    assert EMU_RESERVED <= sentinel < EMU_RESERVED_END
     output = alloc(dll_emu, b"\0" * 4)
     status, _ = call(dll_emu, "ntdll", "LdrGetProcedureAddress", [kernel32, 0, 65535, output])
     assert status != 0
@@ -106,6 +122,13 @@ def test_unknown_module_entries_are_stable_and_leave_pe_unchanged(placeholder_em
 
 
 def test_forwarders_resolve_to_destination_and_keep_eat_strings(dll_emu):
+    # Reported product gap (not adapted): GetProcAddress on a forwarding export
+    # of a synthetic module returns a sentinel keyed to the forwarding module
+    # itself (``forwarding_test!Tick``) instead of following the forwarder to
+    # the destination handler (``kernel32!GetTickCount``). ``resolve_export``
+    # already follows synthetic forwarders; ``resolve_module_export``, used by
+    # GetProcAddress for non-PeLoader modules, ignores ``ExportEntry.forwarder``.
+    # The assertions stay unchanged until the product follows forwarders.
     emu = dll_emu.emu
     base, _ = emu.get_valid_ranges(0x20000, addr=0x63000000)
     module = dll_emu.load_image(
@@ -133,6 +156,13 @@ def test_forwarders_resolve_to_destination_and_keep_eat_strings(dll_emu):
 
 
 def test_dynamic_arena_holds_2048_entries_then_refuses_without_moving_them(dll_emu):
+    # Reported product gap (not adapted): the 2048-slot ``.dyn`` arena still
+    # caps a synthetic module's dynamic entries, but once it is exhausted
+    # ``get_proc`` falls back to ``_alloc_import_sentinel`` and reports a
+    # sentinel instead of refusing with 0. The sentinel allocator itself has no
+    # capacity/refusal contract, so the upstream "refuse without moving them"
+    # invariant is lost. The assertions stay unchanged until the product fixes
+    # the exhaustion path.
     emu = dll_emu.emu
     emu.load_module_by_name("capacity_vendor")
     addresses = [emu.get_proc("capacity_vendor", f"Dynamic{index}") for index in range(2048)]

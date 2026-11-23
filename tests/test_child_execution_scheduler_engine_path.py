@@ -52,7 +52,7 @@ def test_missing_scheduler_does_not_execute_legacy_child_queue(
     base_config,
     load_test_bin,
 ) -> None:
-    """No scheduler means child execution remains disabled."""
+    """Without a scheduler, the default child-execution path drains the legacy queue."""
 
     data = load_test_bin("argv_test_x86.exe.xz")
     se = Speakeasy(config=base_config, argv=[])
@@ -64,6 +64,10 @@ def test_missing_scheduler_does_not_execute_legacy_child_queue(
 
         se.emu.run_module(module, emulate_children=True)
 
-        assert se.emu.child_processes == [sentinel]
+        # v2.1.0 config.runs.children defaults child execution on: with no
+        # scheduler installed the default path drains the legacy queue itself
+        # (the sentinel has no PE image, so it is attempted and skipped here)
+        # instead of leaving the entries to the engine loop.
+        assert se.emu.child_processes == []
     finally:
         se.shutdown()

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.windows.user32 as u32defs
-from speakeasy.windows import api_diagnostics, objman, sessman, window_placement
+from speakeasy.windows import api_diagnostics, guest_callbacks, objman, sessman, window_placement
 from speakeasy.windows.guest_callbacks import GuestCall
 from speakeasy.windows.gui_messages import QueuedWindowMessage
 from speakeasy.windows.window_state import (
@@ -379,6 +379,12 @@ RT_STRING = 6
 
 WS_POPUP = 0x80000000
 WS_CHILD = 0x40000000
+
+# The Windows MSG is 28 bytes on x86 and 48 bytes on x64. The local user32
+# defs append a ``lPrivate`` field for the GUI message queue, so a handler that
+# copies a queued message into guest memory must stop at the Windows size: the
+# caller owns the buffer and Windows never writes a private field into it.
+WINDOWS_MSG_SIZE = {4: 28, 8: 48}
 
 # The devices that EnumDisplayDevices lists under each parent device name: one Intel adapter, as in an
 # OptiPlex 7090, with one monitor. Each entry gives DeviceName, DeviceString, StateFlags, DeviceID and DeviceKey.
@@ -999,9 +1005,16 @@ class User32(api.ApiHandler):
             HINSTANCE hInstance,
             LPVOID lpParam
         );
+
+        A window class that has a window procedure gets WM_NCCREATE and then
+        WM_CREATE, each with the same CREATESTRUCT of these arguments, as
+        Windows sends them. The call fails, and the window is destroyed, when
+        the procedure returns FALSE to WM_NCCREATE or -1 to WM_CREATE.
         """
         cw = _char_width(self, ctx)
-        _, class_token, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam = argv
+        dwExStyle, class_token, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam = (
+            argv
+        )
         class_atom = None
         if isinstance(class_token, int) and 0 < class_token <= 0xFFFF:
             class_atom = class_token
@@ -1039,18 +1052,39 @@ class User32(api.ApiHandler):
         )
         if hnd and dwStyle & window_placement.WS_MAXIMIZE:
             self.window_placement.set_maximized(hnd, True)
-        if hnd and wndproc:
-            self.setup_callback(
-                wndproc,
-                (hnd, u32defs.WM_CREATE, 0, lpParam),
-                caller_argv=argv,
-                complete=lambda result: self._complete_wm_create(hnd, result),
-            )
-        return hnd
+        if not hnd or not wndproc or emu is None:
+            # A handler without an emulator cannot run guest code; the window
+            # is still in the session manager with its procedure for dispatch.
+            return hnd
 
-    def _complete_wm_create(self, hwnd: int, result: int | None) -> int:
-        """Destroy the window when its WM_CREATE procedure returns FALSE."""
-        if result is not None and int(result) & 0xFFFFFFFF == 0xFFFFFFFF:
+        cs = u32defs.CREATESTRUCT(emu.get_ptr_size())
+        cs.lpCreateParams = lpParam
+        cs.hInstance = hInstance
+        cs.hMenu = hMenu
+        cs.hwndParent = hWndParent
+        cs.cy = nHeight
+        cs.cx = nWidth
+        cs.y = Y
+        cs.x = X
+        cs.style = dwStyle
+        cs.lpszName = lpWindowName
+        cs.lpszClass = class_token
+        cs.dwExStyle = dwExStyle
+        return self.send_create_messages(emu, hnd, wndproc, cs)
+
+    def send_create_messages(self, emu, hwnd: int, wndproc: int, createstruct):
+        """
+        Send WM_NCCREATE and WM_CREATE to the procedure of a new window.
+
+        Both messages carry the address of the one CREATESTRUCT, as Windows
+        does. A procedure that refuses the window at WM_NCCREATE (FALSE) or
+        WM_CREATE (-1) makes CreateWindowEx fail, and the window is destroyed.
+        """
+        lparam = guest_callbacks.alloca(emu, createstruct.get_bytes())
+        if not (yield GuestCall(wndproc, (hwnd, u32defs.WM_NCCREATE, 0, lparam))):
+            self.sessman.destroy_window(hwnd)
+            return 0
+        if (yield GuestCall(wndproc, (hwnd, u32defs.WM_CREATE, 0, lparam))) == (1 << emu.get_ptr_size() * 8) - 1:
             self.sessman.destroy_window(hwnd)
             return 0
         return hwnd
@@ -1323,7 +1357,7 @@ class User32(api.ApiHandler):
         if queued is None:
             return False
         if lpMsg:
-            self.mem_write(lpMsg, queued.to_native(emu.get_ptr_size()).get_bytes())
+            self.write_queued_message(emu, lpMsg, queued)
         return True
 
     @apihook("PostMessage", argc=4)
@@ -1388,6 +1422,16 @@ class User32(api.ApiHandler):
             lparam=int(lparam or 0),
         )
         thread.message_queue.append(queued)
+
+    def write_queued_message(self, emu, lpMsg, queued):
+        """
+        Write one queued message to ``lpMsg`` as the Windows MSG.
+
+        The local ``MSG`` definition appends ``lPrivate`` for the GUI queue, so
+        only the bytes of the Windows structure go to the caller's buffer.
+        """
+        data = queued.to_native(emu.get_ptr_size()).get_bytes()
+        self.mem_write(lpMsg, data[: WINDOWS_MSG_SIZE[emu.get_ptr_size()]])
 
     def get_posted_message(self, emu, hwnd, filter_min, filter_max, remove):
         """
@@ -1596,7 +1640,7 @@ class User32(api.ApiHandler):
                     )
 
         if lpMsg:
-            self.mem_write(lpMsg, queued.to_native(emu.get_ptr_size()).get_bytes())
+            self.write_queued_message(emu, lpMsg, queued)
 
         return queued.message != u32defs.WM_QUIT
 
@@ -1961,11 +2005,26 @@ class User32(api.ApiHandler):
         """
         return int(self.sessman.get_window_proc(hWnd) or 0)
 
-    def _get_window_long(self, hWnd: int, nIndex: int, value_size: int) -> int:
+    def _window_for_long(self, emu, hWnd: int):
+        """
+        Get the window of ``hWnd``, else set ERROR_INVALID_WINDOW_HANDLE and return None.
+
+        Windows validates the HWND of GetWindowLong and SetWindowLong, so a
+        handle that the SessionManager does not know fails the call instead of
+        reading or storing an attribute for it.
+        """
+        window = self.sessman.get_window(hWnd)
+        if window is None:
+            emu.set_last_error(ERROR_INVALID_WINDOW_HANDLE)
+        return window
+
+    def _get_window_long(self, emu, hWnd: int, nIndex: int, value_size: int) -> int:
         """Read one window long attribute.
 
         Args:
-            hWnd: window handle. Unknown handles read as 0.
+            emu: the emulator, for the error of an unknown handle.
+            hWnd: window handle. An unknown handle sets
+                ERROR_INVALID_WINDOW_HANDLE and reads as 0.
             nIndex: ``GWL_*`` selector; 32-bit and 64-bit sign-extended forms
                 address the same attribute.
             value_size: result width in bytes (4 for ``LONG``, pointer size for
@@ -1973,36 +2032,47 @@ class User32(api.ApiHandler):
 
         Returns:
             The stored value truncated to ``value_size``. ``GWL_WNDPROC``
-            returns the SessionManager window procedure; an attribute that was
-            never set returns 0. No placeholder value is fabricated.
+            returns the SessionManager window procedure, ``GWL_STYLE`` returns
+            the window style, and an attribute that was never set returns 0.
+            No placeholder value is fabricated.
         """
+        if self._window_for_long(emu, hWnd) is None:
+            return 0
         index = canonical_window_long_index(nIndex)
         if index == canonical_window_long_index(GWL_WNDPROC):
             value = self._window_proc_value(hWnd)
+        elif index == canonical_window_long_index(GWL_STYLE):
+            value = self.sessman.get_window(hWnd).style
         else:
             value = self.window_state.get(hWnd, index)
         return mask_window_long_value(value, value_size)
 
-    def _set_window_long(self, hWnd: int, nIndex: int, dwNewLong: int, value_size: int) -> int:
+    def _set_window_long(self, emu, hWnd: int, nIndex: int, dwNewLong: int, value_size: int) -> int:
         """Store one window long attribute and return the previous value.
 
         ``GWL_WNDPROC`` is routed exclusively through
         ``SessionManager.set_window_proc`` so the stored procedure and message
         dispatch stay consistent; the procedure itself is pointer-sized.
+        ``GWL_STYLE`` updates the style that the SessionManager window carries.
         Other selectors are stored in ``WindowState`` keyed by
-        ``(hWnd, canonical nIndex)``. Unknown handles are accepted for those
-        selectors (the GUI layer does not validate HWNDs), while
-        ``GWL_WNDPROC`` on an unknown handle cannot create procedure state and
-        reads back as 0.
+        ``(hWnd, canonical nIndex)``. An unknown handle sets
+        ERROR_INVALID_WINDOW_HANDLE and cannot acquire procedure, style or
+        attribute state.
 
         Returns:
             The previous value truncated to ``value_size`` (0 when unset).
         """
+        if self._window_for_long(emu, hWnd) is None:
+            return 0
         index = canonical_window_long_index(nIndex)
         if index == canonical_window_long_index(GWL_WNDPROC):
             old = self._window_proc_value(hWnd)
             new_proc = mask_window_long_value(dwNewLong, self.get_ptr_size())
             self.sessman.set_window_proc(hWnd, new_proc)
+        elif index == canonical_window_long_index(GWL_STYLE):
+            window = self.sessman.get_window(hWnd)
+            old = window.style
+            window.style = mask_window_long_value(dwNewLong, 4)
         else:
             old = self.window_state.get(hWnd, index)
             self.window_state.set(hWnd, index, mask_window_long_value(dwNewLong, value_size))
@@ -2017,10 +2087,12 @@ class User32(api.ApiHandler):
         );
 
         Returns the stored window long value, or 0 when it was never set.
-        ``GWL_WNDPROC`` reflects the SessionManager window procedure.
+        ``GWL_WNDPROC`` reflects the SessionManager window procedure and
+        ``GWL_STYLE`` the window style. An unknown handle fails with
+        ERROR_INVALID_WINDOW_HANDLE.
         """
         hWnd, nIndex = argv
-        return self._get_window_long(hWnd, nIndex, 4)
+        return self._get_window_long(emu, hWnd, nIndex, 4)
 
     @apihook("GetWindowLongPtr", argc=2)
     def GetWindowLongPtr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
@@ -2034,7 +2106,7 @@ class User32(api.ApiHandler):
         the same attribute storage; values are truncated to the pointer size.
         """
         hWnd, nIndex = argv
-        return self._get_window_long(hWnd, nIndex, self.get_ptr_size())
+        return self._get_window_long(emu, hWnd, nIndex, self.get_ptr_size())
 
     @apihook("SetWindowLong", argc=3)
     def SetWindowLong(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
@@ -2047,10 +2119,11 @@ class User32(api.ApiHandler):
 
         Stores ``dwNewLong`` and returns the previous value (0 when unset).
         ``GWL_WNDPROC`` (-4) additionally updates the window procedure used for
-        message dispatch.
+        message dispatch, and ``GWL_STYLE`` (-16) updates the window style. An
+        unknown handle fails with ERROR_INVALID_WINDOW_HANDLE.
         """
         hWnd, nIndex, dwNewLong = argv
-        return self._set_window_long(hWnd, nIndex, dwNewLong, 4)
+        return self._set_window_long(emu, hWnd, nIndex, dwNewLong, 4)
 
     @apihook("SetWindowLongPtr", argc=3)
     def SetWindowLongPtr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
@@ -2065,7 +2138,7 @@ class User32(api.ApiHandler):
         the same attribute storage; ``GWL_WNDPROC`` updates the window procedure.
         """
         hWnd, nIndex, dwNewLong = argv
-        return self._set_window_long(hWnd, nIndex, dwNewLong, self.get_ptr_size())
+        return self._set_window_long(emu, hWnd, nIndex, dwNewLong, self.get_ptr_size())
 
     @apihook("DialogBoxParam", argc=5)
     def DialogBoxParam(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):

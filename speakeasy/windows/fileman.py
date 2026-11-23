@@ -655,6 +655,16 @@ class FileManager:
         self.files.append(f)
         return f
 
+    def get_all_files(self):
+        """Return the registered emulated files (local compatibility helper).
+
+        This is a local extension kept from the pre-merge branch: the FX-013
+        loader tests inspect the registered guest files through this name. It
+        returns the same list object as the ``files`` attribute and does not
+        touch the emulation state.
+        """
+        return self.files
+
     def get_file_size(self, path):
         """
         Get the size of the file that a path names, or None when no file or handler has the path.

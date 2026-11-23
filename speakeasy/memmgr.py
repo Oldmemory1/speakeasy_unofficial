@@ -567,10 +567,17 @@ class MemoryManager:
                     raise OutOfMemoryError(f"no free range of 0x{total:x} bytes below 0x{limit:x}")
                 return (base, total)
 
-            if not attempts % 10:
-                base += page_size * 1000
-            else:
-                base += total
+            # Jump past every interval that overlaps this candidate, then align
+            # up, so a freed lower address becomes eligible again (first-fit).
+            # This still skips a huge reservation in one step, so the 32 GB
+            # reserve/fault workload does not fall back to a page-by-page scan.
+            advance = base + page_size
+            for o_start, o_end in occupied:
+                if o_start < end and base < o_end:
+                    advance = max(advance, o_end)
+            if advance % page_size:
+                advance += page_size - (advance % page_size)
+            base = advance
             attempts -= 1
 
         raise OutOfMemoryError("Failed to allocate emulator memory")

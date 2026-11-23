@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import speakeasy.winenv.defs.nt.ddk as ddk
+import speakeasy.winenv.defs.nt.ntoskrnl as ntos
 import speakeasy.winenv.defs.windows.iphlpapi as iphlpapi_types
 import speakeasy.winenv.defs.windows.windows as windefs
 import speakeasy.winenv.defs.winsock.ws2_32 as ws2_types
@@ -38,6 +39,8 @@ class _FakeEmu:
 
 def test_wsprintf_null_string_argument_does_not_dereference_zero() -> None:
     handler = ApiHandler.__new__(ApiHandler)
+    # ``do_str_format`` reads the pointer width from the handler.
+    handler.ptr_size = 4
 
     def read_string(address: int) -> str:
         if address == 0:
@@ -46,7 +49,9 @@ def test_wsprintf_null_string_argument_does_not_dereference_zero() -> None:
 
     handler.read_string = read_string
     handler.read_wide_string = lambda address: "wide"
-    assert handler.do_str_format("%s %s %d", [0x1000, 0, 7]) == "name  7"
+    # B04: the merged (upstream) CRT formatting renders a NULL %s argument as
+    # "(null)" instead of the old empty string; it still never dereferences 0.
+    assert handler.do_str_format("%s %s %d", [0x1000, 0, 7]) == "name (null) 7"
 
 
 def test_dialog_box_resource_identifier_is_not_treated_as_pointer() -> None:
@@ -76,7 +81,9 @@ def test_get_user_name_ex_null_buffer_reports_required_size() -> None:
     argv = [2, 0, 0x2000]
     assert Secur32.GetUserNameEx(handler, emu, argv) == 0
     assert handler.size_write == (0x2000, (8).to_bytes(4, "little"))
-    assert emu.last_error == 122
+    # B17: the merged upstream/Wine semantics report ERROR_MORE_DATA (234)
+    # when the caller buffer is too small, not ERROR_INSUFFICIENT_BUFFER (122).
+    assert emu.last_error == windefs.ERROR_MORE_DATA
 
 
 def test_wsa_startup_rejects_invalid_wsadata_pointer() -> None:
@@ -149,6 +156,12 @@ def test_get_adapters_info_accepts_pydantic_adapter_config() -> None:
     )
     emu = _FakeEmu()
     emu.config = SimpleNamespace(network=SimpleNamespace(adapters=[adapter]))
+    handler.emu = emu
+    # B14: the merged handler reads the caller's SizePointer first and reports
+    # ERROR_BUFFER_OVERFLOW when it is smaller than IP_ADAPTER_INFO. Give the
+    # double a buffer that holds exactly one entry.
+    required = iphlpapi_types.IP_ADAPTER_INFO(emu.get_ptr_size()).sizeof()
+    emu.mem_read = lambda address, size: required.to_bytes(size, "little")
 
     assert Iphlpapi.GetAdaptersInfo(handler, emu, [0x1000, 0x2000]) == 0
     assert handler.adapter_write[0] == 0x1000
@@ -167,20 +180,36 @@ def test_command_line_to_argv_null_input_returns_zero() -> None:
 
 def test_nt_query_system_information_returns_status_for_unknown_class() -> None:
     handler = Ntoskrnl.__new__(Ntoskrnl)
+    handler.win = ntos
     handler.query_writes = []
     handler.mem_write = lambda address, data: handler.query_writes.append((address, data))
     emu = _FakeEmu()
     emu.get_processes = lambda: []
-
-    assert (
-        Ntoskrnl.ZwQuerySystemInformation(
-            handler,
-            emu,
-            [ddk.SYSTEM_INFORMATION_CLASS.SystemBasicInformation, 0x4000, 0x100, 0x3000],
+    # BasicInformation asks the kernel32 handler for the maximum user address.
+    emu.api = SimpleNamespace(
+        load_api_handler=lambda name: SimpleNamespace(
+            get_max_application_address=lambda e: 0x7FFFFFFEFFFF,
         )
+    )
+
+    basic_info = ddk.SYSTEM_INFORMATION_CLASS.SystemBasicInformation
+    required = handler.sizeof(handler.win.SYSTEM_BASIC_INFORMATION(emu.get_ptr_size()))
+    # B05: v2.1.0 accepts BasicInformation only at its exact size. A zero/short
+    # length reports STATUS_INFO_LENGTH_MISMATCH and the required size; the
+    # caller then retries with exactly that size.
+    assert (
+        Ntoskrnl.ZwQuerySystemInformation(handler, emu, [basic_info, 0, 0, 0x3000])
+        == ddk.STATUS_INFO_LENGTH_MISMATCH
+    )
+    assert handler.query_writes[-1] == (0x3000, required.to_bytes(4, "little"))
+
+    handler.query_writes.clear()
+    assert (
+        Ntoskrnl.ZwQuerySystemInformation(handler, emu, [basic_info, 0x4000, required, 0x3000])
         == ddk.STATUS_SUCCESS
     )
     assert handler.query_writes[0][0] == 0x4000
+    assert len(handler.query_writes[0][1]) == required
 
     assert Ntoskrnl.ZwQuerySystemInformation(handler, emu, [0x86, 0x4000, 0x100, 0x3000]) == (
         ddk.STATUS_INVALID_INFO_CLASS

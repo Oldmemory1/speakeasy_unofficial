@@ -94,5 +94,8 @@ def test_tls_directory_past_the_raw_end_of_its_section_is_read_from_the_mapped_i
     """
     image = PeLoader(data=load_test_bin(UPX_EXE)).make_image()
 
-    assert image.tls_directory == 0x1DFF4
+    # Local LoadedImage keeps the parsed TlsDirectory object at
+    # ``.tls_directory``; the upstream integer RVA is ``tls_directory_rva``.
+    assert image.tls_directory_rva == 0x1DFF4
+    assert image.tls_directory is not None
     assert image.tls_callbacks == []

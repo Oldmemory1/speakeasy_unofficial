@@ -149,15 +149,17 @@ def test_nt_allocate_trace_makes_protect_mismatch_visible(emu_env):
     base_out = _read_u32(emu, base_ptr)
     # Baseline behaviour of this diagnostic attempt: the handler still maps the
     # region with the mem_alloc default permissions (Protect not applied yet).
-    # If a later FX changes that semantics, update this diagnostic baseline.
-    assert emu.get_address_perms(base_out) == common.PERM_MEM_NONE
+    # The merged v2.1.0 default is PERM_MEM_RWX (0x16), not PERM_MEM_NONE.
+    assert emu.get_address_perms(base_out) == common.PERM_MEM_RWX
 
     observation = _observation(ctx)
     assert observation["requested_protect"] == "0x2"
     # Requested and effective state are both reported, so the mismatch is
     # visible from the report alone (this is the point of FX-003).
-    assert observation["mapping"]["emu_perms"] == "0x0"
-    assert observation["mapping"]["win_protect"] == "0x1"
+    assert observation["mapping"]["emu_perms"] == "0x16"
+    # Verified against the merged tree: the mem_alloc default also records
+    # PAGE_EXECUTE_READWRITE (0x40) as the mapping's Win32 protection.
+    assert observation["mapping"]["win_protect"] == "0x40"
 
 
 def test_nt_protect_trace_records_before_after_registers_and_writeback(emu_env):

@@ -340,7 +340,8 @@ def _run_program(
 ):
     """Load/run the program and return (report, observation dict)."""
     cfg = config
-    cfg["timeout"] = timeout
+    # v2.1.0 configuration schema: the per-run wall-clock limit is nested.
+    cfg.setdefault("limits", {})["per_run_time"] = timeout
     cfg["exceptions"]["dispatch_handlers"] = dispatch_handlers
 
     code, patches, offsets = _build_program(access, prot=prot, seh_mode=seh_mode, veh_modes=veh_modes)
@@ -622,6 +623,9 @@ def test_veh_declines_keep_original_error_without_runaway_retries(config):
 
     error = _entry_error(report)
     assert error is not None
+    # Local FX-003 baseline: a VEH chain that declines a denied write keeps
+    # the specific protected-fault label (the A1e engine fix restores the
+    # baseline CallbackError identity through the seh dispatcher).
     assert error.type == "invalid_protect_write"
     assert error.pc == obs["fault_va"]
     assert error.address == obs["target_va"]
@@ -650,8 +654,8 @@ def test_protected_fetch_veh_declines_keep_original_error(config):
 
     error = _entry_error(report)
     assert error is not None
-    # The original fetch fault must survive the declining chain; resuming the
-    # instruction used to execute the fault page and record a write instead.
+    # The original fetch fault must survive the declining chain; local FX-003
+    # keeps the specific protected-fault label through the seh dispatcher.
     assert error.type == "invalid_protect_fetch"
     assert error.access_type == "fetch"
     assert error.pc == obs["target_va"]
@@ -675,6 +679,9 @@ def test_protected_read_veh_declines_keep_original_error(config):
 
     error = _entry_error(report)
     assert error is not None
+    # Local FX-003 keeps the specific protected-fault label after a declined
+    # VEH chain; the local read label is ``invalid_prot_read`` (restored by the
+    # A1e engine fix).
     assert error.type == "invalid_prot_read"
     assert error.access_type == "read"
     assert error.pc == obs["fault_va"]
