@@ -4,13 +4,22 @@ import hashlib
 import logging
 import ntpath
 import os
-import shlex
+import re
+import subprocess
+from typing import Any
 
-import speakeasy.common as common
-import speakeasy.windows.objman as objman
+from unicorn.x86_const import UC_X86_INS_IN, UC_X86_INS_OUT
+
+import speakeasy.windows.common as winemu
 import speakeasy.winenv.arch as _arch
-from speakeasy.errors import Win32EmuError
+import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy import common
+from speakeasy.binemu import BinaryEmulator
+from speakeasy.errors import ConfigError, Win32EmuError, WindowsEmuError
+from speakeasy.memmgr import MemMap
 from speakeasy.profiler import ProcessEntryContext, Run
+from speakeasy.report import FileType, RunType
+from speakeasy.windows import objman
 from speakeasy.windows.child_execution import (
     BudgetUsage,
     ExecutionBudget,
@@ -18,53 +27,81 @@ from speakeasy.windows.child_execution import (
 )
 from speakeasy.windows.com import COM
 from speakeasy.windows.loaders import (
+    DLL_PROCESS_ATTACH,
     PeLoader,
     RuntimeModule,
+    ShellcodeLoader,
     get_prot_string,
 )
 from speakeasy.windows.sessman import SessionManager
-from speakeasy.windows.winemu import WindowsEmulator
-from speakeasy.winenv.api.winapi import WindowsApi
-
-DLL_PROCESS_DETACH = 0
-DLL_PROCESS_ATTACH = 1
-
-MAX_EXPORTS_TO_EMULATE = 10
+from speakeasy.windows.winemu import MAX_EXPORTS_TO_EMULATE, REPORT_ARCHES, WindowsEmulator, execution_scope
+from speakeasy.winenv.api.usermode.kernel32 import PROCESSOR_COUNT
+from speakeasy.winenv.api.usermode.shell32 import split_command_line
+from speakeasy.winenv.codepage import encode_ansi
 
 logger = logging.getLogger(__name__)
 
+# An MSVC-decorated non-static member function: after the qualified name, an
+# access code, the this-pointer qualifiers and the calling convention E
+# (__thiscall).
+THISCALL_MEMBER = re.compile(r"^\?.*@@[ABEFIJMNQRUV][FI]*[ABCD]E")
+
+# The v2.1.0 ``limits`` schema disables a limit with 0. The local child
+# execution budget describes an unlimited API-call count with a large finite
+# number, because ``ExecutionBudget`` requires a positive limit.
+UNLIMITED_API_CALLS = (1 << 63) - 1
+
 
 class Win32Emulator(WindowsEmulator):
-    """
-    User Mode Windows Emulator Class
-    """
+    """Emulate a user mode Windows process."""
 
-    def __init__(self, config, argv=None, debug=False, exit_event=None, gdb_port=None, gdb_host=None):
+    file_name: str
+    mod_name: str
+
+    def __init__(self, config, argv=None, *, debug=False, exit_event=None, gdb_port=None, gdb_host=None):
         super().__init__(config, debug=debug, exit_event=exit_event, gdb_port=gdb_port, gdb_host=gdb_host)
 
-        self.last_error = 0
         self.peb_addr = 0
-        self.heap_allocs = []
-        self.argv = argv if argv is not None else []
-        self.sessman = SessionManager(config, self.handle_allocator)
-        self.com = COM(config)
+        self.container_image: RuntimeModule | None = None
+        self.argv: list[str] = argv if argv is not None else []
+        self.sessman: SessionManager = SessionManager(config, self.handle_allocator)
+        self.com: COM = COM(config)
+
+    def get_command_line(self):
+        """Get the command line of the current process, or an empty string if there is no process."""
+        proc = self.get_current_process()
+        return (proc.cmdline or "") if proc is not None else ""
 
     def get_argv(self):
-        """
-        Get command line arguments (if any) that are being passed
-        to the emulated process. (e.g. main(argv))
-        """
-        argv0 = ""
-        out = []
+        """Get the ``argv`` of the current process, split from its command line."""
+        cmdline = self.get_command_line()
+        return split_command_line(cmdline) if cmdline else []
 
-        if len(self.argv):
-            for m in self.modules:
-                if isinstance(m, RuntimeModule) and m.is_exe():
-                    argv0 = m.emu_path
-            out = [argv0] + self.argv
-        elif self.command_line:
-            out = shlex.split(self.command_line, posix=False)
-        return out
+    def init_crt_command_line(self):
+        """
+        Point the CRT command line globals, such as msvcrt ``_acmdln``, at the command line of the current process.
+
+        The globals initialize with the machine, before a process exists, and all processes share one CRT image.
+        """
+        for entry in tuple(self.api_registry.entries.values()):
+            if entry.initialized and entry.name in ("_acmdln", "_wcmdln"):
+                entry.initialized = False
+                self._initialize_api_data(entry)
+
+    def get_main_command_line(self, path, configured=None):
+        """
+        Get the command line of the process in which the input runs.
+
+        ``process.command_line`` wins over ``configured``, the command line of the container entry. Without either,
+        the command line is the quoted image path followed by ``argv``.
+        """
+        for cmdline in (self.config.process.command_line, configured):
+            if cmdline is not None:
+                return cmdline
+        args = subprocess.list2cmdline(self.argv)
+        if not path:
+            return args
+        return f'"{path}" {args}' if args else f'"{path}"'
 
     def build_service_main_args(self, service_name, service_args=None, char_width=1):
         ptr_size = self.get_ptr_size()
@@ -72,18 +109,13 @@ class Win32Emulator(WindowsEmulator):
         if service_args:
             args.extend(service_args)
 
-        enc_args = []
-        if char_width == 1:
-            codec = "utf-8"
-        elif char_width == 2:
-            codec = "utf-16le"
-        else:
+        if char_width not in (1, 2):
             raise Win32EmuError(f"Unsupported service argument width: {char_width}")
 
+        enc_args = []
         for arg in args:
-            if not isinstance(arg, str):
-                arg = str(arg)
-            enc_args.append((arg + "\x00").encode(codec))
+            text = f"{arg}\x00"
+            enc_args.append(encode_ansi(text) if char_width == 1 else text.encode("utf-16le"))
 
         ptr_count = len(enc_args) + 1
         size = ptr_count * ptr_size + sum(len(arg) for arg in enc_args)
@@ -105,25 +137,8 @@ class Win32Emulator(WindowsEmulator):
             return 2
         return 2
 
-    def set_last_error(self, code):
-        """
-        Set the last error code for the current thread
-        """
-        if self.curr_thread:
-            self.curr_thread.last_error = code
-
-    def get_last_error(self):
-        """
-        Get the last error code for the current thread
-        """
-        if self.curr_thread:
-            return self.curr_thread.last_error
-
-    def get_session_manager(self):
-        """
-        Get the session manager for the emulator. This will manage things like desktops,
-        windows, and session isolation
-        """
+    def get_session_manager(self) -> SessionManager:
+        """Get the session manager, which holds the sessions, desktops and windows."""
         return self.sessman
 
     def add_vectored_exception_handler(self, first, handler):
@@ -148,34 +163,32 @@ class Win32Emulator(WindowsEmulator):
         """
         self.veh_registry.remove(handler)
 
-    def get_processes(self):
-        if len(self.processes) <= 1:
-            self.init_processes(self.config.processes)
-        return self.processes
-
     def init_processes(self, processes):
         """
-        Initialize configured processes set in the emulator config
+        Add the processes of the config to the process list.
+
+        Skip the entry with ``is_main_exe``: the main process is the container process or the process of the input EXE.
         """
         for proc in processes:
-            p = objman.Process(self)
+            if proc.is_main_exe:
+                continue
+            # The fixed PEB address is for the main process, which the emulator creates later
+            p = objman.Process(
+                self,
+                name=proc.name,
+                path=proc.path,
+                base=proc.base_addr,
+                cmdline=proc.command_line or "",
+                session=proc.session or 0,
+                fixed_peb=False,
+            )
             self.add_object(p)
-
-            p.name = proc.name
             if proc.pid is not None:
                 p.pid = proc.pid
 
-            base = proc.base_addr
-            if isinstance(base, str):
-                base = int(base, 16)
-            p.base = base
-            p.path = proc.path
-            p.session = proc.session or 0
-            p.image = ntpath.basename(p.path)
-
             self.processes.append(p)
 
-    def load_module(self, path=None, data=None, filename=None):
+    def load_module(self, path=None, data=None, filename=None) -> RuntimeModule:
         self._init_name(path, data, filename=filename)
 
         if not data:
@@ -191,13 +204,12 @@ class Win32Emulator(WindowsEmulator):
 
         self._set_input_metadata(path, data)
 
-        loader = PeLoader(path=path, data=data)
-        image = loader.make_image()
+        image = PeLoader(path=path, data=data).make_image()
         image.name = self.mod_name
         image.emu_path = emu_path
 
-        rtmod = self.load_image(image)
-        self.set_func_args(self.stack_base, self.return_hook, conv=_arch.CALL_CONV_STDCALL)
+        rtmod = self.load_image(image, is_input=True)
+        self.set_func_args(self.get_stack_ptr(), self.return_hook, conv=_arch.CALL_CONV_STDCALL)
 
         if self.input is not None:
             self.input["image_base"] = rtmod.base
@@ -210,156 +222,155 @@ class Win32Emulator(WindowsEmulator):
             cd += "\\"
         return cd + os.path.basename(self.file_name)
 
-    def _set_input_metadata(self, path, data):
-        if not self.profiler:
-            return
-        from speakeasy.windows.common import _PeParser
+    def prepare_module_for_emulation(self, module, entry_point=None, *, exports=None):
+        """Queue the runs for *module* and return the runs that start it.
 
-        pe = _PeParser(path=path, data=data, fast_load=True)
-        pe_type = "unknown"
-        if pe.is_driver():
-            pe_type = "driver"
-        elif pe.is_dll():
-            pe_type = "dll"
-        elif pe.is_exe():
-            pe_type = "exe"
-        arch = "unknown"
-        if pe.arch == _arch.ARCH_AMD64:
-            arch = "x64"
-        elif pe.arch == _arch.ARCH_X86:
-            arch = "x86"
-        self.input = {
-            "path": pe.path,
-            "sha256": pe.hash,
-            "size": pe.file_size,
-            "arch": arch,
-            "filetype": pe_type,
-            "emu_version": self.get_emu_version(),
-            "os_run": self.get_osver_string(),
-        }
-        if not self._root_sample_sha256:
-            self._root_sample_sha256 = pe.hash
-        self.profiler.add_input_metadata(self.input)
-
-    def prepare_module_for_emulation(self, module, all_entrypoints, entry_point=None):
-        """Queue the runs for *module* and return its module-entry run.
+        Args:
+            module: The module to emulate.
+            entry_point: RVA at which to start, in place of the entry point of the PE.
+            exports: Whether to queue the runs of the exports of the module. ``None``
+                uses ``runs.exports`` of the config.
 
         Returns:
-            The ``Run`` whose start address is the module entry point (EXE) or
-            the ``dll_entry.DLL_PROCESS_ATTACH`` entry (DLL), after it has been
-            added to the run queue.
+            The startup runs, in run-queue order: the TLS callbacks, then the module
+            entry point when it is queued.
         """
         if not module:
             self.stop()
             raise Win32EmuError("Module not found")
 
-        # Check if any TLS callbacks exist, these run before the module's entry point
+        if exports is None:
+            exports = self.config.runs.exports
+
+        startup = []
+        # TLS callbacks run before the entry point of the module.
         tls = module.get_tls_callbacks()
         for i, cb_addr in enumerate(tls):
             base = module.base
             if base < cb_addr < base + module.image_size:
                 run = Run()
                 run.start_addr = cb_addr
-                run.type = f"tls_callback_{i}"
+                run.type = RunType.TLS_CALLBACK
+                run.name = str(i)
                 run.args = [base, DLL_PROCESS_ATTACH, 0]
                 self.add_run(run)
+                startup.append(run)
 
         if entry_point is not None:
             ep = module.base + entry_point
         else:
-            ep = module.base + module.ep
+            ep = module.get_ep()
 
         run = Run()
         run.start_addr = ep
 
         if not module.is_exe():
             run.args = [module.base, DLL_PROCESS_ATTACH, 0]
-            run.type = "dll_entry.DLL_PROCESS_ATTACH"
-            container = self.init_container_process()
-            if container:
-                self.processes.append(container)
-                self.curr_process = container
+            run.type = RunType.DLL_ENTRY
+            run.name = "DLL_PROCESS_ATTACH"
         else:
-            run.type = "module_entry"
+            run.type = RunType.MODULE_ENTRY
             run.args = [self.mem_map(8, tag=f"emu.module_arg_{i}") for i in range(4)]
 
-        self.add_run(run)
-        module_entry_run = run
+        if entry_point is not None or module.is_exe() or ep != module.base:
+            self.add_run(run)
+            startup.append(run)
 
-        if all_entrypoints:
-            # Only emulate a subset of all the exported functions
-            # There are some modules (such as the windows kernel) with
-            # thousands of exports
-            exports = [k for k in module.get_exports()[:MAX_EXPORTS_TO_EMULATE]]
+        if exports:
+            # Limit the number of export runs, because some modules, such as the Windows kernel, have
+            # thousands of exports.
+            exports_list = [k for k in module.get_exports()[:MAX_EXPORTS_TO_EMULATE]]
 
-            if exports:
+            if exports_list:
                 args = [self.mem_map(8, tag="emu.export_arg_%d" % (i), base=0x41420000) for i in range(4)]  # noqa
-                for exp in exports:
-                    if exp.name in ("DllMain",):
+                this = None
+                for exp in exports_list:
+                    if (
+                        exp.name in ("DllMain",)
+                        or getattr(exp, "kind", "function") == "data"
+                        or getattr(exp, "forwarder", None) is not None
+                    ):
                         continue
                     run = Run()
-                    if exp.name:
-                        fn = exp.name
-                    else:
-                        fn = "no_name"
-
-                    run.type = f"export.{fn}"
+                    run.type = RunType.EXPORT
+                    run.name = exp.name or f"#{exp.ordinal}"
                     run.start_addr = exp.address
                     if exp.name and exp.name.startswith("ServiceMain"):
                         char_width = self.get_service_main_char_width(module, exp.name)
                         argc, argv = self.build_service_main_args("IPRIP", char_width=char_width)
                         run.args = [argc, argv]
                     else:
-                        # Here we set dummy args to pass into the export function
+                        # Each export gets the same placeholder arguments.
                         run.args = args
-                    # Store these runs and only queue them before the unload
-                    # routine this is because some exports may not be ready to
-                    # be called yet
+                    if module.arch == _arch.ARCH_X86 and exp.name and THISCALL_MEMBER.match(exp.name):
+                        if this is None:
+                            this = self.mem_map(8, tag="emu.export_this", base=0x41420000)
+                        run.registers = {_arch.X86_REG_ECX: this}
+                    # The export runs come after the DllMain run in the queue, because an export can depend
+                    # on the state that DllMain sets up.
                     self.add_run(run)
 
-        return module_entry_run
+        return startup
 
-    def run_module(self, module, all_entrypoints=False, emulate_children=False, entry_point=None):
+    @execution_scope
+    def run_module(self, module, all_entrypoints=False, emulate_children=False, entry_point=None) -> None:
         """
-        Begin emulating a previously loaded module
+        Add the runs of a loaded module to the run queue, and run the queue.
 
-        Arguments:
-            module: Module to emulate
+        The runs include the TLS callbacks and the entry point of the module, and its exports when
+        ``runs.exports`` is true or ``all_entrypoints`` is set. ``emulate_children`` drains the child
+        execution scheduler installed on the emulator after the parent finishes.
+
+        Args:
+            module: Module to emulate.
+            all_entrypoints: Local API override that forces the export runs, regardless of ``runs.exports``.
+            emulate_children: Drain the installed child execution scheduler after the parent.
+            entry_point: RVA to start emulation at instead of the module entry point.
         """
-        entry_run = self.prepare_module_for_emulation(module, all_entrypoints, entry_point=entry_point)
+        startup = self.prepare_module_for_emulation(
+            module,
+            entry_point=entry_point,
+            exports=bool(all_entrypoints or self.config.runs.exports),
+        )
 
-        # Create an empty process object for the module if none is
-        # supplied, only do this for the main module
-        if len(self.processes) == 0:
-            p = objman.Process(self, path=module.emu_path, base=module.base, pe=module, cmdline=self.command_line)
+        # The main module gets a new process if there is no container process.
+        if self.curr_process is None:
+            cmdline = self.get_main_command_line(module.emu_path)
+            p = objman.Process(self, path=module.emu_path, base=module.base, pe=module, cmdline=cmdline)
+            self.processes.append(p)
             self.curr_process = p
-            self.om.objects.update({p.address: p})  # type: ignore[union-attr]
+            self.init_crt_command_line()
+            self.get_object_manager("process registration").add_object(p)
             mm = self.get_address_map(module.base)
             if mm:
                 mm.process = self.curr_process
+        if self.input is not None:
+            self.input["pid"] = self.curr_process.pid
 
         t = objman.Thread(self, stack_base=self.stack_base, stack_commit=module.stack_commit)
+        t.process = self.curr_process
 
-        self.om.objects.update({t.address: t})  # type: ignore[union-attr]
-        self.curr_process.threads.append(t)  # type: ignore[union-attr]
+        self.get_object_manager("thread registration").add_object(t)
+        if self.curr_process is not None:
+            self.curr_process.threads.append(t)
         self.curr_thread = t
 
-        if self.run_queue:
-            self.run_queue[0].thread = t
+        for run in startup:
+            run.thread = t
 
         peb = self.alloc_peb(self.curr_process)
 
-        # Set the TEB
         self.init_teb(t, peb)
 
         # A top-level EXE enters its entry point with the Windows loader
         # convention (x86 EAX/EBX, x64 RCX/RDX). Only this run carries the
         # entry context; TLS callbacks, exports, DLL entry, shellcode and
         # child runs keep their existing state.
+        entry_run = next((run for run in startup if run.type == RunType.MODULE_ENTRY), None)
         if module.is_exe() and entry_run is not None and isinstance(entry_run.start_addr, int):
             entry_run.entry_context = ProcessEntryContext(
                 entry=entry_run.start_addr,
-                peb=self.curr_process.peb.address,
+                peb=peb.address,
             )
 
         # Begin emulation of main module
@@ -406,17 +417,32 @@ class Win32Emulator(WindowsEmulator):
             status="ok" if parent_ok else "simulation_error",
             termination_reason=termination_reason,
             coverage_complete=parent_ok,
-            budget=ExecutionBudget(
-                timeout_seconds=float(self.config.timeout),
-                max_api_count=int(self.config.max_api_count),
-                max_instructions=int(self.config.max_instructions),
-            ),
+            budget=self._child_execution_budget(),
             usage=BudgetUsage(),
         )
         if self.child_dispatcher is not None:
             self.child_dispatcher.parent_finished(parent_result)
         elif self.child_scheduler is not None:
             self.child_scheduler.drain(parent_result)
+
+    def _child_execution_budget(self) -> ExecutionBudget:
+        """Build the parent/child execution budget from the v2.1.0 ``limits`` schema.
+
+        A limit of 0 in the config means "disabled", which the local
+        ``ExecutionBudget`` cannot represent: it requires a positive wall-clock
+        and API-call limit. Disabled limits therefore become an infinite
+        wall-clock time, the largest finite API-call count, and the local
+        ``-1`` instruction sentinel.
+        """
+        limits = self.config.limits
+        per_run_time = float(limits.per_run_time)
+        api_calls = int(limits.api_calls)
+        instructions = int(limits.instructions)
+        return ExecutionBudget(
+            timeout_seconds=per_run_time if per_run_time > 0 else float("inf"),
+            max_api_count=api_calls if api_calls > 0 else UNLIMITED_API_CALLS,
+            max_instructions=-1 if instructions == 0 else instructions,
+        )
 
     def _prepare_child_execution_report(self) -> None:
         """Attach the model-only child request summary to the root report."""
@@ -442,23 +468,10 @@ class Win32Emulator(WindowsEmulator):
             self.file_name = os.path.basename(path)
             self.mod_name = os.path.splitext(self.file_name)[0]
         else:
-            mod_hash = hashlib.sha256()
-            mod_hash.update(data)
-            mod_hash = mod_hash.hexdigest()  # type: ignore[assignment]
-            self.mod_name = mod_hash
+            self.mod_name = hashlib.sha256(data).hexdigest()
             self.file_name = f"{self.mod_name}.exe"
-        self.bin_base_name = os.path.basename(self.file_name)
 
-    def emulate_module(self, path):
-        """
-        Load and emulate binary from the given path
-        """
-        mod = self.load_module(path)
-        self.run_module(mod)
-
-    def load_shellcode(self, path, arch, data=None, filename=None):
-        from speakeasy.windows.loaders import ShellcodeLoader
-
+    def load_shellcode(self, path, arch, data=None, filename=None) -> int:
         self._init_name(path, data, filename=filename)
         if arch == "x86":
             arch = _arch.ARCH_X86
@@ -474,24 +487,17 @@ class Win32Emulator(WindowsEmulator):
         loader = ShellcodeLoader(data=data, arch=arch)
         image = loader.make_image()
         image.name = self.mod_name if filename else str(sc_hash)
-        rtmod = self.load_image(image)
+        rtmod = self.load_image(image, is_input=True)
         sc_addr = rtmod.base
 
-        sc_arch = "unknown"
-        if arch == _arch.ARCH_AMD64:
-            sc_arch = "x64"
-        elif arch == _arch.ARCH_X86:
-            sc_arch = "x86"
-
-        sc_tag = f"emu.shellcode.{sc_hash}"
         if self.profiler:
             self.input = {
                 "path": path,
                 "sha256": sc_hash,
                 "size": len(data),
-                "arch": sc_arch,
+                "arch": REPORT_ARCHES.get(arch),
+                "file_type": FileType.SHELLCODE,
                 "image_base": sc_addr,
-                "mem_tag": sc_tag,
                 "emu_version": self.get_emu_version(),
                 "os_run": self.get_osver_string(),
             }
@@ -499,11 +505,13 @@ class Win32Emulator(WindowsEmulator):
 
         return sc_addr
 
-    def run_shellcode(self, sc_addr, stack_commit=0x4000, offset=0):
+    def run_shellcode(self, sc_addr, stack_commit=0x4000, offset=0) -> None:
         """
-        Begin emulating position independent code (i.e. shellcode) to prepare for emulation
-        """
+        Add a run for the loaded shellcode at ``sc_addr`` + ``offset``, and run the queue.
 
+        Raises:
+            Win32EmuError: if no loaded module starts at ``sc_addr``.
+        """
         target = None
         for mod in self.modules:
             if isinstance(mod, RuntimeModule) and mod.base == sc_addr:
@@ -513,12 +521,12 @@ class Win32Emulator(WindowsEmulator):
         if not target:
             raise Win32EmuError("Invalid shellcode address")
 
-        effective_stack = self.config.stack_size or stack_commit
+        effective_stack = self.config.runs.stack_size or stack_commit
         self.stack_base, stack_addr = self.alloc_stack(effective_stack)
-        self.set_func_args(self.stack_base, self.return_hook, 0x7000, conv=_arch.CALL_CONV_STDCALL)
+        self.set_func_args(stack_addr, self.return_hook, 0x7000, conv=_arch.CALL_CONV_STDCALL)
 
         run = Run()
-        run.type = "shellcode"
+        run.type = RunType.SHELLCODE
         run.start_addr = sc_addr + offset
         run.instr_cnt = 0
         args = [self.mem_map(1024, tag=f"emu.shellcode_arg_{i}", base=0x41420000 + i) for i in range(4)]
@@ -528,40 +536,39 @@ class Win32Emulator(WindowsEmulator):
 
         self.add_run(run)
 
-        # Create an empty process object for the shellcode if none is
-        # supplied
-        container = self.init_container_process()
-        if container:
-            self.processes.append(container)
-            self.curr_process = container
-        else:
-            p = objman.Process(self)
+        # The shellcode gets a new process if there is no container process.
+        if self.curr_process is None:
+            p = objman.Process(self, cmdline=self.get_main_command_line(""))
             self.processes.append(p)
             self.curr_process = p
+            self.init_crt_command_line()
+        if self.input is not None:
+            self.input["pid"] = self.curr_process.pid
 
         mm = self.get_address_map(sc_addr)
         if mm:
             mm.process = self.curr_process
 
         t = objman.Thread(self, stack_base=self.stack_base, stack_commit=stack_commit)
-        self.om.objects.update({t.address: t})  # type: ignore[union-attr]
+        self.get_object_manager("thread registration").add_object(t)
         self.curr_process.threads.append(t)
 
         self.curr_thread = t
 
         peb = self.alloc_peb(self.curr_process)
 
-        # Set the TEB
         self.init_teb(t, peb)
 
         self.start()
 
     def alloc_peb(self, proc):
         """
-        Allocate memory for the Process Environment Block (PEB)
+        Set up the PEB of a process and return it.
+
+        Map the loader data, fill in the version fields and add the modules to the loader lists.
         """
         if proc.is_peb_active:
-            return
+            return proc.peb
         size = proc.peb_ldr_data.sizeof()
         res, size = self.get_valid_ranges(size)
         self.mem_reserve(size, base=res, tag="emu.struct.PEB_LDR_DATA")
@@ -570,33 +577,49 @@ class Win32Emulator(WindowsEmulator):
         peb = proc.peb
         proc.is_peb_active = True
         peb.object.ImageBaseAddress = proc.base
-        peb.object.OSMajorVersion = self.config.os_ver.major or 0
-        peb.object.OSMinorVersion = self.config.os_ver.minor or 0
-        peb.object.OSBuildNumber = self.config.os_ver.build or 0
+        peb.object.OSMajorVersion = self.config.system.os_ver.major or 0
+        peb.object.OSMinorVersion = self.config.system.os_ver.minor or 0
+        peb.object.OSBuildNumber = self.config.system.os_ver.build or 0
+        peb.object.OSPlatformId = windefs.VER_PLATFORM_WIN32_NT
+        peb.object.NumberOfProcessors = PROCESSOR_COUNT
         peb.write_back()
 
-        self._ensure_core_dlls_loaded()
         self.mem_map_reserve(proc.peb_ldr_data.address)
-        self.init_peb(self._ordered_peb_modules(), proc=proc)
+        main = proc.pe or next(
+            (module for module in self.modules if module.base == proc.base and module.is_exe()), None
+        )
+        if main is not None and main.visible_in_peb:
+            proc.add_module_to_peb(main)
+        proc.initializing_peb = True
+        try:
+            self._ensure_core_dlls_loaded()
+            self.init_peb(self._ordered_peb_modules(proc, include_defaults=True), proc=proc)
+        finally:
+            proc.initializing_peb = False
 
         return peb
 
-    def _ordered_peb_modules(self):
-        import os as _os
-
+    def _ordered_peb_modules(self, proc=None, *, include_defaults=False):
         CORE_ORDER = {"ntdll": 0, "kernel32": 1, "kernelbase": 2}
         mods = self.get_peb_modules()
+        proc = proc or self.get_current_process()
+        attached = set(proc.peb_modules) if proc is not None else set()
         exe_mods = []
         core_mods = []
         other_mods = []
         for m in mods:
+            if m.is_driver():
+                continue
             if m.is_exe():
-                exe_mods.append(m)
+                if proc is not None and (m is proc.pe or m.base == proc.base):
+                    exe_mods.append(m)
+                continue
+            if m.base not in attached and not (include_defaults and m.base in self.module_loader.shared_peb_modules):
                 continue
             name = (m.name or "").lower()
             if not name:
                 bn = m.get_base_name()
-                name = _os.path.splitext(bn)[0].lower() if bn else ""
+                name = os.path.splitext(bn)[0].lower() if bn else ""
             if name in CORE_ORDER:
                 core_mods.append((CORE_ORDER[name], m))
             else:
@@ -604,73 +627,56 @@ class Win32Emulator(WindowsEmulator):
         core_mods.sort(key=lambda x: x[0])
         return exe_mods + [m for _, m in core_mods] + other_mods
 
+    def get_run_return_address(self, run: Run) -> int:
+        """
+        Get the return address that the code of run returns to. A return to it ends the run.
+
+        On Windows, BaseThreadInitThunk of kernel32 calls the entry point of an EXE and the start routine of a
+        thread. So these runs return to a jump in kernel32 that goes to the return hook. A search down from the
+        return address finds the headers of kernel32. The other runs return to the return hook.
+        """
+        if run.type not in (RunType.MODULE_ENTRY, RunType.THREAD):
+            return self.return_hook
+        if self.thread_return_addr is None:
+            kernel32 = self.get_mod_by_name("kernel32")
+            if kernel32 is None:
+                return self.return_hook
+            try:
+                self.thread_return_addr = self.api_registry.add_jump(kernel32, self.return_hook)
+            except WindowsEmuError as e:
+                logger.debug("thread start routines return to the return hook: %s", e)
+                return self.return_hook
+        return self.thread_return_addr
+
     def _ensure_core_dlls_loaded(self):
         CORE_DLLS = ["ntdll", "kernel32", "kernelbase"]
         for dll in CORE_DLLS:
             if not self.get_mod_by_name(dll):
                 self.load_module_by_name(dll)
+            self.module_loader.shared_peb_modules.add(self.get_mod_by_name(dll).base)
 
     def set_unhandled_exception_handler(self, handler_addr):
-        """
-        Establish a handler for unhandled exceptions that occur during emulation
-        """
-        self.unhandled_exception_filter = handler_addr
+        """Set the unhandled exception filter of the current process."""
+        self._get_process_state().unhandled_exception_filter = handler_addr
 
-    def setup(self):
+    def init_machine_structures(self):
         self.om = objman.ObjectManager(emu=self)
 
         arch = self.get_arch()
         self._setup_gdt(arch)
         self.setup_user_shared_data()
-        self.set_ptr_size(self.arch)
 
         if arch == _arch.ARCH_X86:
             self.peb_addr = self.fs_addr + 0x30
         elif arch == _arch.ARCH_AMD64:
             self.peb_addr = self.gs_addr + 0x60
 
-        self.api = WindowsApi(self)
+        for sl in self.config.system.symlinks:
+            self.get_object_manager("symlink creation").add_symlink(sl.name, sl.target)
 
-        for sl in self.config.symlinks:
-            self.om.add_symlink(sl.name, sl.target)
-
-        self.init_sys_modules(self.config.modules.system_modules)
+        self.init_sys_modules(self.config.modules.system)
         self._init_user_modules_from_config()
-
-    def init_sys_modules(self, modules_config):
-        """
-        Get the system modules (e.g. drivers) that are loaded in the emulator
-        """
-        rtmods = super().init_sys_modules(modules_config)
-        for mod in rtmods:
-            mod.visible_in_peb = False
-
-        for modconf in modules_config:
-            drv = modconf.driver
-            if drv:
-                for dev in drv.devices:
-                    name = dev.name or ""
-                    do = self.new_object(objman.Device)
-                    do.name = name
-
-        return rtmods
-
-    def init_container_process(self):
-        """
-        Create a process to be used to host shellcode or DLLs
-        """
-        for p in self.config.processes:
-            if p.is_main_exe:
-                name = p.name or ""
-                emu_path = p.path or ""
-                base = p.base_addr or 0
-                if isinstance(base, str):
-                    base = int(base, 0)
-                cmd_line = p.command_line or ""
-
-                proc = objman.Process(self, name=name, path=emu_path, base=base, cmdline=cmd_line)
-                return proc
-        return None
+        self.init_processes(self.config.processes)
 
     def _init_user_modules_from_config(self):
         proc_mod = None
@@ -687,22 +693,81 @@ class Win32Emulator(WindowsEmulator):
         # binaries that resolve APIs by walking the module list) then read the
         # wrong module. See regression ② in documents/speakeasy/.
         if proc_mod and not self.modules:
-            all_user_mods = [proc_mod] + list(self.config.modules.user_modules)
+            all_user_mods = [proc_mod] + list(self.config.modules.user)
         else:
-            all_user_mods = list(self.config.modules.user_modules)
+            all_user_mods = list(self.config.modules.user)
 
         self.init_user_modules(all_user_mods)
 
+    def init_sys_modules(self, modules_config):
+        """Load the system modules of the config, hide them from the PEB and create their devices."""
+        rtmods = super().init_sys_modules(modules_config)
+        for mod in rtmods:
+            mod.visible_in_peb = False
+
+        for modconf in modules_config:
+            drv = modconf.driver
+            if drv:
+                for dev in drv.devices:
+                    name = dev.name or ""
+                    do = self.new_object(objman.Device)
+                    do.name = name
+
+        return rtmods
+
+    def load_container(self):
+        """
+        Load the container image and make its process the current process.
+
+        A DLL or shellcode input runs in this process. Call this method after ``init_machine`` and before the
+        input image loads.
+
+        The container image is the image of the entry in ``processes`` of the config that
+        has ``is_main_exe`` set. If the config has no such entry, do nothing.
+
+        Raises:
+            WindowsEmuError: if the machine is not initialized, or the container is already loaded.
+            OutOfMemoryError: if, on x86, the container image does not fit below the TEB.
+            ConfigError: if ``argv`` and the ``command_line`` of the entry are both set.
+        """
+        if not self.is_machine_ready:
+            raise WindowsEmuError("the machine is not initialized: call init_machine before load_container")
+        if self.container_image is not None:
+            raise WindowsEmuError("the container is already loaded")
+        entry = next((p for p in self.config.processes if p.is_main_exe), None)
+        if entry is None:
+            return None
+        if self.argv and entry.command_line is not None:
+            raise ConfigError("argv conflicts with the command_line of the is_main_exe process: set only one")
+
+        # Load the container image in the machine range, so that the input image can use its preferred base.
+        with self.allocations_from(winemu.MACHINE_BASE):
+            entry_at_machine_base = entry.model_copy(update={"base_addr": winemu.MACHINE_BASE})
+            self.container_image = self.init_user_modules([entry_at_machine_base])[0]
+        process = objman.Process(
+            self,
+            name=entry.name or "",
+            path=entry.path or "",
+            base=self.container_image.base,
+            cmdline=self.get_main_command_line(entry.path, entry.command_line),
+            session=entry.session or 0,
+        )
+        self.processes.append(process)
+        self.curr_process = process
+        self.init_crt_command_line()
+        return process
+
     def exit_process(self):
         """
-        An emulated binary is attempted to terminate its current process.
-        Signal that the run has finished.
+        End the current run, because the guest ended its process.
+
+        The other runs of the process still run, and they can use the handles of the process. So with runs.children,
+        run_module closes the handles after the last run, before the next child process starts.
         """
-        self.enable_code_hook()
-        self.run_complete = True
+        self.end_run()
 
     def _hook_mem_unmapped(self, emu, access, address, size, value):
-        _access = self.emu_eng.mem_access.get(access)  # type: ignore[union-attr]
+        _access = self.emu_eng.mem_access.get(access)
 
         if _access == common.INVALID_MEM_READ:
             p = self.get_current_process()
@@ -714,195 +779,103 @@ class Win32Emulator(WindowsEmulator):
         return super()._hook_mem_unmapped(emu, access, address, size, value)
 
     def set_hooks(self):
-        """Set the emulator callbacks"""
-
+        """Add the hooks of the user mode emulator, then the tracing, coverage and debug hooks."""
         super().set_hooks()
 
-        if not self.builtin_hooks_set:
+        if not self.has_builtin_hooks:
             self.add_mem_invalid_hook(cb=self._hook_mem_unmapped)
             self.add_interrupt_hook(cb=self._hook_interrupt)
             self.add_invalid_instruction_hook(cb=self._hook_invalid_instruction)
-            self.builtin_hooks_set = True
+            if self.config.exceptions.dispatch:
+                # IN and OUT are privileged in user mode, so Windows raises an exception.
+                self.add_instruction_hook(cb=self._hook_in_instruction, insn=UC_X86_INS_IN)
+                self.add_instruction_hook(cb=self._hook_out_instruction, insn=UC_X86_INS_OUT)
+            self.has_builtin_hooks = True
 
+        self.set_call_site_hook()
         self.set_mem_tracing_hooks()
         self.set_coverage_hooks()
         self.set_debug_hooks()
 
-    def stop(self):
-        self.run_complete = True
-        # self._unset_emu_hooks()
-        # self.unset_hooks()
-        super().stop()
-
     def on_emu_complete(self):
-        """
-        Called when all runs have completed emulation
-        """
-        if not self.emu_complete:
-            self.emu_complete = True
-            if self.config.analysis.strings and self.profiler:
+        """Find the decoded strings if the config asks for them, then stop the emulation."""
+        if not self.is_emu_complete:
+            self.is_emu_complete = True
+            if self.config.memory.strings and self.profiler:
                 dec_ansi, dec_unicode = self.get_mem_strings()
-                dec_ansi = [a[1] for a in dec_ansi if a not in self.profiler.strings["ansi"]]
-                dec_unicode = [u[1] for u in dec_unicode if u not in self.profiler.strings["unicode"]]
+                static_ansi = set(self.profiler.strings["ansi"])
+                static_unicode = set(self.profiler.strings["unicode"])
+                dec_ansi = list(dict.fromkeys(s for _, s in dec_ansi if s not in static_ansi))
+                dec_unicode = list(dict.fromkeys(s for _, s in dec_unicode if s not in static_unicode))
                 self.profiler.decoded_strings["ansi"] = dec_ansi
                 self.profiler.decoded_strings["unicode"] = dec_unicode
-        self.stop()
+        # Stop the engine and the run clock. WindowsEmulator.stop also ends the run.
+        BinaryEmulator.stop(self)
 
     def on_run_complete(self):
+        """Record the result of the run: the return value, the exit code of the thread, and the memory layout."""
+        run = self.curr_run
+        if run is not None:
+            run.return_value = self.get_return_val()
+            thread = run.thread
+            if thread and thread.exit_code is None:
+                thread.exit_code = run.return_value & 0xFFFFFFFF
+            if self.profiler:
+                self.profiler.record_dropped_files_event(run, self.get_dropped_files())
+                self._capture_memory_layout(run)
+
+    def _is_guest_memory(self, mm: MemMap) -> bool:
         """
-        Clean up after a run completes. This function will pop the
-        next run from the run queue and emulate it.
+        Get whether the guest owns the data of a memory map, so that the report keeps its contents.
+
+        The guest owns its allocations and heaps (``api.*`` tags), the regions with no tag that API
+        handlers allocate for it, its static TLS data (``emu.tls.*`` tags) and the images of the modules
+        that load from a file, such as the input. The emulator owns the stub images of the system modules,
+        its other structures and the stacks.
         """
-        self.run_complete = True
-        self.curr_run.ret_val = self.get_return_val()  # type: ignore[union-attr]
-        if self.profiler:
-            self.profiler.record_dropped_files_event(self.curr_run, self.get_dropped_files())
-            self._capture_memory_layout()
+        if not mm.tag or mm.tag.startswith(("api.", "emu.tls.")):
+            return True
+        module = self._get_image_module(mm)
+        return module is not None and module._image.source != "synthetic"
 
-        return self._exec_next_run()
-
-    def _capture_memory_layout(self):
-        """
-        Capture current memory layout and loaded modules for the run report.
-        """
-        EXCLUDED_TAG_PREFIXES = ("emu.stack", "api.heap", "emu.process_heap")
-
-        prot_map = {
-            common.PERM_MEM_NONE: "---",
-            common.PERM_MEM_READ: "r--",
-            common.PERM_MEM_WRITE: "-w-",
-            common.PERM_MEM_EXEC: "--x",
-            common.PERM_MEM_READ | common.PERM_MEM_WRITE: "rw-",
-            common.PERM_MEM_READ | common.PERM_MEM_EXEC: "r-x",
-            common.PERM_MEM_WRITE | common.PERM_MEM_EXEC: "-wx",
-            common.PERM_MEM_RWX: "rwx",
-        }
-
-        capture_dumps = getattr(self.config, "snapshot_memory_regions", False)
-
-        modules_by_base: dict[int, object] = {}
-        for m in self.modules:
-            if m.image_size > 0:
-                modules_by_base[m.base] = m
+    def _capture_memory_layout(self, run: Run) -> None:
+        """Record the memory layout and the loaded modules in the report of the run."""
+        capture_dumps = self.config.memory.final_contents and self.profiler is not None
+        keep_freed = self.config.memory.freed_regions
 
         for mm in self.get_mem_maps():
-            prot = prot_map.get(mm.prot, "???")
-            access_stats = None
-            if mm in self.curr_run.mem_access:  # type: ignore[union-attr]
-                ma = self.curr_run.mem_access[mm]  # type: ignore[union-attr]
-                access_stats = {"reads": ma.reads, "writes": ma.writes, "execs": ma.execs}
-
-            tag = mm.tag or ""
-            mm_base = mm.base
-            mm_size = mm.size
-
-            mod = modules_by_base.get(mm_base) if tag.startswith("emu.module.") else None
-            sections = getattr(mod, "sections", None) if mod else None
-
-            if sections:
-                mod_name = ntpath.basename(mod.emu_path) or "unknown"  # type: ignore[union-attr]
+            if mm.free and not keep_freed:
+                continue
+            data = None
+            if capture_dumps and self._is_guest_memory(mm):
                 try:
-                    full_data = self.mem_read(mm_base, mm_size) if capture_dumps else None
+                    data = self.mem_read(mm.base, mm.size)
                 except Exception:
-                    full_data = None
-
-                first_section_rva = sections[0].virtual_address if sections else mm_size
-                hdr_size = first_section_rva
-                hdr_tag = f"emu.module.{mod_name}.headers.0x{mm_base:x}"
-                hdr_access = access_stats
-                hdr_key = (mm_base, 0)
-                hdr_ma = self.curr_run.section_access.get(hdr_key)  # type: ignore[union-attr]
-                if hdr_ma:
-                    hdr_access = {"reads": hdr_ma.reads, "writes": hdr_ma.writes, "execs": hdr_ma.execs}
-                hdr_dict: dict = {
-                    "tag": hdr_tag,
-                    "address": mm_base,
-                    "size": hdr_size,
-                    "prot": "r--",
-                    "is_free": mm.free,
-                    "accesses": hdr_access,
+                    data = None
+            for part in self.get_region_parts(mm):
+                region: dict[str, Any] = {
+                    "base": part.base,
+                    "size": part.size,
+                    "permissions": get_prot_string(part.perms),
+                    "tag": part.tag,
+                    "module": part.module,
+                    "section": part.section,
                 }
-                if full_data and not hdr_tag.startswith(EXCLUDED_TAG_PREFIXES) and self.profiler:
-                    try:
-                        hdr_dict["data_ref"] = self.profiler.artifact_store.put_bytes(full_data[:hdr_size])
-                    except Exception:
-                        pass
-                self.curr_run.memory_regions.append(hdr_dict)  # type: ignore[union-attr]
-
-                for sect in sections:
-                    sec_addr = sect.virtual_address + mm_base
-                    sec_prot = get_prot_string(sect.perms)
-
-                    sec_access = access_stats
-                    sec_key = (mm_base, sect.virtual_address)
-                    sec_ma = self.curr_run.section_access.get(sec_key)  # type: ignore[union-attr]
-                    if sec_ma:
-                        sec_access = {"reads": sec_ma.reads, "writes": sec_ma.writes, "execs": sec_ma.execs}
-
-                    sec_tag = f"emu.module.{mod_name}.{sect.name}.0x{sec_addr:x}"
-                    sec_dict: dict = {
-                        "tag": sec_tag,
-                        "address": sec_addr,
-                        "size": sect.virtual_size,
-                        "prot": sec_prot,
-                        "is_free": mm.free,
-                        "accesses": sec_access,
-                    }
-                    if full_data and not sec_tag.startswith(EXCLUDED_TAG_PREFIXES) and self.profiler:
-                        try:
-                            sec_dict["data_ref"] = self.profiler.artifact_store.put_bytes(
-                                full_data[sect.virtual_address : sect.virtual_address + sect.virtual_size]
-                            )
-                        except Exception:
-                            pass
-                    self.curr_run.memory_regions.append(sec_dict)  # type: ignore[union-attr]
-            else:
-                region_dict: dict = {
-                    "tag": tag,
-                    "address": mm_base,
-                    "size": mm_size,
-                    "prot": prot,
-                    "is_free": mm.free,
-                    "accesses": access_stats,
-                }
-
-                if capture_dumps and not tag.startswith(EXCLUDED_TAG_PREFIXES) and self.profiler:
-                    try:
-                        data = self.mem_read(mm_base, mm_size)
-                        region_dict["data_ref"] = self.profiler.artifact_store.put_bytes(data)
-                    except Exception:
-                        pass
-
-                self.curr_run.memory_regions.append(region_dict)  # type: ignore[union-attr]
+                if keep_freed:
+                    region["freed"] = mm.free
+                if data is not None and self.profiler is not None:
+                    offset = part.base - mm.base
+                    region["data_ref"] = self.profiler.artifact_store.put_bytes(data[offset : offset + part.size])
+                run.memory_regions.append(region)
 
         for m in self.modules:
             if m.image_size == 0:
                 continue
-            mod_name = ntpath.basename(m.emu_path) or "unknown"
-            segments = []
-            for sect in m.sections:
-                segments.append(
-                    {
-                        "name": sect.name,
-                        "address": sect.virtual_address + m.base,
-                        "size": sect.virtual_size,
-                        "prot": get_prot_string(sect.perms),
-                    }
-                )
-            self.curr_run.loaded_modules.append(  # type: ignore[union-attr]
+            run.loaded_modules.append(
                 {
-                    "name": mod_name,
+                    "name": m.get_base_name() or m.name,
                     "path": m.emu_path,
                     "base": m.base,
                     "size": m.image_size,
-                    "segments": segments,
                 }
             )
-
-    def heap_alloc(self, size, heap="None"):
-        """
-        Allocate a memory chunk and add it to the "heap"
-        """
-        addr = self.mem_map(size, base=None, tag=f"api.heap.{heap}")
-        self.heap_allocs.append((addr, size, heap))
-        return addr

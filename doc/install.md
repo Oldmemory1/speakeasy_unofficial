@@ -1,4 +1,4 @@
-# Installation and Docker usage
+# Installation
 
 Speakeasy requires Python 3.10+.
 
@@ -8,7 +8,7 @@ Speakeasy requires Python 3.10+.
 python3 -m pip install speakeasy-emulator
 ```
 
-Verify installation:
+Check the installation:
 
 ```console
 speakeasy -h
@@ -24,28 +24,9 @@ python3 scripts/gen_win32_signatures.py
 python3 scripts/gen_phnt_signatures.py
 ```
 
-The last two steps build the API signature databases from the `deps/win32json` and `deps/phnt` submodules (see [Adding API handlers](api-handlers.md)). Wheels built with `python -m build` include them automatically; an editable install needs them generated once, and again after updating the submodules.
+The last two steps build the API signature databases from the `deps/win32json` and `deps/phnt` submodules (see [Adding API handlers](api-handlers.md)). `python -m build` builds the databases and puts them in the wheel. For an editable install, run the two scripts once, and again after you update the submodules.
 
-Optional GDB support from source:
-
-```console
-python3 -m pip install -e ".[dev,gdb]"
-```
-
-## Run in Docker
-
-Build image:
-
-```console
-cd <repo_base_dir>
-docker build -t speakeasy:local .
-```
-
-Run container with a host sample directory mounted at `/sandbox`:
-
-```console
-docker run -v <path_containing_samples>:/sandbox -it speakeasy:local
-```
+[GDB debugging](gdb.md) needs no extra packages.
 
 ## Related docs
 

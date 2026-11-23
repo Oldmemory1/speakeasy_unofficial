@@ -1,9 +1,17 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+from typing import TYPE_CHECKING
+
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.windows.secur32 as sec32defs
+import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy.winenv.defs.enums import EXTENDED_NAME_FORMAT
+from speakeasy.winenv.defs.lookup import decode
 
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
 
 
 class Secur32(api.ApiHandler):
@@ -16,52 +24,50 @@ class Secur32(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("GetUserNameEx", argc=3, conv=_arch.CALL_CONV_STDCALL)
-    def GetUserNameEx(self, emu, argv, ctx: api.ApiContext = None):
+    def GetUserNameEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOLEAN SEC_ENTRY GetUserNameExA(
-          EXTENDED_NAME_FORMAT NameFormat,
-          LPSTR                lpNameBuffer,
-          PULONG               nSize
+        BOOLEAN GetUserNameEx(
+            EXTENDED_NAME_FORMAT NameFormat,
+            LPTSTR lpNameBuffer,
+            PULONG nSize
         );
         """
-        ctx = ctx or {}
         NameFormat, lpNameBuffer, nSize = argv
 
         cw = self.get_char_width(ctx)
 
-        name_format = sec32defs.get_define(NameFormat, prefix="Name")
-        if name_format:
-            argv[0] = name_format
+        ctx.args["NameFormat"].display = decode(EXTENDED_NAME_FORMAT, NameFormat)
 
         user_name = emu.config.user.name
-        user_name_len = len(user_name) + 1
+        user_name_len = len(user_name)
 
-        argv[1] = user_name
-        argv[2] = user_name_len
+        ctx.args["lpNameBuffer"].display = user_name
+        ctx.args["nSize"].display = hex(user_name_len)
 
         if not nSize or not emu.is_address_valid(nSize):
             return 0
 
-        current_size = int.from_bytes(self.mem_read(nSize, 4), "little")
-        self.mem_write(nSize, user_name_len.to_bytes(4, "little"))
-        if not lpNameBuffer or current_size < user_name_len:
-            emu.set_last_error(122)  # ERROR_INSUFFICIENT_BUFFER
+        size = self.read_dword(nSize)
+        if not lpNameBuffer or size < user_name_len + 1:
+            self.write_dword(nSize, user_name_len + 1)
+            emu.set_last_error(windefs.ERROR_MORE_DATA)
             return 0
 
         self.write_mem_string(user_name, lpNameBuffer, cw)
+        self.write_dword(nSize, user_name_len)
+
         return 1
 
     @apihook("EncryptMessage", argc=4)
-    def EncryptMessage(self, emu, argv, ctx: api.ApiContext = None):
+    def EncryptMessage(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        SECURITY_STATUS SEC_ENTRY EncryptMessage(
-        PCtxtHandle    phContext,
-        unsigned long  fQOP,
-        PSecBufferDesc pMessage,
-        unsigned long  MessageSeqNo
+        SECURITY_STATUS EncryptMessage(
+            PCtxtHandle phContext,
+            unsigned long fQOP,
+            PSecBufferDesc pMessage,
+            unsigned long MessageSeqNo
         );
         """
-
-        PCtxtHandle, fQOP, pMessage, MessageSeqNo = argv
+        phContext, fQOP, pMessage, MessageSeqNo = argv
 
         return sec32defs.SEC_E_INVALID_HANDLE

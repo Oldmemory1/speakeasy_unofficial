@@ -1,12 +1,20 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import logging
+import uuid
+from typing import TYPE_CHECKING
 
 import speakeasy.common as common
-import speakeasy.winenv.defs.windows.com as com
 import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy.winenv.defs.enums import RPC_C_AUTHN_LEVEL, RPC_C_IMP_LEVEL
+from speakeasy.winenv.defs.lookup import decode
+from speakeasy.winenv.defs.windows import com as comdefs
 
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.netman import NetworkManager
+    from speakeasy.windows.win32 import Win32Emulator
 
 logger = logging.getLogger(__name__)
 
@@ -41,81 +49,91 @@ class Ole32(api.ApiHandler):
         self.funcs = {}
         self.data = {}
         super().__get_hook_attrs__(self)
-        self.netman = emu.get_network_manager()
-        self.names = {}
+        self.netman: NetworkManager = emu.get_network_manager()
+        self.com_init: dict[int, tuple[int, int]] = {}
         # Explicit ownership tracking for the COM task allocator: block base ->
         # requested cb. CoTaskMemFree/CoTaskMemRealloc only touch these blocks;
         # image pages and mappings owned by other APIs are never released.
         self._task_allocs: dict[int, int] = {}
 
+    def co_initialize(self, emu, model):
+        tid = emu.get_current_thread().id
+        count, current = self.com_init.get(tid, (0, None))
+        if count and current != model:
+            return comdefs.RPC_E_CHANGED_MODE
+        self.com_init[tid] = (count + 1, model)
+        return comdefs.S_FALSE if count else windefs.S_OK
+
+    def co_uninitialize(self, emu):
+        tid = emu.get_current_thread().id
+        count, model = self.com_init.get(tid, (0, 0))
+        if count > 1:
+            self.com_init[tid] = (count - 1, model)
+        else:
+            self.com_init.pop(tid, None)
+
     @apihook("OleInitialize", argc=1)
-    def OleInitialize(self, emu, argv, ctx: api.ApiContext = None):
+    def OleInitialize(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT OleInitialize(
-            IN LPVOID pvReserved
+            LPVOID pvReserved
         );
         """
+        return self.co_initialize(emu, comdefs.COINIT_APARTMENTTHREADED)
 
-        rv = windefs.S_OK
-
-        return rv
+    @apihook("OleUninitialize", argc=0)
+    def OleUninitialize(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void OleUninitialize();
+        """
+        self.co_uninitialize(emu)
 
     @apihook("CoInitialize", argc=1)
-    def CoInitialize(self, emu, argv, ctx: api.ApiContext = None):
+    def CoInitialize(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoInitialize(
-          LPVOID pvReserved
+            LPVOID pvReserved
         );
         """
-
-        rv = windefs.S_OK
-
-        return rv
+        return self.co_initialize(emu, comdefs.COINIT_APARTMENTTHREADED)
 
     @apihook("CoInitializeEx", argc=2)
-    def CoInitializeEx(self, emu, argv, ctx: api.ApiContext = None):
+    def CoInitializeEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoInitializeEx(
-          LPVOID pvReserved,
-          DWORD  dwCoInit
+            LPVOID pvReserved,
+            DWORD dwCoInit
         );
         """
-
-        rv = windefs.S_OK
-
-        return rv
+        pvReserved, dwCoInit = argv
+        return self.co_initialize(emu, dwCoInit & comdefs.COINIT_APARTMENTTHREADED)
 
     @apihook("CoUninitialize", argc=0)
-    def CoUninitialize(self, emu, argv, ctx: api.ApiContext = None):
+    def CoUninitialize(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void CoUninitialize();
         """
+        self.co_uninitialize(emu)
 
     @apihook("CoInitializeSecurity", argc=9)
-    def CoInitializeSecurity(self, emu, argv, ctx: api.ApiContext = None):
+    def CoInitializeSecurity(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoInitializeSecurity(
-          PSECURITY_DESCRIPTOR        pSecDesc,
-          LONG                        cAuthSvc,
-          SOLE_AUTHENTICATION_SERVICE *asAuthSvc,
-          void                        *pReserved1,
-          DWORD                       dwAuthnLevel,
-          DWORD                       dwImpLevel,
-          void                        *pAuthList,
-          DWORD                       dwCapabilities,
-          void                        *pReserved3
+            PSECURITY_DESCRIPTOR pSecDesc,
+            LONG cAuthSvc,
+            SOLE_AUTHENTICATION_SERVICE *asAuthSvc,
+            void *pReserved1,
+            DWORD dwAuthnLevel,
+            DWORD dwImpLevel,
+            void *pAuthList,
+            DWORD dwCapabilities,
+            void *pReserved3
         );
         """
-
         rv = windefs.S_OK
 
-        authn_level = com.get_define_int(argv[4])
-        if authn_level:
-            argv[4] = authn_level
-
-        imp_level = com.get_define_int(argv[5])
-        if imp_level:
-            argv[5] = imp_level
+        ctx.args["dwAuthnLevel"].display = decode(RPC_C_AUTHN_LEVEL, argv[4])
+        ctx.args["dwImpLevel"].display = decode(RPC_C_IMP_LEVEL, argv[5])
 
         return rv
 
@@ -126,24 +144,24 @@ class Ole32(api.ApiHandler):
     def _read_clsid(self, rclsid) -> tuple[str, str | None]:
         """Resolve a guest REFCLSID to (clsid_str, registered CLSID name or None)."""
         clsid_bytes = self.mem_read(rclsid, self.sizeof(windefs.GUID()))
-        clsid_str = com.convert_guid_bytes_to_str(clsid_bytes)
-        return clsid_str, com.get_clsid(clsid_str)
+        clsid_str = comdefs.convert_guid_bytes_to_str(clsid_bytes)
+        return clsid_str, comdefs.get_clsid(clsid_str)
 
     def _read_iid(self, riid) -> tuple[str, str | None]:
         """Resolve a guest REFIID to (riid_str, registered IID name or None)."""
         riid_bytes = self.mem_read(riid, self.sizeof(windefs.GUID()))
-        riid_str = com.convert_guid_bytes_to_str(riid_bytes)
-        return riid_str, com.get_iid(riid_str)
+        riid_str = comdefs.convert_guid_bytes_to_str(riid_bytes)
+        return riid_str, comdefs.get_iid(riid_str)
 
     @apihook("CoCreateInstance", argc=5)
-    def CoCreateInstance(self, emu, argv, ctx: api.ApiContext = None):
+    def CoCreateInstance(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoCreateInstance(
-          REFCLSID  rclsid,
-          LPUNKNOWN pUnkOuter,
-          DWORD     dwClsContext,
-          REFIID    riid,
-          LPVOID    *ppv
+            REFCLSID rclsid,
+            LPUNKNOWN pUnkOuter,
+            DWORD dwClsContext,
+            REFIID riid,
+            LPVOID *ppv
         );
 
         COM contract (same as Wine combase CoCreateInstance/CoCreateInstanceEx):
@@ -156,7 +174,7 @@ class Ole32(api.ApiHandler):
 
         if not ppv:
             # Wine combase.c:1695-1704 returns E_POINTER when obj is NULL.
-            return com.E_POINTER
+            return comdefs.E_POINTER
 
         # Wine zeroes the interface result before class lookup (combase.c:1908
         # init_multi_qi), so no failure path can leave a stale pointer behind.
@@ -165,31 +183,31 @@ class Ole32(api.ApiHandler):
         clsid_str, clsid_name = self._read_clsid(rclsid)
         if not clsid_name:
             logger.info("Unsupported COM CLSID %s", clsid_str)
-            return com.REGDB_E_CLASSNOTREG
+            return comdefs.REGDB_E_CLASSNOTREG
 
-        argv[0] = clsid_name
+        ctx.args["rclsid"].display = clsid_name
         riid_str, iid_name = self._read_iid(riid)
         if not iid_name:
             logger.info("Unsupported COM IID %s", riid_str)
-            return com.E_NOINTERFACE
+            return comdefs.E_NOINTERFACE
 
-        argv[3] = iid_name
+        ctx.args["riid"].display = iid_name
         ci = emu.com.get_interface(emu, ptr_size, iid_name.replace("IID_", ""))
         pv = self.mem_alloc(ptr_size, tag=f"emu.COM.pv_{iid_name}")
-        self.mem_write(pv, ci.address.to_bytes(ptr_size, "little"))
-        self.mem_write(ppv, pv.to_bytes(ptr_size, "little"))
+        self.write_ptr(pv, ci.address)
+        self.write_ptr(ppv, pv)
 
         return windefs.S_OK
 
     @apihook("CoGetClassObject", argc=5)
-    def CoGetClassObject(self, emu, argv, ctx: api.ApiContext = None):
+    def CoGetClassObject(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoGetClassObject(
-          REFCLSID       rclsid,
-          DWORD          dwClsContext,
-          COSERVERINFO   *pServerInfo,
-          REFIID         riid,
-          LPVOID         *ppv
+            REFCLSID rclsid,
+            DWORD dwClsContext,
+            COSERVERINFO *pServerInfo,
+            REFIID riid,
+            LPVOID *ppv
         );
 
         Same COM failure contract as CoCreateInstance: *ppv is NULL on failure
@@ -203,29 +221,49 @@ class Ole32(api.ApiHandler):
         ptr_size = emu.get_ptr_size()
 
         if not ppv:
-            return com.E_POINTER
+            return comdefs.E_POINTER
 
         self._zero_com_out_pointer(ppv, ptr_size)
 
         clsid_str, clsid_name = self._read_clsid(rclsid)
         if not clsid_name:
             logger.info("Unsupported COM CLSID %s", clsid_str)
-            return com.REGDB_E_CLASSNOTREG
+            return comdefs.REGDB_E_CLASSNOTREG
 
-        argv[0] = clsid_name
+        ctx.args["rclsid"].display = clsid_name
         riid_str, iid_name = self._read_iid(riid)
         if iid_name:
-            argv[3] = iid_name
+            ctx.args["riid"].display = iid_name
         logger.info("No COM class object for CLSID %s (IID %s)", clsid_name, riid_str)
-        return com.E_NOINTERFACE
+        return comdefs.E_NOINTERFACE
+
+    @apihook("CoGetObject", argc=4)
+    def CoGetObject(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HRESULT CoGetObject(
+            LPCWSTR pszName,
+            BIND_OPTS *pBindOptions,
+            REFIID riid,
+            void **ppv
+        );
+
+        No moniker names are modeled, so every name fails to parse.
+        """
+        pszName, pBindOptions, riid, ppv = argv
+
+        if pszName:
+            ctx.args["pszName"].display = self.read_mem_string(pszName, 2)
+        if ppv:
+            self.mem_write(ppv, b"\x00" * emu.get_ptr_size())
+        return comdefs.MK_E_SYNTAX
 
     @apihook("OleDuplicateData", argc=3)
-    def OleDuplicateData(self, emu, argv, ctx: api.ApiContext = None):
+    def OleDuplicateData(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HGLOBAL OleDuplicateData(
-          HGLOBAL   hSrc,
-          CLIPFORMAT cfFormat,
-          UINT      uiFlags
+            HGLOBAL   hSrc,
+            CLIPFORMAT cfFormat,
+            UINT      uiFlags
         );
 
         Duplicate a clipboard data handle. Wine (ole32/ole2.c:3094) routes the
@@ -280,59 +318,97 @@ class Ole32(api.ApiHandler):
         return mm.size
 
     @apihook("CoSetProxyBlanket", argc=8)
-    def CoSetProxyBlanket(self, emu, argv, ctx: api.ApiContext = None):
+    def CoSetProxyBlanket(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT CoSetProxyBlanket(
-            IUnknown                 *pProxy,
-            DWORD                    dwAuthnSvc,
-            DWORD                    dwAuthzSvc,
-            OLECHAR                  *pServerPrincName,
-            DWORD                    dwAuthnLevel,
-            DWORD                    dwImpLevel,
+            IUnknown *pProxy,
+            DWORD dwAuthnSvc,
+            DWORD dwAuthzSvc,
+            OLECHAR *pServerPrincName,
+            DWORD dwAuthnLevel,
+            DWORD dwImpLevel,
             RPC_AUTH_IDENTITY_HANDLE pAuthInfo,
-            DWORD                    dwCapabilities
+            DWORD dwCapabilities
         );
         """
-        return 1
+        return windefs.S_OK
 
     @apihook("StringFromCLSID", argc=2)
-    def StringFromCLSID(self, emu, argv, ctx: api.ApiContext = None):
+    def StringFromCLSID(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT StringFromCLSID(
-        REFCLSID rclsid,
-        LPOLESTR *lplpsz
+            REFCLSID rclsid,
+            LPOLESTR *lplpsz
         );
         """
-
         rclsid, lplpsz = argv
         rv = windefs.S_OK
 
         guid = self.mem_read(rclsid, self.sizeof(windefs.GUID()))
-        u = com.convert_guid_bytes_to_str(guid)
-        argv[1] = u
+        u = comdefs.convert_guid_bytes_to_str(guid)
+        ctx.args["lplpsz"].display = u
         u = (u + "\x00").encode("utf-16le")
 
         ptr = self.mem_alloc(len(u), tag="api.StringFromCLSID")
+        self.mem_write(ptr, u)
 
         if lplpsz:
-            self.mem_write(lplpsz, ptr.to_bytes(emu.get_ptr_size(), "little"))
+            self.write_ptr(lplpsz, ptr)
 
         return rv
 
-    @apihook("CoCreateGuid", argc=1)
-    def CoCreateGuid(self, emu, argv, ctx: api.ApiContext = None):
-        pguid = argv[0]
-        guid_bytes = b"\xde\xad\xc0\xde\xbe\xef\xca\xfe\xba\xbe\x01\x23\x45\x67\x89\xab"
-        if pguid:
-            try:
-                self.emu.mem_write(pguid, guid_bytes)
-            except Exception:
-                self.emu.mem_map(pguid & ~0xFFF, 0x1000)
-                self.emu.mem_write(pguid, guid_bytes)
-        return 0
+    @apihook("CLSIDFromProgID", argc=2)
+    def CLSIDFromProgID(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HRESULT CLSIDFromProgID(
+            LPCOLESTR lpszProgID,
+            LPCLSID lpclsid
+        );
+        """
+        lpszProgID, lpclsid = argv
+
+        progid = self.read_mem_string(lpszProgID, 2) if lpszProgID else ""
+        clsid = comdefs.PROGID_CLSIDS.get(progid.lower())
+        if clsid is None:
+            self.mem_write(lpclsid, b"\x00" * 16)
+            return comdefs.CO_E_CLASSSTRING
+
+        self.mem_write(lpclsid, uuid.UUID(clsid).bytes_le)
+        ctx.args["lpclsid"].display = clsid
+        return windefs.S_OK
+
+    @apihook("CLSIDFromProgIDEx", argc=2)
+    def CLSIDFromProgIDEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HRESULT CLSIDFromProgIDEx(
+            LPCOLESTR lpszProgID,
+            LPCLSID lpclsid
+        );
+        """
+        return self.CLSIDFromProgID(emu, argv, ctx)
+
+    @apihook("StringFromGUID2", argc=3)
+    def StringFromGUID2(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int StringFromGUID2(
+            REFGUID rguid,
+            LPOLESTR lpsz,
+            int cchMax
+        );
+        """
+        rguid, lpsz, cchMax = argv
+
+        guid = self.mem_read(rguid, self.sizeof(windefs.GUID()))
+        u = comdefs.convert_guid_bytes_to_str(guid) + "\x00"
+        if cchMax < len(u):
+            return 0
+
+        self.write_mem_string(u, lpsz, 2)
+        ctx.args["lpsz"].display = u[:-1]
+        return len(u)
 
     @apihook("CoTaskMemAlloc", argc=1)
-    def CoTaskMemAlloc(self, emu, argv, ctx: api.ApiContext = None):
+    def CoTaskMemAlloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void *CoTaskMemAlloc(SIZE_T cb);
 
@@ -347,7 +423,7 @@ class Ole32(api.ApiHandler):
         return self._task_alloc(cb)
 
     @apihook("CoTaskMemFree", argc=1)
-    def CoTaskMemFree(self, emu, argv, ctx: api.ApiContext = None):
+    def CoTaskMemFree(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void CoTaskMemFree(LPVOID pv);
 
@@ -360,7 +436,7 @@ class Ole32(api.ApiHandler):
         self._task_free(pv)
 
     @apihook("CoTaskMemRealloc", argc=2)
-    def CoTaskMemRealloc(self, emu, argv, ctx: api.ApiContext = None):
+    def CoTaskMemRealloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void *CoTaskMemRealloc(LPVOID pv, SIZE_T cb);
 
@@ -397,6 +473,19 @@ class Ole32(api.ApiHandler):
 
         self._task_free(pv)
         return new_addr
+
+    @apihook("CoCreateGuid", argc=1)
+    def CoCreateGuid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HRESULT CoCreateGuid(
+            GUID *pguid
+        );
+        """
+        (pguid,) = argv
+        if not pguid:
+            return windefs.E_INVALIDARG
+        self.mem_write(pguid, uuid.UUID(bytes=emu.rng.randbytes(16), version=4).bytes_le)
+        return windefs.S_OK
 
     def _task_alloc(self, cb: int) -> int:
         """Map and track a task-allocator block for ``cb`` bytes (0 on failure)."""

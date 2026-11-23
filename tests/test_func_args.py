@@ -1,5 +1,6 @@
 import pytest
 
+from speakeasy import Speakeasy
 from speakeasy.config import SpeakeasyConfig
 from speakeasy.windows.win32 import Win32Emulator
 from speakeasy.winenv import arch as e_arch
@@ -55,14 +56,6 @@ def test_round_trip(emu, argc):
             f"arch={emu.arch}, conv={_conv_name(conv)}, argc={argc}: "
             f"expected {[hex(a) for a in args]}, got {[hex(a) for a in got]}"
         )
-        emu.reset_stack(emu.stack_base)
-
-
-@pytest.mark.parametrize("argc", ARG_COUNTS)
-def test_ret_address(emu, argc):
-    for conv in _convs_for_arch(emu.arch):
-        args = _make_args(argc)
-        emu.set_func_args(emu.stack_base, RET_ADDR, *args, conv=conv)
         got_ret = emu.get_ret_address()
         assert got_ret == RET_ADDR, (
             f"arch={emu.arch}, conv={_conv_name(conv)}: ret expected {hex(RET_ADDR)}, got {hex(got_ret)}"
@@ -70,25 +63,33 @@ def test_ret_address(emu, argc):
         emu.reset_stack(emu.stack_base)
 
 
+@pytest.mark.parametrize("conv", [e_arch.CALL_CONV_STDCALL, e_arch.CALL_CONV_FASTCALL], ids=["stdcall", "fastcall"])
 @pytest.mark.parametrize("argc", ARG_COUNTS)
-def test_x86_stdcall_stack_restored(emu, argc):
+def test_x86_callee_cleanup_stack_restored(emu, argc, conv):
     if emu.arch != e_arch.ARCH_X86:
         pytest.skip("x86 only")
-    conv = e_arch.CALL_CONV_STDCALL
     args = _make_args(argc)
     sp_before = emu.get_stack_ptr()
-    emu.set_func_args(emu.stack_base, RET_ADDR, *args, conv=conv)
+    emu.set_func_args(sp_before, RET_ADDR, *args, conv=conv)
     emu.do_call_return(argc, ret_addr=RET_ADDR, conv=conv)
     assert emu.get_stack_ptr() == sp_before
 
 
-@pytest.mark.parametrize("argc", ARG_COUNTS)
-def test_x86_fastcall_stack_restored(emu, argc):
-    if emu.arch != e_arch.ARCH_X86:
-        pytest.skip("x86 only")
-    conv = e_arch.CALL_CONV_FASTCALL
-    args = _make_args(argc)
-    sp_before = emu.get_stack_ptr()
-    emu.set_func_args(emu.stack_base, RET_ADDR, *args, conv=conv)
-    emu.do_call_return(argc, ret_addr=RET_ADDR, conv=conv)
-    assert emu.get_stack_ptr() == sp_before
+def test_x86_run_reads_stack_arguments_it_was_not_given(config):
+    se = Speakeasy(config=config)
+    try:
+        # mov eax, [esp + 0x24]; ret
+        addr = se.load_shellcode(data=b"\x8b\x44\x24\x24\xc3", arch="x86")
+        se.run_shellcode(addr)
+        assert se.get_report().runs[0].error is None
+    finally:
+        se.shutdown()
+
+
+def test_x64_call_reads_stack_arguments_it_was_not_given(config):
+    with Speakeasy(config=config) as se:
+        # ret; mov rax, [rsp + 0x60]; ret
+        addr = se.load_shellcode(data=b"\xc3\x48\x8b\x44\x24\x60\xc3", arch="x64")
+        se.run_shellcode(addr)
+        se.call(addr + 1)
+        assert se.get_report().runs[1].error is None

@@ -1,11 +1,16 @@
-"""Instruction-budget state regression test."""
+"""Instruction-budget state and the ``limits.instructions`` cap through the public interfaces."""
+
+import copy
+import struct
+
+import pytest
 
 from speakeasy import Speakeasy
 
 
 def test_instruction_budget_state_is_exposed(config):
-    config = dict(config)
-    config["max_instructions"] = 1
+    config = copy.deepcopy(config)
+    config["limits"]["instructions"] = 1
     se = Speakeasy(config=config)
     try:
         shellcode = se.load_shellcode(data=b"\x90\x90\xc3", arch="amd64")
@@ -16,8 +21,8 @@ def test_instruction_budget_state_is_exposed(config):
 
 
 def test_normal_completion_does_not_set_instruction_budget(config):
-    config = dict(config)
-    config["max_instructions"] = 1_000
+    config = copy.deepcopy(config)
+    config["limits"]["instructions"] = 1_000
     se = Speakeasy(config=config)
     try:
         shellcode = se.load_shellcode(data=b"\x90\x90\xc3", arch="amd64")
@@ -26,3 +31,99 @@ def test_normal_completion_does_not_set_instruction_budget(config):
         assert se.emu.run_complete is True
     finally:
         se.shutdown()
+
+
+@pytest.fixture
+def capped_session(config):
+    config["limits"]["per_run_time"] = 3
+    sessions = []
+
+    def create(budget, accesses=False):
+        config["limits"]["instructions"] = budget
+        config["memory"]["accesses"] = accesses
+        se = Speakeasy(config=config)
+        sessions.append(se)
+        return se
+
+    yield create
+    for se in sessions:
+        se.shutdown()
+
+
+def assert_limit(run, budget):
+    assert run.error.type == "instruction_limit"
+    assert run.error.limit == budget
+    assert run.instruction_count == budget
+
+
+@pytest.mark.parametrize("accesses", [False, True])
+@pytest.mark.parametrize("budget", [8, 17])
+def test_cap_stops_loop_at_exact_instruction(capped_session, budget, accesses):
+    se = capped_session(budget, accesses)
+    # Seven NOPs then a jump to the first NOP: eight instructions per cycle.
+    base = se.load_shellcode(data=b"\x90" * 7 + b"\xeb\xf7", arch="x86")
+    se.run_shellcode(base)
+    run = se.get_report().runs[0]
+    assert_limit(run, budget)
+    assert int(run.error.pc) == base + budget % 8
+
+
+def test_cap_counts_each_rep_iteration(capped_session):
+    se = capped_session(4)
+    # MOV ECX,5; MOV EDI,destination; REP STOSB; NOP; JMP $
+    code = b"\xb9\x05\0\0\0\xbf\0\0\0\0\xf3\xaa\x90\xeb\xfe"
+    base = se.load_shellcode(data=code, arch="x86")
+    destination = se.mem_alloc(0x1000)
+    se.mem_write(base + 6, struct.pack("<I", destination))
+    se.run_shellcode(base)
+    run = se.get_report().runs[0]
+    assert_limit(run, 4)
+    assert se.reg_read("ecx") == 3
+    assert se.reg_read("edi") == destination + 2
+    assert int(run.error.pc) == base + 10
+
+
+def test_cap_is_shared_across_api_calls(capped_session):
+    se = capped_session(40)
+    hits = []
+    # MOV EAX,target; CALL EAX; JMP back to MOV
+    code = b"\xb8\0\0\0\0\xff\xd0\xeb\xf7"
+    base = se.load_shellcode(data=code, arch="x86")
+
+    def hook(e, api, original, args):
+        hits.append(api)
+        return 1
+
+    se.add_api_hook(hook, "budget_test", "Tick", argc=0)
+    se.mem_write(base + 1, se.emu.get_proc("budget_test", "Tick").to_bytes(4, "little"))
+    se.run_shellcode(base)
+    run = se.get_report().runs[0]
+    assert_limit(run, 40)
+    assert 1 < len(hits) < 40
+
+
+def test_each_public_run_has_a_fresh_budget(capped_session):
+    se = capped_session(1)
+    base = se.load_shellcode(data=b"\x90\xc3", arch="x86")
+    se.run_shellcode(base)
+    se.run_shellcode(base)
+    runs = se.get_report().runs
+    assert len(runs) == 2
+    for run in runs:
+        assert_limit(run, 1)
+        assert int(run.error.pc) == base + 1
+
+
+def test_cap_reached_at_an_api_trap_reports_the_public_entry(capped_session):
+    # MOV EAX,GetTickCount; CALL EAX; RET. The x86 API stub is five instructions:
+    # mov edi, edi; push ebp; mov ebp, esp; pop ebp; jmp trap. The cap of seven
+    # runs out when the jump reaches the private trap, before the API runs.
+    se = capped_session(7)
+    base = se.load_shellcode(data=b"\xb8\0\0\0\0\xff\xd0\xc3", arch="x86")
+    api = se.emu.get_proc("kernel32", "GetTickCount")
+    se.mem_write(base + 1, api.to_bytes(4, "little"))
+    se.run_shellcode(base)
+    run = se.get_report().runs[0]
+    assert_limit(run, 7)
+    assert int(run.error.pc) == api
+    assert not [event for event in run.events if event.event == "api"]

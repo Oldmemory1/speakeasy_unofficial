@@ -1,8 +1,13 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+from typing import TYPE_CHECKING
+
 import speakeasy.winenv.arch as _arch
 
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
 
 
 class Msi32(api.ApiHandler):
@@ -15,12 +20,12 @@ class Msi32(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("MsiDatabaseMergeA", argc=3, conv=_arch.CALL_CONV_STDCALL, ordinal=29)
-    def MsiDatabaseMergeA(self, emu, argv, ctx: api.ApiContext = None):
+    def MsiDatabaseMergeA(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT MsiDatabaseMergeA(
-          MSIHANDLE hDatabase,
-          MSIHANDLE hDatabaseMerge,
-          LPCSTR    szTableName
+            MSIHANDLE hDatabase,
+            MSIHANDLE hDatabaseMerge,
+            LPCSTR szTableName
         );
         """
         return 0

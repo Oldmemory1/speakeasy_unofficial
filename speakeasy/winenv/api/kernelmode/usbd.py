@@ -1,7 +1,12 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
-import speakeasy.winenv.defs.nt.ddk as ddk
+from typing import TYPE_CHECKING
+
 from speakeasy.winenv.api import api
+from speakeasy.winenv.defs.nt import ddk
+
+if TYPE_CHECKING:
+    from speakeasy.windows.kernel import WinKernelEmulator
 
 
 class Usbd(api.ApiHandler):
@@ -25,14 +30,16 @@ class Usbd(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("USBD_ValidateConfigurationDescriptor", argc=5)
-    def USBD_ValidateConfigurationDescriptor(self, emu, argv, ctx: api.ApiContext = None):
+    def USBD_ValidateConfigurationDescriptor(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         USBD_STATUS USBD_ValidateConfigurationDescriptor(
-          PUSB_CONFIGURATION_DESCRIPTOR ConfigDesc,
-          ULONG                         BufferLength,
-          USHORT                        Level,
-          PUCHAR                        *Offset,
-          ULONG                         Tag
+            PUSB_CONFIGURATION_DESCRIPTOR ConfigDesc,
+            ULONG BufferLength,
+            USHORT Level,
+            PUCHAR *Offset,
+            ULONG Tag
         );
         """
         rv = ddk.STATUS_SUCCESS

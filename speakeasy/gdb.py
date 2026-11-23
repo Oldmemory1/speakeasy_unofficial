@@ -1,9 +1,9 @@
-"""Speakeasy-native GDB Remote Serial Protocol server.
+"""
+A GDB Remote Serial Protocol (RSP) server for the emulator.
 
-The server deliberately implements the all-stop subset used by GDB and IDA.
-Target operations are performed by the emulation thread; a small reader thread
-only parses transport packets and interrupts a running Unicorn instance on
-Ctrl-C.
+The server implements the all-stop subset of RSP that GDB and IDA use. The emulator thread runs
+the commands that read or change the target. A reader thread reads the packets from the socket,
+sends the acknowledgements, and stops Unicorn when it gets Ctrl-C.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from typing import Any
 
 import unicorn.x86_const as ux
 
+from speakeasy.common import CodeHook, Hook, ReadMemHook, WriteMemHook
 from speakeasy.winenv import arch
 
 logger = logging.getLogger(__name__)
@@ -69,41 +70,49 @@ class StopReason:
 @dataclass(frozen=True)
 class RegisterInfo:
     name: str
-    unicorn_id: int | None
+    unicorn_id: int
     size: int
     group: str = ""
 
 
 class GdbServer:
-    """An all-stop RSP server backed directly by a WindowsEmulator."""
+    """An all-stop RSP server that reads and changes the state of a WindowsEmulator."""
 
     def __init__(self, emu: Any, port: int, host: str):
-        self.emu = emu
-        self.host = host
-        self.port = port
+        self.emu: Any = emu
+        self.host: str = host
+        self.port: int = port
         self._listener: socket.socket | None = None
         self._client: socket.socket | None = None
         self._reader: threading.Thread | None = None
         self._commands: queue.Queue[bytes | None] = queue.Queue()
-        self._send_lock = threading.Lock()
-        self._state_lock = threading.Lock()
-        self._closed = threading.Event()
-        self._no_ack = False
+        self._send_lock: threading.Lock = threading.Lock()
+        self._state_lock: threading.Lock = threading.Lock()
+        self._closed: threading.Event = threading.Event()
+        self._no_ack: bool = False
         self._last_packet: bytes | None = None
-        self._running = False
-        self._stop_reason = StopReason()
-        self._stop_pending = False
-        self._library_list_changed = False
-        self._resume_from_breakpoint: int | None = None
-        self._exec_breakpoints: dict[tuple[int, int], int] = {}
+        self._running: bool = False
+        self._stop_reason: StopReason = StopReason()
+        self._stop_pending: bool = False
+        self._library_list_changed: bool = False
+        # The pc where the client resumed. The first instruction there does not hit its
+        # breakpoint, so a resume from a breakpoint stop does not stop again at once.
+        self._resume_pc: int | None = None
+        self._exec_breakpoints: dict[tuple[int, int, int], int] = {}
+        # ``_on_code`` runs for each instruction in a hooked range, so it finds a one-byte breakpoint by
+        # a dict lookup and scans only the larger breakpoints.
+        self._exec_breakpoint_addresses: dict[int, int] = {}
+        self._exec_breakpoint_ranges: tuple[tuple[int, int, int], ...] = ()
         self._read_watchpoints: dict[tuple[int, int], int] = {}
         self._write_watchpoints: dict[tuple[int, int], int] = {}
         self._access_watchpoints: dict[tuple[int, int], int] = {}
-        self._registers = self._make_registers()
-        self._hooks: list[Any] = []
-        self._code_hook: Any | None = None
-        self._read_hook: Any | None = None
-        self._write_hook: Any | None = None
+        self._registers: list[RegisterInfo] = self._make_registers()
+        self._hooks: list[Hook] = []
+        self._code_hook: CodeHook | None = None
+        # Code hooks limited to the breakpoints, keyed by their inclusive address range.
+        self._breakpoint_hooks: dict[tuple[int, int], CodeHook] = {}
+        self._read_hook: ReadMemHook | None = None
+        self._write_hook: WriteMemHook | None = None
 
     def __enter__(self) -> GdbServer:
         try:
@@ -171,14 +180,9 @@ class GdbServer:
             self.emu.module_change_listeners.remove(self._on_module_change)
         for hook in self._hooks:
             try:
-                self._remove_hook(hook)
+                self.emu.remove_hook(hook)
             except Exception:
                 pass
-        # Prevent BinaryEmulator.set_hooks() from restoring debugger hooks if
-        # emulation is started again after this session closes.
-        for registered_hooks in getattr(self.emu, "hooks", {}).values():
-            if isinstance(registered_hooks, list):
-                registered_hooks[:] = [hook for hook in registered_hooks if hook not in self._hooks]
 
     @staticmethod
     def _extract_packet(buffer: bytearray) -> tuple[bytes, bytes, bool] | None:
@@ -238,6 +242,9 @@ class GdbServer:
             pass
         finally:
             self._commands.put(None)
+            # If the client disconnects while the target runs, stop the run. ``command_loop`` then reads
+            # None and detaches.
+            self._request_stop(StopReason(signal=2, kind="interrupt"))
 
     def _send_raw(self, data: bytes) -> None:
         if self._client is None:
@@ -258,7 +265,10 @@ class GdbServer:
     def command_loop(self, reason: StopReason | None = None) -> ResumeAction:
         if reason is not None:
             self._stop_reason = reason
-            self._reply(self._stop_reply(reason))
+            try:
+                self._reply(self._stop_reply(reason))
+            except OSError:
+                return ResumeAction(detach=True)
         with self._state_lock:
             self._running = False
             self._stop_pending = False
@@ -280,10 +290,11 @@ class GdbServer:
                 continue
             if action is not None:
                 if not action.detach and not action.kill:
-                    # Mark the resume transition so Ctrl-C arriving before
-                    # begin_run() becomes a pending interrupt, not a queued '?'.
+                    # Set ``_running`` now, so that a Ctrl-C before ``begin_run`` gives a pending
+                    # interrupt and not a ``?`` command.
                     with self._state_lock:
                         self._running = True
+                        self._resume_pc = self.emu.get_pc()
                 return action
         return ResumeAction(detach=True)
 
@@ -293,15 +304,17 @@ class GdbServer:
             if self._stop_pending:
                 return False
             self._stop_reason = StopReason()
-            pc = self.emu.get_pc()
-            at_breakpoint = any(begin <= pc < begin + size for begin, size in self._exec_breakpoints)
-            self._resume_from_breakpoint = pc if at_breakpoint else None
+            if self._resume_pc != self.emu.get_pc():
+                # A run that starts at another pc, such as the run after a fault, skips no breakpoint.
+                self._resume_pc = None
         self._refresh_hooks()
         return True
 
     def finish_run(self, action: ResumeAction) -> StopReason | None:
         with self._state_lock:
             self._running = False
+            # A later run that starts on a breakpoint hits it.
+            self._resume_pc = None
             if self._stop_pending:
                 return self._stop_reason
         if action.step:
@@ -314,8 +327,20 @@ class GdbServer:
                 return
             self._stop_reason = reason
             self._stop_pending = True
-        if self.emu.emu_eng is not None:
+        # A memory hook runs before the instruction completes. If the server stopped Unicorn here, the
+        # write could complete at an unchanged pc, and a resume would run the instruction again. So
+        # ``_on_code`` stops a watch at the next instruction, or the run loop stops when Unicorn
+        # returns by itself, for example after a single step or at a native exit.
+        if reason.kind not in ("watch", "rwatch", "awatch") and self.emu.emu_eng is not None:
             self.emu.emu_eng.stop()
+
+    def has_pending_stop(self) -> bool:
+        with self._state_lock:
+            return self._stop_pending
+
+    def pending_stop_reason(self) -> StopReason | None:
+        with self._state_lock:
+            return self._stop_reason if self._stop_pending else None
 
     def _on_module_change(self) -> None:
         with self._state_lock:
@@ -338,61 +363,100 @@ class GdbServer:
         self._refresh_hooks()
 
     @staticmethod
-    def _remove_hook(hook: Any) -> None:
-        if hook.added and hook.native_hook:
-            hook.emu_eng.hook_remove(hook.handle)
-        hook.handle = 0
-        hook.added = False
-        hook.enabled = False
-
-    @classmethod
-    def _set_hook_enabled(cls, hook: Any | None, enabled: bool) -> None:
+    def _set_hook_enabled(hook: Any | None, enabled: bool) -> None:
         if hook is None:
             return
         if enabled and not hook.added:
+            # A detached hook is disabled, and ``add`` keeps that state.
             hook.add()
+            hook.enable()
         elif not enabled and hook.added:
-            # Hook.disable() still enters Python for every native event. Remove
-            # the Unicorn hook entirely to avoid that callback overhead.
-            cls._remove_hook(hook)
+            # A disabled hook still calls Python for each event, so remove the Unicorn hook.
+            hook.detach()
+
+    def _breakpoint_ranges(self) -> set[tuple[int, int]]:
+        """
+        Get the inclusive address ranges of the exec breakpoints.
+
+        This method merges the overlapping and adjacent breakpoints, so that no instruction calls two hooks.
+        """
+        ranges: list[tuple[int, int]] = []
+        for begin, size, _ in sorted(self._exec_breakpoints):
+            end = begin + size - 1
+            if ranges and begin <= ranges[-1][1] + 1:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+            else:
+                ranges.append((begin, end))
+        return set(ranges)
 
     def _refresh_hooks(self) -> None:
-        self._set_hook_enabled(
-            self._code_hook,
-            bool(self._exec_breakpoints) or self._resume_from_breakpoint is not None,
-        )
+        code_hook_added = self._code_hook is not None and self._code_hook.added
+        # ``_on_code`` stops a watch at the next instruction, so while a watchpoint is set, the code hook
+        # runs for each instruction. Otherwise only the breakpoint ranges have code hooks.
+        watching = bool(self._read_watchpoints or self._write_watchpoints or self._access_watchpoints)
+        self._set_hook_enabled(self._code_hook, watching)
+        hook_added = self._code_hook is not None and self._code_hook.added and not code_hook_added
+        wanted = set() if watching else self._breakpoint_ranges()
+        for key in self._breakpoint_hooks.keys() - wanted:
+            hook = self._breakpoint_hooks.pop(key)
+            self._hooks.remove(hook)
+            self.emu.remove_hook(hook)
+        for begin, end in wanted - self._breakpoint_hooks.keys():
+            hook = self.emu.add_code_hook(self._on_code, begin=begin, end=end)
+            self._breakpoint_hooks[(begin, end)] = hook
+            self._hooks.append(hook)
+            hook_added = True
+        if hook_added:
+            # Unicorn does not call a new hook from code that it translated before the hook was added.
+            self.emu.emu_eng.flush_translations()
         self._set_hook_enabled(self._read_hook, bool(self._read_watchpoints or self._access_watchpoints))
         self._set_hook_enabled(self._write_hook, bool(self._write_watchpoints or self._access_watchpoints))
 
     def _on_code(self, _emu: Any, address: int, _size: int) -> bool:
-        if self._resume_from_breakpoint == address:
-            self._resume_from_breakpoint = None
+        reason = self.pending_stop_reason()
+        if reason is not None and reason.kind in ("watch", "rwatch", "awatch"):
+            # The watched instruction completed. Stop before the next instruction, and keep the
+            # reason and the address of the watch stop.
+            self.emu.emu_eng.stop()
             return True
-        for (begin, size), bp_type in tuple(self._exec_breakpoints.items()):
-            if begin <= address < begin + size:
-                kind = "swbreak" if bp_type == 0 else "hwbreak"
-                self._request_stop(StopReason(kind=kind, address=address))
-                break
+        if self._resume_pc == address:
+            self._resume_pc = None
+            return True
+        bp_type = self._exec_breakpoint_addresses.get(address)
+        if bp_type is None:
+            bp_type = next(
+                (t for begin, size, t in self._exec_breakpoint_ranges if begin <= address < begin + size), None
+            )
+        if bp_type is not None:
+            kind = "swbreak" if bp_type == 0 else "hwbreak"
+            self._request_stop(StopReason(kind=kind, address=address))
         return True
 
     def _on_read(self, _emu: Any, _access: int, address: int, size: int, _value: int) -> bool:
-        if self._overlaps_watchpoint(self._access_watchpoints, address, size):
-            self._request_stop(StopReason(kind="awatch", address=address))
-        elif self._overlaps_watchpoint(self._read_watchpoints, address, size):
-            self._request_stop(StopReason(kind="rwatch", address=address))
+        if (watched := self._find_watchpoint(self._access_watchpoints, address, size)) is not None:
+            self._request_stop(StopReason(kind="awatch", address=watched))
+        elif (watched := self._find_watchpoint(self._read_watchpoints, address, size)) is not None:
+            self._request_stop(StopReason(kind="rwatch", address=watched))
         return True
 
     def _on_write(self, _emu: Any, _access: int, address: int, size: int, _value: int) -> bool:
-        if self._overlaps_watchpoint(self._access_watchpoints, address, size):
-            self._request_stop(StopReason(kind="awatch", address=address))
-        elif self._overlaps_watchpoint(self._write_watchpoints, address, size):
-            self._request_stop(StopReason(kind="watch", address=address))
+        if (watched := self._find_watchpoint(self._access_watchpoints, address, size)) is not None:
+            self._request_stop(StopReason(kind="awatch", address=watched))
+        elif (watched := self._find_watchpoint(self._write_watchpoints, address, size)) is not None:
+            self._request_stop(StopReason(kind="watch", address=watched))
         return True
 
     @staticmethod
-    def _overlaps_watchpoint(watchpoints: dict[tuple[int, int], int], address: int, size: int) -> bool:
+    def _find_watchpoint(watchpoints: dict[tuple[int, int], int], address: int, size: int) -> int | None:
+        """
+        Get the first address of the access in a watchpoint that the access overlaps.
+
+        Clients find the watchpoint of a stop by this address, so it must be in the watched range.
+        """
         end = address + size
-        return any(begin < end and address < begin + length for begin, length in watchpoints)
+        return next(
+            (max(address, begin) for begin, length in watchpoints if begin < end and address < begin + length), None
+        )
 
     # ------------------------------------------------------------------
     # Commands
@@ -445,21 +509,29 @@ class GdbServer:
         elif payload.startswith(b"T"):
             self._reply(b"OK" if payload[1:] in (b"1", b"0", b"-1") else b"E01")
         elif payload == b"vCont?":
-            self._reply(b"vCont;c;s")
+            self._reply(b"vCont;c;C;s;S")
         elif payload.startswith(b"vCont;"):
             return self._resume_command(payload[6:])
-        elif payload[:1] in (b"c", b"s"):
-            if len(payload) > 1:
+        elif payload[:1] in (b"c", b"s", b"C", b"S"):
+            # The emulator does not deliver signals, so the server ignores the signal of C and S.
+            address = payload[1:] if payload[:1] in (b"c", b"s") else payload[1:].partition(b";")[2]
+            if address:
                 try:
-                    self.emu.set_pc(int(payload[1:], 16))
+                    self.emu.set_pc(int(address, 16))
                 except ValueError:
                     self._reply(b"E01")
                     return None
-            return ResumeAction(step=payload[:1] == b"s")
+            return ResumeAction(step=payload[:1] in (b"s", b"S"))
         elif payload.startswith(b"D"):
             self._reply(b"OK")
             return ResumeAction(detach=True)
-        elif payload[:1] in (b"k",) or payload.startswith(b"vKill"):
+        elif payload == b"k":
+            # RSP gives no reply to k, but lldb waits for an exit reply, because lldb-server sends one.
+            # GDB does not read the reply.
+            self._reply(b"X09")
+            return ResumeAction(kill=True)
+        elif payload.startswith(b"vKill"):
+            self._reply(b"OK")
             return ResumeAction(kill=True)
         elif payload == b"!":
             self._reply(b"")
@@ -489,24 +561,32 @@ class GdbServer:
             bp_type = int(bp_type_text, 16)
             address = int(address_text, 16)
             size = int(size_text.split(b";", 1)[0], 16)
+            if bp_type in (0, 1):
+                # For a breakpoint, the third field is a kind and not a length. IDA sends kind 0 for a breakpoint
+                # that it adds with size 0, and a length for a range breakpoint. Kind 0 stops at one instruction.
+                size = max(size, 1)
             if size <= 0:
                 raise ValueError
-            key = (address, size)
             if bp_type in (0, 1):
-                target = self._exec_breakpoints
-            elif bp_type == 2:
-                target = self._write_watchpoints
-            elif bp_type == 3:
-                target = self._read_watchpoints
-            elif bp_type == 4:
-                target = self._access_watchpoints
+                exec_key = (address, size, bp_type)
+                if set_breakpoint:
+                    self._exec_breakpoints[exec_key] = bp_type
+                else:
+                    self._exec_breakpoints.pop(exec_key, None)
+                breakpoints = self._exec_breakpoints.items()
+                self._exec_breakpoint_addresses = {begin: t for (begin, length, _), t in breakpoints if length == 1}
+                self._exec_breakpoint_ranges = tuple(
+                    (begin, length, t) for (begin, length, _), t in breakpoints if length > 1
+                )
+            elif bp_type in (2, 3, 4):
+                target = {2: self._write_watchpoints, 3: self._read_watchpoints, 4: self._access_watchpoints}[bp_type]
+                if set_breakpoint:
+                    target[(address, size)] = bp_type
+                else:
+                    target.pop((address, size), None)
             else:
                 self._reply(b"")
                 return
-            if set_breakpoint:
-                target[key] = bp_type
-            else:
-                target.pop(key, None)
             self._refresh_hooks()
             self._reply(b"OK")
         except ValueError:
@@ -519,6 +599,7 @@ class GdbServer:
     # Registers and memory
 
     def _make_registers(self) -> list[RegisterInfo]:
+        definitions: list[tuple[str, int, int] | tuple[str, int, int, str]]
         if self.emu.get_arch() == arch.ARCH_AMD64:
             definitions = [
                 ("rax", ux.UC_X86_REG_RAX, 8),
@@ -558,10 +639,18 @@ class GdbServer:
             )
         )
         definitions.extend((f"st{i}", getattr(ux, f"UC_X86_REG_FP{i}"), 10, "float") for i in range(8))
-        # Unicorn does not expose all x87 environment fields independently.
-        # Keep their standard RSP slots so clients retain the canonical layout.
         definitions.extend(
-            (name, None, 4, "float") for name in ("fctrl", "fstat", "ftag", "fiseg", "fioff", "foseg", "fooff", "fop")
+            (name, reg, 4, "float")
+            for name, reg in (
+                ("fctrl", ux.UC_X86_REG_FPCW),
+                ("fstat", ux.UC_X86_REG_FPSW),
+                ("ftag", ux.UC_X86_REG_FPTAG),
+                ("fiseg", ux.UC_X86_REG_FCS),
+                ("fioff", ux.UC_X86_REG_FIP),
+                ("foseg", ux.UC_X86_REG_FDS),
+                ("fooff", ux.UC_X86_REG_FDP),
+                ("fop", ux.UC_X86_REG_FOP),
+            )
         )
         xmm_count = 16 if self.emu.get_arch() == arch.ARCH_AMD64 else 8
         definitions.extend((f"xmm{i}", getattr(ux, f"UC_X86_REG_XMM{i}"), 16, "vector") for i in range(xmm_count))
@@ -574,13 +663,11 @@ class GdbServer:
 
     def _read_register_value(self, index: int) -> bytes:
         register = self._registers[index]
-        if register.unicorn_id is None:
-            return bytes(register.size)
         value = self._uc.reg_read(register.unicorn_id)
         if register.name.startswith("st"):
             mantissa, exponent = value
             return int(mantissa).to_bytes(8, "little") + int(exponent).to_bytes(2, "little")
-        return int(value).to_bytes(register.size, "little")
+        return (int(value) & ((1 << (8 * register.size)) - 1)).to_bytes(register.size, "little")
 
     def _read_registers(self) -> None:
         try:
@@ -606,8 +693,6 @@ class GdbServer:
             self._reply(b"E01")
 
     def _write_register_value(self, register: RegisterInfo, value: bytes) -> None:
-        if register.unicorn_id is None:
-            return
         if register.name.startswith("st"):
             mantissa = int.from_bytes(value[:8], "little")
             exponent = int.from_bytes(value[8:], "little")
@@ -618,6 +703,8 @@ class GdbServer:
     def _read_register(self, encoded_index: bytes) -> None:
         try:
             index = int(encoded_index, 16)
+            if index < 0:
+                raise IndexError
             self._reply(self._read_register_value(index).hex().encode("ascii"))
         except (ValueError, IndexError):
             self._reply(b"E01")
@@ -626,6 +713,8 @@ class GdbServer:
         try:
             index_text, value_text = payload.split(b"=", 1)
             index = int(index_text, 16)
+            if index < 0:
+                raise IndexError
             register = self._registers[index]
             value = bytes.fromhex(value_text.decode("ascii"))
             if len(value) != register.size:
@@ -639,7 +728,7 @@ class GdbServer:
         try:
             address_text, size_text = payload.split(b",", 1)
             address, size = int(address_text, 16), int(size_text, 16)
-            if address < 0 or size < 0 or size > (_PACKET_SIZE - 1) // 2:
+            if address < 0 or size < 0 or size > _PACKET_SIZE // 2:
                 raise ValueError
             self._reply(bytes(self.emu.mem_read(address, size)).hex().encode("ascii"))
         except Exception:
@@ -705,7 +794,8 @@ class GdbServer:
 
         if offset >= len(data):
             return b"l"
-        # Reserve one payload byte for the m/l marker. _reply will escape data.
+        # Leave one byte for the m/l marker, and half of the rest, because the escapes of ``_reply``
+        # can double the size.
         chunk = data[offset : offset + min(requested, (_PACKET_SIZE - 1) // 2)]
         marker = b"l" if offset + len(chunk) >= len(data) else b"m"
         return marker + chunk
@@ -766,8 +856,8 @@ class GdbServer:
         lines = ["<memory-map>"]
         if self.emu.emu_eng is not None:
             for begin, end, perms in self.emu.emu_eng.mem_regions():
-                # GDB's memory-map DTD has no permissions attribute. IDA maps
-                # RAM as RWX and ROM as RX, which is the closest representation.
+                # The memory-map DTD of GDB has no permissions attribute. IDA shows RAM as RWX and ROM
+                # as RX, so a writable region is RAM and the other regions are ROM.
                 memory_type = "ram" if perms & 2 else "rom"
                 lines.append(f'<memory type="{memory_type}" start="0x{begin:x}" length="0x{end - begin + 1:x}"/>')
         lines.append("</memory-map>")
@@ -794,8 +884,9 @@ class GdbServer:
             reply += reason.kind.encode("ascii") + b":;"
         elif reason.kind in ("watch", "rwatch", "awatch") and reason.address is not None:
             reply += f"{reason.kind}:{reason.address:x};".encode("ascii")
-        # A library change is a flag rather than a stop kind, so it can coalesce
-        # with another pending stop reason or with a whole dependency chain.
+        # The server keeps a library change as a flag and not as a stop kind. So one stop reply can
+        # report it with another stop reason, and one ``library`` stop can cover a module and the
+        # modules that it loads.
         with self._state_lock:
             library_list_changed = self._library_list_changed
             self._library_list_changed = False

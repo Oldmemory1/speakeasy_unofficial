@@ -1,22 +1,19 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
-from socket import inet_aton
-from typing import Any
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-import speakeasy.windows.netman as netman
 import speakeasy.winenv.arch as _arch
-import speakeasy.winenv.defs.wininet as windefs
+import speakeasy.winenv.defs.windows.windows as windefs
+import speakeasy.winenv.defs.wininet as inetdefs
+from speakeasy.windows import netman
+from speakeasy.winenv.defs.enums import WINHTTP_ADDREQ_FLAG, WINHTTP_OPEN_REQUEST_FLAGS, WINHTTP_QUERY
+from speakeasy.winenv.defs.lookup import decode
 
 from .. import api
 
-
-def is_ip_address(ip):
-    try:
-        inet_aton(ip)
-        return True
-    except Exception:
-        return False
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
 
 
 class WinHttp(api.ApiHandler):
@@ -31,238 +28,267 @@ class WinHttp(api.ApiHandler):
     def __init__(self, emu):
         super().__init__(emu)
 
-        self.funcs: dict[str, Any] = {}
-        self.data: dict[str, Any] = {}
-        self.win: Any | None = None
-        self.netman = netman.NetworkManager(emu.handle_allocator, config=emu.config.network)
+        self.funcs = {}
+        self.data = {}
+        self.netman: netman.NetworkManager = emu.get_network_manager()
         super().__get_hook_attrs__(self)
 
     @apihook("WinHttpOpen", argc=5, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpOpen(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpOpen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        WINHTTPAPI HINTERNET WinHttpOpen(
-          LPCWSTR pszAgentW,
-          DWORD   dwAccessType,
-          LPCWSTR pszProxyW,
-          LPCWSTR pszProxyBypassW,
-          DWORD   dwFlags
+        HINTERNET WinHttpOpen(
+            LPCWSTR pszAgentW,
+            DWORD dwAccessType,
+            LPCWSTR pszProxyW,
+            LPCWSTR pszProxyBypassW,
+            DWORD dwFlags
         );
         """
+        pszAgentW: int | str
+        pszProxyW: int | str
+        pszProxyBypassW: int | str
+        pszAgentW, dwAccessType, pszProxyW, pszProxyBypassW, dwFlags = argv
 
-        ua, access, proxy, bypass, flags = argv
+        if pszAgentW:
+            pszAgentW = self.read_mem_string(pszAgentW, 2)
+            ctx.args["pszAgentW"].display = pszAgentW
+        if pszProxyW:
+            pszProxyW = self.read_mem_string(pszProxyW, 2)
+            ctx.args["pszProxyW"].display = pszProxyW
+        if pszProxyBypassW:
+            pszProxyBypassW = self.read_mem_string(pszProxyBypassW, 2)
+            ctx.args["pszProxyBypassW"].display = pszProxyBypassW
 
-        if ua:
-            ua = self.read_mem_string(ua, 2)
-            argv[0] = ua
-        if proxy:
-            proxy = self.read_mem_string(proxy, 2)
-            argv[2] = proxy
-        if bypass:
-            bypass = self.read_mem_string(bypass, 2)
-            argv[3] = bypass
-
-        conn = self.netman.new_wininet_inst(ua, access, proxy, bypass, flags)
+        conn = self.netman.new_wininet_inst(pszAgentW, dwAccessType, pszProxyW, pszProxyBypassW, dwFlags)
         hnd = conn.get_handle()
         return hnd
 
     @apihook("WinHttpConnect", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpConnect(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpConnect(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        WINHTTPAPI HINTERNET WinHttpConnect(
-          IN HINTERNET     hSession,
-          IN LPCWSTR       pswzServerName,
-          IN INTERNET_PORT nServerPort,
-          IN DWORD         dwReserved
+        HINTERNET WinHttpConnect(
+            HINTERNET hSession,
+            LPCWSTR pswzServerName,
+            INTERNET_PORT nServerPort,
+            DWORD dwReserved
         );
         """
-        hnd, server, port, reserve = argv
+        pswzServerName: int | str
+        hSession, pswzServerName, nServerPort, dwReserved = argv
+        nServerPort &= 0xFFFF
 
-        if server:
-            server = self.read_mem_string(server, 2)
-            argv[1] = server
+        if pswzServerName:
+            pswzServerName = self.read_mem_string(pswzServerName, 2)
+            ctx.args["pswzServerName"].display = pswzServerName
 
-        wini = self.netman.get_wininet_object(hnd)
-
+        wini = self.netman.get_wininet(hSession, netman.WininetInstance)
         if not wini:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
-
-        sess = wini.new_session(server, port, None, None, 0, 0, None)
+        sess = wini.new_session(pswzServerName, nServerPort, None, None, 0, 0, None)
         hdl = sess.get_handle()
         return hdl
 
     @apihook("WinHttpOpenRequest", argc=7, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpOpenRequest(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpOpenRequest(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        WINHTTPAPI HINTERNET WinHttpOpenRequest(
-          IN HINTERNET hConnect,
-          IN LPCWSTR   pwszVerb,
-          IN LPCWSTR   pwszObjectName,
-          IN LPCWSTR   pwszVersion,
-          IN LPCWSTR   pwszReferrer,
-          IN LPCWSTR   *ppwszAcceptTypes,
-          IN DWORD     dwFlags
+        HINTERNET WinHttpOpenRequest(
+            HINTERNET hConnect,
+            LPCWSTR pwszVerb,
+            LPCWSTR pwszObjectName,
+            LPCWSTR pwszVersion,
+            LPCWSTR pwszReferrer,
+            LPCWSTR *ppwszAcceptTypes,
+            DWORD dwFlags
         );
         """
-        hnd, verb, objname, ver, ref, accepts, flags = argv
+        pwszVerb: int | str
+        pwszObjectName: int | str
+        pwszVersion: int | str
+        pwszReferrer: int | str
+        ppwszAcceptTypes: int | str
+        hConnect, pwszVerb, pwszObjectName, pwszVersion, pwszReferrer, ppwszAcceptTypes, dwFlags = argv
 
-        if verb:
-            verb = self.read_mem_string(verb, 2)
-            argv[1] = verb
-        if objname:
-            objname = self.read_mem_string(objname, 2)
-            argv[2] = objname
-        if ver:
-            ver = self.read_mem_string(ver, 2)
-            argv[3] = ver
-        if ref:
-            ref = self.read_mem_string(ref, 2)
-            argv[4] = ref
-        if accepts:
-            accepts = self.read_mem_string(accepts, 2)
-            argv[5] = accepts
+        if pwszVerb:
+            pwszVerb = self.read_mem_string(pwszVerb, 2)
+            ctx.args["pwszVerb"].display = pwszVerb
+        if pwszObjectName:
+            pwszObjectName = self.read_mem_string(pwszObjectName, 2)
+            ctx.args["pwszObjectName"].display = pwszObjectName
+        if pwszVersion:
+            pwszVersion = self.read_mem_string(pwszVersion, 2)
+            ctx.args["pwszVersion"].display = pwszVersion
+        if pwszReferrer:
+            pwszReferrer = self.read_mem_string(pwszReferrer, 2)
+            ctx.args["pwszReferrer"].display = pwszReferrer
+        if ppwszAcceptTypes:
+            ppwszAcceptTypes = self.read_mem_string(ppwszAcceptTypes, 2)
+            ctx.args["ppwszAcceptTypes"].display = ppwszAcceptTypes
 
-        defs = windefs.get_flag_defines(flags)
-        argv[6] = " | ".join(defs)
+        ctx.args["dwFlags"].display = decode(WINHTTP_OPEN_REQUEST_FLAGS, dwFlags)
 
-        sess = self.netman.get_wininet_object(hnd)
-        req = sess.new_request(verb, objname, ver, ref, accepts, defs, None)
+        sess = self.netman.get_wininet(hConnect, netman.WininetSession)
+        if not sess:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+        req = sess.new_request(pwszVerb, pwszObjectName, pwszVersion, pwszReferrer, ppwszAcceptTypes, dwFlags, None)
         hdl = req.get_handle()
 
         return hdl
 
     @apihook("WinHttpGetIEProxyConfigForCurrentUser", argc=1, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpGetIEProxyConfigForCurrentUser(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpGetIEProxyConfigForCurrentUser(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
-        BOOLAPI WinHttpGetIEProxyConfigForCurrentUser(
-          IN OUT WINHTTP_CURRENT_USER_IE_PROXY_CONFIG *pProxyConfig
+        BOOL WinHttpGetIEProxyConfigForCurrentUser(
+            WINHTTP_CURRENT_USER_IE_PROXY_CONFIG *pProxyConfig
         );
         """
+        (pProxyConfig,) = argv
 
-        (proxy_config,) = argv
-
-        if proxy_config:
-            self.mem_write(proxy_config, (1).to_bytes(4, "little"))
+        if pProxyConfig:
+            ps = self.get_ptr_size()
+            self.mem_write(pProxyConfig, (1).to_bytes(ps, "little") + b"\0" * (3 * ps))
 
         return True
 
     @apihook("WinHttpGetProxyForUrl", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpGetProxyForUrl(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpGetProxyForUrl(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOLAPI WinHttpGetProxyForUrl(
-          IN HINTERNET                 hSession,
-          IN LPCWSTR                   lpcwszUrl,
-          IN WINHTTP_AUTOPROXY_OPTIONS *pAutoProxyOptions,
-          OUT WINHTTP_PROXY_INFO       *pProxyInfo
+        BOOL WinHttpGetProxyForUrl(
+            HINTERNET hSession,
+            LPCWSTR lpcwszUrl,
+            WINHTTP_AUTOPROXY_OPTIONS *pAutoProxyOptions,
+            WINHTTP_PROXY_INFO *pProxyInfo
         );
         """
+        hSession, lpcwszUrl, pAutoProxyOptions, pProxyInfo = argv
 
-        hnd, url, proxopts, proxinfo = argv
+        if lpcwszUrl:
+            ctx.args["lpcwszUrl"].display = self.read_mem_string(lpcwszUrl, 2)
 
-        if url:
-            url = self.read_mem_string(url, 2)
-            argv[1] = url
+        if pProxyInfo:
+            ps = self.get_ptr_size()
+            self.mem_write(pProxyInfo, inetdefs.WINHTTP_ACCESS_TYPE_NO_PROXY.to_bytes(ps, "little") + b"\0" * (2 * ps))
 
         return True
 
     @apihook("WinHttpSetOption", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpSetOption(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpSetOption(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOLAPI WinHttpSendRequest(
-          IN HINTERNET hRequest,
-          LPCWSTR      lpszHeaders,
-          IN DWORD     dwHeadersLength,
-          LPVOID       lpOptional,
-          IN DWORD     dwOptionalLength,
-          IN DWORD     dwTotalLength,
-          IN DWORD_PTR dwContext
+        BOOL WinHttpSetOption(
+            HINTERNET hInternet,
+            DWORD dwOption,
+            LPVOID lpBuffer,
+            DWORD dwBufferLength
         );
         """
-        hnd, option, buff, buflen = argv
+        hInternet, dwOption, lpBuffer, dwBufferLength = argv
 
         return True
 
     @apihook("WinHttpSendRequest", argc=7, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpSendRequest(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpSendRequest(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOLAPI WinHttpSendRequest(
-          IN HINTERNET hRequest,
-          LPCWSTR      lpszHeaders,
-          IN DWORD     dwHeadersLength,
-          LPVOID       lpOptional,
-          IN DWORD     dwOptionalLength,
-          IN DWORD     dwTotalLength,
-          IN DWORD_PTR dwContext
+        BOOL WinHttpSendRequest(
+            HINTERNET hRequest,
+            LPCWSTR lpszHeaders,
+            DWORD dwHeadersLength,
+            LPVOID lpOptional,
+            DWORD dwOptionalLength,
+            DWORD dwTotalLength,
+            DWORD_PTR dwContext
         );
         """
-        hnd, headers, hdrlen, lpOptional, dwOptionalLength, totlen, context = argv
+        lpszHeaders: int | str
+        hRequest, lpszHeaders, dwHeadersLength, lpOptional, dwOptionalLength, dwTotalLength, dwContext = argv
 
         body = b""
 
-        if headers:
-            headers = self.read_mem_string(headers, 2)
-            argv[1] = headers
+        if lpszHeaders:
+            lpszHeaders = self.read_mem_string(lpszHeaders, 2)
+            ctx.args["lpszHeaders"].display = lpszHeaders
 
         if lpOptional and dwOptionalLength:
             body = self.mem_read(lpOptional, dwOptionalLength)
 
-        req = self.netman.get_wininet_object(hnd)
-        srv = req.get_server()
-        port = req.get_port()
-
-        if not is_ip_address(srv):
-            self.record_dns_event(srv)
-
-        rv = 1
-        req_str = req.format_http_request(headers=headers)
-
-        self.record_http_event(srv, port, headers=req_str, body=body, secure=req.is_secure())
-        return rv
+        req = self.netman.get_wininet(hRequest, netman.WininetRequest)
+        if not req:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+        self.netman.send_request(req, headers=lpszHeaders, body=body)
+        return 1
 
     @apihook("WinHttpReceiveResponse", argc=2, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpReceiveResponse(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpReceiveResponse(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        WINHTTPAPI BOOL WinHttpReceiveResponse(
-          IN HINTERNET hRequest,
-          IN LPVOID    lpReserved
+        BOOL WinHttpReceiveResponse(
+            HINTERNET hRequest,
+            LPVOID lpReserved
         );
         """
-        hnd, lpReserved = argv
+        hRequest, lpReserved = argv
 
         return True
 
     @apihook("WinHttpReadData", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpReadData(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpReadData(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOLAPI WinHttpReadData(
-          IN HINTERNET hRequest,
-          LPVOID       lpBuffer,
-          IN DWORD     dwNumberOfBytesToRead,
-          OUT LPDWORD  lpdwNumberOfBytesRead
+        BOOL WinHttpReadData(
+            HINTERNET hRequest,
+            LPVOID lpBuffer,
+            DWORD dwNumberOfBytesToRead,
+            LPDWORD lpdwNumberOfBytesRead
         );
         """
-        hnd, buf, size, bytes_read = argv
+        hRequest, lpBuffer, dwNumberOfBytesToRead, lpdwNumberOfBytesRead = argv
 
         rv = 1
 
-        req = self.netman.get_wininet_object(hnd)
+        req = self.netman.get_wininet(hRequest, netman.WininetRequest)
+        if not req:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
         resp = req.get_response()
-        data = resp.read(size)
+        data = resp.read(dwNumberOfBytesToRead)
 
-        if buf:
-            self.mem_write(buf, data)
+        if lpBuffer:
+            self.mem_write(lpBuffer, data)
 
-        if bytes_read:
-            self.mem_write(bytes_read, (len(data)).to_bytes(4, "little"))
+        if lpdwNumberOfBytesRead:
+            self.write_dword(lpdwNumberOfBytesRead, len(data))
 
         return rv
 
-    @apihook("WinHttpCrackUrl", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpCrackUrl(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("WinHttpQueryDataAvailable", argc=2, conv=_arch.CALL_CONV_STDCALL)
+    def WinHttpQueryDataAvailable(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOLAPI WinHttpCrackUrl(
-            LPCWSTR          pwszUrl,
-            DWORD            dwUrlLength,
-            DWORD            dwFlags,
+        BOOL WinHttpQueryDataAvailable(
+            HINTERNET hRequest,
+            LPDWORD lpdwNumberOfBytesAvailable
+        );
+        """
+        hRequest, lpdwNumberOfBytesAvailable = argv
+
+        req = self.netman.get_wininet(hRequest, netman.WininetRequest)
+        if not req:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+        avail = req.get_response_size()
+
+        if lpdwNumberOfBytesAvailable:
+            self.write_dword(lpdwNumberOfBytesAvailable, avail)
+
+        return True
+
+    @apihook("WinHttpCrackUrl", argc=4, conv=_arch.CALL_CONV_STDCALL)
+    def WinHttpCrackUrl(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL WinHttpCrackUrl(
+            LPCWSTR pwszUrl,
+            DWORD dwUrlLength,
+            DWORD dwFlags,
             LPURL_COMPONENTS lpUrlComponents
         );
         """
@@ -273,92 +299,117 @@ class WinHttp(api.ApiHandler):
         # url = self.read_mem_string(pwszUrl, dwUrlLength)
         if pwszUrl and lpUrlComponents:
             url = self.read_mem_string(pwszUrl, cw)
-            argv[0] = url
+            ctx.args["pwszUrl"].display = url
             rv = True
 
-            uc = windefs.URL_COMPONENTS(emu.get_ptr_size())
+            uc = inetdefs.URL_COMPONENTS(emu.get_ptr_size())
             url_comp = self.mem_cast(uc, lpUrlComponents)
 
             crack = urlparse(url)
             if crack.scheme == "https":
-                url_comp.nScheme = windefs.INTERNET_SCHEME_HTTPS
+                url_comp.nScheme = inetdefs.INTERNET_SCHEME_HTTPS
             elif crack.scheme == "http":
-                url_comp.nScheme = windefs.INTERNET_SCHEME_HTTP
-            if url_comp.dwHostNameLength > 0:
-                if url_comp.lpszHostName:
-                    host = crack.netloc + "\x00"
-                    enc = self.get_encoding(cw)
-                    self.mem_write(url_comp.lpszHostName, host.encode(enc))
+                url_comp.nScheme = inetdefs.INTERNET_SCHEME_HTTP
+            port, parts = inetdefs.crack_url(url)
+            url_comp.nPort = port
+            for part, (text, offset) in parts.items():
+                length = getattr(url_comp, f"dw{part}Length")
+                if not length:
+                    continue
+                buf = getattr(url_comp, f"lpsz{part}")
+                if buf:
+                    if length <= len(text):
+                        setattr(url_comp, f"dw{part}Length", len(text) + 1)
+                        self.mem_write(lpUrlComponents, url_comp.get_bytes())
+                        emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+                        return False
+                    self.write_mem_string(text, buf, cw)
                 else:
-                    offset = url.find(crack.netloc)
-                    ptr = pwszUrl + (offset * cw)
-                    url_comp.lpszHostName = ptr
-                    url_comp.dwHostNameLength = len(crack.netloc)
+                    setattr(url_comp, f"lpsz{part}", pwszUrl + offset * cw)
+                setattr(url_comp, f"dw{part}Length", len(text))
 
             self.mem_write(lpUrlComponents, url_comp.get_bytes())
 
         return rv
 
     @apihook("WinHttpAddRequestHeaders", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpAddRequestHeaders(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpAddRequestHeaders(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOLAPI WinHttpAddRequestHeaders(
-          HINTERNET hRequest,
-          LPCWSTR   lpszHeaders,
-          DWORD     dwHeadersLength,
-          DWORD     dwModifiers
+        BOOL WinHttpAddRequestHeaders(
+            HINTERNET hRequest,
+            LPCWSTR lpszHeaders,
+            DWORD dwHeadersLength,
+            DWORD dwModifiers
         );
         """
-        hnd, headers, dwHeaderlen, dwModfier = argv
+        hRequest, lpszHeaders, dwHeadersLength, dwModifiers = argv
 
-        headers = self.read_wide_string(headers, dwHeaderlen)
-        argv[1] = headers
-        flags = windefs.get_header_info_winhttp(dwModfier)
-        argv[3] = " | ".join(flags)
+        lpszHeaders = self.read_wide_string(lpszHeaders, dwHeadersLength)
+        ctx.args["lpszHeaders"].display = lpszHeaders
+        ctx.args["dwModifiers"].display = decode(WINHTTP_ADDREQ_FLAG, dwModifiers)
         rv = 1
 
         return rv
 
     @apihook("WinHttpQueryHeaders", argc=6, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpQueryHeaders(self, emu, argv, ctx: api.ApiContext = None):
+    def WinHttpQueryHeaders(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOLAPI WinHttpQueryHeaders(
-           HINTERNET hRequest,
-           DWORD     dwInfoLevel,
-           LPCWSTR   pwszName,
-           LPVOID    lpBuffer,
-           LPDWORD   lpdwBufferLength,
-           LPDWORD   lpdwIndex
-         );
-        """
-        hnd, dwInfoLevel, name, buffer, bufferLen, index = argv
-
-        header_query = windefs.get_header_query(dwInfoLevel)
-        argv[2] = header_query
-
-        if buffer == 0:
-            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
-            return 0
-
-        # If program checks for WINHTTP_QUERY_STATUS_CODE and the buffer is set, write '200' to buffer
-        if (header_query == windefs.WINHTTP_QUERY_STATUS_CODE) and (buffer != 0):
-            self.mem_write(buffer, b"\x32\x00\x30\x00\x30\x00\x00\x00")
-            argv[3] = buffer
-            self.mem_write(bufferLen, 8)
-            argv[4] = bufferLen
-
-        argv[5] = 0
-        rv = 1
-
-        return rv
-
-    @apihook("WinHttpCloseHandle", argc=1, conv=_arch.CALL_CONV_STDCALL)
-    def WinHttpCloseHandle(self, emu, argv, ctx: api.ApiContext = None):
-        """
-        BOOLAPI WinHttpCloseHandle(
-          HINTERNET hInternet
+        BOOL WinHttpQueryHeaders(
+            HINTERNET hRequest,
+            DWORD dwInfoLevel,
+            LPCWSTR pwszName,
+            LPVOID lpBuffer,
+            LPDWORD lpdwBufferLength,
+            LPDWORD lpdwIndex
         );
         """
-        rv = 1
+        hRequest, dwInfoLevel, pwszName, lpBuffer, lpdwBufferLength, lpdwIndex = argv
 
-        return rv
+        header_id = dwInfoLevel & inetdefs.HTTP_QUERY_HEADER_MASK
+        as_number = bool(dwInfoLevel & inetdefs.WINHTTP_QUERY_FLAG_NUMBER)
+        header_query = decode(WINHTTP_QUERY, header_id)
+        if as_number:
+            header_query += "|WINHTTP_QUERY_FLAG_NUMBER"
+        ctx.args["dwInfoLevel"].display = header_query
+
+        if header_id == WINHTTP_QUERY.WINHTTP_QUERY_STATUS_CODE:
+            text = inetdefs.HTTP_STATUS_OK
+        else:
+            req = self.netman.get_wininet(hRequest, netman.WininetRequest)
+            if not req:
+                emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+                return 0
+            text = inetdefs.get_header_text(header_id, req.get_response_headers())
+            if text is None:
+                emu.set_last_error(inetdefs.ERROR_HTTP_HEADER_NOT_FOUND)
+                return 0
+
+        if as_number:
+            if not text.isdigit():
+                emu.set_last_error(inetdefs.ERROR_HTTP_INVALID_QUERY_REQUEST)
+                return 0
+            out = int(text).to_bytes(4, "little")
+            out_len = len(out)
+        else:
+            out = (text + "\x00").encode("utf-16le")
+            out_len = len(out) - 2
+        if lpBuffer == 0 or self.read_dword(lpdwBufferLength) < len(out):
+            self.write_dword(lpdwBufferLength, len(out))
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            return 0
+        self.mem_write(lpBuffer, out)
+        self.write_dword(lpdwBufferLength, out_len)
+        return 1
+
+    @apihook("WinHttpCloseHandle", argc=1, conv=_arch.CALL_CONV_STDCALL)
+    def WinHttpCloseHandle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL WinHttpCloseHandle(
+            HINTERNET hInternet
+        );
+        """
+        (hInternet,) = argv
+        if not self.netman.close_wininet_object(hInternet):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+        return 1

@@ -1,27 +1,173 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+import io
 import math
+import ntpath
+import re
 import struct
-from typing import Any
+from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 import speakeasy.winenv.arch as e_arch
-import speakeasy.winenv.defs.windows.windows as windef
-from speakeasy.windows.guest_call import start_guest_call_chain
+import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy.windows import seh32
+from speakeasy.windows.common import FILETIME_UNIX_EPOCH
+from speakeasy.windows.guest_callbacks import GuestCall
+from speakeasy.windows.seh import EXCEPTION_NONCONTINUABLE
+from speakeasy.winenv.codepage import decode_ansi, encode_ansi
 
-from .. import api
+from .. import api, exception_apis
+from ..compare import ASCII_LOWER_TABLE, Fold, get_string_order
 
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
+
+ENOENT = 2
+EBADF = 9
+EAGAIN = 11
+EEXIST = 17
 EINVAL = 22
+EDOM = 33
 ERANGE = 34
-_TRUNCATE = 0xFFFFFFFF
-
-# UCRT startup enums used by the CRT initialization stubs below.
+EILSEQ = 42
+THRD_SUCCESS = 0
+THRD_TIMEDOUT = 2
+# UCRT startup enums used by the CRT initialization stubs.
 _CRT_ARGV_MODES = (0, 1, 2)  # no arguments, unexpanded, expanded
-_O_TEXT = 0x4000
-_O_BINARY = 0x8000
+# Size of the _Cnd_internal_imp_t that _Cnd_init allocates, on x64
+CND_SIZE = 0x48
+# The C locale block has the __crt_locale_pointers at offset 0, then the locale data and the
+# multibyte data, each with room for the full UCRT struct on x64
+C_LOCALE_LOCINFO = 0x10
+C_LOCALE_MBCINFO = 0x400
+C_LOCALE_SIZE = 0x1000
+# The exception code and first parameter of a C++ throw, from ehdata.h of the MSVC runtime
+EH_EXCEPTION_NUMBER = 0xE06D7363
+EH_MAGIC_NUMBER1 = 0x19930520
+O_APPEND = 0x8
+O_CREAT = 0x100
+O_TRUNC = 0x200
+O_EXCL = 0x400
+O_TEXT = 0x4000
+O_BINARY = 0x8000
+ENABLE_PER_THREAD_LOCALE = 1
+DISABLE_PER_THREAD_LOCALE = 2
+STRUNCATE = 80
+_CRT_INTERNAL_PRINTF_LEGACY_VSPRINTF_NULL_TERMINATION = 1
+_CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR = 2
+_CRT_INTERNAL_SCANF_SECURECRT = 1
+
+# ios_base::iostate, fmtflags and openmode bits of the MSVC C++ library
+IOS_GOODBIT = 0x0
+IOS_BADBIT = 0x4
+IOS_STATMASK = 0x17
+IOS_UNITBUF = 0x2
+IOS_UPPERCASE = 0x4
+IOS_SHOWBASE = 0x8
+IOS_LEFT = 0x40
+IOS_INTERNAL = 0x100
+IOS_ADJUSTFIELD = 0x1C0
+IOS_OCT = 0x400
+IOS_HEX = 0x800
+IOS_BASEFIELD = 0xE00
+IOS_IN = 0x1
+IOS_OUT = 0x2
+IOS_ATE = 0x4
+IOS_APP = 0x8
+IOS_TRUNC = 0x10
+IOS_BINARY = 0x20
+IOS_NOCREATE = 0x40
+IOS_NOREPLACE = 0x80
+
+# x64 layout of the MSVC basic_ios<char>, with its ios_base:
+#
+#   struct basic_ios {
+#       void *vftable;                  // 0x00
+#       size_t _Stdstr;                 // 0x08
+#       int _Mystate;                   // 0x10
+#       int _Except;                    // 0x14
+#       int _Fmtfl;                     // 0x18
+#       int64_t _Prec;                  // 0x20
+#       int64_t _Wide;                  // 0x28
+#       _Iosarray *_Arr;                // 0x30
+#       _Fnarray *_Calls;               // 0x38
+#       locale *_Ploc;                  // 0x40
+#       basic_streambuf *_Mystrbuf;     // 0x48
+#       basic_ostream *_Tiestr;         // 0x50
+#       char _Fillch;                   // 0x58
+#   };                                  // 0x60
+IOS64_OFFSET_MYSTATE = 0x10
+IOS64_OFFSET_FMTFL = 0x18
+IOS64_OFFSET_WIDE = 0x28
+IOS64_OFFSET_MYSTRBUF = 0x48
+IOS64_OFFSET_TIESTR = 0x50
+IOS64_OFFSET_FILLCH = 0x58
+IOS64_SIZE = 0x60
+
+# x64 layout of the MSVC basic_streambuf<char>:
+#
+#   struct basic_streambuf {
+#       void *vftable;                  // 0x00
+#       char *_Gfirst;                  // 0x08
+#       char *_Pfirst;                  // 0x10
+#       char **_IGfirst;                // 0x18
+#       char **_IPfirst;                // 0x20
+#       char *_Gnext;                   // 0x28
+#       char *_Pnext;                   // 0x30
+#       char **_IGnext;                 // 0x38
+#       char **_IPnext;                 // 0x40
+#       int _Gcount;                    // 0x48
+#       int _Pcount;                    // 0x4C
+#       int *_IGcount;                  // 0x50
+#       int *_IPcount;                  // 0x58
+#       locale *_Plocale;               // 0x60
+#   };                                  // 0x68
+STREAMBUF64_OFFSET_IPNEXT = 0x40
+STREAMBUF64_OFFSET_IPCOUNT = 0x58
+STREAMBUF64_OFFSET_PLOCALE = 0x60
+STREAMBUF64_SIZE = 0x68
+
+# A basic_ostream starts with a vbptr. Its vbtable holds the offset of the
+# basic_ios virtual base at +4. In std::cout the basic_ios follows the vbptr.
+VBTABLE_OFFSET_VBASE = 4
+
+# virtual function slots of basic_streambuf: ~basic_streambuf, _Lock, _Unlock,
+# overflow, pbackfail, showmanyc, underflow, uflow, xsgetn, xsputn, seekoff,
+# seekpos, setbuf, sync, imbue
+STREAMBUF_VTABLE_LOCK = 1
+STREAMBUF_VTABLE_UNLOCK = 2
+STREAMBUF_VTABLE_OVERFLOW = 3
+STREAMBUF_VTABLE_XSPUTN = 9
+STREAMBUF_VTABLE_SYNC = 13
+STREAMBUF_VTABLE_SLOTS = 15
+
+# char_traits<char>::eof() as an unsigned 32-bit value
+CHAR_TRAITS_EOF = 0xFFFFFFFF
+
+# The fopen mode that _Fiopen uses for each open mode, without ate and binary
+IOS_FOPEN_MODES = {
+    IOS_IN: "r",
+    IOS_OUT: "w",
+    IOS_OUT | IOS_TRUNC: "w",
+    IOS_OUT | IOS_APP: "a",
+    IOS_APP: "a",
+    IOS_IN | IOS_OUT: "r+",
+    IOS_IN | IOS_OUT | IOS_TRUNC: "w+",
+    IOS_IN | IOS_OUT | IOS_APP: "a+",
+    IOS_IN | IOS_APP: "a+",
+}
+
+# std::locale::all of the MSVC C++ library
+LOCALE_ALL = 0x7E
 
 TIME_BASE = 1576292568
+S_IFREG_RW = 0x81B6
+A_SUBDIR = 0x10
+DRIVE_C = 2
 RAND_BASE = 0
 TICK_BASE = 86400000  # 1 day in millisecs
+PERF_COUNTER_BASE = 0x5FD27D571F
 
 # Signal types
 SIGINT = 2  # interrupt
@@ -31,6 +177,9 @@ SIGSEGV = 11  # segment violation
 SIGTERM = 15  # Software termination signal from kill
 SIGBREAK = 21  # Ctrl-Break sequence
 SIGABRT = 22  # abnormal termination triggered by abort call
+SIGNALS = (SIGINT, SIGILL, SIGFPE, SIGSEGV, SIGTERM, SIGBREAK, SIGABRT)
+# The _FPE_* code that raise passes to a SIGFPE handler
+FPE_EXPLICITGEN = 0x8C
 
 # Signal action codes
 SIG_DFL = 0  # default signal action
@@ -39,6 +188,355 @@ SIG_GET = 2  # return current value
 SIG_SGE = 3  # signal gets error
 SIG_ACK = 4  # acknowledge
 SIG_ERR = -1  # signal error value
+
+# The exceptions that the CRT exception filter maps to a signal, with the _FPE_* code it passes to a SIGFPE handler
+EXCEPTION_SIGNALS = {
+    0xC0000005: (SIGSEGV, 0),  # STATUS_ACCESS_VIOLATION
+    0xC000001D: (SIGILL, 0),  # STATUS_ILLEGAL_INSTRUCTION
+    0xC0000096: (SIGILL, 0),  # STATUS_PRIVILEGED_INSTRUCTION
+    0xC000008D: (SIGFPE, 0x82),  # STATUS_FLOAT_DENORMAL_OPERAND
+    0xC000008E: (SIGFPE, 0x83),  # STATUS_FLOAT_DIVIDE_BY_ZERO
+    0xC000008F: (SIGFPE, 0x86),  # STATUS_FLOAT_INEXACT_RESULT
+    0xC0000090: (SIGFPE, 0x81),  # STATUS_FLOAT_INVALID_OPERATION
+    0xC0000091: (SIGFPE, 0x84),  # STATUS_FLOAT_OVERFLOW
+    0xC0000092: (SIGFPE, 0x8A),  # STATUS_FLOAT_STACK_CHECK
+    0xC0000093: (SIGFPE, 0x85),  # STATUS_FLOAT_UNDERFLOW
+    0xC00002B4: (SIGFPE, 0x8D),  # STATUS_FLOAT_MULTIPLE_FAULTS
+    0xC00002B5: (SIGFPE, 0x8E),  # STATUS_FLOAT_MULTIPLE_TRAPS
+}
+
+# Messages of the errno values 0 to 42, in _sys_errlist order
+SYS_ERRLIST = [
+    "No error",
+    "Operation not permitted",
+    "No such file or directory",
+    "No such process",
+    "Interrupted function call",
+    "Input/output error",
+    "No such device or address",
+    "Arg list too long",
+    "Exec format error",
+    "Bad file descriptor",
+    "No child processes",
+    "Resource temporarily unavailable",
+    "Not enough space",
+    "Permission denied",
+    "Bad address",
+    "Unknown error",
+    "Resource device",
+    "File exists",
+    "Improper link",
+    "No such device",
+    "Not a directory",
+    "Is a directory",
+    "Invalid argument",
+    "Too many open files in system",
+    "Too many open files",
+    "Inappropriate I/O control operation",
+    "Unknown error",
+    "File too large",
+    "No space left on device",
+    "Invalid seek",
+    "Read-only file system",
+    "Too many links",
+    "Broken pipe",
+    "Domain error",
+    "Result too large",
+    "Unknown error",
+    "Resource deadlock avoided",
+    "Unknown error",
+    "Filename too long",
+    "No locks available",
+    "Function not implemented",
+    "Directory not empty",
+    "Illegal byte sequence",
+]
+
+
+DIGITS = b"0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def get_digit(c: bytes, base: int) -> int:
+    d = DIGITS.find(c.lower()) if len(c) == 1 else -1
+    return d if d < base else -1
+
+
+def parse_c_integer(text: bytes, base: int, width: int = 0) -> tuple[int, int]:
+    """
+    Parse an integer like strtol, from at most ``width`` bytes when ``width`` is
+    not 0. Return the value and the number of bytes used. With no digits, the
+    number of bytes used is 0.
+    """
+    if width:
+        text = text[:width]
+    i = len(text) - len(text.lstrip(b" \t\n\v\f\r"))
+    sign = -1 if text[i : i + 1] == b"-" else 1
+    i += text[i : i + 1] in (b"+", b"-")
+    if base in (0, 16) and text[i : i + 2].lower() == b"0x" and get_digit(text[i + 2 : i + 3], 16) >= 0:
+        base, i = 16, i + 2
+    elif base == 0:
+        base = 8 if text[i : i + 1] == b"0" else 10
+    start = i
+    val = 0
+    while (d := get_digit(text[i : i + 1], base)) >= 0:
+        val = val * base + d
+        i += 1
+    return (sign * val, i) if i > start else (0, 0)
+
+
+SCANF_SPEC = re.compile(rb"%(\*?)(\d*)(hh|h|ll|l|L|I64|I32|I|j|z|t)?([%diouxXpneEfgGaAcs]|\[\^?\]?[^\]]*\])")
+SCANF_FLOAT = re.compile(rb"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?")
+SCANF_SPACE = b" \t\n\v\f\r"
+
+_UPPER, _LOWER, _DIGIT, _SPACE, _PUNCT, _CONTROL, _BLANK, _HEX, _ALPHA = (
+    0x1,
+    0x2,
+    0x4,
+    0x8,
+    0x10,
+    0x20,
+    0x40,
+    0x80,
+    0x100,
+)
+
+
+def get_c_locale_ctype(c: int) -> int:
+    """Return the _pctype flags of a character in the C locale."""
+    ch = chr(c)
+    if c >= 0x80:
+        return 0
+    flags = 0
+    if ch.isupper():
+        flags |= _UPPER | _ALPHA
+    if ch.islower():
+        flags |= _LOWER | _ALPHA
+    if ch.isdigit():
+        flags |= _DIGIT
+    if ch in "0123456789abcdefABCDEF":
+        flags |= _HEX
+    if c in SCANF_SPACE:
+        flags |= _SPACE
+    if c < 0x20 or c == 0x7F:
+        flags |= _CONTROL
+    if ch in " \t":
+        flags |= _BLANK
+    if 0x20 < c < 0x7F and not ch.isalnum():
+        flags |= _PUNCT
+    return flags
+
+
+C_LOCALE_CTYPE = [get_c_locale_ctype(c) for c in range(256)]
+
+
+def get_rounded(x: float, func) -> float:
+    """Round with math.floor or math.ceil; infinities and NaN round to themselves."""
+    return float(func(x)) if math.isfinite(x) else x
+
+
+def get_scanf_set(spec: bytes) -> tuple[set[int], bool]:
+    """Return the bytes of a %[...] set and whether the set is negated."""
+    negate = spec.startswith(b"[^")
+    body = spec[2 if negate else 1 : -1]
+    chars: set[int] = set()
+    i = 0
+    while i < len(body):
+        if i + 2 < len(body) and body[i + 1 : i + 2] == b"-":
+            chars.update(range(min(body[i], body[i + 2]), max(body[i], body[i + 2]) + 1))
+            i += 3
+        else:
+            chars.add(body[i])
+            i += 1
+    return chars, negate
+
+
+def scan_c_format(text: bytes, fmt: bytes, ptr_size: int) -> tuple[list[bytes], int]:
+    """
+    Match ``text`` against a narrow scanf format. Return the bytes to store for
+    each conversion that takes a pointer, in argument order, and the scanf
+    return value. The integer, float, %s, %c, %[...] and %n conversions are
+    supported, with widths, %* and length modifiers.
+    """
+    out: list[bytes] = []
+    pos = i = assigned = 0
+    while i < len(fmt):
+        if fmt[i] in SCANF_SPACE:
+            pos = len(text) - len(text[pos:].lstrip(SCANF_SPACE))
+            i += 1
+            continue
+        m = SCANF_SPEC.match(fmt, i) if fmt[i : i + 1] == b"%" else None
+        if m is None or m.group(4) == b"%":
+            literal = fmt[i + 1] if m else fmt[i]
+            if m:
+                pos = len(text) - len(text[pos:].lstrip(SCANF_SPACE))
+            if pos >= len(text):
+                return out, assigned or -1
+            if text[pos] != literal:
+                break
+            pos, i = pos + 1, (m.end() if m else i + 1)
+            continue
+        i = m.end()
+        suppress, width, mod, conv = m.group(1), int(m.group(2) or 0), m.group(3) or b"", m.group(4)
+        size = {b"hh": 1, b"h": 2, b"ll": 8, b"I64": 8, b"j": 8, b"I": ptr_size, b"z": ptr_size, b"t": ptr_size}.get(
+            mod, 4
+        )
+        if conv == b"n":
+            out.append((pos & ((1 << (8 * size)) - 1)).to_bytes(size, "little"))
+            continue
+        if conv[:1] not in (b"c", b"["):
+            pos = len(text) - len(text[pos:].lstrip(SCANF_SPACE))
+        if pos >= len(text):
+            return out, assigned or -1
+        rest = text[pos : pos + width] if width else text[pos:]
+        if conv in b"diouxXp":
+            base = {b"d": 10, b"i": 0, b"o": 8, b"u": 10}.get(conv, 16)
+            val, used = parse_c_integer(rest, base)
+            size = ptr_size if conv == b"p" else size
+            data = (val & ((1 << (8 * size)) - 1)).to_bytes(size, "little")
+        elif conv in b"eEfgGaA":
+            fm = SCANF_FLOAT.match(rest)
+            used = fm.end() if fm else 0
+            data = struct.pack("<d" if mod in (b"l", b"L") else "<f", float(rest[:used])) if used else b""
+        elif conv == b"c":
+            used = width or 1
+            data = rest[:used]
+            if len(data) < used:
+                break
+        else:
+            chars, negate = get_scanf_set(conv) if conv != b"s" else (set(SCANF_SPACE), True)
+            used = next((k for k, b in enumerate(rest) if (b in chars) == negate), len(rest))
+            data = rest[:used] + b"\x00"
+        if not used:
+            break
+        pos += used
+        if not suppress:
+            out.append(data)
+            assigned += 1
+    return out, assigned
+
+
+def get_winmain_command_line(cmdline: str) -> str:
+    """Get the part of a command line that the CRT passes to WinMain, after the program name."""
+    if cmdline.startswith('"'):
+        end = cmdline.find('"', 1)
+        pos = len(cmdline) if end < 0 else end + 1
+    else:
+        pos = next((i for i, c in enumerate(cmdline) if c in " \t"), len(cmdline))
+    return cmdline[pos:].lstrip(" \t")
+
+
+def get_full_path(cwd: str, path: str) -> str:
+    """Resolve a path against a current directory, as the CRT _fullpath does."""
+    drive, rest = ntpath.splitdrive(path)
+    if not drive:
+        path = (
+            ntpath.join(ntpath.splitdrive(cwd)[0] + "\\", rest)
+            if rest.startswith(("\\", "/"))
+            else ntpath.join(cwd, path)
+        )
+    return ntpath.normpath(path)
+
+
+def get_made_path(drive: str | None, directory: str | None, fname: str | None, ext: str | None) -> str:
+    """Join the parts of a path as the CRT _makepath does. None and empty parts are left out."""
+    path = drive[0] + ":" if drive else ""
+    if directory:
+        path += directory if directory.endswith(("\\", "/")) else directory + "\\"
+    path += fname or ""
+    if ext:
+        path += ext if ext.startswith(".") else "." + ext
+    return path
+
+
+def get_split_path(path: str) -> tuple[str, str, str, str]:
+    """Split a path into drive, directory, file name and extension, as the CRT _splitpath does."""
+    drive = path[:2] if path[1:2] == ":" else ""
+    rest = path[len(drive) :]
+    end = max(rest.rfind("\\"), rest.rfind("/")) + 1
+    directory, name = rest[:end], rest[end:]
+    dot = name.rfind(".")
+    if dot < 0:
+        return drive, directory, name, ""
+    return drive, directory, name[:dot], name[dot:]
+
+
+def get_struct_tm(t: datetime) -> bytes:
+    """Encode a time as a C struct tm."""
+    tt = t.timetuple()
+    return struct.pack(
+        "<9i",
+        tt.tm_sec,
+        tt.tm_min,
+        tt.tm_hour,
+        tt.tm_mday,
+        tt.tm_mon - 1,
+        tt.tm_year - 1900,
+        (tt.tm_wday + 1) % 7,
+        tt.tm_yday - 1,
+        0,
+    )
+
+
+def render_stat(size: int, size64: bool, time64: bool) -> bytes:
+    """
+    Encode a struct _stat* for a regular file of ``size`` bytes.
+
+    The variants differ in the width of st_size and of the three time
+    fields. st_size and the times follow 4 bytes of padding when they are
+    64-bit.
+    """
+    data = struct.pack("<IHHhhhxxI", DRIVE_C, 0, S_IFREG_RW, 1, 0, 0, DRIVE_C)
+    data += struct.pack("<4xq", size) if size64 else struct.pack("<i", size)
+    data += struct.pack("<3q" if time64 else "<3i", TIME_BASE, TIME_BASE, TIME_BASE)
+    if size64 or time64:
+        data += b"\x00" * (-len(data) % 8)
+    return data
+
+
+def render_finddata(name: str, is_dir: bool, time64: bool) -> bytes:
+    """
+    Build the msvcrt.dll struct _finddata_t for one search result. With
+    64-bit times, the struct has 4 bytes of padding before the time fields.
+    """
+    data = struct.pack("<I", A_SUBDIR if is_dir else 0)
+    data += struct.pack("<4x3q" if time64 else "<3i", TIME_BASE, TIME_BASE, TIME_BASE)
+    data += struct.pack("<I", 0) + encode_ansi(name)[:259].ljust(260, b"\x00")
+    if time64:
+        data += b"\x00" * (-len(data) % 8)
+    return data
+
+
+STRFTIME_C_LOCALE = {"c": "%m/%d/%y %H:%M:%S", "x": "%m/%d/%y", "X": "%H:%M:%S", "z": "+0000", "Z": "UTC"}
+
+
+def render_strftime(fmt: str, t: datetime) -> str:
+    """
+    Format a time as strftime does in the C locale, with the emulated time zone (UTC).
+    The # flag removes leading zeros.
+    """
+    out = []
+    i = 0
+    while i < len(fmt):
+        c = fmt[i]
+        if c != "%" or i + 1 == len(fmt):
+            out.append(c)
+            i += 1
+            continue
+        spec = fmt[i + 1]
+        strip = spec == "#" and i + 2 < len(fmt)
+        if strip:
+            spec = fmt[i + 2]
+        i += 3 if strip else 2
+        if spec == "%":
+            text = "%"
+        elif spec in STRFTIME_C_LOCALE:
+            text = t.strftime(STRFTIME_C_LOCALE[spec])
+        elif spec in "aAbBdHIjmMpSUwWyY":
+            text = t.strftime("%" + spec)
+        else:
+            text = ""
+        out.append(text.lstrip("0") or "0" if strip and text.isdigit() else text)
+    return "".join(out)
 
 
 class Msvcrt(api.ApiHandler):
@@ -49,26 +547,52 @@ class Msvcrt(api.ApiHandler):
     name = "msvcrt"
     apihook = api.ApiHandler.apihook
     impdata = api.ApiHandler.impdata
+    emu: "Win32Emulator"
 
     def __init__(self, emu):
         super().__init__(emu)
 
-        self.stdin = 0
-        self.stdout = 1
-        self.stderr = 2
+        self.stdin: int = 0
+        self.stdout: int = 1
+        self.stderr: int = 2
 
-        self.rand_int = RAND_BASE
+        self.rand_int: int = RAND_BASE
+        self.rand_seed: int = 1
 
-        self.funcs: dict[str, Any] = {}
-        self.data: dict[str, Any] = {}
-        self.wintypes = windef
+        self.funcs = {}
+        self.data = {}
+        self.wintypes = windefs
 
         self.tick_counter: int = TICK_BASE
+        self.perf_counter: int = PERF_COUNTER_BASE
         self.errno_t: int | None = None
-        self.file_streams: dict[int, Any] = {}
+        self.file_streams: dict[int, int] = {}
+        self.crt_streams: set[int] = set()
+        self.fds: dict[int, int] = {}
         self.signal_handlers: dict[int, int] = {}
-        self._environ_pointer: int | None = None
+        self.lconv: int | None = None
+        self.locale_name: int | None = None
+        self.pctype_table: int | None = None
+        self.strerror_buf: int | None = None
+        self.lc_locale_names: int | None = None
+        self.c_locale: int | None = None
+        self.iob: int | None = None
+        self.tm_buf: int | None = None
+        self.new_mode: int = 0
+        self.thread_locale: int = DISABLE_PER_THREAD_LOCALE
+        self.exception_slots: dict[str, int] = {}
+        self.invalid_parameter_handler: int = 0
+        self.thread_invalid_parameter_handlers: dict[int, int] = {}
+        self.istream_vbtable: int | None = None
+        self.ostream_buffer: int | None = None
+        self.find_searches: dict[int, Iterator[tuple[str, bool]]] = {}
+        self.global_locimp: int | None = None
+        # Pointer cells that a loader-bound CRT data import shares with the
+        # matching __p__* accessor (see _resolved_crt_cell).
+        self._acmdln_pointer: int | None = None
         self._wcmdln_pointer: int | None = None
+        self._environ_pointer: int | None = None
+        self._wenviron_pointer: int | None = None
 
         super().__get_hook_attrs__(self)
 
@@ -77,100 +601,214 @@ class Msvcrt(api.ApiHandler):
         x = struct.unpack("d", x)[0]
         return x
 
+    def read_cstr(self, addr, max_chars=0, width=1):
+        """
+        Read the bytes of a NUL-terminated string, without the NUL. The CRT
+        string functions work on raw characters, which a decoded string can drop.
+        """
+        data = b""
+        while not max_chars or len(data) < max_chars * width:
+            char = self.mem_read(addr + len(data), width)
+            if char == b"\x00" * width:
+                break
+            data += char
+        return data
+
+    def format_int32(self, val, radix):
+        """
+        Format a 32-bit int as _itoa does: signed in radix 10, unsigned in any
+        other radix, with lowercase digits.
+        """
+        if not 2 <= radix <= 36:
+            return ""
+        val &= 0xFFFFFFFF
+        sign = ""
+        if radix == 10 and val & 0x80000000:
+            sign = "-"
+            val = 0x100000000 - val
+        digits = ""
+        while True:
+            val, d = divmod(val, radix)
+            digits = "0123456789abcdefghijklmnopqrstuvwxyz"[d] + digits
+            if not val:
+                return sign + digits
+
     def double_to_hex(self, x):
         return struct.unpack("<Q", struct.pack("<d", x))[0]
 
-    @impdata("_acmdln")
-    def _acmdln(self, ptr=0):
-        """Command line global CRT variable"""
+    def _resolved_crt_cell(self, symbol: str) -> int | None:
+        """Return the loader-bound pointer cell of a CRT data import.
 
-        cmdln = ptr
-        _argv = self.emu.get_argv()
-        _argv = " ".join(_argv).encode("utf-8")
-
-        ptr_size = self.emu.get_ptr_size()
-
-        if not ptr:
-            cmdln = self.mem_alloc(len(_argv) + ptr_size, base=None, tag="api.msvcrt._acmdln")
-            p_cmdln = cmdln + ptr_size
-            self.emu.mem_write(cmdln, p_cmdln.to_bytes(ptr_size, "little"))
-            self.emu.mem_write(p_cmdln, _argv)
-        return cmdln
-
-    @apihook("__p__acmdln", argc=0)
-    def __p__acmdln(self, emu, argv, ctx: api.ApiContext = None):
-        """Command line global CRT variable"""
-
-        cmdln = self._acmdln()
-
-        return cmdln
-
-    def _resolved_wcmdln_cell(self) -> int | None:
-        """Return the loader-resolved ``_wcmdln`` data-import cell, if any.
-
-        ``Win32Emulator.load_image`` records every resolved data import in
-        ``emu.global_data`` as ``[dll.symbol, data_ptr]``. The handler instance
-        that runs later may differ from the one bound at load time (the engine
-        rebuilds its API registry during setup), so this explicit engine record
-        keeps the CRT global identity stable across those instances.
+        ``Win32Emulator.load_image`` records each resolved data import in
+        ``emu.global_data`` as ``[dll.symbol, data_ptr]``. The data import and
+        the matching ``__p__*`` accessor must observe the same writable cell,
+        including when a later handler instance performs the lookup.
         """
-        for symbol, data_ptr in self.emu.global_data.values():
-            if not data_ptr or not symbol:
+        global_data = getattr(self.emu, "global_data", None)
+        if not global_data:
+            return None
+        for symbol_name, data_ptr in global_data.values():
+            if not data_ptr or not symbol_name:
                 continue
-            if symbol.rsplit(".", 1)[-1] == "_wcmdln":
+            if symbol_name.rsplit(".", 1)[-1] == symbol:
                 return int(data_ptr)
         return None
 
+    def _crt_command_line(self) -> str:
+        """Get the command line that the CRT command-line globals describe.
+
+        A data import that the loader resolves before the input process exists
+        falls back to the configured process command line, because the
+        per-process command line is only available after ``run_module``.
+        """
+        cmdline = self.emu.get_command_line()
+        if cmdline:
+            return cmdline
+        config = getattr(self.emu, "config", None)
+        process = getattr(config, "process", None)
+        return getattr(process, "command_line", None) or ""
+
+    @impdata("_acmdln")
+    def _acmdln(self, ptr=0):
+        """
+        char *_acmdln;
+
+        Command line global CRT variable. The loader may resolve the data
+        import with no cell before the input process exists; allocate the
+        writable pointer cell in that case.
+        """
+        if not ptr:
+            resolved = self._resolved_crt_cell("_acmdln")
+            if resolved is not None:
+                self._acmdln_pointer = resolved
+                return resolved
+            ptr = self.mem_alloc(self.get_ptr_size(), tag="api.msvcrt._acmdln")
+            self._acmdln_pointer = ptr
+        data = encode_ansi(self._crt_command_line())
+
+        p_cmdln = self.mem_alloc(len(data) + 1, base=None, tag="api.msvcrt.command_line")
+        self.write_ptr(ptr, p_cmdln)
+        self.emu.mem_write(p_cmdln, data + b"\x00")
+        return ptr
+
     @impdata("_wcmdln")
     def _wcmdln(self, ptr=0):
-        """Wide command line global CRT variable (``wchar_t *_wcmdln``).
-
-        Returns the address of the writable pointer cell. The cell holds a
-        NUL-terminated UTF-16LE copy of the emulated command line
-        (``" ".join(emu.get_argv())``). One cell is reused per emulator so the
-        data import and ``__p__wcmdln`` observe the same CRT global.
-        ``ptr`` is the loader-supplied cell address and is returned unchanged
-        when non-zero. Architecture-neutral; raises only if guest memory
-        cannot be allocated or written.
         """
-        if ptr:
-            return ptr
-        resolved = self._resolved_wcmdln_cell()
-        if resolved is not None:
-            return resolved
-        if self._wcmdln_pointer is not None:
-            return self._wcmdln_pointer
+        wchar_t *_wcmdln;
 
-        ptr_size = self.emu.get_ptr_size()
-        _argv = " ".join(self.emu.get_argv())
-        wide = _argv.encode("utf-16le") + b"\x00\x00"
-
-        cmdln = self.mem_alloc(ptr_size + len(wide), base=None, tag="api.msvcrt._wcmdln")
-        p_cmdln = cmdln + ptr_size
-        self.emu.mem_write(cmdln, p_cmdln.to_bytes(ptr_size, "little"))
-        self.emu.mem_write(p_cmdln, wide)
-        self._wcmdln_pointer = cmdln
-        return cmdln
+        Wide command line global CRT variable. The loader may resolve the data
+        import with no cell before the input process exists; allocate the
+        writable pointer cell in that case.
+        """
+        if not ptr:
+            resolved = self._resolved_crt_cell("_wcmdln")
+            if resolved is not None:
+                self._wcmdln_pointer = resolved
+                return resolved
+            ptr = self.mem_alloc(self.get_ptr_size(), tag="api.msvcrt._wcmdln")
+            self._wcmdln_pointer = ptr
+        data = (self._crt_command_line() + "\x00").encode("utf-16le")
+        p_cmdln = self.mem_alloc(len(data), tag="api.msvcrt.command_line")
+        self.write_ptr(ptr, p_cmdln)
+        self.emu.mem_write(p_cmdln, data)
+        return ptr
 
     @apihook("__p__wcmdln", argc=0)
-    def __p__wcmdln(self, emu, argv, ctx: api.ApiContext = None):
-        """WCHAR ** __p__wcmdln(void); returns the ``_wcmdln`` pointer cell."""
+    def __p__wcmdln(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t **__p__wcmdln();
 
-        return self._wcmdln()
+        Return the address of the wide command line global.
+        """
+        if self._wcmdln_pointer:
+            return self._wcmdln_pointer
+        resolved = self._resolved_crt_cell("_wcmdln")
+        if resolved is not None:
+            return resolved
+        return emu.get_proc("msvcrt", "_wcmdln")
+
+    @apihook("__p__acmdln", argc=0)
+    def __p__acmdln(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char **__p__acmdln();
+
+        Return the address of the command line global.
+        """
+        if self._acmdln_pointer:
+            return self._acmdln_pointer
+        resolved = self._resolved_crt_cell("_acmdln")
+        if resolved is not None:
+            return resolved
+        return emu.get_proc("msvcrt", "_acmdln")
+
+    def get_winmain_command_line_ptr(self, emu, width: int) -> int:
+        """Get the command line of the current process without the program name, as WinMain gets it."""
+        proc = emu.get_current_process()
+        ptr: int | None = proc.winmain_command_line_buffers.get(width)
+        if ptr is None:
+            tail = get_winmain_command_line(proc.cmdline)
+            data = self.encode_string(tail + "\x00", width)
+            ptr = self.mem_alloc(len(data), tag="api.msvcrt.winmain_command_line")
+            self.mem_write(ptr, data)
+            proc.winmain_command_line_buffers[width] = ptr
+        return ptr
+
+    @apihook("_sleep", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _sleep(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _sleep(
+            unsigned long duration
+        );
+        """
+        return
+
+    @apihook("_get_narrow_winmain_command_line", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _get_narrow_winmain_command_line(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        char *_get_narrow_winmain_command_line();
+        """
+        return self.get_winmain_command_line_ptr(emu, 1)
+
+    @apihook("_get_wide_winmain_command_line", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _get_wide_winmain_command_line(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        wchar_t *_get_wide_winmain_command_line();
+        """
+        return self.get_winmain_command_line_ptr(emu, 2)
 
     @apihook("_onexit", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _onexit(self, emu, argv, ctx: api.ApiContext = None):
+    def _onexit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         _onexit_t _onexit(
             _onexit_t function
-        )
-        """
+        );
 
+        Speakeasy does not keep the function, and exit does not call it.
+        """
+        (function,) = argv
+        return function
+
+    @apihook("atexit", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def atexit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int atexit(
+            void (*func)(void)
+        );
+
+        Speakeasy does not keep the function, and exit does not call it.
+        A NULL callback fails registration, as the CRT does.
+        """
         (func,) = argv
-        return func
+        if not func:
+            return 1
+        return 0
 
     @apihook("mbstowcs_s", argc=5, conv=e_arch.CALL_CONV_CDECL)
-    def mbstowcs_s(self, emu, argv, ctx: api.ApiContext = None):
+    def mbstowcs_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         errno_t mbstowcs_s(
             size_t *pReturnValue,
@@ -178,133 +816,97 @@ class Msvcrt(api.ApiHandler):
             size_t sizeInWords,
             const char *mbstr,
             size_t count
-        )
+        );
         """
-
         pReturnValue, wcstr, sizeInWords, mbstr, count = argv
 
-        rv = 0
+        if bool(wcstr) != bool(sizeInWords):
+            return EINVAL
+        if wcstr:
+            self.mem_write(wcstr, b"\x00\x00")
         if pReturnValue:
-            self.mem_write(pReturnValue, struct.pack("<I", 0))
+            self.write_ptr(pReturnValue, 0)
+        if not mbstr:
+            return EINVAL
 
-        # Sanity checks
-        if sizeInWords > 0 and not wcstr:
-            rv = EINVAL
-        elif not mbstr:
-            rv = EINVAL
-        elif sizeInWords == 0 and wcstr:
-            rv = EINVAL
+        is_truncated = count == self.get_max_int()
+        if wcstr and not is_truncated:
+            mbs = self.read_cstr(mbstr, max_chars=count) if count else b""
         else:
-            # Convert the string
-            mbs = self.read_mem_string(mbstr, 1)
-            argv[3] = mbs
-            mbs += "\x00"
-            ws = mbs.encode("utf-16le")
+            mbs = self.read_cstr(mbstr)
+        # The C locale maps each byte to the wide character with the same value.
+        text = mbs.decode("latin-1")
+        ctx.args[3].display = text
 
-            if (len(ws) / 2 > sizeInWords and count != _TRUNCATE) and (count >= sizeInWords):
-                # Buffer too small
-                rv = ERANGE
-            else:
-                if count == _TRUNCATE:
-                    self.mem_write(wcstr, ws[: (sizeInWords - 1) * 2])
-                    if pReturnValue:
-                        self.mem_write(pReturnValue, struct.pack("<I", sizeInWords))
-                else:
-                    self.mem_write(wcstr, ws[: count * 2])
-                    if pReturnValue:
-                        self.mem_write(pReturnValue, struct.pack("<I", count + 1))
-
+        rv = 0
+        n = len(text) + 1
+        if wcstr:
+            if n > sizeInWords:
+                if not is_truncated:
+                    return ERANGE
+                n = sizeInWords
+                rv = STRUNCATE
+            self.mem_write(wcstr, (text[: n - 1] + "\x00").encode("utf-16le"))
+        if pReturnValue:
+            self.write_ptr(pReturnValue, n)
         return rv
 
     @apihook("_wcsnicmp", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def _wcsnicmp(self, emu, argv, ctx: api.ApiContext = None):
+    def _wcsnicmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _wcsnicmp(
             const wchar_t *string1,
             const wchar_t *string2,
             size_t count
-        )
+        );
         """
-
         string1, string2, count = argv
-        rv = 1
+        if not count:
+            return 0
 
         ws1 = self.read_wide_string(string1, max_chars=count)
         ws2 = self.read_wide_string(string2, max_chars=count)
 
-        argv[0] = ws1
-        argv[1] = ws2
+        ctx.args[0].display = ws1
+        ctx.args[1].display = ws2
 
-        if ws1.lower() == ws2.lower():
-            rv = 0
-
-        return rv
+        return get_string_order(ws1, ws2, Fold.ASCII_LOWER)
 
     # Reference: https://wiki.osdev.org/Visual_C%2B%2B_Runtime
     @apihook("_initterm_e", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _initterm_e(self, emu, argv, ctx: api.ApiContext = None):
+    def _initterm_e(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        static int _initterm_e(_PIFV * pfbegin,
-                                 _PIFV * pfend)
+        int _initterm_e(
+            PIFV *pfbegin,
+            PIFV *pfend
+        );
         """
-
         pfbegin, pfend = argv
-
-        return self._traverse_initterm(emu, pfbegin, pfend, stop_on_nonzero=True)
+        return self._call_initializers(pfbegin, pfend, stop_on_error=True)
 
     @apihook("_initterm", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _initterm(self, emu, argv, ctx: api.ApiContext = None):
-        """static void _initterm (_PVFV * pfbegin, _PVFV * pfend)"""
-
-        pfbegin, pfend = argv
-
-        return self._traverse_initterm(emu, pfbegin, pfend, stop_on_nonzero=False)
-
-    def _traverse_initterm(self, emu, pfbegin, pfend, *, stop_on_nonzero):
-        """Traverse a CRT initializer table and run every non-NULL entry.
-
-        Windows contract: ``[pfbegin, pfend)`` is an array of pointer-sized
-        function pointers; NULL entries are skipped; each non-NULL initializer
-        is called with no arguments. ``_initterm_e`` stops at the first
-        initializer returning a non-zero ``int`` and returns that value;
-        ``_initterm`` ignores results and returns 0. Both return 0 for an
-        empty or all-NULL table.
-
-        Initializers execute as ordinary guest code (ordered chain of guest
-        calls), so they may call APIs again. The true ``_initterm_e`` result
-        reaches EAX/RAX when the chain completes; the value returned to the
-        dispatcher here is the provisional 0 used for API tracing. Raises on
-        an unreadable table instead of reporting a fake success.
+    def _initterm(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
+        void _initterm(
+            PVFV *pfbegin,
+            PVFV *pfend
+        );
+        """
+        pfbegin, pfend = argv
+        return self._call_initializers(pfbegin, pfend, stop_on_error=False)
 
+    def _call_initializers(self, pfbegin, pfend, stop_on_error):
         ptr_size = self.get_ptr_size()
-        functions = []
-        cursor = pfbegin
-        while cursor < pfend:
-            fn = int.from_bytes(self.mem_read(cursor, ptr_size), "little")
-            if fn:
-                functions.append(fn)
-            cursor += ptr_size
-
-        start_guest_call_chain(
-            emu,
-            functions,
-            conv=e_arch.CALL_CONV_CDECL,
-            stop_on_nonzero=stop_on_nonzero,
-        )
+        for entry in range(pfbegin, pfend, ptr_size):
+            function = self.read_ptr(entry)
+            if not function:
+                continue
+            result = (yield GuestCall(function)) & 0xFFFFFFFF
+            if stop_on_error and result:
+                return result
         return 0
 
-    @apihook("__getmainargs", argc=5)
-    def __getmainargs(self, emu, argv, ctx: api.ApiContext = None):
-        """
-        int __getmainargs(
-            int * _Argc,
-            char *** _Argv,
-            char *** _Env,
-            int _DoWildCard,
-            _startupinfo * _StartInfo);
-        """
-
+    def _write_main_args(self, emu, argv, width):
         _Argc, _Argv, _Env, _DoWildCard, _StartInfo = argv
         rv = 0
 
@@ -314,10 +916,10 @@ class Msvcrt(api.ApiHandler):
         argc = len(_argv)
 
         if _Argc:
-            self.mem_write(_Argc, argc.to_bytes(4, "little"))
+            self.write_dword(_Argc, argc)
 
         if _Argv:
-            argv_list = [(a + "\x00").encode("utf-8") for a in _argv]
+            argv_list = [self.encode_string(a + "\x00", width) for a in _argv]
             array_size = ptr_size * (len(argv_list) + 1)
             total = sum([len(a) for a in argv_list]) + array_size
 
@@ -326,21 +928,20 @@ class Msvcrt(api.ApiHandler):
             sptr = arg_mem + array_size
 
             for a in argv_list:
-                self.mem_write(pptr, sptr.to_bytes(ptr_size, "little"))
+                self.write_ptr(pptr, sptr)
                 pptr += ptr_size
                 self.mem_write(sptr, a)
                 sptr += len(a)
             self.mem_write(pptr, b"\x00" * ptr_size)
 
-            self.mem_write(_Argv, arg_mem.to_bytes(ptr_size, "little"))
+            self.write_ptr(_Argv, arg_mem)
 
         if _Env:
             env = emu.get_env()
             fmt_env = []
             total = ptr_size
             for k, v in env.items():
-                envstr = f"{k}={v}\x00"
-                envstr = envstr.encode("utf-8")
+                envstr = self.encode_string(f"{k}={v}\x00", width)
                 total += len(envstr)
                 fmt_env.append(envstr)
                 total += ptr_size
@@ -350,42 +951,65 @@ class Msvcrt(api.ApiHandler):
             sptr = env_mem + ptr_size * (len(fmt_env) + 1)
 
             for v in fmt_env:
-                self.mem_write(pptr, sptr.to_bytes(ptr_size, "little"))
+                self.write_ptr(pptr, sptr)
                 pptr += ptr_size
                 self.mem_write(sptr, v)
                 sptr += len(v)
             self.mem_write(pptr, b"\x00" * ptr_size)
 
-            self.mem_write(_Env, env_mem.to_bytes(ptr_size, "little"))
+            self.write_ptr(_Env, env_mem)
 
         return rv
 
-    @apihook("__wgetmainargs", argc=5)
-    def __wgetmainargs(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("__getmainargs", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def __getmainargs(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int __wgetmainargs (
-           int *_Argc,
-           wchar_t ***_Argv,
-           wchar_t ***_Env,
-           int _DoWildCard,
-           _startupinfo * _StartInfo);
+        int __getmainargs(
+            int *argc,
+            char ***argv,
+            char ***env,
+            int doWildCard,
+            _startupinfo *startInfo
+        );
         """
+        return self._write_main_args(emu, argv, 1)
 
-        _Argc, _Argv, _Env, _DoWildCard, _StartInfo = argv
-        rv = 0
+    @apihook("__GetMainArgs", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def __GetMainArgs(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void __GetMainArgs(
+            int *argc,
+            char ***argv,
+            char ***env,
+            int doWildCard
+        );
+        """
+        self.__getmainargs(emu, [*argv, 0], ctx)
 
-        return rv
+    @apihook("__wgetmainargs", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def __wgetmainargs(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __wgetmainargs(
+            int *argc,
+            wchar_t ***argv,
+            wchar_t ***env,
+            int doWildCard,
+            _startupinfo *startInfo
+        );
+        """
+        return self._write_main_args(emu, argv, 2)
 
     @apihook("__p___wargv", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def __p___wargv(self, emu, argv, ctx: api.ApiContext = None):
-        """WCHAR *** __p___wargv ()"""
-
+    def __p___wargv(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t ***__p___wargv();
+        """
         ptr_size = self.get_ptr_size()
         _argv = emu.get_argv()
 
-        argv = [(a + "\x00\x00\x00\x00").encode("utf-16le") for a in _argv]
-        array_size = ptr_size * (len(argv) + 2)
-        total = sum([len(a) for a in argv])
+        args = [(a + "\x00\x00\x00\x00").encode("utf-16le") for a in _argv]
+        array_size = ptr_size * (len(args) + 2)
+        total = sum([len(a) for a in args])
         total += array_size
 
         sptr = 0
@@ -393,11 +1017,11 @@ class Msvcrt(api.ApiHandler):
 
         arg_mem = self.mem_alloc(size=total, tag="api.argv")
         pptr = arg_mem + ptr_size
-        self.mem_write(arg_mem, pptr.to_bytes(ptr_size, "little"))
+        self.write_ptr(arg_mem, pptr)
         sptr = pptr + array_size
 
-        for a in argv:
-            self.mem_write(pptr, sptr.to_bytes(ptr_size, "little"))
+        for a in args:
+            self.write_ptr(pptr, sptr)
             pptr += ptr_size
             self.mem_write(sptr, a)
             sptr += len(a)
@@ -408,16 +1032,17 @@ class Msvcrt(api.ApiHandler):
         return rv
 
     @apihook("__p___argv", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def __p___argv(self, emu, argv, ctx: api.ApiContext = None):
-        """char *** __p___argv ()"""
-
+    def __p___argv(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char ***__p___argv();
+        """
         ptr_size = self.get_ptr_size()
         _argv = emu.get_argv()
 
-        argv = [(a + "\x00\x00\x00\x00").encode("utf-8") for a in _argv]
+        args = [encode_ansi(a + "\x00\x00\x00\x00") for a in _argv]
 
-        array_size = ptr_size * (len(argv) + 2)
-        total = sum([len(a) for a in argv])
+        array_size = ptr_size * (len(args) + 2)
+        total = sum([len(a) for a in args])
         total += array_size
 
         sptr = 0
@@ -425,11 +1050,11 @@ class Msvcrt(api.ApiHandler):
 
         arg_mem = self.mem_alloc(size=total, tag="api.argv")
         pptr = arg_mem + ptr_size
-        self.mem_write(arg_mem, pptr.to_bytes(ptr_size, "little"))
+        self.write_ptr(arg_mem, pptr)
         sptr = pptr + array_size
 
-        for a in argv:
-            self.mem_write(pptr, sptr.to_bytes(ptr_size, "little"))
+        for a in args:
+            self.write_ptr(pptr, sptr)
             pptr += ptr_size
             self.mem_write(sptr, a)
             sptr += len(a)
@@ -439,26 +1064,124 @@ class Msvcrt(api.ApiHandler):
         return rv
 
     @apihook("__p___argc", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def __p___argc(self, emu, argv, ctx: api.ApiContext = None):
-        """int * __p___argc ()"""
-
+    def __p___argc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int *__p___argc();
+        """
         _argv = emu.get_argv()
 
         argc = self.mem_alloc(size=4, tag="api.argc")
-        self.mem_write(argc, len(_argv).to_bytes(4, "little"))
+        self.write_dword(argc, len(_argv))
         return argc
 
-    @apihook("__p___initenv", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def __p___initenv(self, emu, argv, ctx: api.ApiContext = None):
-        """char *** __p___initenv ()"""
-        ptr_size = self.get_ptr_size()
-        ptr = self.mem_alloc(size=ptr_size, tag="api.initenv")
+    @impdata("__initenv")
+    def __initenv(self, ptr):
+        """
+        char **__initenv;
+
+        Writable global, shared with __p___initenv.
+        """
+        self.mem_write(ptr, b"\x00" * self.get_ptr_size())
         return ptr
 
-    @apihook("_get_initial_narrow_environment", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def _get_initial_narrow_environment(self, emu, argv, ctx: api.ApiContext = None):
-        """char** _get_initial_narrow_environment ()"""
+    @apihook("__p___initenv", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p___initenv(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char ***__p___initenv();
+        """
+        return emu.get_proc("msvcrt", "__initenv")
 
+    @impdata("__winitenv")
+    def __winitenv(self, ptr):
+        """
+        wchar_t **__winitenv;
+
+        Writable global, shared with __p___winitenv.
+        """
+        self.mem_write(ptr, b"\x00" * self.get_ptr_size())
+        return ptr
+
+    @apihook("__p___winitenv", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p___winitenv(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t ***__p___winitenv();
+        """
+        return emu.get_proc("msvcrt", "__winitenv")
+
+    @impdata("_environ")
+    def _environ(self, ptr=0):
+        """
+        char **_environ;
+
+        Writable global, shared with __p__environ. Allocate the pointer cell
+        when the loader resolves the data import before the process exists.
+        """
+        if not ptr:
+            resolved = self._resolved_crt_cell("_environ")
+            if resolved is not None:
+                self._environ_pointer = resolved
+                return resolved
+            ptr = self.mem_alloc(self.get_ptr_size(), tag="api.msvcrt._environ")
+            self._environ_pointer = ptr
+        envp = self._get_initial_narrow_environment(self.emu, [])
+        self.write_ptr(ptr, envp)
+        return ptr
+
+    @apihook("__p__environ", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p__environ(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char ***__p__environ();
+        """
+        if self._environ_pointer:
+            return self._environ_pointer
+        resolved = self._resolved_crt_cell("_environ")
+        if resolved is not None:
+            return resolved
+        get_proc = getattr(emu, "get_proc", None)
+        if get_proc is not None:
+            cell = get_proc("msvcrt", "_environ")
+            if cell:
+                return cell
+        return self._environ()
+
+    @impdata("_wenviron")
+    def _wenviron(self, ptr=0):
+        """
+        wchar_t **_wenviron;
+
+        Writable global, shared with __p__wenviron. Allocate the pointer cell
+        when the loader resolves the data import before the process exists.
+        """
+        if not ptr:
+            resolved = self._resolved_crt_cell("_wenviron")
+            if resolved is not None:
+                self._wenviron_pointer = resolved
+                return resolved
+            ptr = self.mem_alloc(self.get_ptr_size(), tag="api.msvcrt._wenviron")
+            self._wenviron_pointer = ptr
+        envp = self._get_initial_wide_environment(self.emu, [])
+        self.write_ptr(ptr, envp)
+        return ptr
+
+    @apihook("__p__wenviron", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p__wenviron(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t ***__p__wenviron();
+        """
+        if self._wenviron_pointer:
+            return self._wenviron_pointer
+        resolved = self._resolved_crt_cell("_wenviron")
+        if resolved is not None:
+            return resolved
+        return emu.get_proc("msvcrt", "_wenviron")
+
+    @apihook("_get_initial_narrow_environment", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _get_initial_narrow_environment(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        char **_get_initial_narrow_environment();
+        """
         ptr_size = self.get_ptr_size()
         env = emu.get_env()
         total = ptr_size
@@ -466,8 +1189,7 @@ class Msvcrt(api.ApiHandler):
         pptr = 0
         fmt_env = []
         for k, v in env.items():
-            envstr = f"{k}={v}\x00"
-            envstr = envstr.encode("utf-8")
+            envstr = encode_ansi(f"{k}={v}\x00")
             total += len(envstr)
             fmt_env.append(envstr)
             total += ptr_size
@@ -478,36 +1200,20 @@ class Msvcrt(api.ApiHandler):
         sptr += envp
 
         for v in fmt_env:
-            self.mem_write(pptr, sptr.to_bytes(ptr_size, "little"))
+            self.write_ptr(pptr, sptr)
             pptr += ptr_size
             self.mem_write(sptr, v)
             sptr += len(v)
 
         return envp
 
-    @apihook("__p__environ", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def __p__environ(self, emu, argv, ctx: api.ApiContext = None):
-        """char*** __p__environ(void)."""
-        if self._environ_pointer:
-            return self._environ_pointer
-
-        ptr_size = emu.get_ptr_size()
-        environment = self._get_initial_narrow_environment(emu, argv, ctx)
-        environ_pointer = self.mem_alloc(
-            size=ptr_size,
-            tag="api.msvcrt.__p__environ",
-        )
-        self.mem_write(
-            environ_pointer,
-            environment.to_bytes(ptr_size, "little"),
-        )
-        self._environ_pointer = environ_pointer
-        return environ_pointer
-
     @apihook("_get_initial_wide_environment", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def _get_initial_wide_environment(self, emu, argv, ctx: api.ApiContext = None):
-        """WCHAR** _get_initial_wide_environment ()"""
-
+    def _get_initial_wide_environment(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        wchar_t **_get_initial_wide_environment();
+        """
         ptr_size = self.get_ptr_size()
         env = emu.get_env()
         total = ptr_size
@@ -515,8 +1221,7 @@ class Msvcrt(api.ApiHandler):
         pptr = 0
         fmt_env = []
         for k, v in env.items():
-            envstr = f"{k}={v}\x00"
-            envstr = envstr.encode("utf-16le")
+            envstr = f"{k}={v}\x00".encode("utf-16le")
             total += len(envstr)
             fmt_env.append(envstr)
             total += ptr_size
@@ -527,7 +1232,7 @@ class Msvcrt(api.ApiHandler):
         sptr += envp
 
         for v in fmt_env:
-            self.mem_write(pptr, sptr.to_bytes(ptr_size, "little"))
+            self.write_ptr(pptr, sptr)
             pptr += ptr_size
             self.mem_write(sptr, v)
             sptr += len(v)
@@ -535,61 +1240,134 @@ class Msvcrt(api.ApiHandler):
         return envp
 
     @apihook("exit", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def exit(self, emu, argv, ctx: api.ApiContext = None):
+    def exit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void exit(
-           int const status
+            int status
         );
         """
-
         self.exit_process()
 
     @apihook("_exit", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _exit(self, emu, argv, ctx: api.ApiContext = None):
+    def _exit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void _exit(
-           int const status
+            int status
         );
         """
+        self.exit_process()
 
+    @apihook("_amsg_exit", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _amsg_exit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _amsg_exit(
+            int rterrnum
+        );
+        """
+        self.exit_process()
+
+    @apihook("abort", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def abort(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void abort();
+        """
+        self.exit_process()
+
+    @apihook("_assert", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _assert(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _assert(
+            const char *message,
+            const char *filename,
+            unsigned line
+        );
+        """
+        message, filename, line = argv
+        for i, string in ((0, message), (1, filename)):
+            if string:
+                ctx.args[i].display = decode_ansi(self.read_cstr(string))
         self.exit_process()
 
     @apihook("_XcptFilter", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _XcptFilter(self, emu, argv, ctx: api.ApiContext = None):
+    def _XcptFilter(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _XcptFilter(
-            unsigned long xcptnum,
-            struct _EXCEPTION_POINTERS *pxcptinfoptrs
+            unsigned long exceptionNum,
+            struct _EXCEPTION_POINTERS *exceptionPtr
         );
         """
-        _xcptnum, _pxcptinfoptrs = argv
+        exceptionNum, exceptionPtr = argv
 
         return 0
 
     @apihook("_CxxThrowException", argc=2, conv=e_arch.CALL_CONV_STDCALL)
-    def _CxxThrowException(self, emu, argv, ctx: api.ApiContext = None):
+    def _CxxThrowException(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void _CxxThrowException(
             void *pExceptionObject,
             _ThrowInfo *pThrowInfo
         );
+
+        Raise the non-continuable C++ exception. On x64, the ThrowInfo has RVAs, so the fourth
+        parameter is the image base of the module that contains it.
         """
-        return
+        pExceptionObject, pThrowInfo = argv
+        if not emu.config.exceptions.dispatch:
+            return None
+        params = [EH_MAGIC_NUMBER1, pExceptionObject, pThrowInfo]
+        if emu.get_arch() == e_arch.ARCH_AMD64:
+            mod = emu.get_mod_from_addr(pThrowInfo)
+            params.append(mod.base if mod else 0)
+        return emu.exception_dispatcher().raise_exception(emu, EH_EXCEPTION_NUMBER, EXCEPTION_NONCONTINUABLE, params)
 
     @apihook("__acrt_iob_func", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def __acrt_iob_func(self, emu, argv, ctx: api.ApiContext = None):
-        """FILE * __acrt_iob_func (fd)"""
+    def __acrt_iob_func(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *__acrt_iob_func(
+            unsigned Ix
+        );
+        """
+        (Ix,) = argv
 
-        (fd,) = argv
+        size, _ = self.get_file_layout()
+        return self.__iob_func(emu, [], ctx) + Ix * size
 
-        return fd
+    @apihook("__iob_func", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __iob_func(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *__iob_func();
+
+        Return the _iob array of stdin, stdout, and stderr. A FILE is 0x20
+        bytes on x86 and 0x30 bytes on x64, and _file is its fifth field.
+        """
+        return self.iob or emu.get_proc("msvcrt", "_iob")
+
+    @impdata("_iob")
+    def _iob(self, ptr):
+        """
+        FILE _iob[3];
+
+        The array holds stdin, stdout and stderr.
+        """
+        size, file_offset = self.get_file_layout()
+        for fd in (self.stdin, self.stdout, self.stderr):
+            self.write_dword(ptr + fd * size + file_offset, fd)
+        self.iob = ptr
+        return ptr
+
+    @apihook("__p__iob", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p__iob(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *__p__iob();
+        """
+        return self.__iob_func(emu, [], ctx)
 
     @apihook("pow", argc=2, conv=e_arch.CALL_CONV_FLOAT)
-    def pow(self, emu, argv, ctx: api.ApiContext = None):
+    def pow(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         double pow(
-           double x,
-           double y
+            double x,
+            double y
         );
         """
         x, y = argv
@@ -597,32 +1375,103 @@ class Msvcrt(api.ApiHandler):
         x = self.hex_to_double(x)
         y = self.hex_to_double(y)
 
-        z = pow(x, y)
+        try:
+            z = math.pow(x, y)
+        except (OverflowError, ValueError):
+            if x < 0 and not y.is_integer():
+                z = math.nan
+                self.set_errno(EDOM)
+            else:
+                odd = y.is_integer() and y % 2 == 1
+                z = math.copysign(math.inf, x) if odd else math.inf
+                self.set_errno(ERANGE)
 
         z = self.double_to_hex(z)
 
         return z
 
     @apihook("floor", argc=1, conv=e_arch.CALL_CONV_FLOAT)
-    def floor(self, emu, argv, ctx: api.ApiContext = None):
+    def floor(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         double floor(
-           double x
+            double x
         );
         """
         (x,) = argv
 
         y = self.hex_to_double(x)
-        z = math.floor(y)
-        z = self.double_to_hex(z)
+        z = self.double_to_hex(get_rounded(y, math.floor))
 
         return z
 
+    @apihook("ceil", argc=1, conv=e_arch.CALL_CONV_FLOAT)
+    def ceil(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        double ceil(
+            double x
+        );
+        """
+        (x,) = argv
+        return self.double_to_hex(get_rounded(self.hex_to_double(x), math.ceil))
+
+    def round_single(self, emu, bits, func):
+        """
+        Apply func to a float argument. x64 returns a float in xmm0; x86
+        returns it in ST(0), which holds it as a double.
+        """
+        x = struct.unpack("<f", (bits & 0xFFFFFFFF).to_bytes(4, "little"))[0]
+        y = get_rounded(x, func)
+        if emu.get_arch() == e_arch.ARCH_X86:
+            return self.double_to_hex(y)
+        return int.from_bytes(struct.pack("<f", y), "little")
+
+    @apihook("ceilf", argc=1, conv=e_arch.CALL_CONV_FLOAT)
+    def ceilf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        float ceilf(
+            float x
+        );
+        """
+        return self.round_single(emu, argv[0], math.ceil)
+
+    @apihook("floorf", argc=1, conv=e_arch.CALL_CONV_FLOAT)
+    def floorf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        float floorf(
+            float x
+        );
+        """
+        return self.round_single(emu, argv[0], math.floor)
+
+    @apihook("fmod", argc=2, conv=e_arch.CALL_CONV_FLOAT)
+    def fmod(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        double fmod(
+            double x,
+            double y
+        );
+        """
+        x, y = (self.hex_to_double(v) for v in argv)
+        if y == 0 or math.isinf(x) or math.isnan(x) or math.isnan(y):
+            return self.double_to_hex(math.nan)
+        return self.double_to_hex(math.fmod(x, y))
+
+    @apihook("_CIfmod", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _CIfmod(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        double _CIfmod();
+
+        Compute fmod(ST(1), ST(0)), pop both operands, and push the result.
+        """
+        y = emu.pop_fpu_double()
+        x = emu.pop_fpu_double()
+        emu.push_fpu_double(self.fmod(emu, [x, y], ctx))
+
     @apihook("sin", argc=1, conv=e_arch.CALL_CONV_FLOAT)
-    def sin(self, emu, argv, ctx: api.ApiContext = None):
+    def sin(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         double sin(
-           double x
+            double x
         );
         """
         (x,) = argv
@@ -634,108 +1483,209 @@ class Msvcrt(api.ApiHandler):
         return z
 
     @apihook("abs", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def abs(self, emu, argv, ctx: api.ApiContext = None):
+    def abs(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int abs(
-           int x
+            int n
         );
         """
-        (x,) = argv
-        y = abs(x)
+        (n,) = argv
+        y = abs(n)
         return y
 
     @apihook("strstr", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def strstr(self, emu, argv, ctx: api.ApiContext = None):
+    def strstr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         char *strstr(
-           const char *str,
-           const char *strSearch
+            const char *str,
+            const char *strSearch
         );
         """
-        hay, needle = argv
+        str, strSearch = argv
 
-        if hay:
-            _hay = self.read_mem_string(hay, 1)
-            argv[0] = _hay
+        _hay = self.read_cstr(str)
+        _needle = self.read_cstr(strSearch)
+        ctx.args[0].display = decode_ansi(_hay)
+        ctx.args[1].display = decode_ansi(_needle)
 
-        if needle:
-            needle = self.read_mem_string(needle, 1)
-            argv[1] = needle
+        ret = _hay.find(_needle)
+        return str + ret if ret != -1 else 0
 
-        ret = _hay.find(needle)
-        if ret != -1:
-            ret = hay + ret
-        else:
-            ret = 0
+    @apihook("strcspn", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def strcspn(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t strcspn(
+            const char *str,
+            const char *strCharSet
+        );
+        """
+        str, strCharSet = argv
 
-        return ret
+        _s = self.read_cstr(str)
+        _charset = set(self.read_cstr(strCharSet))
+        ctx.args[0].display = decode_ansi(_s)
+        ctx.args[1].display = decode_ansi(bytes(sorted(_charset)))
+        return next((i for i, c in enumerate(_s) if c in _charset), len(_s))
+
+    @apihook("wcscspn", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def wcscspn(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t wcscspn(
+            const wchar_t *str,
+            const wchar_t *strCharSet
+        );
+        """
+        str, strCharSet = argv
+
+        _s = self.read_wide_string(str)
+        _charset = self.read_wide_string(strCharSet)
+        ctx.args[0].display = _s
+        ctx.args[1].display = _charset
+        return next((i for i, c in enumerate(_s) if c in _charset), len(_s))
+
+    @apihook("strpbrk", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def strpbrk(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char *strpbrk(
+            const char *str,
+            const char *strCharSet
+        );
+        """
+        str, strCharSet = argv
+
+        _s = self.read_cstr(str)
+        _charset = set(self.read_cstr(strCharSet))
+        ctx.args[0].display = decode_ansi(_s)
+        ctx.args[1].display = decode_ansi(bytes(sorted(_charset)))
+        return next((str + i for i, c in enumerate(_s) if c in _charset), 0)
+
+    @apihook("wcspbrk", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def wcspbrk(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t *wcspbrk(
+            const wchar_t *str,
+            const wchar_t *strCharSet
+        );
+        """
+        str, strCharSet = argv
+
+        _s = self.read_wide_string(str)
+        _charset = self.read_wide_string(strCharSet)
+        ctx.args[0].display = _s
+        ctx.args[1].display = _charset
+        return next((str + 2 * i for i, c in enumerate(_s) if c in _charset), 0)
 
     @apihook("wcsstr", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def wcsstr(self, emu, argv, ctx: api.ApiContext = None):
+    def wcsstr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         wchar_t *wcsstr(
             const wchar_t *str,
             const wchar_t *strSearch
         );
         """
-        hay, needle = argv
+        str, strSearch = argv
 
-        if hay:
-            _hay = self.read_mem_string(hay, 2)
-            argv[0] = _hay
+        if str:
+            _hay = self.read_mem_string(str, 2)
+            ctx.args[0].display = _hay
 
-        if needle:
-            needle = self.read_mem_string(needle, 2)
-            argv[1] = needle
+        if strSearch:
+            _needle = self.read_mem_string(strSearch, 2)
+            ctx.args[1].display = _needle
 
-        ret = _hay.find(needle)
+        ret = _hay.find(_needle)
         if ret != -1:
-            ret = hay + ret
+            ret = str + ret * 2
         else:
             ret = 0
 
         return ret
 
     @apihook("strncat_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
-    def strncat_s(self, emu, argv, ctx: api.ApiContext = None):
+    def strncat_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         errno_t strncat_s(
-           char *strDest,
-           size_t numberOfElements,
-           const char *strSource,
-           size_t count
+            char *strDest,
+            size_t numberOfElements,
+            const char *strSource,
+            size_t count
         );
         """
-        strDest, num, src, count = argv
-        rv = 0
+        return self.append_n_secure(ctx, argv, 1)
 
-        is_truncated = 0xFFFFFFFF & count
-        if is_truncated == _TRUNCATE:
-            is_truncated = True
-        else:
-            is_truncated = False
+    @apihook("wcsncat_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def wcsncat_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t wcsncat_s(
+            wchar_t *strDest,
+            size_t numberOfElements,
+            const wchar_t *strSource,
+            size_t count
+        );
+        """
+        return self.append_n_secure(ctx, argv, 2)
 
-        argv[0] = self.read_mem_string(strDest, 1)
-        argv[2] = self.read_mem_string(src, 1)
+    def append_n_secure(self, ctx, argv, width):
+        """Append as strncat_s and wcsncat_s do. ``width`` is the size of a character in bytes."""
+        dest, num, src, count = argv
+        is_truncated = count == self.get_max_int()
+        nul = b"\x00" * width
 
-        slen1 = self.mem_string_len(strDest, 1)
-        rem = num - slen1
+        s1 = self.read_cstr(dest, width=width)
+        s2 = self.read_cstr(src, max_chars=0 if is_truncated else count, width=width) if count else b""
+        ctx.args[0].display = self.decode_string(s1, width)
+        ctx.args[2].display = self.decode_string(s2, width)
+
+        rem = num - len(s1) // width
+        if rem <= 0:
+            return EINVAL
+
+        if len(s2) // width < rem:
+            self.mem_write(dest + len(s1), s2 + nul)
+            return 0
 
         if is_truncated:
-            if rem < count:
-                self.mem_copy(strDest + slen1, src, count - 1)
-            else:
-                self.mem_copy(strDest + slen1, src, count)
-        else:
-            if rem < count:
-                rv = EINVAL
-            else:
-                self.mem_copy(strDest + slen1, src, count)
+            self.mem_write(dest + len(s1), s2[: (rem - 1) * width] + nul)
+            return STRUNCATE
 
-        return rv
+        self.mem_write(dest, nul)
+        return ERANGE
 
     @apihook("__stdio_common_vfprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
-    def __stdio_common_vfprintf(self, emu, argv, ctx: api.ApiContext = None):
+    def __stdio_common_vfprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __stdio_common_vfprintf(
+            unsigned __int64 Options,
+            FILE *Stream,
+            const char *Format,
+            _locale_t Locale,
+            va_list ArgList
+        );
+
+        The 64-bit options argument takes two slots on x86.
+        """
+        return self.stdio_common_vfprintf(emu, ctx, 1)
+
+    @apihook("__stdio_common_vfwprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def __stdio_common_vfwprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __stdio_common_vfwprintf(
+            unsigned __int64 Options,
+            FILE *Stream,
+            const wchar_t *Format,
+            _locale_t Locale,
+            va_list ArgList
+        );
+
+        The 64-bit options argument takes two slots on x86.
+        """
+        return self.stdio_common_vfprintf(emu, ctx, 2)
+
+    def stdio_common_vfprintf(self, emu, ctx, width):
+        """
+        Format to a stream for __stdio_common_vfprintf and __stdio_common_vfwprintf. The
+        64-bit options argument takes two slots on x86.
+        """
         arch = emu.get_arch()
         if arch == e_arch.ARCH_AMD64:
             opts, stream, fmt, _, va_list = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 5)[:5]
@@ -744,338 +1694,872 @@ class Msvcrt(api.ApiHandler):
 
         rv = 0
 
-        fmt_str = self.read_mem_string(fmt, 1)
+        fmt_str = self.read_mem_string(fmt, width)
         fmt_cnt = self.get_va_arg_count(fmt_str)
 
         vargs = self.va_args(va_list, fmt_cnt)
-        fin = self.do_str_format(fmt_str, vargs)
+        fin = self.do_str_format(fmt_str, vargs, wide=width == 2)
 
-        argv[:] = [opts, stream, fin]
+        ctx.args.clear()
+        ctx.args.append(hex(opts))
+        ctx.args.append(hex(stream))
+        ctx.args.append(fin)
+        self.write_stream(stream, encode_ansi(fin))
 
         rv = len(fin)
         return rv
 
     @apihook("fprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
-    def fprintf(self, emu, argv, ctx: api.ApiContext = None):
+    def fprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int fprintf(
             FILE *stream,
             const char *format,
             ...
-            );
+        );
         """
         stream, fmt = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 2)
         fmt_str = self.read_string(fmt)
         fmt_cnt = self.get_va_arg_count(fmt_str)
 
-        if not fmt_cnt:
-            argv.clear()
-            argv.extend([stream, fmt_str])
-            return len(fmt_str)
-
         _argv = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 2 + fmt_cnt)[2:]
         fin = self.do_str_format(fmt_str, _argv)
-        argv.clear()
-        argv.extend([stream, fin])
+        ctx.args.clear()
+        ctx.args.append(hex(stream))
+        ctx.args.append(fin)
+        self.write_stream(stream, encode_ansi(fin))
+        return len(fin)
+
+    @apihook("fwprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def fwprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int fwprintf(
+            FILE *stream,
+            const wchar_t *format,
+            ...
+        );
+        """
+        stream, fmt = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 2)
+        fmt_str = self.read_wide_string(fmt)
+        fmt_cnt = self.get_va_arg_count(fmt_str)
+
+        _argv = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 2 + fmt_cnt)[2:]
+        fin = self.do_str_format(fmt_str, _argv, wide=True)
+        ctx.args.clear()
+        ctx.args.append(hex(stream))
+        ctx.args.append(fin)
+        self.write_stream(stream, encode_ansi(fin))
+        return len(fin)
+
+    @apihook("vfprintf", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def vfprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int vfprintf(
+            FILE *stream,
+            const char *format,
+            va_list argptr
+        );
+        """
+        stream, format, argptr = argv
+        fmt_str = self.read_string(format)
+        fmt_cnt = self.get_va_arg_count(fmt_str)
+
+        fin = self.do_str_format(fmt_str, self.va_args(argptr, fmt_cnt))
+        ctx.args.clear()
+        ctx.args.append(hex(stream))
+        ctx.args.append(fin)
+        self.write_stream(stream, encode_ansi(fin))
         return len(fin)
 
     @apihook("printf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
-    def printf(self, emu, argv, ctx: api.ApiContext = None):
+    def printf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int printf(
             const char *format,
             ...
-            );
+        );
         """
         (fmt,) = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 1)
         fmt_str = self.read_string(fmt)
         fmt_cnt = self.get_va_arg_count(fmt_str)
 
-        if not fmt_cnt:
-            argv.clear()
-            argv.extend([fmt_str])
-            return len(fmt_str)
-
         fmt_argv = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 1 + fmt_cnt)[1:]
         fin = self.do_str_format(fmt_str, fmt_argv)
-        argv.clear()
-        argv.extend([fin])
+        ctx.args.clear()
+        ctx.args.append(fin)
         return len(fin)
 
     @apihook("memset", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def memset(self, emu, argv, ctx: api.ApiContext = None):
+    def memset(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void *memset ( void * ptr,
-                       int value,
-                       size_t num );
+        void *memset(
+            void *dest,
+            int c,
+            size_t count
+        );
         """
+        dest, c, count = argv
 
-        ptr, value, num = argv
+        data = bytes([c & 0xFF]) * count
+        self.mem_write(dest, data)
 
-        data = value.to_bytes(1, "little") * num
-        self.mem_write(ptr, data)
-
-        return ptr
+        return dest
 
     @apihook("time", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def time(self, emu, argv, ctx: api.ApiContext = None):
+    def time(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        time_t time( time_t *destTime );
+        time_t time(
+            time_t *destTime
+        );
         """
-
         (destTime,) = argv
+        return self.write_time(destTime, self.get_time_size(emu))
 
-        out_time = TIME_BASE
-        if destTime:
-            self.mem_write(destTime, out_time.to_bytes(4, "little", signed=False))
+    @apihook("_time32", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _time32(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        __time32_t _time32(
+            __time32_t *destTime
+        );
+        """
+        (destTime,) = argv
+        return self.write_time(destTime, 4)
 
-        return out_time
+    @apihook("_time64", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _time64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        __time64_t _time64(
+            __time64_t *destTime
+        );
+        """
+        (destTime,) = argv
+        return self.return_int64(emu, self.write_time(destTime, 8))
+
+    def write_time(self, dest: int, size: int) -> int:
+        now = self.get_clock_ticks() // 10_000_000
+        if dest:
+            self.mem_write(dest, now.to_bytes(size, "little"))
+        return now
+
+    def get_clock_ticks(self) -> int:
+        """
+        Return the kernel32 system time in 100 ns units since 1970.
+        """
+        system_time: int = self.emu.api.load_api_handler("kernel32").get_system_time()
+        return system_time - FILETIME_UNIX_EPOCH
+
+    def get_time_size(self, emu) -> int:
+        # x86 msvcrt.dll uses a 32-bit time_t
+        return self.get_ptr_size()
+
+    def read_time(self, timer: int, size: int) -> datetime | None:
+        value = int.from_bytes(self.mem_read(timer, size), "little", signed=True)
+        if value < 0:
+            return None
+        try:
+            return datetime.fromtimestamp(value, timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
+
+    def write_struct_tm(self, timer: int, size: int) -> int:
+        if not timer:
+            return 0
+        t = self.read_time(timer, size)
+        if t is None:
+            return 0
+        if self.tm_buf is None:
+            self.tm_buf = self.mem_alloc(36, tag="api.msvcrt.tm")
+        self.mem_write(self.tm_buf, get_struct_tm(t))
+        return self.tm_buf
+
+    def write_struct_tm_s(self, tm: int, timer: int, size: int) -> int:
+        if not tm:
+            return EINVAL
+        t = self.read_time(timer, size) if timer else None
+        if t is None:
+            self.mem_write(tm, struct.pack("<9i", *[-1] * 9))
+            return EINVAL
+        self.mem_write(tm, get_struct_tm(t))
+        return 0
+
+    @apihook("localtime", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def localtime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        struct tm *localtime(
+            const time_t *sourceTime
+        );
+        """
+        # The emulated time zone is UTC
+        (sourceTime,) = argv
+        return self.write_struct_tm(sourceTime, self.get_time_size(emu))
+
+    @apihook("_localtime32", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _localtime32(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        struct tm *_localtime32(
+            const __time32_t *sourceTime
+        );
+        """
+        (sourceTime,) = argv
+        return self.write_struct_tm(sourceTime, 4)
+
+    @apihook("_localtime64", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _localtime64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        struct tm *_localtime64(
+            const __time64_t *sourceTime
+        );
+        """
+        (sourceTime,) = argv
+        return self.write_struct_tm(sourceTime, 8)
+
+    @apihook("_localtime64_s", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _localtime64_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _localtime64_s(
+            struct tm *tmDest,
+            const __time64_t *sourceTime
+        );
+        """
+        tmDest, sourceTime = argv
+        return self.write_struct_tm_s(tmDest, sourceTime, 8)
+
+    @apihook("gmtime", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def gmtime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        struct tm *gmtime(
+            const time_t *sourceTime
+        );
+        """
+        (sourceTime,) = argv
+        return self.write_struct_tm(sourceTime, self.get_time_size(emu))
+
+    @apihook("_gmtime32", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _gmtime32(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        struct tm *_gmtime32(
+            const __time32_t *sourceTime
+        );
+        """
+        (sourceTime,) = argv
+        return self.write_struct_tm(sourceTime, 4)
+
+    @apihook("_gmtime64", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _gmtime64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        struct tm *_gmtime64(
+            const __time64_t *sourceTime
+        );
+        """
+        (sourceTime,) = argv
+        return self.write_struct_tm(sourceTime, 8)
+
+    @apihook("_gmtime64_s", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _gmtime64_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _gmtime64_s(
+            struct tm *tmDest,
+            const __time64_t *sourceTime
+        );
+        """
+        tmDest, sourceTime = argv
+        return self.write_struct_tm_s(tmDest, sourceTime, 8)
+
+    def make_time(self, tm: int, size: int) -> int:
+        sec, minute, hour, mday, mon, year = struct.unpack("<6i", self.mem_read(tm, 24))
+        year, mon = year + 1900 + mon // 12, mon % 12
+        try:
+            t = datetime(year, mon + 1, 1, tzinfo=timezone.utc) + timedelta(
+                days=mday - 1, hours=hour, minutes=minute, seconds=sec
+            )
+        except (ValueError, OverflowError):
+            return -1
+        value = int(t.timestamp())
+        if value < 0 or value >= 1 << (8 * size - 1):
+            return -1
+        self.mem_write(tm, get_struct_tm(t))
+        return value
+
+    @apihook("mktime", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def mktime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        time_t mktime(
+            struct tm *timeptr
+        );
+        """
+        (timeptr,) = argv
+        return self.make_time(timeptr, self.get_time_size(emu))
+
+    @apihook("_mktime32", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _mktime32(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        __time32_t _mktime32(
+            struct tm *timeptr
+        );
+        """
+        (timeptr,) = argv
+        return self.make_time(timeptr, 4)
+
+    @apihook("_mktime64", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _mktime64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        __time64_t _mktime64(
+            struct tm *timeptr
+        );
+        """
+        (timeptr,) = argv
+        return self.return_int64(emu, self.make_time(timeptr, 8))
+
+    @apihook("strftime", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def strftime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t strftime(
+            char *strDest,
+            size_t maxsize,
+            const char *format,
+            const struct tm *timeptr
+        );
+        """
+        return self.format_time(argv, ctx, 1)
+
+    @apihook("wcsftime", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def wcsftime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t wcsftime(
+            wchar_t *strDest,
+            size_t maxsize,
+            const wchar_t *format,
+            const struct tm *timeptr
+        );
+        """
+        return self.format_time(argv, ctx, 2)
+
+    def format_time(self, argv, ctx: api.ApiContext, width: int) -> int:
+        """
+        Format a struct tm for strftime (width 1) or wcsftime (width 2).
+        maxsize and the result count characters.
+        """
+        dest, maxsize, fmt, tm = argv
+        fmt_str = self.read_mem_string(fmt, width)
+        ctx.args[2].display = fmt_str
+        sec, minute, hour, mday, mon, year = struct.unpack("<6i", self.mem_read(tm, 24))
+        try:
+            t = datetime(year + 1900, mon + 1, mday, hour, minute, sec, tzinfo=timezone.utc)
+        except (ValueError, OverflowError):
+            self.set_errno(EINVAL)
+            return 0
+        text = render_strftime(fmt_str, t)
+        if len(text) + 1 > maxsize:
+            if maxsize:
+                self.mem_write(dest, b"\x00" * width)
+            self.set_errno(ERANGE)
+            return 0
+        self.mem_write(dest, self.encode_string(text + "\x00", width))
+        ctx.args[0].display = text
+        return len(text)
+
+    @apihook("_tzset", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _tzset(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _tzset();
+
+        The emulated time zone is UTC, so there is nothing to set.
+        """
+        return
 
     @apihook("_strtime", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _strtime(self, emu, argv, ctx: api.ApiContext = None):
+    def _strtime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        char *_strtime(char *buffer);
+        char *_strtime(
+            char *timestr
+        );
         """
-        (buffer,) = argv
-        if not buffer:
+        (timestr,) = argv
+        if not timestr:
             return 0
-        self.mem_write(buffer, b"12:34:56\x00")
-        return buffer
+        now = datetime.fromtimestamp(self.get_clock_ticks() // 10_000_000, timezone.utc)
+        self.mem_write(timestr, now.strftime("%H:%M:%S").encode() + b"\x00")
+        return timestr
 
     @apihook("_strdate", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _strdate(self, emu, argv, ctx: api.ApiContext = None):
+    def _strdate(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        char *_strdate(char *buffer);
+        char *_strdate(
+            char *datestr
+        );
         """
-        (buffer,) = argv
-        if not buffer:
+        (datestr,) = argv
+        if not datestr:
             return 0
-        self.mem_write(buffer, b"12/29/19\x00")
-        return buffer
+        now = datetime.fromtimestamp(self.get_clock_ticks() // 10_000_000, timezone.utc)
+        self.mem_write(datestr, now.strftime("%m/%d/%y").encode() + b"\x00")
+        return datestr
 
     @apihook("clock", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def clock(self, emu, argv, ctx: api.ApiContext = None):
+    def clock(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        clock_t clock( void );
+        clock_t clock();
         """
-
         self.tick_counter += 200
 
         return self.tick_counter
 
+    def return_int64(self, emu, value: int) -> int:
+        if emu.get_arch() == e_arch.ARCH_X86:
+            value &= 0xFFFFFFFFFFFFFFFF
+            emu.reg_write(e_arch.X86_REG_EDX, value >> 32)
+            return value & 0xFFFFFFFF
+        return value
+
+    @apihook("_Query_perf_frequency", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _Query_perf_frequency(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        long long _Query_perf_frequency();
+        """
+        return self.return_int64(emu, windefs.PERF_FREQUENCY)
+
+    @apihook("_Query_perf_counter", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _Query_perf_counter(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        long long _Query_perf_counter();
+        """
+        self.perf_counter += windefs.PERF_FREQUENCY // 50
+        return self.return_int64(emu, self.perf_counter)
+
+    @apihook("_Xtime_get_ticks", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _Xtime_get_ticks(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        long long _Xtime_get_ticks();
+
+        The time in 100 ns units since 1970, on the clock that time() uses.
+        """
+        return self.return_int64(emu, self.get_clock_ticks())
+
+    @apihook("_Random_device", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _Random_device(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned int _Random_device();
+        """
+        self.rand_int += 1
+        return self.rand_int & 0xFFFFFFFF
+
     @apihook("srand", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def srand(self, emu, argv, ctx: api.ApiContext = None):
+    def srand(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void srand (unsigned int seed);
+        void srand(
+            unsigned int seed
+        );
         """
-
         (seed,) = argv
-
-        return
+        self.rand_seed = seed
 
     @apihook("sprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
-    def sprintf(self, emu, argv, ctx: api.ApiContext = None):
+    def sprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int sprintf(
             char *buffer,
-            const char *format [,
-            argument] ...
-            );
+            const char *format,
+            ...
+        );
         """
         buf, fmt = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 2)
         fmt_str = self.read_string(fmt)
         fmt_cnt = self.get_va_arg_count(fmt_str)
-        if not fmt_cnt:
-            self.write_string(fmt_str, buf)
-            return len(fmt_str)
-
         _argv = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 2 + fmt_cnt)[2:]
         fin = self.do_str_format(fmt_str, _argv)
 
         self.write_string(fin, buf)
-        argv.clear()
-        argv.append(fin)
+        ctx.args.clear()
+        ctx.args.append(fin)
         return len(fin)
 
     @apihook("_snprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
-    def _snprintf(self, emu, argv, ctx: api.ApiContext = None):
+    def _snprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _snprintf(
-        char *buffer,
-        size_t count,
-        const char *format [,
-        argument] ...
+            char *buffer,
+            size_t count,
+            const char *format,
+            ...
         );
         """
         buf, count, fmt = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 3)
         fmt_str = self.read_string(fmt)
         fmt_cnt = self.get_va_arg_count(fmt_str)
-        if not fmt_cnt:
-            self.write_string(fmt_str, buf)
-            return len(fmt_str)
-
         _argv = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 3 + fmt_cnt)[3:]
         fin = self.do_str_format(fmt_str, _argv)
+        ctx.args.clear()
+        ctx.args.append(fin)
 
-        self.write_string(fin, buf)
-        argv.clear()
-        argv.append(fin)
-        return len(fin)
+        out = encode_ansi(fin[:count])
+        if len(fin) < count:
+            out += b"\x00"
+        self.mem_write(buf, out)
+        return len(fin) if len(fin) <= count else -1
+
+    @apihook("atol", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def atol(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        long atol(
+            const char *str
+        );
+        """
+        return self.atoi(emu, argv, ctx)
 
     @apihook("atoi", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def atoi(self, emu, argv, ctx: api.ApiContext = None):
+    def atoi(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int atoi(
             const char *str
         );
         """
+        return self.ato(ctx, argv[0], 1, 32)
 
-        (_str,) = argv
+    @apihook("_wtol", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _wtol(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        long _wtol(
+            const wchar_t *str
+        );
+        """
+        return self.ato(ctx, argv[0], 2, 32)
 
-        i = self.read_string(_str)
-        argv[0] = i
+    @apihook("_wtoi", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _wtoi(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _wtoi(
+            const wchar_t *str
+        );
+        """
+        return self.ato(ctx, argv[0], 2, 32)
 
-        try:
-            rv = int(i)
-        except ValueError:
-            rv = 0
+    @apihook("_wtoi64", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _wtoi64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        __int64 _wtoi64(
+            const wchar_t *str
+        );
+        """
+        return self.return_int64(emu, self.ato(ctx, argv[0], 2, 64))
 
-        return rv
+    def ato(self, ctx, addr, width, bits):
+        """Parse a decimal number like atoi and saturate it to a signed integer of ``bits`` bits."""
+        text = self.read_number_text(addr, width)
+        ctx.args[0].display = decode_ansi(text)
+        val, _ = parse_c_integer(text, 10)
+        limit = 1 << (bits - 1)
+        return max(-limit, min(val, limit - 1))
 
     @apihook("rand", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def rand(self, emu, argv, ctx: api.ApiContext = None):
+    def rand(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int rand( void );
+        int rand();
         """
+        self.rand_seed = (self.rand_seed * 214013 + 2531011) & 0xFFFFFFFF
 
+        return (self.rand_seed >> 16) & 0x7FFF
+
+    @apihook("rand_s", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def rand_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t rand_s(
+            unsigned int *randomValue
+        );
+        """
+        (randomValue,) = argv
+        if not randomValue:
+            return EINVAL
         self.rand_int += 1
-
-        return self.rand_int
+        self.write_dword(randomValue, self.rand_int & 0xFFFFFFFF)
+        return 0
 
     @apihook("__set_app_type", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def __set_app_type(self, emu, argv, ctx: api.ApiContext = None):
+    def __set_app_type(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void __set_app_type (
+        void __set_app_type(
             int at
-        )
+        );
         """
         return
 
     @apihook("_set_app_type", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _set_app_type(self, emu, argv, ctx: api.ApiContext = None):
+    def _set_app_type(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _set_app_type(
+            _crt_app_type appType
+        );
+        """
         return
 
-    @apihook("__p__fmode", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def __p__fmode(self, emu, argv, ctx: api.ApiContext = None):
+    @impdata("_fmode")
+    def _fmode(self, ptr):
         """
-        int* __p__fmode();
+        int _fmode;
+
+        Writable file-mode global, initialized to _O_TEXT.
         """
         _O_TEXT = 0x4000
 
-        ptr = self.mem_alloc(4, tag="api.fmode")
-        data = _O_TEXT.to_bytes(4, "little")
-        self.mem_write(ptr, data)
+        self.write_dword(ptr, _O_TEXT)
         return ptr
 
-    @apihook("__p__commode", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def __p__commode(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("__p__fmode", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p__fmode(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int* __p__commode();
+        int *__p__fmode();
+        """
+        return emu.get_proc("msvcrt", "_fmode")
+
+    @impdata("_commode")
+    def _commode(self, ptr):
+        """
+        int _commode;
+
+        Writable commit-mode global, initialized to _IOCOMMIT.
         """
         _IOCOMMIT = 0x4000
 
-        ptr = self.mem_alloc(4, tag="api.commode")
-        data = _IOCOMMIT.to_bytes(4, "little")
-        self.mem_write(ptr, data)
+        self.write_dword(ptr, _IOCOMMIT)
         return ptr
 
-    @apihook("_controlfp", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _controlfp(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("__p__commode", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p__commode(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        unsigned int _controlfp(unsigned int new,
-                                unsinged int mask)
+        int *__p__commode();
+        """
+        return emu.get_proc("msvcrt", "_commode")
+
+    @apihook("_controlfp", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _controlfp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned int _controlfp(
+            unsigned int new,
+            unsigned int mask
+        );
         """
         return 0
 
     @apihook("strcpy", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def strcpy(self, emu, argv, ctx: api.ApiContext = None):
+    def strcpy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         char *strcpy(
-           char *strDestination,
-           const char *strSource
+            char *strDestination,
+            const char *strSource
         );
         """
-        dest, src = argv
-        s = self.read_string(src)
+        strDestination, strSource = argv
+        s = self.read_cstr(strSource)
 
-        self.write_string(s, dest)
-        argv[1] = s
-        return dest
+        self.mem_write(strDestination, s + b"\x00")
+        ctx.args[1].display = decode_ansi(s)
+        return strDestination
+
+    @apihook("strcpy_s", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def strcpy_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t strcpy_s(
+            char *dest,
+            rsize_t dest_size,
+            const char *src
+        );
+        """
+        dest, dest_size, src = argv
+        if not dest or not dest_size:
+            return EINVAL
+        if not src:
+            self.mem_write(dest, b"\x00")
+            return EINVAL
+        s = self.read_cstr(src)
+        ctx.args[2].display = decode_ansi(s)
+        if len(s) >= dest_size:
+            self.mem_write(dest, b"\x00")
+            return ERANGE
+        self.mem_write(dest, s + b"\x00")
+        return 0
+
+    @apihook("wcscpy_s", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def wcscpy_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t wcscpy_s(
+            wchar_t *dest,
+            rsize_t dest_size,
+            const wchar_t *src
+        );
+        """
+        dest, dest_size, src = argv
+        if not dest or not dest_size:
+            return EINVAL
+        if not src:
+            self.mem_write(dest, b"\x00\x00")
+            return EINVAL
+        ws = self.read_wide_string(src)
+        ctx.args[2].display = ws
+        if len(ws) >= dest_size:
+            self.mem_write(dest, b"\x00\x00")
+            return ERANGE
+        self.write_wide_string(ws + "\x00", dest)
+        return 0
+
+    def copy_n_secure(self, emu, argv, ctx, width):
+        """
+        Copy as strncpy_s and wcsncpy_s do. When the text does not fit, the
+        characters copied so far stay and the first one is cleared.
+        """
+        dest, size, src, count = argv
+        count &= self.get_max_int()
+        nul = b"\x00" * width
+        if not dest or not size:
+            return EINVAL
+        if not src:
+            self.mem_write(dest, nul)
+            return EINVAL
+        if width == 1:
+            data = self.read_cstr(src)
+            ctx.args[2].display = decode_ansi(data)
+        else:
+            text = self.read_wide_string(src)
+            ctx.args[2].display = text
+            data = text.encode("utf-16le", "surrogatepass")
+        length = len(data) // width
+        n = min(length, count)
+        if n < size:
+            self.mem_write(dest, data[: n * width] + nul)
+            return 0
+        if count == self.get_max_int():
+            self.mem_write(dest, data[: (size - 1) * width] + nul)
+            return STRUNCATE
+        self.mem_write(dest, nul + data[width : size * width])
+        return ERANGE
+
+    @apihook("strncpy_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def strncpy_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t strncpy_s(
+            char *strDest,
+            size_t numberOfElements,
+            const char *strSource,
+            size_t count
+        );
+        """
+        return self.copy_n_secure(emu, argv, ctx, 1)
+
+    @apihook("wcsncpy_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def wcsncpy_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t wcsncpy_s(
+            wchar_t *strDest,
+            size_t numberOfElements,
+            const wchar_t *strSource,
+            size_t count
+        );
+        """
+        return self.copy_n_secure(emu, argv, ctx, 2)
 
     @apihook("wcscpy", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def wcscpy(self, emu, argv, ctx: api.ApiContext = None):
+    def wcscpy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         wchar_t *wcscpy(
             wchar_t *strDestination,
             const wchar_t *strSource
         );
         """
-        dest, src = argv
-        ws = self.read_wide_string(src)
-        self.write_wide_string(ws, dest)
-        argv[1] = ws
-        return dest
+        strDestination, strSource = argv
+        ws = self.read_wide_string(strSource)
+        self.write_wide_string(ws, strDestination)
+        ctx.args[1].display = ws
+        return strDestination
 
     @apihook("strncpy", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def strncpy(self, emu, argv, ctx: api.ApiContext = None):
+    def strncpy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        char * strncpy(
-            char * destination,
-            const char * source,
-            size_t num
+        char *strncpy(
+            char *strDest,
+            const char *strSource,
+            size_t count
         );
         """
-        dest, src, length = argv
-        s = self.read_string(src, max_chars=length)
-        if len(s) < length:
-            s += "\x00" * (length - len(s))
-        self.write_string(s, dest)
-        argv[1] = s
-        return dest
+        strDest, strSource, count = argv
+        if count:
+            s = self.read_cstr(strSource, max_chars=count)
+            self.mem_write(strDest, s.ljust(count, b"\x00"))
+            ctx.args[1].display = decode_ansi(s)
+        return strDest
 
     @apihook("wcsncpy", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def wcsncpy(self, emu, argv, ctx: api.ApiContext = None):
+    def wcsncpy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         wchar_t *wcsncpy(
-           wchar_t *strDest,
-           const wchar_t *strSource,
-           size_t count
+            wchar_t *strDest,
+            const wchar_t *strSource,
+            size_t count
         );
         """
-        dest, src, count = argv
-        ws = self.read_wide_string(src, max_chars=count)
-        if len(ws) < count:
-            ws += "\x00" * (count - len(ws))
-        self.write_wide_string(ws, dest)
-        argv[1] = ws
-        return dest
+        strDest, strSource, count = argv
+        if count:
+            ws = self.read_cstr(strSource, max_chars=count, width=2)
+            self.mem_write(strDest, ws.ljust(count * 2, b"\x00"))
+            ctx.args[1].display = ws.decode("utf-16le", "replace")
+        return strDest
 
     @apihook("memcpy", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def memcpy(self, emu, argv, ctx: api.ApiContext = None):
+    def memcpy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void *memcpy(
             void *dest,
             const void *src,
             size_t count
-            );
+        );
         """
         dest, src, count = argv
         data = self.mem_read(src, count)
         self.mem_write(dest, data)
         return dest
 
+    @apihook("memcpy_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def memcpy_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t memcpy_s(
+            void *dest,
+            size_t destSize,
+            const void *src,
+            size_t count
+        );
+
+        On a NULL source or a short destination, the destination is zeroed.
+        """
+        dest, destSize, src, count = argv
+        if not count:
+            return 0
+        if not dest:
+            return EINVAL
+        if not src or destSize < count:
+            self.mem_write(dest, b"\x00" * destSize)
+            return EINVAL if not src else ERANGE
+        self.mem_write(dest, self.mem_read(src, count))
+        return 0
+
+    @apihook("memmove_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def memmove_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t memmove_s(
+            void *dest,
+            size_t numberOfElements,
+            const void *src,
+            size_t count
+        );
+        """
+        dest, numberOfElements, src, count = argv
+        if not count:
+            return 0
+        if not dest or not src:
+            return EINVAL
+        if numberOfElements < count:
+            return ERANGE
+        self.mem_write(dest, self.mem_read(src, count))
+        return 0
+
     @apihook("memmove", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def memmove(self, emu, argv, ctx: api.ApiContext = None):
+    def memmove(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void *memmove(
             void *dest,
@@ -1089,179 +2573,257 @@ class Msvcrt(api.ApiHandler):
         return dest
 
     @apihook("memcmp", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def memcmp(self, emu, argv, ctx: api.ApiContext = None):
+    def memcmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int memcmp(
-           const void *buffer1,
-           const void *buffer2,
-           size_t count
+            const void *buffer1,
+            const void *buffer2,
+            size_t count
         );
         """
-        diff = 0
-        buff1, buff2, cnt = argv
-        for i in range(cnt):
-            b1 = self.mem_read(buff1, 1)
-            b2 = self.mem_read(buff2, 1)
-            if b1 > b2:
-                diff = 1
-                break
-            elif b1 < b2:
-                diff = -1
-                break
+        buffer1, buffer2, count = argv
+        b1 = self.mem_read(buffer1, count)
+        b2 = self.mem_read(buffer2, count)
+        return (b1 > b2) - (b1 < b2)
 
-        return diff
+    @apihook("qsort", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def qsort(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void qsort(
+            void *base,
+            size_t number,
+            size_t width,
+            int (*compare)(const void *, const void *)
+        );
+        """
+        base, number, width, compare = argv
+        if number < 2 or not width:
+            return None
+        return self.sort_elements(base, number, width, compare)
+
+    def sort_elements(self, base: int, number: int, width: int, compare: int):
+        """Merge sort the elements in place, with a guest call to ``compare`` for each comparison."""
+        order = [base + i * width for i in range(number)]
+        run = 1
+        while run < number:
+            merged = []
+            for start in range(0, number, 2 * run):
+                left, right = order[start : start + run], order[start + run : start + 2 * run]
+                i = j = 0
+                while i < len(left) and j < len(right):
+                    result = (yield GuestCall(compare, (left[i], right[j]))) & 0xFFFFFFFF
+                    if 0 < result < 0x80000000:
+                        merged.append(right[j])
+                        j += 1
+                    else:
+                        merged.append(left[i])
+                        i += 1
+                merged += left[i:] + right[j:]
+            order, run = merged, run * 2
+        self.mem_write(base, b"".join(self.mem_read(element, width) for element in order))
 
     @apihook("_except_handler4_common", argc=6, conv=e_arch.CALL_CONV_CDECL)
-    def _except_handler4_common(self, emu, argv, ctx: api.ApiContext = None):
+    def _except_handler4_common(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        _CRTIMP  __C_specific_handler(
-        _In_    struct _EXCEPTION_RECORD   *ExceptionRecord,
-        _In_    void                       *EstablisherFrame,
-        _Inout_ struct _CONTEXT            *ContextRecord,
-        _Inout_ struct _DISPATCHER_CONTEXT *DispatcherContext
+        EXCEPTION_DISPOSITION _except_handler4_common(
+            PUINT_PTR CookiePointer,
+            PCOOKIE_CHECK CookieCheckFunction,
+            PEXCEPTION_RECORD ExceptionRecord,
+            PEXCEPTION_REGISTRATION_RECORD EstablisherFrame,
+            PCONTEXT ContextRecord,
+            PVOID DispatcherContext
         );
         """
-        # Inferred from the SEH teardowns described here:
-        # https://bytepointer.com/resources/pietrek_crash_course_depths_of_win32_seh.htm
-        # http://www.openrce.org/articles/full_view/21
-
-        # Two additional arguments are pushed to the function to check security cookies
-        cookie_ptr, cookie_func, record, frame, context, dispath_ctx = argv
-        rv = 0
-
-        cookie = self.mem_read(cookie_ptr, 4)
-        cookie = int.from_bytes(cookie, "little")
-
-        thread = emu.get_current_thread()
-
-        # Break down the exception records into something more manageable
-        curr_frame = frame
-        seh = thread.seh
-
-        _ctx = self.wintypes.CONTEXT(emu.get_ptr_size())
-        _ctx = self.mem_cast(_ctx, context)
-
-        seh.set_context(_ctx, address=context)
-        seh.record = record
-
-        seh.clear_frames()
-
-        while curr_frame != 0:
-            reg = self.wintypes.EXCEPTION_REGISTRATION(emu.get_ptr_size())
-            reg = self.mem_cast(reg, curr_frame)
-
-            scope_table = reg.ScopeTable ^ cookie
-
-            st = self.wintypes.EH4_SCOPETABLE(emu.get_ptr_size())
-            st = self.mem_cast(st, scope_table)
-
-            rec = self.wintypes.EH4_SCOPETABLE_RECORD(emu.get_ptr_size())
-            # The trylevel will tell us what scope record to get
-            scope_record_offset = scope_table + st.sizeof()
-            tl = reg.TryLevel
-            if reg.TryLevel & 0x80000000:
-                tl = -0x100000000 + reg.TryLevel
-
-            if tl == -2:  # -2 is the outermost scope
-                tl = 0
-
-            scope_record_offset += rec.sizeof() * tl
-            rec = self.mem_cast(rec, scope_record_offset)
-
-            seh.add_frame(
-                reg,
-                st,
-                [
-                    rec,
-                ],
-            )
-
-            curr_frame = reg.Next
-
-        return rv
+        return seh32.except_handler4_common(emu, *argv)
 
     @apihook("_seh_filter_exe", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _seh_filter_exe(self, emu, argv, ctx: api.ApiContext = None):
+    def _seh_filter_exe(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int __cdecl _seh_filter_exe(
-           unsigned long _ExceptionNum,
-           struct _EXCEPTION_POINTERS* _ExceptionPtr
+        int _seh_filter_exe(
+            unsigned long exceptionNum,
+            struct _EXCEPTION_POINTERS *exceptionPtr
         );
         """
-        except_num, exc_ptr = argv
-        rv = 1
+        exceptionNum, exceptionPtr = argv
+        if exceptionNum not in EXCEPTION_SIGNALS:
+            return windefs.EXCEPTION_CONTINUE_SEARCH
+        sig, fpe_code = EXCEPTION_SIGNALS[exceptionNum]
+        action = self.signal_handlers.get(sig, SIG_DFL)
+        if action == SIG_DFL:
+            return windefs.EXCEPTION_CONTINUE_SEARCH
+        if action == SIG_IGN:
+            return windefs.EXCEPTION_CONTINUE_EXECUTION & 0xFFFFFFFF
+        self.signal_handlers[sig] = SIG_DFL
+        return self.call_signal_handler(action, (sig, fpe_code) if sig == SIGFPE else (sig,))
 
+    def call_signal_handler(self, handler, args, rv=windefs.EXCEPTION_CONTINUE_EXECUTION & 0xFFFFFFFF):
+        yield GuestCall(handler, args)
         return rv
+
+    @apihook("__C_specific_handler", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def __C_specific_handler(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        EXCEPTION_DISPOSITION __C_specific_handler(
+            struct _EXCEPTION_RECORD *ExceptionRecord,
+            void *EstablisherFrame,
+            struct _CONTEXT *ContextRecord,
+            struct _DISPATCHER_CONTEXT *DispatcherContext
+        );
+        """
+        return exception_apis.c_specific_handler(emu, argv)
 
     @apihook("_except_handler3", argc=4, conv=e_arch.CALL_CONV_CDECL)
-    def _except_handler3(self, emu, argv, ctx: api.ApiContext = None):
+    def _except_handler3(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _except_handler3(
-        PEXCEPTION_RECORD exception_record,
-        PEXCEPTION_REGISTRATION registration,
-        PCONTEXT context,
-        PEXCEPTION_REGISTRATION dispatcher
+            PEXCEPTION_RECORD exception_record,
+            PEXCEPTION_REGISTRATION registration,
+            PCONTEXT context,
+            PEXCEPTION_REGISTRATION dispatcher
         );
         """
-        rv = 1
-        return rv
+        return seh32.except_handler3(emu, *argv)
+
+    @apihook("_abnormal_termination", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _abnormal_termination(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _abnormal_termination();
+
+        Return 1 in an x86 __finally block that the MSVC language handler runs for an unwind.
+        """
+        return int(seh32.is_abnormal_termination(emu))
+
+    @apihook("_unwind_handler", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _unwind_handler(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        EXCEPTION_DISPOSITION _unwind_handler(
+            PEXCEPTION_RECORD ExceptionRecord,
+            PEXCEPTION_REGISTRATION_RECORD EstablisherFrame,
+            PCONTEXT ContextRecord,
+            PVOID DispatcherContext
+        );
+
+        The handler of the registration that the x86 local unwind adds while a __finally block runs.
+        An unwind continues to the frame of the __finally block, which continues its local unwind.
+        """
+        return windefs.ExceptionContinueSearch
 
     @apihook("_seh_filter_dll", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _seh_filter_dll(self, emu, argv, ctx: api.ApiContext = None):
+    def _seh_filter_dll(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int __cdecl _seh_filter_dll(
-           unsigned long _ExceptionNum,
-           struct _EXCEPTION_POINTERS* _ExceptionPtr
+        int _seh_filter_dll(
+            unsigned long exceptionNum,
+            struct _EXCEPTION_POINTERS *exceptionPtr
         );
         """
-        except_num, exc_ptr = argv
-        rv = 1
-
-        return rv
+        exceptionNum, exceptionPtr = argv
+        # Only C++ exceptions go on to _seh_filter_exe, and no signal maps to them
+        return windefs.EXCEPTION_CONTINUE_SEARCH
 
     @apihook("puts", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def puts(self, emu, argv, ctx: api.ApiContext = None):
+    def puts(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int puts(
-           const char *str
+            const char *str
         );
         """
-        (s,) = argv
+        (str,) = argv
 
-        string = self.read_mem_string(s, 1)
-        argv[0] = string
+        string = self.read_mem_string(str, 1)
+        ctx.args[0].display = string
         rv = len(string)
 
         return rv
 
+    def read_onexit_table(self, emu, table: int) -> tuple[int, int, int]:
+        ptr_size = self.get_ptr_size()
+        first, last, end = (self.read_ptr(table + i * ptr_size) for i in range(3))
+        return first, last, end
+
+    def write_onexit_table(self, emu, table: int, first: int, last: int, end: int) -> None:
+        ptr_size = self.get_ptr_size()
+        for i, value in enumerate((first, last, end)):
+            self.write_ptr(table + i * ptr_size, value)
+
     @apihook("_initialize_onexit_table", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _initialize_onexit_table(self, emu, argv, ctx: api.ApiContext = None):
+    def _initialize_onexit_table(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _initialize_onexit_table(
-            _onexit_table_t* table
-            );
+            _onexit_table_t *table
+        );
         """
-        rv = 0
-
-        return rv
+        (table,) = argv
+        if not table:
+            return -1
+        if not self.read_onexit_table(emu, table)[0]:
+            self.write_onexit_table(emu, table, 0, 0, 0)
+        return 0
 
     @apihook("_register_onexit_function", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _register_onexit_function(self, emu, argv, ctx: api.ApiContext = None):
+    def _register_onexit_function(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _register_onexit_function(
-            _onexit_table_t* table,
-            _onexit_t        function
-            );
+            _onexit_table_t *table,
+            _onexit_t function
+        );
         """
-        rv = 0
+        table, function = argv
+        if not table:
+            return -1
+        ptr_size = self.get_ptr_size()
+        first, last, end = self.read_onexit_table(emu, table)
+        if first in (0, (1 << (ptr_size * 8)) - 1):
+            first = last = end = 0
+        if last == end:
+            count = (last - first) // ptr_size
+            array = self.heap_alloc(max(count * 2, 32) * ptr_size, heap="HeapAlloc")
+            if count:
+                self.mem_write(array, self.mem_read(first, count * ptr_size))
+                self.heap_free(first)
+            first, last, end = array, array + count * ptr_size, array + max(count * 2, 32) * ptr_size
+        self.write_ptr(last, function)
+        self.write_onexit_table(emu, table, first, last + ptr_size, end)
+        return 0
 
-        return rv
+    @apihook("_execute_onexit_table", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _execute_onexit_table(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _execute_onexit_table(
+            _onexit_table_t *table
+        );
+        """
+        (table,) = argv
+        if not table:
+            return -1
+        return self.call_onexit_functions(emu, table)
+
+    def call_onexit_functions(self, emu, table: int):
+        ptr_size = self.get_ptr_size()
+        first, last, _ = self.read_onexit_table(emu, table)
+        if first in (0, (1 << (ptr_size * 8)) - 1):
+            return 0
+        saved = (first, last)
+        while True:
+            last -= ptr_size
+            while last >= first and not self.read_ptr(last):
+                last -= ptr_size
+            if last < first:
+                break
+            function = self.read_ptr(last)
+            self.write_ptr(last, 0)
+            yield GuestCall(function)
+            new_first, new_last, _ = self.read_onexit_table(emu, table)
+            if (new_first, new_last) != saved:
+                first, last = saved = (new_first, new_last)
+        self.heap_free(first)
+        self.write_onexit_table(emu, table, 0, 0, 0)
+        return 0
 
     @apihook("malloc", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def malloc(self, emu, argv, ctx: api.ApiContext = None):
+    def malloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void *malloc(
-        size_t size
+            size_t size
         );
         """
         (size,) = argv
@@ -1269,43 +2831,605 @@ class Msvcrt(api.ApiHandler):
         chunk = self.heap_alloc(size, heap="HeapAlloc")
         return chunk
 
+    @apihook("_malloc_crt", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _malloc_crt(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *_malloc_crt(
+            size_t size
+        );
+        """
+        return self.malloc(emu, argv, ctx)
+
+    @apihook("_calloc_crt", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _calloc_crt(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *_calloc_crt(
+            size_t num,
+            size_t size
+        );
+        """
+        return self.calloc(emu, argv, ctx)
+
+    @apihook("_realloc_crt", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _realloc_crt(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *_realloc_crt(
+            void *memblock,
+            size_t size
+        );
+        """
+        return self.realloc(emu, argv, ctx)
+
+    # The same encoding as kernel32.EncodePointer and DecodePointer, so the values mix
+    @apihook("_encode_pointer", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _encode_pointer(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *_encode_pointer(
+            void *ptr
+        );
+        """
+        (ptr,) = argv
+        return ptr + 1
+
+    @apihook("_decode_pointer", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _decode_pointer(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *_decode_pointer(
+            void *ptr
+        );
+        """
+        (ptr,) = argv
+        return ptr - 1
+
+    @apihook("_encoded_null", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _encoded_null(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *_encoded_null();
+        """
+        return self._encode_pointer(emu, [0], ctx)
+
+    @apihook("_strdup", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _strdup(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char *_strdup(
+            const char *strSource
+        );
+        """
+        (strSource,) = argv
+        if not strSource:
+            return 0
+        data = self.read_cstr(strSource) + b"\x00"
+        dst = self.heap_alloc(len(data), heap="HeapAlloc")
+        self.mem_write(dst, data)
+        return dst
+
+    @apihook("_wcsdup", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _wcsdup(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t *_wcsdup(
+            const wchar_t *strSource
+        );
+        """
+        (strSource,) = argv
+        if not strSource:
+            return 0
+        data = self.read_cstr(strSource, width=2) + b"\x00\x00"
+        dst = self.heap_alloc(len(data), heap="HeapAlloc")
+        self.mem_write(dst, data)
+        return dst
+
+    @apihook("_mbsdup", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsdup(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbsdup(
+            const unsigned char *strSource
+        );
+        """
+        return self._strdup(emu, argv, ctx)
+
+    @apihook("_mbsstr", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsstr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbsstr(
+            const unsigned char *str,
+            const unsigned char *strSearch
+        );
+        """
+        return self.strstr(emu, argv, ctx)
+
+    @apihook("_mbspbrk", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _mbspbrk(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbspbrk(
+            const unsigned char *str,
+            const unsigned char *strCharSet
+        );
+        """
+        return self.strpbrk(emu, argv, ctx)
+
+    @apihook("_mbschr", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _mbschr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbschr(
+            const unsigned char *str,
+            unsigned int c
+        );
+        """
+        return self.strchr(emu, argv, ctx)
+
+    @apihook("_mbsrchr", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsrchr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbsrchr(
+            const unsigned char *str,
+            unsigned int c
+        );
+        """
+        return self.strrchr(emu, argv, ctx)
+
+    @apihook("_mbscmp", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _mbscmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _mbscmp(
+            const unsigned char *string1,
+            const unsigned char *string2
+        );
+        """
+        return self.strcmp(emu, argv, ctx)
+
+    @apihook("_mbscoll", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _mbscoll(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _mbscoll(
+            const unsigned char *string1,
+            const unsigned char *string2
+        );
+        """
+        return self.strcmp(emu, argv, ctx)
+
+    @apihook("_mbsicmp", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsicmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _mbsicmp(
+            const unsigned char *string1,
+            const unsigned char *string2
+        );
+        """
+        return self._stricmp(emu, argv, ctx)
+
+    @apihook("_mbsicoll", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsicoll(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _mbsicoll(
+            const unsigned char *string1,
+            const unsigned char *string2
+        );
+        """
+        return self._stricmp(emu, argv, ctx)
+
+    @apihook("_mbsnbcmp", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsnbcmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _mbsnbcmp(
+            const unsigned char *string1,
+            const unsigned char *string2,
+            size_t count
+        );
+        """
+        return self.strncmp(emu, argv, ctx)
+
+    @apihook("_mbsncmp", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsncmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _mbsncmp(
+            const unsigned char *string1,
+            const unsigned char *string2,
+            size_t count
+        );
+        """
+        return self.strncmp(emu, argv, ctx)
+
+    @apihook("_mbscpy", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _mbscpy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbscpy(
+            unsigned char *strDestination,
+            const unsigned char *strSource
+        );
+        """
+        return self.strcpy(emu, argv, ctx)
+
+    @apihook("_mbscat", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _mbscat(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbscat(
+            unsigned char *strDestination,
+            const unsigned char *strSource
+        );
+        """
+        return self.strcat(emu, argv, ctx)
+
+    @apihook("_mbslen", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _mbslen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t _mbslen(
+            const unsigned char *str
+        );
+
+        The emulated code page has one byte for each character.
+        """
+        return self.strlen(emu, argv, ctx)
+
+    @apihook("_mbsncpy", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsncpy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbsncpy(
+            unsigned char *strDest,
+            const unsigned char *strSource,
+            size_t count
+        );
+
+        The emulated code page has one byte for each character.
+        """
+        return self.strncpy(emu, argv, ctx)
+
+    @apihook("_mbsnbcpy", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsnbcpy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbsnbcpy(
+            unsigned char *strDest,
+            const unsigned char *strSource,
+            size_t count
+        );
+        """
+        return self.strncpy(emu, argv, ctx)
+
+    @apihook("_mbslwr", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _mbslwr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbslwr(
+            unsigned char *str
+        );
+        """
+        return self._strlwr(emu, argv, ctx)
+
+    @apihook("_ismbcdigit", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _ismbcdigit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _ismbcdigit(
+            unsigned int c
+        );
+        """
+        return self.isdigit(emu, argv, ctx)
+
+    @apihook("_ismbcspace", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _ismbcspace(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _ismbcspace(
+            unsigned int c
+        );
+        """
+        return self.isspace(emu, argv, ctx)
+
+    @apihook("_mbsupr", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsupr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbsupr(
+            unsigned char *str
+        );
+        """
+        (str,) = argv
+        if not str:
+            return 0
+        string = self.read_cstr(str)
+        ctx.args[0].display = decode_ansi(string)
+        self.mem_write(str, string.upper())
+        return str
+
+    @apihook("_mbsrev", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsrev(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbsrev(
+            unsigned char *str
+        );
+        """
+        (str,) = argv
+        string = self.read_cstr(str)
+        ctx.args[0].display = decode_ansi(string)
+        self.mem_write(str, string[::-1])
+        return str
+
+    @apihook("_mbsinc", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _mbsinc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned char *_mbsinc(
+            const unsigned char *current
+        );
+
+        The emulated code page has one byte for each character.
+        """
+        (current,) = argv
+        return current + 1
+
+    @apihook("_mbclen", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _mbclen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t _mbclen(
+            const unsigned char *c
+        );
+        """
+        return 1
+
+    @apihook("realloc", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def realloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *realloc(
+            void *memblock,
+            size_t size
+        );
+        """
+        memblock, size = argv
+        if memblock and not size:
+            self.heap_free(memblock)
+            return 0
+        dst = self.heap_alloc(size, heap="HeapAlloc")
+        if not dst:
+            return 0
+        if memblock:
+            self.mem_write(dst, self.mem_read(memblock, min(self.get_block_size(emu, memblock), size)))
+            self.heap_free(memblock)
+        return dst
+
+    def get_block_size(self, emu, mem):
+        size = next((n for a, n, _ in reversed(emu.get_heap_allocs()) if a == mem), None)
+        if size is None:
+            mm = emu.get_address_map(mem)
+            size = mm.base + mm.size - mem if mm else 0
+        return size
+
+    @apihook("_recalloc", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _recalloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *_recalloc(
+            void *memblock,
+            size_t num,
+            size_t size
+        );
+        """
+        memblock, num, size = argv
+        total = num * size
+        if total > self.get_max_int():
+            return 0
+        old = self.get_block_size(emu, memblock) if memblock else 0
+        dst = self.realloc(emu, [memblock, total], ctx)
+        if dst and total > old:
+            self.mem_write(dst + old, b"\x00" * (total - old))
+        return dst
+
+    @apihook("getenv", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def getenv(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char *getenv(
+            const char *varname
+        );
+        """
+        (varname,) = argv
+        key = decode_ansi(self.read_cstr(varname))
+        ctx.args[0].display = key
+        val = next((v for k, v in emu.get_env().items() if k.lower() == key.lower()), None)
+        if val is None:
+            return 0
+        data = encode_ansi(val + "\x00")
+        dst = self.heap_alloc(len(data), heap="HeapAlloc")
+        self.mem_write(dst, data)
+        return dst
+
+    def dupenv(self, emu, argv, ctx, width):
+        buffer, count, name = argv
+        key = self.read_mem_string(name, width) if name else ""
+        ctx.args[2].display = key
+        if not buffer or not name:
+            self.set_errno(EINVAL)
+            return EINVAL
+        val = next((v for k, v in emu.get_env().items() if k.lower() == key.lower()), None)
+        dst = 0
+        if val is not None:
+            data = self.encode_string(val + "\x00", width)
+            dst = self.heap_alloc(len(data), heap="HeapAlloc")
+            self.mem_write(dst, data)
+        self.write_ptr(buffer, dst)
+        if count:
+            self.write_ptr(count, len(val) + 1 if val is not None else 0)
+        return 0
+
+    @apihook("_dupenv_s", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _dupenv_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _dupenv_s(
+            char **buffer,
+            size_t *numberOfElements,
+            const char *varname
+        );
+        """
+        return self.dupenv(emu, argv, ctx, 1)
+
+    @apihook("_wdupenv_s", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _wdupenv_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _wdupenv_s(
+            wchar_t **buffer,
+            size_t *numberOfElements,
+            const wchar_t *varname
+        );
+        """
+        return self.dupenv(emu, argv, ctx, 2)
+
+    @apihook("memchr", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def memchr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *memchr(
+            const void *buffer,
+            int c,
+            size_t count
+        );
+        """
+        buffer, c, count = argv
+        needle = bytes([c & 0xFF])
+        for off in range(0, count, 0x1000):
+            i = self.mem_read(buffer + off, min(0x1000, count - off)).find(needle)
+            if i >= 0:
+                return buffer + off + i
+        return 0
+
+    @apihook("strtol", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def strtol(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        long strtol(
+            const char *string,
+            char **end_ptr,
+            int base
+        );
+        """
+        string, end_ptr, base = argv
+        val, used = parse_c_integer(self.read_cstr(string), base)
+        if end_ptr:
+            self.write_ptr(end_ptr, string + used)
+        return max(-0x80000000, min(val, 0x7FFFFFFF))
+
+    @apihook("strtoul", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def strtoul(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned long strtoul(
+            const char *strSource,
+            char **endptr,
+            int base
+        );
+        """
+        strSource, endptr, base = argv
+        val, used = parse_c_integer(self.read_cstr(strSource), base)
+        if endptr:
+            self.write_ptr(endptr, strSource + used)
+        return 0xFFFFFFFF if abs(val) > 0xFFFFFFFF else val & 0xFFFFFFFF
+
+    @apihook("wcstoul", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def wcstoul(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned long wcstoul(
+            const wchar_t *strSource,
+            wchar_t **endptr,
+            int base
+        );
+        """
+        strSource, endptr, base = argv
+        val, used = parse_c_integer(self.read_number_text(strSource, 2), base)
+        if endptr:
+            self.write_ptr(endptr, strSource + used * 2)
+        return 0xFFFFFFFF if abs(val) > 0xFFFFFFFF else val & 0xFFFFFFFF
+
+    def read_number_text(self, addr, width):
+        """
+        Read the string at ``addr`` for parse_c_integer. A wide character
+        outside ASCII becomes "?", which ends the number.
+        """
+        text = self.read_cstr(addr, width=width)
+        return text if width == 1 else text.decode("utf-16le", "replace").encode("ascii", "replace")
+
+    def strtoi64(self, emu, argv, width, signed):
+        src, endptr, base = argv
+        val, used = parse_c_integer(self.read_number_text(src, width), base)
+        if endptr:
+            self.write_ptr(endptr, src + used * width)
+        if signed and not -(1 << 63) <= val < 1 << 63:
+            self.set_errno(ERANGE)
+            val = -(1 << 63) if val < 0 else (1 << 63) - 1
+        elif not signed and abs(val) >= 1 << 64:
+            self.set_errno(ERANGE)
+            val = (1 << 64) - 1
+        return self.return_int64(emu, val)
+
+    @apihook("_strtoi64", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _strtoi64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        __int64 _strtoi64(
+            const char *strSource,
+            char **endptr,
+            int base
+        );
+        """
+        return self.strtoi64(emu, argv, 1, True)
+
+    @apihook("_strtoui64", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _strtoui64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned __int64 _strtoui64(
+            const char *strSource,
+            char **endptr,
+            int base
+        );
+        """
+        return self.strtoi64(emu, argv, 1, False)
+
+    @apihook("_wcstoi64", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _wcstoi64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        __int64 _wcstoi64(
+            const wchar_t *strSource,
+            wchar_t **endptr,
+            int base
+        );
+        """
+        return self.strtoi64(emu, argv, 2, True)
+
+    @apihook("_wcstoui64", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _wcstoui64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        unsigned __int64 _wcstoui64(
+            const wchar_t *strSource,
+            wchar_t **endptr,
+            int base
+        );
+        """
+        return self.strtoi64(emu, argv, 2, False)
+
     @apihook("calloc", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def calloc(self, emu, argv, ctx: api.ApiContext = None):
+    def calloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void *calloc(
-        size_t num,
-        size_t size
+            size_t number,
+            size_t size
         );
         """
         (
-            num,
+            number,
             size,
         ) = argv
 
-        chunk = self.heap_alloc(num * size, heap="HeapAlloc")
-
-        buf = b"\x00" * (num * size)
-        self.mem_write(chunk, buf)
+        total = number * size
+        if total > self.get_max_int():
+            return 0
+        chunk = self.heap_alloc(total, heap="HeapAlloc")
+        if chunk:
+            self.mem_write(chunk, b"\x00" * total)
 
         return chunk
 
     @apihook("free", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def free(self, emu, argv, ctx: api.ApiContext = None):
+    def free(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void free(
-        void *memblock
+            void *memblock
         );
         """
-        (mem,) = argv
-        self.mem_free(mem)
+        (memblock,) = argv
+        self.heap_free(memblock)
 
     @apihook("_beginthreadex", argc=6, conv=e_arch.CALL_CONV_CDECL)
-    def _beginthreadex(self, emu, argv, ctx: api.ApiContext = None):
+    def _beginthreadex(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         uintptr_t _beginthreadex(
             void *security,
             unsigned stack_size,
-            unsigned ( __stdcall *start_address )( void * ),
+            unsigned (*start_address)(void *),
             void *arglist,
             unsigned initflag,
             unsigned *thrdaddr
@@ -1314,199 +3438,405 @@ class Msvcrt(api.ApiHandler):
         security, stack_size, start_address, arglist, initflag, thrdaddr = argv
 
         handle, obj = self.create_thread(start_address, arglist, emu.get_current_process())
+        if not obj:
+            self.set_errno(EAGAIN)
+            return 0
 
         if thrdaddr:
-            self.mem_write(thrdaddr, obj.id.to_bytes(4, "little"))
+            self.write_dword(thrdaddr, obj.id)
 
         return handle
 
     @apihook("_beginthread", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def _beginthread(self, emu, argv, ctx: api.ApiContext = None):
+    def _beginthread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        uintptr_t _beginthread
-        void( __cdecl *start_address )( void * ),
-        unsigned stack_size,
-        void *arglist
+        uintptr_t _beginthread(
+            void (*start_address)(void *),
+            unsigned stack_size,
+            void *arglist
         );
         """
         start_address, stack_size, arglist = argv
 
         handle, obj = self.create_thread(start_address, arglist, emu.get_current_process())
+        if not obj:
+            self.set_errno(EAGAIN)
+            return self.get_max_int()
         return handle
 
-    @apihook("system", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def system(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("_endthreadex", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _endthreadex(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int system(
-           const char *command
+        void _endthreadex(
+            unsigned retval
         );
         """
-        (s,) = argv
+        (retval,) = argv
+        emu.get_current_thread().exit_code = retval
+        self.exit_process()
 
-        string = self.read_mem_string(s, 1)
-        argv[0] = string
-        rv = len(string)
+    @apihook("_endthread", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _endthread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _endthread();
+        """
+        emu.get_current_thread().exit_code = 0
+        self.exit_process()
 
-        return rv
+    @apihook("system", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def system(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int system(
+            const char *command
+        );
+        """
+        (command,) = argv
+
+        if not command:
+            return 1
+
+        string = self.read_mem_string(command, 1)
+        ctx.args[0].display = string
+
+        return 0
+
+    def open_pipe(self, argv, width, ctx):
+        """
+        Give a pipe stream for a command that the emulator does not run. Reads
+        are at end of file and writes are discarded.
+        """
+        command, mode = argv
+        mode_str = self.read_mem_string(mode, width) if mode else ""
+        if not command or mode_str[:1] not in ("r", "w"):
+            self.set_errno(EINVAL)
+            return 0
+
+        ctx.args[0].display = self.read_mem_string(command, width)
+        ctx.args[1].display = mode_str
+        return self.new_stream(self.new_fd(0), None, "api.msvcrt._popen")
+
+    @apihook("_popen", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _popen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *_popen(
+            const char *command,
+            const char *mode
+        );
+        """
+        return self.open_pipe(argv, 1, ctx)
+
+    @apihook("_wpopen", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _wpopen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *_wpopen(
+            const wchar_t *command,
+            const wchar_t *mode
+        );
+        """
+        return self.open_pipe(argv, 2, ctx)
+
+    @apihook("_pclose", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _pclose(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _pclose(
+            FILE *stream
+        );
+        """
+        (stream,) = argv
+        fd = self.get_stream_fd(stream)
+        if fd is None or self.fds.get(fd) != 0:
+            self.set_errno(EINVAL)
+            return -1
+        return self.fclose(emu, argv, ctx)
 
     @apihook("toupper", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def toupper(self, emu, argv, ctx: api.ApiContext = None):
+    def toupper(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int toupper(
-           int c
+            int c
         );
         """
         (c,) = argv
-        argv[0] = c
-        if 0x00 <= c <= 0x7F:
-            c = ord(chr(c).upper())
-        else:
-            c = 0x00
+        if ord("a") <= c <= ord("z"):
+            c -= 0x20
         return c
 
     @apihook("strlen", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def strlen(self, emu, argv, ctx: api.ApiContext = None):
+    def strlen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         size_t strlen(
             const char *str
         );
         """
-        (s,) = argv
+        (str,) = argv
 
-        string = self.read_mem_string(s, 1)
-        argv[0] = string
-        rv = len(string)
+        string = self.read_cstr(str)
+        ctx.args[0].display = decode_ansi(string)
 
+        return len(string)
+
+    @apihook("strnlen", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def strnlen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t strnlen(
+            const char *str,
+            size_t numberOfElements
+        );
+        """
+        str, numberOfElements = argv
+        ctx.args[0].display = self.read_mem_string(str, 1, max_chars=numberOfElements)
+
+        rv = 0
+        while rv < numberOfElements and self.mem_read(str + rv, 1) != b"\x00":
+            rv += 1
         return rv
 
     @apihook("strcat", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def strcat(self, emu, argv, ctx: api.ApiContext = None):
+    def strcat(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         char *strcat(
             char *strDestination,
             const char *strSource
         );
         """
-        _str1, _str2 = argv
-        s1 = self.read_mem_string(_str1, 1)
-        s2 = self.read_mem_string(_str2, 1)
-        argv[0] = s1
-        argv[1] = s2
-        new = (s1 + s2).encode("utf-8")
-        self.mem_write(_str1, new + b"\x00")
-        return _str1
+        strDestination, strSource = argv
+        s1 = self.read_cstr(strDestination)
+        s2 = self.read_cstr(strSource)
+        ctx.args[0].display = decode_ansi(s1)
+        ctx.args[1].display = decode_ansi(s2)
+        self.mem_write(strDestination + len(s1), s2 + b"\x00")
+        return strDestination
 
     @apihook("_strlwr", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _strlwr(self, emu, argv, ctx: api.ApiContext = None):
+    def _strlwr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         char *_strlwr(
             char *str
-            );
+        );
         """
-        (string_ptr,) = argv
+        (str,) = argv
 
-        if not string_ptr:
+        if not str:
             return 0
 
-        string = self.read_string(string_ptr)
-        argv[0] = string
-        self.write_string(string.lower(), string_ptr)
-        return string_ptr
+        string = self.read_cstr(str)
+        ctx.args[0].display = decode_ansi(string)
+        self.mem_write(str, string.lower())
+        return str
+
+    @apihook("_wcslwr", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _wcslwr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t *_wcslwr(
+            wchar_t *str
+        );
+        """
+        (str,) = argv
+        if not str:
+            return 0
+        self.lower_wide_string(ctx, str, self.read_cstr(str, width=2))
+        return str
+
+    @apihook("_wcslwr_s", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _wcslwr_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _wcslwr_s(
+            wchar_t *str,
+            size_t numberOfElements
+        );
+        """
+        str, numberOfElements = argv
+        if not str:
+            return EINVAL
+        data = self.read_cstr(str, max_chars=numberOfElements, width=2) if numberOfElements else b""
+        if len(data) // 2 >= numberOfElements:
+            self.mem_write(str, b"\x00\x00")
+            return EINVAL
+        self.lower_wide_string(ctx, str, data)
+        return 0
+
+    def lower_wide_string(self, ctx, address, data):
+        """Lower the case of a wide string in place, in the C locale, which changes only A to Z."""
+        text = data.decode("utf-16le", "surrogatepass")
+        ctx.args[0].display = text
+        self.mem_write(address, text.translate(ASCII_LOWER_TABLE).encode("utf-16le", "surrogatepass"))
 
     @apihook("strncat", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def strncat(self, emu, argv, ctx: api.ApiContext = None):
+    def strncat(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         char *strncat(
-            char *destination,
-            const char *source,
-            size_t num
+            char *strDest,
+            const char *strSource,
+            size_t count
         );
         """
-        dest, src, count = argv
-        s1 = self.read_mem_string(dest, 1)
-        s2 = self.read_string(src, max_chars=count)
-        argv[0] = s1
-        argv[1] = s2
-        new = (s1 + s2).encode("utf-8")
-        self.mem_write(dest, new + b"\x00")
-        return dest
+        strDest, strSource, count = argv
+        s1 = self.read_cstr(strDest)
+        s2 = self.read_cstr(strSource, max_chars=count) if count else b""
+        ctx.args[0].display = decode_ansi(s1)
+        ctx.args[1].display = decode_ansi(s2)
+        self.mem_write(strDest + len(s1), s2 + b"\x00")
+        return strDest
 
     @apihook("wcscat", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def wcscat(self, emu, argv, ctx: api.ApiContext = None):
+    def wcscat(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         wchar_t *wcscat(
-           wchar_t *strDestination,
-           const wchar_t *strSource
+            wchar_t *strDestination,
+            const wchar_t *strSource
         );
         """
-        _str1, _str2 = argv
-        s1 = self.read_mem_string(_str1, 2)
-        s2 = self.read_mem_string(_str2, 2)
-        argv[0] = s1
-        argv[1] = s2
+        strDestination, strSource = argv
+        s1 = self.read_mem_string(strDestination, 2)
+        s2 = self.read_mem_string(strSource, 2)
+        ctx.args[0].display = s1
+        ctx.args[1].display = s2
         new = (s1 + s2).encode("utf-16le")
-        self.mem_write(_str1, new + b"\x00\x00")
-        return _str1
+        self.mem_write(strDestination, new + b"\x00\x00")
+        return strDestination
+
+    @apihook("strcat_s", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def strcat_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t strcat_s(
+            char *strDestination,
+            size_t numberOfElements,
+            const char *strSource
+        );
+        """
+        strDestination, numberOfElements, strSource = argv
+        if not strDestination or not numberOfElements:
+            return EINVAL
+        if not strSource:
+            self.mem_write(strDestination, b"\x00")
+            return EINVAL
+        s1 = self.read_cstr(strDestination)
+        s2 = self.read_cstr(strSource)
+        ctx.args[0].display = decode_ansi(s1)
+        ctx.args[2].display = decode_ansi(s2)
+        if len(s1) + len(s2) >= numberOfElements:
+            self.mem_write(strDestination, b"\x00")
+            return ERANGE
+        self.mem_write(strDestination, s1 + s2 + b"\x00")
+        return 0
+
+    @apihook("wcscat_s", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def wcscat_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t wcscat_s(
+            wchar_t *strDestination,
+            size_t numberOfElements,
+            const wchar_t *strSource
+        );
+        """
+        strDestination, numberOfElements, strSource = argv
+        if not strDestination or not numberOfElements:
+            return EINVAL
+        if not strSource:
+            self.mem_write(strDestination, b"\x00\x00")
+            return EINVAL
+        s1 = self.read_wide_string(strDestination)
+        s2 = self.read_wide_string(strSource)
+        ctx.args[0].display = s1
+        ctx.args[2].display = s2
+        if len(s1) + len(s2) >= numberOfElements:
+            self.mem_write(strDestination, b"\x00\x00")
+            return ERANGE
+        self.write_wide_string(s1 + s2 + "\x00", strDestination)
+        return 0
 
     @apihook("wcslen", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def wcslen(self, emu, argv, ctx: api.ApiContext = None):
+    def wcslen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         size_t wcslen(
-          const wchar_t* wcs
+            const wchar_t *str
         );
         """
-        (s,) = argv
-        string = self.read_wide_string(s)
-        argv[0] = string
+        (str,) = argv
+        string = self.read_wide_string(str)
+        ctx.args[0].display = string
         rv = len(string)
 
         return rv
 
-    @apihook("_lock", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _lock(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("wcsnlen", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def wcsnlen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void __cdecl _lock
+        size_t wcsnlen(
+            const wchar_t *str,
+            size_t numberOfElements
+        );
+        """
+        str, numberOfElements = argv
+        ctx.args[0].display = self.read_wide_string(str, max_chars=numberOfElements)
+
+        rv = 0
+        while rv < numberOfElements and self.mem_read(str + rv * 2, 2) != b"\x00\x00":
+            rv += 1
+        return rv
+
+    @apihook("_lock", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _lock(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _lock(
             int locknum
         );
         """
         return
 
     @apihook("_unlock", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _unlock(self, emu, argv, ctx: api.ApiContext = None):
+    def _unlock(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void __cdecl _unlock
+        void _unlock(
             int locknum
         );
         """
         return
 
+    @apihook("_lock_file", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _lock_file(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _lock_file(
+            FILE *file
+        );
+        """
+        return
+
+    @apihook("_unlock_file", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _unlock_file(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _unlock_file(
+            FILE *file
+        );
+        """
+        return
+
     @apihook("_ltoa", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def _ltoa(self, emu, argv, ctx: api.ApiContext = None):
+    def _ltoa(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         char *_ltoa(
             long value,
-            char *str,
+            char *buffer,
             int radix
         );
         """
         (
-            val,
-            out_str,
+            value,
+            buffer,
             radix,
         ) = argv
 
-        v = str(val).encode("utf-8")
-        self.mem_write(out_str, v)
-        return
+        self.write_string(self.format_int32(value, radix), buffer)
+        return buffer
 
     @apihook("__dllonexit", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def __dllonexit(self, emu, argv, ctx: api.ApiContext = None):
+    def __dllonexit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        onexit_t __dllonexit(
+        _onexit_t __dllonexit(
             _onexit_t func,
-            _PVFV **  pbegin,
-            _PVFV **  pend
-        )
+            _PVFV **pbegin,
+            _PVFV **pend
+        );
         """
         (
             func,
@@ -1516,7 +3846,7 @@ class Msvcrt(api.ApiHandler):
         return func
 
     @apihook("strncmp", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def strncmp(self, emu, argv, ctx: api.ApiContext = None):
+    def strncmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int strncmp(
             const char *string1,
@@ -1524,148 +3854,1105 @@ class Msvcrt(api.ApiHandler):
             size_t count
         );
         """
-        s1, s2, c = argv
-        rv = 1
+        string1, string2, count = argv
+        if not count:
+            return 0
 
-        string1 = self.read_mem_string(s1, 1)
-        string2 = self.read_mem_string(s2, 1)
-        if string1 == string2:
-            rv = 0
-        argv[0] = string1
-        argv[1] = string2
+        s1 = self.read_cstr(string1, count)
+        s2 = self.read_cstr(string2, count)
+        ctx.args[0].display = decode_ansi(s1)
+        ctx.args[1].display = decode_ansi(s2)
 
-        return rv
+        return (s1 > s2) - (s1 < s2)
+
+    @apihook("wcsncmp", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def wcsncmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int wcsncmp(
+            const wchar_t *string1,
+            const wchar_t *string2,
+            size_t count
+        );
+        """
+        string1, string2, count = argv
+        if not count:
+            return 0
+
+        s1 = self.read_wide_string(string1, max_chars=count)
+        s2 = self.read_wide_string(string2, max_chars=count)
+        ctx.args[0].display = s1
+        ctx.args[1].display = s2
+
+        return (s1 > s2) - (s1 < s2)
 
     @apihook("strcmp", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def strcmp(self, emu, argv, ctx: api.ApiContext = None):
+    def strcmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int strcmp(
             const char *string1,
-            const char *string2,
+            const char *string2
         );
         """
-        s1, s2 = argv
-        rv = 1
+        string1, string2 = argv
 
-        string1 = self.read_mem_string(s1, 1)
-        string2 = self.read_mem_string(s2, 1)
-        if string1 == string2:
-            rv = 0
-        argv[0] = string1
-        argv[1] = string2
+        s1 = self.read_cstr(string1)
+        s2 = self.read_cstr(string2)
+        ctx.args[0].display = decode_ansi(s1)
+        ctx.args[1].display = decode_ansi(s2)
 
-        return rv
+        return (s1 > s2) - (s1 < s2)
 
     @apihook("strrchr", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def strrchr(self, emu, argv, ctx: api.ApiContext = None):
+    def strrchr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         char *strrchr(
             const char *str,
             int c
-            );
+        );
         """
-        cstr, c = argv
-        if not cstr or not emu.is_address_valid(cstr):
-            return 0
-        cs = self.read_string(cstr)
-        hay = cs.encode("utf-8")
-        needle = c.to_bytes(1, "little")
+        str, c = argv
+        # The terminator is part of the string, so a NUL finds it
+        hay = self.read_cstr(str) + b"\x00"
+        needle = bytes([c & 0xFF])
 
         offset = hay.rfind(needle)
-        if offset < 0:
-            rv = 0
-        else:
-            rv = cstr + offset
 
-        argv[0] = cs
-        argv[1] = needle.decode("utf-8")
+        ctx.args[0].display = decode_ansi(hay[:-1])
+        ctx.args[1].display = decode_ansi(needle)
 
-        return rv
+        return str + offset if offset >= 0 else 0
+
+    @apihook("wcsrchr", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def wcsrchr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t *wcsrchr(
+            const wchar_t *str,
+            wchar_t c
+        );
+        """
+        str, c = argv
+        hay = self.read_mem_string(str, 2) + "\x00"
+        offset = hay.rfind(chr(c & 0xFFFF))
+        ctx.args[0].display = hay[:-1]
+        return str + offset * 2 if offset >= 0 else 0
+
+    @apihook("wcschr", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def wcschr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t *wcschr(
+            const wchar_t *str,
+            wchar_t c
+        );
+        """
+        str, c = argv
+        hay = self.read_mem_string(str, 2) + "\x00"
+        offset = hay.find(chr(c & 0xFFFF))
+        ctx.args[0].display = hay[:-1]
+        return str + offset * 2 if offset >= 0 else 0
 
     @apihook("_ftol", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _ftol(self, emu, argv, ctx: api.ApiContext = None):
+    def _ftol(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int _ftol(int);
+        long _ftol(
+            double number
+        );
         """
-        (f,) = argv
-        return int(f)
+        (number,) = argv
+        return int(number)
 
     @apihook("_adjust_fdiv", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def _adjust_fdiv(self, emu, argv, ctx: api.ApiContext = None):
+    def _adjust_fdiv(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void _adjust_fdiv(void)
+        void _adjust_fdiv();
         """
         return
 
     @apihook("tolower", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def tolower(self, emu, argv, ctx: api.ApiContext = None):
+    def tolower(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int tolower ( int c );
+        int tolower(
+            int c
+        );
         """
         (c,) = argv
-        return c | 0x20
+        if ord("A") <= c <= ord("Z"):
+            c += 0x20
+        return c
+
+    @apihook("towlower", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def towlower(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int towlower(
+            wint_t c
+        );
+        """
+        (c,) = argv
+        c &= 0xFFFF
+        if ord("A") <= c <= ord("Z"):
+            c += 0x20
+        return c
+
+    @apihook("towupper", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def towupper(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int towupper(
+            wint_t c
+        );
+        """
+        (c,) = argv
+        c &= 0xFFFF
+        if ord("a") <= c <= ord("z"):
+            c -= 0x20
+        return c
 
     @apihook("isdigit", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def isdigit(self, emu, argv, ctx: api.ApiContext = None):
+    def isdigit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int isdigit(
             int c
-            );
+        );
         """
         (c,) = argv
         return int(48 <= c <= 57)
 
-    @apihook("sscanf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
-    def sscanf(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("isspace", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def isspace(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int sscanf ( const char * s, const char * format, ...);
+        int isspace(
+            int c
+        );
+        """
+        (c,) = argv
+        return int(0 <= c < 0x100 and c in SCANF_SPACE)
+
+    @apihook("iswspace", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def iswspace(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int iswspace(
+            wint_t c
+        );
+        """
+        (c,) = argv
+        c &= 0xFFFF
+        return int(c in SCANF_SPACE or (c > 0x7F and chr(c).isspace()))
+
+    @apihook("iswalpha", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def iswalpha(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int iswalpha(
+            wint_t c
+        );
+        """
+        (c,) = argv
+        return int(chr(c & 0xFFFF).isalpha())
+
+    def get_ctype(self, c, mask):
+        c &= 0xFFFFFFFF
+        return C_LOCALE_CTYPE[c] & mask if c < 0x100 else 0
+
+    @apihook("_isctype", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _isctype(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _isctype(
+            int c,
+            _ctype_t desc
+        );
+        """
+        c, desc = argv
+        return self.get_ctype(c, desc)
+
+    @apihook("isalnum", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def isalnum(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int isalnum(
+            int c
+        );
+        """
+        return self.get_ctype(argv[0], _ALPHA | _DIGIT)
+
+    @apihook("isalpha", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def isalpha(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int isalpha(
+            int c
+        );
+        """
+        return self.get_ctype(argv[0], _ALPHA)
+
+    @apihook("isupper", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def isupper(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int isupper(
+            int c
+        );
+        """
+        return self.get_ctype(argv[0], _UPPER)
+
+    @apihook("islower", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def islower(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int islower(
+            int c
+        );
+        """
+        return self.get_ctype(argv[0], _LOWER)
+
+    @apihook("isxdigit", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def isxdigit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int isxdigit(
+            int c
+        );
+        """
+        return self.get_ctype(argv[0], _HEX)
+
+    @apihook("ispunct", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def ispunct(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int ispunct(
+            int c
+        );
+        """
+        return self.get_ctype(argv[0], _PUNCT)
+
+    @apihook("isprint", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def isprint(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int isprint(
+            int c
+        );
+        """
+        return self.get_ctype(argv[0], _BLANK | _PUNCT | _ALPHA | _DIGIT)
+
+    @apihook("iscntrl", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def iscntrl(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int iscntrl(
+            int c
+        );
+        """
+        return self.get_ctype(argv[0], _CONTROL)
+
+    @apihook("isgraph", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def isgraph(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int isgraph(
+            int c
+        );
+        """
+        return self.get_ctype(argv[0], _PUNCT | _ALPHA | _DIGIT)
+
+    @apihook("iswalnum", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def iswalnum(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int iswalnum(
+            wint_t c
+        );
+        """
+        return int(chr(argv[0] & 0xFFFF).isalnum())
+
+    @apihook("iswdigit", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def iswdigit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int iswdigit(
+            wint_t c
+        );
+        """
+        return int(chr(argv[0] & 0xFFFF).isdigit())
+
+    @apihook("iswupper", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def iswupper(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int iswupper(
+            wint_t c
+        );
+        """
+        return int(chr(argv[0] & 0xFFFF).isupper())
+
+    @apihook("iswlower", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def iswlower(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int iswlower(
+            wint_t c
+        );
+        """
+        return int(chr(argv[0] & 0xFFFF).islower())
+
+    @apihook("iswxdigit", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def iswxdigit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int iswxdigit(
+            wint_t c
+        );
+        """
+        return self.get_ctype(argv[0] & 0xFFFF, _HEX)
+
+    def get_pctype_table(self):
+        """Return the C locale _pctype table, which has an EOF entry before index 0."""
+        if not self.pctype_table:
+            table = self.mem_alloc(2 * 257, tag="api.msvcrt._pctype")
+            self.mem_write(table, struct.pack("<257H", 0, *C_LOCALE_CTYPE))
+            self.pctype_table = table + 2
+        return self.pctype_table
+
+    @impdata("_pctype")
+    def _pctype(self, ptr):
+        """
+        const unsigned short *_pctype;
+
+        Writable global, shared with __p__pctype.
+        """
+        self.write_ptr(ptr, self.get_pctype_table())
+        return ptr
+
+    @apihook("__pctype_func", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __pctype_func(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        const unsigned short *__pctype_func();
+        """
+        return self.get_pctype_table()
+
+    @apihook("__p__pctype", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p__pctype(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        const unsigned short **__p__pctype();
+        """
+        return emu.get_proc("msvcrt", "_pctype")
+
+    @impdata("__mb_cur_max")
+    def __mb_cur_max(self, ptr):
+        """
+        int __mb_cur_max;
+
+        Writable global. The C locale has single-byte characters.
+        """
+        self.write_dword(ptr, 1)
+        return ptr
+
+    @apihook("__p___mb_cur_max", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __p___mb_cur_max(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int *__p___mb_cur_max();
+        """
+        return emu.get_proc("msvcrt", "__mb_cur_max")
+
+    @apihook("_isatty", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _isatty(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _isatty(
+            int fd
+        );
+        """
+        # Standard streams are files, as kernel32.GetFileType reports
+        return 0
+
+    @apihook("_fileno", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _fileno(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _fileno(
+            FILE *stream
+        );
+        """
+        (stream,) = argv
+        fd = self.get_stream_fd(stream)
+        if fd is None:
+            self.set_errno(EINVAL)
+            return -1
+        return fd
+
+    @apihook("_setmode", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _setmode(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _setmode(
+            int fd,
+            int mode
+        );
+        """
+        fd, mode = argv
+        if fd in (self.stdin, self.stdout, self.stderr):
+            return O_TEXT
+        self.set_errno(EBADF)
+        return -1
+
+    @apihook("_read", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _read(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _read(
+            int fd,
+            void *buffer,
+            unsigned buffer_size
+        );
+        """
+        fd, buffer, buffer_size = argv
+        buffer_size &= 0xFFFFFFFF
+        fobj = self.get_fd_file(fd)
+        if fobj is None:
+            if fd == self.stdin:
+                return 0
+            self.set_errno(EBADF)
+            return -1
+        data = self.emu.get_file_manager().read_file(fobj, buffer_size, buffer=buffer) if buffer_size else b""
+        if data:
+            self.mem_write(buffer, data)
+        return len(data)
+
+    @apihook("_write", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _write(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _write(
+            int fd,
+            const void *buffer,
+            unsigned int count
+        );
+        """
+        fd, buffer, count = argv
+        count &= 0xFFFFFFFF
+        data = self.mem_read(buffer, count) if count else b""
+        fobj = self.get_fd_file(fd)
+        if fobj is None:
+            if fd in (self.stdout, self.stderr):
+                ctx.args[1].display = decode_ansi(data)
+                return count
+            self.set_errno(EBADF)
+            return -1
+        self.emu.get_file_manager().write_file(fobj, data, buffer=buffer)
+        return count
+
+    @apihook("_open", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _open(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _open(
+            const char *filename,
+            int oflag,
+            int pmode
+        );
+        """
+        return self.open_fd(argv, 1, ctx)
+
+    @apihook("_wopen", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _wopen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _wopen(
+            const wchar_t *filename,
+            int oflag,
+            int pmode
+        );
+        """
+        return self.open_fd(argv, 2, ctx)
+
+    def open_fd(self, argv, width, ctx):
+        """
+        Open a file as _open does for ``oflag`` and return a new descriptor,
+        or -1 with errno set.
+        """
+        filename, oflag, _ = argv
+        if not filename:
+            self.set_errno(EINVAL)
+            return -1
+        path = self.read_mem_string(filename, width)
+        ctx.args[0].display = path
+
+        exists = self.does_file_exist(path)
+        if exists and oflag & O_CREAT and oflag & O_EXCL:
+            self.set_errno(EEXIST)
+            return -1
+        if oflag & O_CREAT and (not exists or oflag & O_TRUNC):
+            hfile = self.file_open(path, create=True, truncate=True)
+        else:
+            hfile = self.file_open(path)
+        if hfile is None:
+            self.set_errno(ENOENT)
+            return -1
+
+        fobj = self.file_get(hfile)
+        if oflag & O_TRUNC and fobj.get_size():
+            fobj.remove_data()
+        fobj.append = bool(oflag & O_APPEND)
+        return self.new_fd(hfile)
+
+    @apihook("_close", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _close(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _close(
+            int fd
+        );
+        """
+        (fd,) = argv
+        if self.fds.pop(fd, None) is None and fd not in (self.stdin, self.stdout, self.stderr):
+            self.set_errno(EBADF)
+            return -1
+        return 0
+
+    @apihook("_lseek", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _lseek(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        long _lseek(
+            int fd,
+            long offset,
+            int origin
+        );
+        """
+        fd, offset, origin = argv
+        offset &= 0xFFFFFFFF
+        offset -= (offset & 0x80000000) << 1
+        return self.seek_fd(fd, offset, origin)
+
+    @apihook("_lseeki64", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _lseeki64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        __int64 _lseeki64(
+            int fd,
+            __int64 offset,
+            int origin
+        );
+
+        The offset takes two stack slots on x86 and one register on x64.
+        """
+        if self.get_ptr_size() == 4:
+            fd, lo, hi, origin = argv
+            offset = (hi << 32) | lo
+        else:
+            fd, offset, origin = argv[:3]
+        offset &= 0xFFFFFFFFFFFFFFFF
+        offset -= (offset & (1 << 63)) << 1
+        return self.return_int64(emu, self.seek_fd(fd, offset, origin))
+
+    def seek_fd(self, fd, offset, origin):
+        """Move the file pointer of ``fd``. Return the new position, or -1 with errno set."""
+        fobj = self.get_fd_file(fd)
+        if fobj is None:
+            self.set_errno(EBADF)
+            return -1
+        if origin == io.SEEK_SET:
+            pos = offset
+        elif origin == io.SEEK_CUR:
+            pos = fobj.tell() + offset
+        elif origin == io.SEEK_END:
+            pos = fobj.get_size() + offset
+        else:
+            pos = -1
+        if pos < 0:
+            self.set_errno(EINVAL)
+            return -1
+        fobj.seek(pos, io.SEEK_SET)
+        return pos
+
+    @apihook("_fdopen", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _fdopen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *_fdopen(
+            int fd,
+            const char *mode
+        );
+        """
+        fd, mode = argv
+        if not mode:
+            self.set_errno(EINVAL)
+            return 0
+        ctx.args[1].display = self.read_string(mode)
+        if fd not in self.fds and fd not in (self.stdin, self.stdout, self.stderr):
+            self.set_errno(EBADF)
+            return 0
+        return self.new_stream(fd, self.fds.get(fd), "api.msvcrt._fdopen")
+
+    @apihook("_get_stream_buffer_pointers", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _get_stream_buffer_pointers(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _get_stream_buffer_pointers(
+            FILE *stream,
+            char ***base,
+            char ***ptr,
+            int **count
+        );
+
+        Return the addresses of the _base, _ptr and _cnt fields of a UCRT FILE.
+        """
+        stream, base, ptr, count = argv
+        if not stream:
+            self.set_errno(EINVAL)
+            return EINVAL
+        ptr_size = self.get_ptr_size()
+        for out, field in ((base, stream + ptr_size), (ptr, stream), (count, stream + 2 * ptr_size)):
+            if out:
+                self.write_ptr(out, field)
+        return 0
+
+    def get_file_layout(self):
+        """
+        Return the size of a FILE and the offset of its _file field. A FILE is
+        0x20 bytes on x86 and 0x30 bytes on x64, and _file is its fifth field.
+        """
+        return (0x30, 0x1C) if self.get_ptr_size() == 8 else (0x20, 0x10)
+
+    def new_fd(self, hfile):
+        """Give ``hfile`` the lowest free descriptor above the standard ones."""
+        fd = 3
+        while fd in self.fds:
+            fd += 1
+        self.fds[fd] = hfile
+        return fd
+
+    def new_stream(self, fd, hfile, tag):
+        """Allocate a FILE for descriptor ``fd`` and the file handle ``hfile``."""
+        size, file_offset = self.get_file_layout()
+        stream = self.mem_alloc(size, tag=tag)
+        self.write_dword(stream + file_offset, fd)
+        self.crt_streams.add(stream)
+        if hfile is not None:
+            self.file_streams[stream] = hfile
+        return stream
+
+    def get_stream_fd(self, stream):
+        """Return the descriptor of a FILE that the runtime made, or None for another pointer."""
+        size, file_offset = self.get_file_layout()
+        in_iob = self.iob is not None and 0 <= stream - self.iob < 3 * size and not (stream - self.iob) % size
+        if not in_iob and stream not in self.crt_streams:
+            return None
+        return int.from_bytes(self.mem_read(stream + file_offset, 4), "little", signed=True)
+
+    def get_fd_file(self, fd):
+        """Return the file object of descriptor ``fd``, or None."""
+        hfile = self.fds.get(fd)
+        return self.file_get(hfile) if hfile is not None else None
+
+    @apihook("_Mtx_init_in_situ", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _Mtx_init_in_situ(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _Mtx_init_in_situ(
+            _Mtx_t mtx,
+            int type
+        );
         """
         return
 
+    @apihook("_Mtx_destroy_in_situ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Mtx_destroy_in_situ(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _Mtx_destroy_in_situ(
+            _Mtx_t mtx
+        );
+        """
+        return
+
+    @apihook("_Mtx_lock", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Mtx_lock(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _Thrd_result _Mtx_lock(
+            _Mtx_t mtx
+        );
+        """
+        return THRD_SUCCESS
+
+    @apihook("_Mtx_trylock", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Mtx_trylock(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _Thrd_result _Mtx_trylock(
+            _Mtx_t mtx
+        );
+        """
+        return THRD_SUCCESS
+
+    @apihook("_Mtx_unlock", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Mtx_unlock(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _Thrd_result _Mtx_unlock(
+            _Mtx_t mtx
+        );
+        """
+        return THRD_SUCCESS
+
+    @apihook("_Cnd_init_in_situ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Cnd_init_in_situ(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _Cnd_init_in_situ(
+            _Cnd_t cond
+        );
+        """
+        return
+
+    @apihook("_Cnd_destroy_in_situ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Cnd_destroy_in_situ(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _Cnd_destroy_in_situ(
+            _Cnd_t cond
+        );
+        """
+        return
+
+    @apihook("_Cnd_init", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Cnd_init(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _Thrd_result _Cnd_init(
+            _Cnd_t *pcond
+        );
+        """
+        (pcond,) = argv
+        cond = self.heap_alloc(CND_SIZE, heap="HeapAlloc")
+        self.mem_write(cond, b"\x00" * CND_SIZE)
+        self.write_ptr(pcond, cond)
+        return THRD_SUCCESS
+
+    @apihook("_Cnd_destroy", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Cnd_destroy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _Cnd_destroy(
+            _Cnd_t cond
+        );
+        """
+        (cond,) = argv
+        if cond:
+            self.heap_free(cond)
+
+    @apihook("_Cnd_signal", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Cnd_signal(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _Thrd_result _Cnd_signal(
+            _Cnd_t cond
+        );
+        """
+        return THRD_SUCCESS
+
+    @apihook("_Cnd_broadcast", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Cnd_broadcast(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _Thrd_result _Cnd_broadcast(
+            _Cnd_t cond
+        );
+        """
+        return THRD_SUCCESS
+
+    @apihook("_Cnd_wait", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _Cnd_wait(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _Thrd_result _Cnd_wait(
+            _Cnd_t cond,
+            _Mtx_t mtx
+        );
+        """
+        return THRD_SUCCESS
+
+    @apihook("_Cnd_timedwait", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _Cnd_timedwait(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _Thrd_result _Cnd_timedwait(
+            _Cnd_t cond,
+            _Mtx_t mtx,
+            const _timespec64 *target
+        );
+
+        Threads run one after another, so the wait times out only when no
+        queued run is left that could signal the condition.
+        """
+        cond, mtx, target = argv
+        if emu.run_queue:
+            return THRD_SUCCESS
+        sec, nsec = struct.unpack("<qi", self.mem_read(target, 12))
+        remaining = sec * 10_000_000 + nsec // 100 - self.get_clock_ticks()
+        if remaining > 0:
+            self.emu.api.load_api_handler("kernel32").advance_clock(-(-remaining // 10_000))
+        return THRD_TIMEDOUT
+
+    @apihook("_Thrd_id", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _Thrd_id(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _Thrd_id_t _Thrd_id();
+        """
+        return emu.get_current_thread().id
+
+    @apihook("_Thrd_detach", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _Thrd_detach(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _Thrd_result _Thrd_detach(
+            _Thrd_t thr
+        );
+
+        Speakeasy does not close the thread handle. On x86, the _Thrd_t struct uses two
+        stack slots, and the call shows only the first.
+        """
+        return THRD_SUCCESS
+
+    @apihook("__telemetry_main_invoke_trigger", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def __telemetry_main_invoke_trigger(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        void __telemetry_main_invoke_trigger(
+            HINSTANCE instance
+        );
+        """
+        return
+
+    @apihook("__telemetry_main_return_trigger", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def __telemetry_main_return_trigger(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        void __telemetry_main_return_trigger(
+            HINSTANCE instance
+        );
+        """
+        return
+
+    @apihook("setvbuf", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def setvbuf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int setvbuf(
+            FILE *stream,
+            char *buffer,
+            int mode,
+            size_t size
+        );
+        """
+        _IOFBF, _IONBF, _IOLBF = 0, 4, 0x40
+        stream, buffer, mode, size = argv
+        return 0 if stream and mode in (_IOFBF, _IONBF, _IOLBF) else -1
+
+    @apihook("_getpid", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _getpid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _getpid();
+        """
+        return emu.get_current_process().id
+
+    @apihook("setbuf", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def setbuf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void setbuf(
+            FILE *stream,
+            char *buffer
+        );
+        """
+        return
+
+    @apihook("sscanf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def sscanf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int sscanf(
+            const char *buffer,
+            const char *format,
+            ...
+        );
+        """
+        buf, fmt = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 2)
+        text, fmt_str = self.read_cstr(buf), self.read_cstr(fmt)
+        values, rv = scan_c_format(text, fmt_str, emu.get_ptr_size())
+        ptrs = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 2 + len(values))[2:]
+        for ptr, data in zip(ptrs, values):
+            self.mem_write(ptr, data)
+        ctx.args.clear()
+        ctx.args.append(decode_ansi(text))
+        ctx.args.append(decode_ansi(fmt_str))
+        return rv
+
+    @apihook("__stdio_common_vsscanf", argc=7, conv=e_arch.CALL_CONV_CDECL)
+    def __stdio_common_vsscanf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __stdio_common_vsscanf(
+            unsigned __int64 Options,
+            const char *Buffer,
+            size_t BufferCount,
+            const char *Format,
+            _locale_t Locale,
+            va_list ArgList
+        );
+
+        The 64-bit options argument takes two slots on x86. With the secure option, as
+        in sscanf_s, each %c, %s and %[ conversion has a buffer size after
+        its pointer, and a value that does not fit leaves an empty buffer
+        and ends the scan.
+        """
+        options = argv[0]
+        first = 1 if emu.get_arch() == e_arch.ARCH_AMD64 else 2
+        buf, count, fmt, _, arglist = argv[first : first + 5]
+        text = self.read_cstr(buf, count) if count else b""
+        fmt_str = self.read_cstr(fmt)
+        ctx.args[first].display = decode_ansi(text)
+        ctx.args[first + 2].display = decode_ansi(fmt_str)
+        values, rv = scan_c_format(text, fmt_str, emu.get_ptr_size())
+        convs = [m.group(4) for m in SCANF_SPEC.finditer(fmt_str) if not m.group(1) and m.group(4) != b"%"]
+        slot = arglist
+        for k, (conv, data) in enumerate(zip(convs, values)):
+            dest = self.va_args(slot, 1)[0]
+            slot += emu.get_ptr_size()
+            if options & _CRT_INTERNAL_SCANF_SECURECRT and conv[:1] in (b"c", b"s", b"["):
+                size = self.va_args(slot, 1)[0] & 0xFFFFFFFF
+                slot += emu.get_ptr_size()
+                if len(data) > size:
+                    if size:
+                        self.mem_write(dest, b"\x00")
+                    return sum(c != b"n" for c in convs[:k])
+            self.mem_write(dest, data)
+        return rv
+
     @apihook("strchr", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def strchr(self, emu, argv, ctx: api.ApiContext = None):
+    def strchr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         char *strchr(
             const char *str,
             int c
-            );
+        );
         """
-        cstr, c = argv
-        cs = self.read_string(cstr)
-        hay = cs.encode("utf-8")
-        needle = c.to_bytes(1, "little")
+        str, c = argv
+        # The terminator is part of the string, so a NUL finds it
+        hay = self.read_cstr(str) + b"\x00"
+        needle = bytes([c & 0xFF])
 
         offset = hay.find(needle)
-        if offset < 0:
-            rv = 0
-        else:
-            rv = cstr + offset
 
-        argv[0] = cs
-        argv[1] = needle.decode("utf-8")
+        ctx.args[0].display = decode_ansi(hay[:-1])
+        ctx.args[1].display = decode_ansi(needle)
 
-        return rv
+        return str + offset if offset >= 0 else 0
 
     @apihook("_set_invalid_parameter_handler", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _set_invalid_parameter_handler(self, emu, argv, ctx: api.ApiContext = None):
+    def _set_invalid_parameter_handler(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         _invalid_parameter_handler _set_invalid_parameter_handler(
-        _invalid_parameter_handler pNew
+            _invalid_parameter_handler pNew
         );
         """
         (pNew,) = argv
+        rv, self.invalid_parameter_handler = self.invalid_parameter_handler, pNew
+        return rv
 
-        return 0
+    @apihook("_get_invalid_parameter_handler", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _get_invalid_parameter_handler(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        _invalid_parameter_handler _get_invalid_parameter_handler();
+        """
+        return self.invalid_parameter_handler
+
+    @apihook("_set_thread_local_invalid_parameter_handler", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _set_thread_local_invalid_parameter_handler(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(
+            _invalid_parameter_handler pNew
+        );
+        """
+        (pNew,) = argv
+        tid = emu.get_current_thread().id
+        rv = self.thread_invalid_parameter_handlers.get(tid, 0)
+        self.thread_invalid_parameter_handlers[tid] = pNew
+        return rv
+
+    @apihook("_get_thread_local_invalid_parameter_handler", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _get_thread_local_invalid_parameter_handler(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        _invalid_parameter_handler _get_thread_local_invalid_parameter_handler();
+        """
+        return self.thread_invalid_parameter_handlers.get(emu.get_current_thread().id, 0)
+
+    @apihook("_invalid_parameter_noinfo", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _invalid_parameter_noinfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _invalid_parameter_noinfo();
+
+        Call the thread or global invalid parameter handler. Without a handler,
+        return to the caller, which then fails with EINVAL.
+        """
+        tid = emu.get_current_thread().id
+        handler = self.thread_invalid_parameter_handlers.get(tid) or self.invalid_parameter_handler
+        if not handler:
+            return None
+        return self.call_invalid_parameter_handler(handler)
+
+    def call_invalid_parameter_handler(self, handler):
+        yield GuestCall(handler, (0, 0, 0, 0, 0))
+
+    @apihook("_invalid_parameter_noinfo_noreturn", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _invalid_parameter_noinfo_noreturn(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        void _invalid_parameter_noinfo_noreturn();
+        """
+        self.exit_process()
+
+    @apihook("_invoke_watson", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def _invoke_watson(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _invoke_watson(
+            const wchar_t *expression,
+            const wchar_t *function_name,
+            const wchar_t *file_name,
+            unsigned int line_number,
+            uintptr_t reserved
+        );
+        """
+        self.exit_process()
+
+    @apihook("__vcrt_InitializeCriticalSectionEx", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def __vcrt_InitializeCriticalSectionEx(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        BOOL __vcrt_InitializeCriticalSectionEx(
+            LPCRITICAL_SECTION critical_section,
+            DWORD spin_count,
+            DWORD flags
+        );
+        """
+        critical_section, spin_count, flags = argv
+        self.mem_write(critical_section, b"\x00" * (40 if self.get_ptr_size() == 8 else 24))
+        return 1
+
+    @apihook("__std_exception_copy", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def __std_exception_copy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void __std_exception_copy(
+            const __std_exception_data *src,
+            __std_exception_data *dst
+        );
+        """
+        src, dst = argv
+        what = self.read_ptr(src)
+        do_free = self.mem_read(src + self.get_ptr_size(), 1) != b"\x00"
+        if do_free and what:
+            what = self._strdup(emu, [what], ctx)
+        else:
+            do_free = False
+        self.write_ptr(dst, what)
+        self.mem_write(dst + self.get_ptr_size(), bytes([do_free]))
+
+    @apihook("__std_exception_destroy", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def __std_exception_destroy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void __std_exception_destroy(
+            __std_exception_data *data
+        );
+        """
+        (data,) = argv
+        if self.mem_read(data + self.get_ptr_size(), 1) != b"\x00":
+            self.heap_free(self.read_ptr(data))
+        self.write_ptr(data, 0)
+        self.mem_write(data + self.get_ptr_size(), b"\x00")
+
+    @apihook("__std_type_info_destroy_list", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def __std_type_info_destroy_list(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void __std_type_info_destroy_list(
+            __type_info_node *root_node
+        );
+        """
+        return
 
     @apihook("__CxxFrameHandler", argc=4, conv=e_arch.CALL_CONV_CDECL)
-    def __CxxFrameHandler(self, emu, argv, ctx: api.ApiContext = None):
+    def __CxxFrameHandler(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         EXCEPTION_DISPOSITION __CxxFrameHandler(
-            EHExceptionRecord  *pExcept,
+            EHExceptionRecord *pExcept,
             EHRegistrationNode *pRN,
-            void               *pContext,
-            DispatcherContext  *pDC
-        )
+            void *pContext,
+            DispatcherContext *pDC
+        );
         """
         (
             pExcept,
@@ -1673,10 +4960,63 @@ class Msvcrt(api.ApiHandler):
             pContext,
             pDC,
         ) = argv
-        return 0
+        return windefs.ExceptionContinueSearch
+
+    @apihook("__CxxFrameHandler2", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def __CxxFrameHandler2(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        EXCEPTION_DISPOSITION __CxxFrameHandler2(
+            EHExceptionRecord *pExcept,
+            EHRegistrationNode *pRN,
+            void *pContext,
+            DispatcherContext *pDC
+        );
+        """
+        return self.__CxxFrameHandler(emu, argv, ctx)
+
+    @apihook("__CxxFrameHandler3", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def __CxxFrameHandler3(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        EXCEPTION_DISPOSITION __CxxFrameHandler3(
+            EHExceptionRecord *pExcept,
+            EHRegistrationNode *pRN,
+            void *pContext,
+            DispatcherContext *pDC
+        );
+        """
+        return self.__CxxFrameHandler(emu, argv, ctx)
+
+    @apihook("__CxxFrameHandler4", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def __CxxFrameHandler4(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        EXCEPTION_DISPOSITION __CxxFrameHandler4(
+            EHExceptionRecord *pExcept,
+            EHRegistrationNode *pRN,
+            void *pContext,
+            DispatcherContext *pDC
+        );
+        """
+        return self.__CxxFrameHandler(emu, argv, ctx)
+
+    @apihook("vsprintf", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def vsprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int vsprintf(
+            char *buffer,
+            const char *format,
+            va_list argptr
+        );
+        """
+        buffer, format, argptr = argv
+        fmt_str = self.read_mem_string(format, 1)
+        fin = self.do_str_format(fmt_str, self.va_args(argptr, self.get_va_arg_count(fmt_str)))
+        self.mem_write(buffer, encode_ansi(fin) + b"\x00")
+        ctx.args[0].display = fin
+        ctx.args[1].display = fmt_str
+        return len(fin)
 
     @apihook("_vsnprintf", argc=4, conv=e_arch.CALL_CONV_CDECL)
-    def _vsnprintf(self, emu, argv, ctx: api.ApiContext = None):
+    def _vsnprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _vsnprintf(
             char *buffer,
@@ -1685,60 +5025,193 @@ class Msvcrt(api.ApiHandler):
             va_list argptr
         );
         """
-        buffer, count, _format, argptr = argv
-        rv = 0
+        buffer, count, format, argptr = argv
 
-        fmt_str = self.read_mem_string(_format, 1)
+        fmt_str = self.read_mem_string(format, 1)
         fmt_cnt = self.get_va_arg_count(fmt_str)
 
         vargs = self.va_args(argptr, fmt_cnt)
 
         fin = self.do_str_format(fmt_str, vargs)
-        fin = fin[:count] + "\x00"
+        out = encode_ansi(fin[:count])
+        if len(fin) < count:
+            out += b"\x00"
+        self.mem_write(buffer, out)
+        ctx.args[0].display = fin[:count]
+        ctx.args[2].display = fmt_str
 
-        rv = len(fin)
-        self.mem_write(buffer, fin.encode("utf-8"))
-        argv[0] = fin.replace("\x00", "")
-        argv[1] = fmt_str
+        return len(fin) if len(fin) <= count else -1
 
+    def stdio_common_format(self, emu, argv, ctx, width, secure=False, max_count=False):
+        """
+        Format into a buffer for the __stdio_common_v*printf* family. The
+        64-bit options take two slots on x86. The _s variants empty the
+        buffer when the text does not fit, and the n variants also limit the
+        text to a count of characters, where _TRUNCATE allows truncation.
+        """
+        options = argv[0]
+        first = 1 if emu.get_arch() == e_arch.ARCH_AMD64 else 2
+        fields = argv[first : first + (6 if max_count else 5)]
+        if max_count:
+            buffer, size, count, _format, _, argptr = fields
+        else:
+            buffer, size, _format, _, argptr = fields
+            count = None
+        fmt_str = self.read_mem_string(_format, width)
+        fmt_cnt = self.get_va_arg_count(fmt_str)
+
+        vargs = self.va_args(argptr, fmt_cnt)
+
+        fin = self.do_str_format(fmt_str, vargs, wide=width == 2)
+        ctx.args[first + len(fields) - 3].display = fmt_str
+
+        if secure:
+            return self.write_secure_format(buffer, size, count, fin, width, ctx.args[first])
+
+        if not buffer and not size:
+            return len(fin)
+
+        if options & _CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR:
+            out = fin[: size - 1] + "\x00"
+            rv = len(fin)
+        elif options & _CRT_INTERNAL_PRINTF_LEGACY_VSPRINTF_NULL_TERMINATION:
+            out = fin[:size] if len(fin) >= size else fin + "\x00"
+            rv = len(fin) if len(fin) <= size else -1
+        else:
+            out = fin[: size - 1] + "\x00"
+            rv = len(fin) if len(fin) < size else -1
+
+        if size:
+            self.mem_write(buffer, self.encode_string(out, width))
+            ctx.args[first].display = out.rstrip("\x00")
+
+        return rv
+
+    def write_secure_format(self, buffer, size, count, fin, width, arg):
+        """
+        Write formatted text like the _s printf functions: empty the buffer
+        when the text does not fit, limit the text to count characters when
+        count is given, and truncate to the buffer when count is _TRUNCATE.
+        """
+        if not buffer or not size:
+            return -1
+        truncate = count == (1 << (self.get_ptr_size() * 8)) - 1
+        text = fin if count is None or truncate else fin[:count]
+        if len(text) < size:
+            out, rv = text, len(fin) if text == fin else -1
+        elif truncate:
+            out, rv = text[: size - 1], -1
+        else:
+            out, rv = "", -1
+        self.mem_write(buffer, self.encode_string(out + "\x00", width))
+        arg.display = out
         return rv
 
     @apihook("__stdio_common_vsprintf", argc=7, conv=e_arch.CALL_CONV_CDECL)
-    def __stdio_common_vsprintf(self, emu, argv, ctx: api.ApiContext = None):
+    def __stdio_common_vsprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int __stdio_common_vsprintf(
-            unsigned int64 Options,
+            unsigned __int64 Options,
             char *Buffer,
-            unsigned int BufferCount,
-            const char *format,
-            locale_t Locale,
-            va_list argptr
+            size_t BufferCount,
+            const char *Format,
+            _locale_t Locale,
+            va_list ArgList
         );
+
+        The 64-bit options argument takes two slots on x86.
         """
-        options_lo, options_hi, buffer, count, _format, locale, argptr = argv
-        rv = 0
-        fmt_str = self.read_mem_string(_format, 1)
-        fmt_cnt = self.get_va_arg_count(fmt_str)
+        return self.stdio_common_format(emu, argv, ctx, 1)
 
-        vargs = self.va_args(argptr, fmt_cnt)
+    @apihook("__stdio_common_vswprintf", argc=7, conv=e_arch.CALL_CONV_CDECL)
+    def __stdio_common_vswprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __stdio_common_vswprintf(
+            unsigned __int64 Options,
+            wchar_t *Buffer,
+            size_t BufferCount,
+            const wchar_t *Format,
+            _locale_t Locale,
+            va_list ArgList
+        );
 
-        fin = self.do_str_format(fmt_str, vargs)
-        fin = fin[:count] + "\x00"
+        The 64-bit options argument takes two slots on x86.
+        """
+        return self.stdio_common_format(emu, argv, ctx, 2)
 
-        rv = len(fin)
-        self.mem_write(buffer, fin.encode("utf-8"))
-        argv[0] = fin.replace("\x00", "")
-        argv[1] = fmt_str
+    @apihook("__stdio_common_vsprintf_s", argc=7, conv=e_arch.CALL_CONV_CDECL)
+    def __stdio_common_vsprintf_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __stdio_common_vsprintf_s(
+            unsigned __int64 Options,
+            char *Buffer,
+            size_t BufferCount,
+            const char *Format,
+            _locale_t Locale,
+            va_list ArgList
+        );
 
-        return rv
+        The 64-bit options argument takes two slots on x86.
+        """
+        return self.stdio_common_format(emu, argv, ctx, 1, secure=True)
+
+    @apihook("__stdio_common_vswprintf_s", argc=7, conv=e_arch.CALL_CONV_CDECL)
+    def __stdio_common_vswprintf_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __stdio_common_vswprintf_s(
+            unsigned __int64 Options,
+            wchar_t *Buffer,
+            size_t BufferCount,
+            const wchar_t *Format,
+            _locale_t Locale,
+            va_list ArgList
+        );
+
+        The 64-bit options argument takes two slots on x86.
+        """
+        return self.stdio_common_format(emu, argv, ctx, 2, secure=True)
+
+    @apihook("__stdio_common_vsnprintf_s", argc=8, conv=e_arch.CALL_CONV_CDECL)
+    def __stdio_common_vsnprintf_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __stdio_common_vsnprintf_s(
+            unsigned __int64 Options,
+            char *Buffer,
+            size_t BufferCount,
+            size_t MaxCount,
+            const char *Format,
+            _locale_t Locale,
+            va_list ArgList
+        );
+
+        The 64-bit options argument takes two slots on x86.
+        """
+        return self.stdio_common_format(emu, argv, ctx, 1, secure=True, max_count=True)
+
+    @apihook("__stdio_common_vsnwprintf_s", argc=8, conv=e_arch.CALL_CONV_CDECL)
+    def __stdio_common_vsnwprintf_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __stdio_common_vsnwprintf_s(
+            unsigned __int64 Options,
+            wchar_t *Buffer,
+            size_t BufferCount,
+            size_t MaxCount,
+            const wchar_t *Format,
+            _locale_t Locale,
+            va_list ArgList
+        );
+
+        The 64-bit options argument takes two slots on x86.
+        """
+        return self.stdio_common_format(emu, argv, ctx, 2, secure=True, max_count=True)
 
     @apihook("_strcmpi", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _strcmpi(self, emu, argv, ctx: api.ApiContext = None):
+    def _strcmpi(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _strcmpi(
-                const char *string1,
-                const char *string2
-                );
+            const char *string1,
+            const char *string2
+        );
         """
         string1, string2 = argv
         rv = 1
@@ -1746,173 +5219,1115 @@ class Msvcrt(api.ApiHandler):
         if not string1 or not string2:
             return rv
 
-        cs1 = self.read_string(string1)
-        cs2 = self.read_string(string2)
+        cs1 = self.read_cstr(string1)
+        cs2 = self.read_cstr(string2)
 
-        argv[0] = cs1
-        argv[1] = cs2
+        ctx.args[0].display = decode_ansi(cs1)
+        ctx.args[1].display = decode_ansi(cs2)
 
-        if cs1.lower() == cs2.lower():
-            rv = 0
-
-        return rv
-
-    @apihook("_wcsicmp", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _wcsicmp(self, emu, argv, ctx: api.ApiContext = None):
-        """
-        int _wcsicmp(
-                const wchar_t *string1,
-                const wchar_t *string2
-                );
-        """
-        string1, string2 = argv
-        rv = 1
-
-        if not string1 or not string2:
-            return rv
-
-        cs1 = self.read_wide_string(string1)
-        cs2 = self.read_wide_string(string2)
-
-        argv[0] = cs1
-        argv[1] = cs2
-
-        if cs1.lower() == cs2.lower():
-            rv = 0
-
-        return rv
+        cs1, cs2 = cs1.lower(), cs2.lower()
+        return (cs1 > cs2) - (cs1 < cs2)
 
     @apihook("??3@YAXPAX@Z", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def __3_YAXPAX_Z(self, emu, argv, ctx: api.ApiContext = None):
+    def __3_YAXPAX_Z(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void operator delete(
+            void *ptr
+        );
+        """
         (ptr,) = argv
         if ptr:
-            self.mem_free(ptr)
-        return
+            self.heap_free(ptr)
 
     @apihook("??2@YAPAXI@Z", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def __2_YAPAXI_Z(self, emu, argv, ctx: api.ApiContext = None):
+    def __2_YAPAXI_Z(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *operator new(
+            unsigned int size
+        );
+        """
         (size,) = argv
         if size <= 0:
             size = self.get_ptr_size()
-        return self.mem_alloc(size, tag="api.msvcrt.operator_new")
+        return self.heap_alloc(size, heap="operator_new")
+
+    @apihook("??_U@YAPAXI@Z", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def __U_YAPAXI_Z(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *operator new[](
+            unsigned int size
+        );
+        """
+        return self.__2_YAPAXI_Z(emu, argv, ctx)
+
+    @apihook("??_V@YAXPAX@Z", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def __V_YAXPAX_Z(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void operator delete[](
+            void *ptr
+        );
+        """
+        return self.__3_YAXPAX_Z(emu, argv, ctx)
+
+    @apihook("??2@YAPEAX_K@Z", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def __2_YAPEAX_K_Z(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *operator new(
+            unsigned __int64 size
+        );
+        """
+        return self.__2_YAPAXI_Z(emu, argv, ctx)
+
+    @apihook("??3@YAXPEAX@Z", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def __3_YAXPEAX_Z(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void operator delete(
+            void *ptr
+        );
+        """
+        return self.__3_YAXPAX_Z(emu, argv, ctx)
+
+    @apihook("??_U@YAPEAX_K@Z", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def __U_YAPEAX_K_Z(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *operator new[](
+            unsigned __int64 size
+        );
+        """
+        return self.__2_YAPAXI_Z(emu, argv, ctx)
+
+    @apihook("??_V@YAXPEAX@Z", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def __V_YAXPEAX_Z(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void operator delete[](
+            void *ptr
+        );
+        """
+        return self.__3_YAXPAX_Z(emu, argv, ctx)
+
+    def iostream_init_this(self, emu):
+        if emu.get_arch() == e_arch.ARCH_AMD64:
+            return emu.reg_read(e_arch.AMD64_REG_RCX)
+        return emu.reg_read(e_arch.X86_REG_ECX)
+
+    @apihook("??0Init@ios_base@std@@QAE@XZ", argc=0)
+    def ios_base_Init_ctor_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::ios_base::Init::Init();
+        """
+        return self.iostream_init_this(emu)
+
+    @apihook("??1Init@ios_base@std@@QAE@XZ", argc=0)
+    def ios_base_Init_dtor_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::ios_base::Init::~Init();
+        """
+        return
+
+    @apihook("??0_Winit@std@@QAE@XZ", argc=0)
+    def Winit_ctor_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::_Winit::_Winit();
+        """
+        return self.iostream_init_this(emu)
+
+    @apihook("??1_Winit@std@@QAE@XZ", argc=0)
+    def Winit_dtor_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::_Winit::~_Winit();
+        """
+        return
+
+    @apihook("??0Init@ios_base@std@@QEAA@XZ", argc=0)
+    def ios_base_Init_ctor_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::ios_base::Init::Init();
+        """
+        return self.iostream_init_this(emu)
+
+    @apihook("??1Init@ios_base@std@@QEAA@XZ", argc=0)
+    def ios_base_Init_dtor_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::ios_base::Init::~Init();
+        """
+        return
+
+    @apihook("??0_Winit@std@@QEAA@XZ", argc=0)
+    def Winit_ctor_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::_Winit::_Winit();
+        """
+        return self.iostream_init_this(emu)
+
+    @apihook("??1_Winit@std@@QEAA@XZ", argc=0)
+    def Winit_dtor_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::_Winit::~_Winit();
+        """
+        return
+
+    @apihook("??0?$basic_ios@DU?$char_traits@D@std@@@std@@IAE@XZ", argc=0)
+    def basic_ios_ctor_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_ios<char>::basic_ios();
+        """
+        return self.iostream_init_this(emu)
+
+    @apihook("??1?$basic_ios@DU?$char_traits@D@std@@@std@@UAE@XZ", argc=0)
+    def basic_ios_dtor_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_ios<char>::~basic_ios();
+        """
+        return
+
+    @apihook("??0?$basic_ios@_WU?$char_traits@_W@std@@@std@@IAE@XZ", argc=0)
+    def wbasic_ios_ctor_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_ios<wchar_t>::basic_ios();
+        """
+        return self.iostream_init_this(emu)
+
+    @apihook("??1?$basic_ios@_WU?$char_traits@_W@std@@@std@@UAE@XZ", argc=0)
+    def wbasic_ios_dtor_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_ios<wchar_t>::~basic_ios();
+        """
+        return
+
+    def get_ios_base(self, emu, obj):
+        """Return the address of the basic_ios virtual base of an x64 stream object."""
+        vbtable = self.read_ptr(obj)
+        return obj + int.from_bytes(self.mem_read(vbtable + VBTABLE_OFFSET_VBASE, 4), "little", signed=True)
+
+    def init_basic_ios(self, ios, strbuf):
+        """
+        Set the members of an x64 basic_ios<char> as basic_ios::init does: no
+        exceptions, skipws | dec, precision 6, and a space as the fill character.
+        """
+        state = IOS_GOODBIT if strbuf else IOS_BADBIT
+        fields = struct.pack("<QIIIIQQQQQQQB", 0, state, 0, 0x201, 0, 6, 0, 0, 0, 0, strbuf, 0, ord(" "))
+        self.mem_write(ios + 8, fields)
+
+    def init_basic_streambuf(self, sb):
+        """Point the buffer pointers of an x64 basic_streambuf<char> at its own empty members."""
+        self.mem_write(
+            sb + 8, struct.pack("<11Q", 0, 0, sb + 8, sb + 0x10, 0, 0, sb + 0x28, sb + 0x30, 0, sb + 0x48, sb + 0x4C)
+        )
+
+    @apihook("??0?$basic_ios@DU?$char_traits@D@std@@@std@@IEAA@XZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_ios_ctor_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_ios<char>::basic_ios();
+
+        The first argument is the implicit this pointer.
+        """
+        return argv[0]
+
+    @apihook("??1?$basic_ios@DU?$char_traits@D@std@@@std@@UEAA@XZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_ios_dtor_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_ios<char>::~basic_ios();
+
+        The first argument is the implicit this pointer.
+        """
+        return
+
+    @apihook("?setstate@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAXH_N@Z", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def basic_ios_setstate_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void std::basic_ios<char>::setstate(
+            std::ios_base::iostate state,
+            bool reraise
+        );
+
+        A stream without a buffer also gets badbit. The exception that
+        exceptions() can request is not raised.
+
+        The first argument is the implicit this pointer.
+        """
+        ios, state, reraise = argv
+        state |= self.read_dword(ios + IOS64_OFFSET_MYSTATE)
+        if not self.read_ptr(ios + IOS64_OFFSET_MYSTRBUF):
+            state |= IOS_BADBIT
+        self.write_dword(ios + IOS64_OFFSET_MYSTATE, state & IOS_STATMASK)
+
+    @apihook(
+        "??0?$basic_istream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z",
+        argc=4,
+        conv=e_arch.CALL_CONV_CDECL,
+    )
+    def basic_istream_ctor_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_istream<char>::basic_istream(
+            std::basic_streambuf<char> *strbuf,
+            bool isstd
+        );
+
+        The last argument is the MSVC flag that asks the constructor to build
+        the virtual base. A derived class such as ifstream builds it itself.
+
+        The first argument is the implicit this pointer.
+        """
+        this, strbuf, isstd, init_vbase = argv
+        if init_vbase:
+            if self.istream_vbtable is None:
+                self.istream_vbtable = self.mem_alloc(8, tag="api.msvcrt.basic_istream_vbtable")
+                self.mem_write(self.istream_vbtable, struct.pack("<ii", 0, 0x10))
+            self.write_ptr(this, self.istream_vbtable)
+        self.mem_write(this + 8, b"\x00" * 8)
+        self.init_basic_ios(self.get_ios_base(emu, this), strbuf)
+        return this
+
+    @apihook("??1?$basic_istream@DU?$char_traits@D@std@@@std@@UEAA@XZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_istream_dtor_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_istream<char>::~basic_istream();
+
+        The first argument is the implicit this pointer.
+        """
+        return
+
+    @apihook("??0?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAA@XZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_streambuf_ctor_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_streambuf<char>::basic_streambuf();
+
+        The first argument is the implicit this pointer.
+        """
+        (sb,) = argv
+        self.init_basic_streambuf(sb)
+        self.write_ptr(sb + STREAMBUF64_OFFSET_PLOCALE, 0)
+        return sb
+
+    @apihook("??1?$basic_streambuf@DU?$char_traits@D@std@@@std@@UEAA@XZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_streambuf_dtor_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_streambuf<char>::~basic_streambuf();
+
+        The first argument is the implicit this pointer.
+        """
+        return
+
+    @apihook("?_Init@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXXZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_streambuf_Init_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void std::basic_streambuf<char>::_Init();
+
+        The first argument is the implicit this pointer.
+        """
+        self.init_basic_streambuf(argv[0])
+
+    def fiopen(self, argv, width, ctx):
+        """Open a file for a file stream buffer with the fopen mode of an ios_base::openmode."""
+        filename, mode, _ = argv
+        path = self.read_mem_string(filename, width)
+        ctx.args[0].display = path
+        mode_str = IOS_FOPEN_MODES.get(mode & ~(IOS_ATE | IOS_BINARY | IOS_NOCREATE | IOS_NOREPLACE))
+        exists = self.does_file_exist(path)
+        if mode_str is None or (mode & IOS_NOCREATE and not exists):
+            return 0
+        if mode & IOS_NOREPLACE and mode & (IOS_OUT | IOS_APP) and exists:
+            return 0
+        stream = self.open_stream(path, mode_str + ("b" if mode & IOS_BINARY else ""), "api.msvcrt._Fiopen")
+        if stream and mode & IOS_ATE:
+            fobj = self.file_get(self.file_streams[stream])
+            fobj.seek(fobj.get_size(), io.SEEK_SET)
+        return stream
+
+    @apihook("?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _Fiopen_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *std::_Fiopen(
+            const char *filename,
+            std::ios_base::openmode mode,
+            int prot
+        );
+        """
+        return self.fiopen(argv, 1, ctx)
+
+    @apihook("?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _wFiopen_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *std::_Fiopen(
+            const wchar_t *filename,
+            std::ios_base::openmode mode,
+            int prot
+        );
+        """
+        return self.fiopen(argv, 2, ctx)
+
+    @impdata("?cout@std@@3V?$basic_ostream@DU?$char_traits@D@std@@@1@A")
+    def cout(self, ptr):
+        """
+        std::ostream std::cout;
+
+        On x64, a basic_ostream<char> with its vbtable after it,
+        and an unbuffered filebuf whose virtual functions write to stdout.
+        """
+        if self.get_ptr_size() != 8:
+            return ptr
+        virtuals = {
+            STREAMBUF_VTABLE_LOCK: self.basic_filebuf_Lock_x64,
+            STREAMBUF_VTABLE_UNLOCK: self.basic_filebuf_Unlock_x64,
+            STREAMBUF_VTABLE_OVERFLOW: self.basic_filebuf_overflow_x64,
+            STREAMBUF_VTABLE_XSPUTN: self.basic_filebuf_xsputn_x64,
+            STREAMBUF_VTABLE_SYNC: self.basic_filebuf_sync_x64,
+        }
+        filebuf = self.mem_alloc(STREAMBUF64_SIZE + STREAMBUF_VTABLE_SLOTS * 8, tag="api.msvcrt.cout_filebuf")
+        vtable = filebuf + STREAMBUF64_SIZE
+        self.init_basic_streambuf(filebuf)
+        self.write_ptr(filebuf, vtable)
+        for slot, handler in virtuals.items():
+            self.write_ptr(vtable + slot * 8, self.emu.get_proc("msvcrt", handler.__apihook__[0]))  # type: ignore[attr-defined]
+        ios = ptr + 8
+        vbtable = ios + IOS64_SIZE
+        self.mem_write(vbtable, struct.pack("<ii", 0, ios - ptr))
+        self.write_ptr(ptr, vbtable)
+        self.init_basic_ios(ios, filebuf)
+        return ptr
+
+    @apihook("?_Lock@?$basic_filebuf@DU?$char_traits@D@std@@@std@@UEAAXXZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_filebuf_Lock_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void std::basic_filebuf<char>::_Lock();
+
+        The first argument is the implicit this pointer.
+        """
+        return
+
+    @apihook("?_Unlock@?$basic_filebuf@DU?$char_traits@D@std@@@std@@UEAAXXZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_filebuf_Unlock_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void std::basic_filebuf<char>::_Unlock();
+
+        The first argument is the implicit this pointer.
+        """
+        return
+
+    @apihook("?overflow@?$basic_filebuf@DU?$char_traits@D@std@@@std@@MEAAHH@Z", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def basic_filebuf_overflow_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int std::basic_filebuf<char>::overflow(
+            int c
+        );
+
+        Only the filebuf of std::cout uses this handler, so the character goes to stdout.
+
+        The first argument is the implicit this pointer.
+        """
+        c = argv[1] & 0xFFFFFFFF
+        if c == CHAR_TRAITS_EOF:
+            return 0
+        c &= 0xFF
+        ctx.args[1].display = chr(c) if c < 0x80 else f"\\x{c:02x}"
+        return c
+
+    @apihook("?xsputn@?$basic_filebuf@DU?$char_traits@D@std@@@std@@MEAA_JPEBD_J@Z", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def basic_filebuf_xsputn_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::streamsize std::basic_filebuf<char>::xsputn(
+            const char *s,
+            std::streamsize count
+        );
+
+        Only the filebuf of std::cout uses this handler, so the characters go to stdout.
+
+        The first argument is the implicit this pointer.
+        """
+        _, s, count = argv
+        if count <= 0 or count >= 1 << 63:
+            return 0
+        ctx.args[1].display = decode_ansi(self.mem_read(s, count))
+        return count
+
+    @apihook("?sync@?$basic_filebuf@DU?$char_traits@D@std@@@std@@MEAAHXZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_filebuf_sync_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int std::basic_filebuf<char>::sync();
+
+        The first argument is the implicit this pointer.
+        """
+        return 0
+
+    @apihook("?sputc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAAHD@Z", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def basic_streambuf_sputc_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int std::basic_streambuf<char>::sputc(
+            char c
+        );
+
+        Store the character in the put area, or call the virtual overflow when the area is full.
+
+        The first argument is the implicit this pointer.
+        """
+        sb, c = argv
+        c &= 0xFF
+        pnext_ptr, pcount_ptr = (
+            self.read_ptr(sb + STREAMBUF64_OFFSET_IPNEXT),
+            self.read_ptr(sb + STREAMBUF64_OFFSET_IPCOUNT),
+        )
+        pnext = self.read_ptr(pnext_ptr)
+        pcount = int.from_bytes(self.mem_read(pcount_ptr, 4), "little", signed=True) if pnext else 0
+        if pcount > 0:
+            self.write_dword(pcount_ptr, pcount - 1)
+            self.write_ptr(pnext_ptr, pnext + 1)
+            self.mem_write(pnext, bytes([c]))
+            return c
+        return (yield GuestCall(self.get_streambuf_virtual(emu, sb, STREAMBUF_VTABLE_OVERFLOW), (sb, c))) & 0xFFFFFFFF
+
+    @apihook(
+        "?sputn@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAA_JPEBD_J@Z", argc=3, conv=e_arch.CALL_CONV_CDECL
+    )
+    def basic_streambuf_sputn_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::streamsize std::basic_streambuf<char>::sputn(
+            const char *s,
+            std::streamsize count
+        );
+
+        The first argument is the implicit this pointer.
+        """
+        sb, s, count = argv
+        return (yield GuestCall(self.get_streambuf_virtual(emu, sb, STREAMBUF_VTABLE_XSPUTN), (sb, s, count)))
+
+    @apihook("?good@ios_base@std@@QEBA_NXZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def ios_base_good_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        bool std::ios_base::good() const;
+
+        The first argument is the implicit this pointer.
+        """
+        return int(self.mem_read(argv[0] + IOS64_OFFSET_MYSTATE, 4) == b"\x00" * 4)
+
+    def get_streambuf_virtual(self, emu, sb, slot):
+        """Return the address of a virtual function of an x64 basic_streambuf."""
+        return self.read_ptr(self.read_ptr(sb) + slot * 8)
+
+    def sync_ostream(self, emu, ostream):
+        """Call the virtual sync of the buffer of a good stream, and set badbit when it fails."""
+        ios = self.get_ios_base(emu, ostream)
+        sb = self.read_ptr(ios + IOS64_OFFSET_MYSTRBUF)
+        if not sb or not self.ios_base_good_x64(emu, [ios]):
+            return
+        sync = self.get_streambuf_virtual(emu, sb, STREAMBUF_VTABLE_SYNC)
+        if ((yield GuestCall(sync, (sb,))) & 0xFFFFFFFF) == CHAR_TRAITS_EOF:
+            self.basic_ios_setstate_x64(emu, [ios, IOS_BADBIT, 0])
+
+    @apihook("?flush@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@XZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_ostream_flush_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::basic_ostream<char> &std::basic_ostream<char>::flush();
+
+        The first argument is the implicit this pointer.
+        """
+        yield from self.sync_ostream(emu, argv[0])
+        return argv[0]
+
+    @apihook("?_Osfx@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAXXZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def basic_ostream_Osfx_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void std::basic_ostream<char>::_Osfx();
+
+        The first argument is the implicit this pointer.
+        """
+        ios = self.get_ios_base(emu, argv[0])
+        if self.read_dword(ios + IOS64_OFFSET_FMTFL) & IOS_UNITBUF:
+            yield from self.sync_ostream(emu, argv[0])
+
+    @apihook("??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV01@K@Z", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def basic_ostream_insert_ulong_x64(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        std::basic_ostream<char> &std::basic_ostream<char>::operator<<(
+            unsigned long value
+        );
+
+        Format the value as num_put does, with the base, case, prefix, width and
+        fill of the stream, and write it with the virtual xsputn of the buffer.
+
+        The first argument is the implicit this pointer.
+        """
+        ostream, value = argv
+        value &= 0xFFFFFFFF
+        ios = self.get_ios_base(emu, ostream)
+        tie = self.read_ptr(ios + IOS64_OFFSET_TIESTR)
+        if self.ios_base_good_x64(emu, [ios]) and tie and tie != ostream:
+            yield from self.sync_ostream(emu, tie)
+        sb = self.read_ptr(ios + IOS64_OFFSET_MYSTRBUF)
+        if not sb or not self.ios_base_good_x64(emu, [ios]):
+            self.basic_ios_setstate_x64(emu, [ios, IOS_GOODBIT, 0])
+            return ostream
+
+        flags = self.read_dword(ios + IOS64_OFFSET_FMTFL)
+        prefix = ""
+        if flags & IOS_BASEFIELD == IOS_HEX:
+            digits = f"{value:X}" if flags & IOS_UPPERCASE else f"{value:x}"
+            if flags & IOS_SHOWBASE and value:
+                prefix = "0X" if flags & IOS_UPPERCASE else "0x"
+        elif flags & IOS_BASEFIELD == IOS_OCT:
+            digits = f"{value:o}"
+            if flags & IOS_SHOWBASE and value:
+                prefix = "0"
+        else:
+            digits = str(value)
+        width = int.from_bytes(self.mem_read(ios + IOS64_OFFSET_WIDE, 8), "little", signed=True)
+        pad = self.mem_read(ios + IOS64_OFFSET_FILLCH, 1) * max(0, width - len(prefix) - len(digits))
+        if flags & IOS_ADJUSTFIELD == IOS_LEFT:
+            text = prefix.encode() + digits.encode() + pad
+        elif flags & IOS_ADJUSTFIELD == IOS_INTERNAL:
+            text = prefix.encode() + pad + digits.encode()
+        else:
+            text = pad + prefix.encode() + digits.encode()
+        self.mem_write(ios + IOS64_OFFSET_WIDE, b"\x00" * 8)
+
+        if self.ostream_buffer is None:
+            self.ostream_buffer = self.mem_alloc(0x100, tag="api.msvcrt.ostream_buffer")
+        xsputn = self.get_streambuf_virtual(emu, sb, STREAMBUF_VTABLE_XSPUTN)
+        for i in range(0, len(text), 0x100):
+            chunk = text[i : i + 0x100]
+            self.mem_write(self.ostream_buffer, chunk)
+            if (yield GuestCall(xsputn, (sb, self.ostream_buffer, len(chunk)))) != len(chunk):
+                self.basic_ios_setstate_x64(emu, [ios, IOS_BADBIT, 0])
+                break
+        return ostream
+
+    @apihook("?uncaught_exceptions@std@@YAHXZ", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def uncaught_exceptions(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int std::uncaught_exceptions() noexcept;
+        """
+        return 0
+
+    @apihook("?uncaught_exception@std@@YA_NXZ", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def uncaught_exception(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        bool std::uncaught_exception() noexcept;
+        """
+        return 0
+
+    def get_global_locimp(self, emu):
+        """
+        Return the _Locimp of the global locale, and create it on the first
+        call. The _Locimp is the "C" locale with all categories and no facets.
+        Set its reference count to 2: one reference for the global locale and
+        one for the classic locale.
+        """
+        if self.global_locimp is not None:
+            return self.global_locimp
+        if emu.get_ptr_size() == 8:
+            methods = (
+                "??_G_Locimp@locale@std@@MEAAPEAXI@Z",
+                "?_Incref@facet@locale@std@@UEAAXXZ",
+                "?_Decref@facet@locale@std@@UEAAPEAV_Facet_base@3@XZ",
+            )
+            layout, size = "<QI4xQQIB3xQB", 0x38
+        else:
+            methods = (
+                "??_G_Locimp@locale@std@@MAEPAXI@Z",
+                "?_Incref@facet@locale@std@@UAEXXZ",
+                "?_Decref@facet@locale@std@@UAEPAV_Facet_base@3@XZ",
+            )
+            layout, size = "<IIIIIB3xIB", 0x20
+        ptr_size = emu.get_ptr_size()
+        vtable = self.mem_alloc(len(methods) * ptr_size, tag="api.msvcrt.locimp_vtable")
+        for i, method in enumerate(methods):
+            self.write_ptr(vtable + i * ptr_size, emu.add_callback(self.name, method))
+        name = self.mem_alloc(2, tag="api.msvcrt.locimp_name")
+        self.mem_write(name, b"C\x00")
+        locimp = self.mem_alloc(size, tag="api.msvcrt.locimp")
+        self.mem_write(locimp, struct.pack(layout, vtable, 2, 0, 0, LOCALE_ALL, 0, name, 0))
+        self.global_locimp = locimp
+        return locimp
+
+    def add_facet_refs(self, facet, delta):
+        """Add ``delta`` to the reference count of a std::locale::facet and return the new count."""
+        refs_offset = self.get_ptr_size()
+        refs = (self.read_dword(facet + refs_offset) + delta) & 0xFFFFFFFF
+        self.write_dword(facet + refs_offset, refs)
+        return refs
+
+    def locale_init(self, emu, do_incref):
+        locimp = self.get_global_locimp(emu)
+        if do_incref & 0xFF:
+            self.add_facet_refs(locimp, 1)
+        return locimp
+
+    @apihook("?_Init@locale@std@@CAPAV_Locimp@12@_N@Z", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def locale_Init_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        static std::locale::_Locimp *std::locale::_Init(
+            bool do_incref
+        );
+        """
+        return self.locale_init(emu, argv[0])
+
+    @apihook("?_Init@locale@std@@CAPEAV_Locimp@12@_N@Z", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def locale_Init_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        static std::locale::_Locimp *std::locale::_Init(
+            bool do_incref
+        );
+        """
+        return self.locale_init(emu, argv[0])
+
+    @apihook("?_Getgloballocale@locale@std@@CAPAV_Locimp@12@XZ", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def locale_Getgloballocale_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        static std::locale::_Locimp *std::locale::_Getgloballocale();
+        """
+        return self.get_global_locimp(emu)
+
+    @apihook("?_Getgloballocale@locale@std@@CAPEAV_Locimp@12@XZ", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def locale_Getgloballocale_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        static std::locale::_Locimp *std::locale::_Getgloballocale();
+        """
+        return self.get_global_locimp(emu)
+
+    @apihook("?_Incref@facet@locale@std@@UAEXXZ", argc=0)
+    def facet_Incref_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void std::locale::facet::_Incref();
+        """
+        self.add_facet_refs(self.iostream_init_this(emu), 1)
+
+    @apihook("?_Incref@facet@locale@std@@UEAAXXZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def facet_Incref_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void std::locale::facet::_Incref();
+
+        The first argument is the implicit this pointer.
+        """
+        self.add_facet_refs(argv[0], 1)
+
+    @apihook("?_Decref@facet@locale@std@@UAEPAV_Facet_base@3@XZ", argc=0)
+    def facet_Decref_x86(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::_Facet_base *std::locale::facet::_Decref();
+
+        Return the facet when its count drops to 0, so that the caller deletes it.
+        Otherwise return NULL.
+        """
+        this = self.iostream_init_this(emu)
+        return this if self.add_facet_refs(this, -1) == 0 else 0
+
+    @apihook("?_Decref@facet@locale@std@@UEAAPEAV_Facet_base@3@XZ", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def facet_Decref_x64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        std::_Facet_base *std::locale::facet::_Decref();
+
+        Return the facet when its count drops to 0, so that the caller deletes it.
+        Otherwise return NULL.
+
+        The first argument is the implicit this pointer.
+        """
+        return argv[0] if self.add_facet_refs(argv[0], -1) == 0 else 0
+
+    def get_exception_slot(self, name):
+        slot = self.exception_slots.get(name)
+        if slot is None:
+            slot = self.mem_alloc(self.get_ptr_size(), tag=f"api.msvcrt.{name}")
+            self.exception_slots[name] = slot
+        return slot
 
     @apihook("__current_exception_context", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def __current_exception_context(self, emu, argv, ctx: api.ApiContext = None):
-        return
+    def __current_exception_context(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void **__current_exception_context();
+        """
+        return self.get_exception_slot("__current_exception_context")
 
     @apihook("__current_exception", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def __current_exception(self, emu, argv, ctx: api.ApiContext = None):
-        return
+    def __current_exception(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void **__current_exception();
+        """
+        return self.get_exception_slot("__current_exception")
 
     @apihook("_set_new_mode", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _set_new_mode(self, emu, argv, ctx: api.ApiContext = None):
-        return
+    def _set_new_mode(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _set_new_mode(
+            int newhandlermode
+        );
+        """
+        (newhandlermode,) = argv
+        rv = self.new_mode
+        self.new_mode = newhandlermode & 0xFFFFFFFF
+        return rv
+
+    @apihook("_callnewh", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _callnewh(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _callnewh(
+            size_t size
+        );
+
+        No new handler is installed, so the allocation fails.
+        """
+        return 0
 
     @apihook("_configthreadlocale", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _configthreadlocale(self, emu, argv, ctx: api.ApiContext = None):
-        return
+    def _configthreadlocale(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _configthreadlocale(
+            int per_thread_locale_type
+        );
+        """
+        (per_thread_locale_type,) = argv
+        rv = self.thread_locale
+        if per_thread_locale_type in (ENABLE_PER_THREAD_LOCALE, DISABLE_PER_THREAD_LOCALE):
+            self.thread_locale = per_thread_locale_type
+        return rv
 
     @apihook("_setusermatherr", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _setusermatherr(self, emu, argv, ctx: api.ApiContext = None):
+    def _setusermatherr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _setusermatherr(
+            int (*pf)(struct _exception *)
+        );
+        """
         return
 
     @apihook("__setusermatherr", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def __setusermatherr(self, emu, argv, ctx: api.ApiContext = None):
+    def __setusermatherr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void __setusermatherr(
+            _UserMathErrorFunctionPointer pf
+        );
+        """
         return
 
     @apihook("_cexit", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def _cexit(self, emu, argv, ctx: api.ApiContext = None):
+    def _cexit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _cexit();
+        """
         # TODO: handle atexit flavor functions
         self.exit_process()
 
     @apihook("_c_exit", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def _c_exit(self, emu, argv, ctx: api.ApiContext = None):
+    def _c_exit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _c_exit();
+        """
         self.exit_process()
 
     @apihook("_register_thread_local_exe_atexit_callback", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _register_thread_local_exe_atexit_callback(self, emu, argv, ctx: api.ApiContext = None):
+    def _register_thread_local_exe_atexit_callback(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        void _register_thread_local_exe_atexit_callback(
+            _tls_callback_type callback
+        );
+        """
         return
 
     @apihook("_crt_atexit", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _crt_atexit(self, emu, argv, ctx: api.ApiContext = None):
-        return
+    def _crt_atexit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _crt_atexit(
+            _PVFV function
+        );
+
+        Speakeasy does not keep the function, and exit does not call it.
+        """
+        return 0
+
+    @apihook("_crt_at_quick_exit", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _crt_at_quick_exit(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _crt_at_quick_exit(
+            _PVFV function
+        );
+        """
+        return 0
 
     @apihook("_controlfp_s", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def _controlfp_s(self, emu, argv, ctx: api.ApiContext = None):
-        return
+    def _controlfp_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _controlfp_s(
+            unsigned int *currentControl,
+            unsigned int newControl,
+            unsigned int mask
+        );
+        """
+        return 0
 
     @apihook("terminate", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def terminate(self, emu, argv, ctx: api.ApiContext = None):
+    def terminate(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void terminate();
+        """
         self.exit_process()
 
-    @apihook("_crt_atexit", argc=1, conv=e_arch.CALL_CONV_CDECL)  # type: ignore[no-redef]
-    def _crt_atexit(self, emu, argv, ctx: api.ApiContext = None):
-        return
+    @apihook("__std_terminate", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __std_terminate(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void __std_terminate();
+        """
+        self.exit_process()
+
+    @apihook("_purecall", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _purecall(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _purecall();
+        """
+        self.exit_process()
 
     @apihook("_initialize_narrow_environment", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def _initialize_narrow_environment(self, emu, argv, ctx: api.ApiContext = None):
-        """errno_t _initialize_narrow_environment(void).
-
-        UCRT startup calls this from the CRT initializer table and branches on
-        the ``errno_t`` result: 0 is success. The engine already exposes the
-        environment through ``_get_initial_narrow_environment``/
-        ``__p__environ``, so no additional guest-visible setup is required here.
-
-        Returns:
-            0 (success), on x86 and x64. Unknown inputs: none (no arguments).
+    def _initialize_narrow_environment(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        int _initialize_narrow_environment();
         """
         return 0
 
     @apihook("_configure_narrow_argv", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _configure_narrow_argv(self, emu, argv, ctx: api.ApiContext = None):
-        """errno_t _configure_narrow_argv(_crt_argv_mode mode).
+    def _configure_narrow_argv(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _configure_narrow_argv(
+            _crt_argv_mode mode
+        );
 
-        UCRT startup calls this from an initializer table and checks the
-        ``errno_t`` result. Returning ``None`` left EAX with a stale non-zero
-        value, so a success looked like a failure and the fast-fail path ran.
-        Argument data is provided by the ``__getmainargs``/``__p___argv``
-        handlers; this stub implements the documented mode check and result.
-
-        Args:
-            mode: 0 = no arguments, 1 = unexpanded arguments,
-                2 = expanded arguments.
-
-        Returns:
-            0 for a documented mode, EINVAL (22) otherwise, on x86 and x64.
+        Return 0 for a documented mode and EINVAL otherwise.
         """
         (mode,) = argv
         if mode in _CRT_ARGV_MODES:
             return 0
         return EINVAL
 
+    @apihook("_initialize_wide_environment", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _initialize_wide_environment(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _initialize_wide_environment();
+        """
+        return 0
+
+    @apihook("_configure_wide_argv", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _configure_wide_argv(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _configure_wide_argv(
+            _crt_argv_mode mode
+        );
+        """
+        return 0
+
     @apihook("_set_fmode", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def _set_fmode(self, emu, argv, ctx: api.ApiContext = None):
-        """errno_t _set_fmode(int mode).
-
-        Sets the default file translation mode. Called from a UCRT initializer
-        whose caller may branch on the ``errno_t`` result.
-
-        Args:
-            mode: ``_O_TEXT`` (0x4000) or ``_O_BINARY`` (0x8000).
-
-        Returns:
-            0 for a documented mode, EINVAL (22) otherwise, on x86 and x64.
+    def _set_fmode(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _set_fmode(
+            int mode
+        );
         """
         (mode,) = argv
-        if mode in (_O_TEXT, _O_BINARY):
-            return 0
-        return EINVAL
+        if mode not in (O_TEXT, O_BINARY):
+            return EINVAL
+        self.write_dword(emu.get_proc("msvcrt", "_fmode"), mode)
+        return 0
 
     @apihook("_itoa", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def _itoa(self, emu, argv, ctx: api.ApiContext = None):
-        return
+    def _itoa(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char *_itoa(
+            int value,
+            char *buffer,
+            int radix
+        );
+        """
+        value, buffer, radix = argv
+        self.write_string(self.format_int32(value, radix), buffer)
+        return buffer
 
     @apihook("_itow", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def _itow(self, emu, argv, ctx: api.ApiContext = None):
-        return
+    def _itow(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t *_itow(
+            int value,
+            wchar_t *buffer,
+            int radix
+        );
+        """
+        value, buffer, radix = argv
+        self.write_wide_string(self.format_int32(value, radix), buffer)
+        return buffer
+
+    def convert_int_s(self, argv, bits, signed, width):
+        """
+        Write an integer as the _itoa_s family does. A 64-bit value takes two
+        stack slots on x86.
+        """
+        if bits == 64 and self.get_ptr_size() == 4:
+            lo, hi, buf, size, radix = argv
+            val = (hi << 32) | lo
+        else:
+            val, buf, size, radix = argv[:4]
+        val &= (1 << bits) - 1
+        negative = signed and radix == 10 and bool(val >> (bits - 1))
+        if not buf or not size:
+            self.set_errno(EINVAL)
+            return EINVAL
+        self.mem_write(buf, b"\x00" * width)
+        if size <= 1 + negative:
+            self.set_errno(ERANGE)
+            return ERANGE
+        if not 2 <= radix <= 36:
+            self.set_errno(EINVAL)
+            return EINVAL
+        if negative:
+            val = (1 << bits) - val
+        digits = ""
+        while True:
+            val, d = divmod(val, radix)
+            digits = "0123456789abcdefghijklmnopqrstuvwxyz"[d] + digits
+            if not val:
+                break
+        text = "-" * negative + digits
+        if len(text) >= size:
+            self.set_errno(ERANGE)
+            return ERANGE
+        self.write_mem_string(text, buf, width)
+        return 0
+
+    @apihook("_itoa_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _itoa_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _itoa_s(
+            int value,
+            char *buffer,
+            size_t size,
+            int radix
+        );
+        """
+        return self.convert_int_s(argv, 32, True, 1)
+
+    @apihook("_itow_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _itow_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _itow_s(
+            int value,
+            wchar_t *buffer,
+            size_t size,
+            int radix
+        );
+        """
+        return self.convert_int_s(argv, 32, True, 2)
+
+    @apihook("_ltoa_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _ltoa_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _ltoa_s(
+            long value,
+            char *buffer,
+            size_t size,
+            int radix
+        );
+        """
+        return self.convert_int_s(argv, 32, True, 1)
+
+    @apihook("_ltow_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _ltow_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _ltow_s(
+            long value,
+            wchar_t *buffer,
+            size_t size,
+            int radix
+        );
+        """
+        return self.convert_int_s(argv, 32, True, 2)
+
+    @apihook("_ultoa_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _ultoa_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _ultoa_s(
+            unsigned long value,
+            char *buffer,
+            size_t size,
+            int radix
+        );
+        """
+        return self.convert_int_s(argv, 32, False, 1)
+
+    @apihook("_ultow_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _ultow_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _ultow_s(
+            unsigned long value,
+            wchar_t *buffer,
+            size_t size,
+            int radix
+        );
+        """
+        return self.convert_int_s(argv, 32, False, 2)
+
+    @apihook("_i64toa_s", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def _i64toa_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _i64toa_s(
+            __int64 value,
+            char *buffer,
+            size_t size,
+            int radix
+        );
+
+        The value takes two stack slots on x86.
+        """
+        return self.convert_int_s(argv, 64, True, 1)
+
+    @apihook("_i64tow_s", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def _i64tow_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _i64tow_s(
+            __int64 value,
+            wchar_t *buffer,
+            size_t size,
+            int radix
+        );
+
+        The value takes two stack slots on x86.
+        """
+        return self.convert_int_s(argv, 64, True, 2)
+
+    @apihook("_ui64toa_s", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def _ui64toa_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _ui64toa_s(
+            unsigned __int64 value,
+            char *buffer,
+            size_t size,
+            int radix
+        );
+
+        The value takes two stack slots on x86.
+        """
+        return self.convert_int_s(argv, 64, False, 1)
+
+    @apihook("_ui64tow_s", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def _ui64tow_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _ui64tow_s(
+            unsigned __int64 value,
+            wchar_t *buffer,
+            size_t size,
+            int radix
+        );
+
+        The value takes two stack slots on x86.
+        """
+        return self.convert_int_s(argv, 64, False, 2)
 
     @apihook("_EH_prolog", argc=0, conv=e_arch.CALL_CONV_CDECL)
-    def _EH_prolog(self, emu, argv, ctx: api.ApiContext = None):
+    def _EH_prolog(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _EH_prolog();
+
+        Build an x86 exception frame. The helper takes the handler in EAX
+        and the caller frame in EBP, not on the stack.
+        """
         # push    -1
         emu.push_stack(0xFFFFFFFF)
 
@@ -1921,16 +6336,16 @@ class Msvcrt(api.ApiHandler):
 
         # mov     eax, DWORD PTR fs:[0]
         # push    eax
-        emu.push_stack(emu.read_ptr(emu.fs_addr + 0))
+        emu.push_stack(self.read_ptr(emu.fs_addr + 0))
 
         # mov     eax, DWORD PTR [esp+12]
-        eax = emu.read_ptr(emu.reg_read(e_arch.X86_REG_ESP) + 12)
+        eax = self.read_ptr(emu.reg_read(e_arch.X86_REG_ESP) + 12)
 
         # mov     DWORD PTR fs:[0], esp
-        emu.write_ptr(emu.fs_addr + 0, emu.reg_read(e_arch.X86_REG_ESP))
+        self.write_ptr(emu.fs_addr + 0, emu.reg_read(e_arch.X86_REG_ESP))
 
         # mov     DWORD PTR [esp+12], ebp
-        emu.write_ptr(emu.reg_read(e_arch.X86_REG_ESP) + 12, emu.reg_read(e_arch.X86_REG_EBP))
+        self.write_ptr(emu.reg_read(e_arch.X86_REG_ESP) + 12, emu.reg_read(e_arch.X86_REG_EBP))
 
         # lea     ebp, DWORD PTR [esp+12]
         emu.reg_write(e_arch.X86_REG_EBP, emu.reg_read(e_arch.X86_REG_ESP) + 12)
@@ -1938,10 +6353,123 @@ class Msvcrt(api.ApiHandler):
         # push    eax
         # ret     0
         emu.push_stack(eax)
-        return
+        emu.do_call_return(0, eax, conv=e_arch.CALL_CONV_CDECL)
+
+    def jump_buffer_layout(self, emu):
+        if emu.get_arch() == e_arch.ARCH_X86:
+            return (
+                [
+                    (0x0, e_arch.X86_REG_EBP),
+                    (0x4, e_arch.X86_REG_EBX),
+                    (0x8, e_arch.X86_REG_EDI),
+                    (0xC, e_arch.X86_REG_ESI),
+                ],
+                0x10,
+                0x14,
+            )
+        return (
+            [
+                (0x8, e_arch.AMD64_REG_RBX),
+                (0x18, e_arch.AMD64_REG_RBP),
+                (0x20, e_arch.AMD64_REG_RSI),
+                (0x28, e_arch.AMD64_REG_RDI),
+                (0x30, e_arch.AMD64_REG_R12),
+                (0x38, e_arch.AMD64_REG_R13),
+                (0x40, e_arch.AMD64_REG_R14),
+                (0x48, e_arch.AMD64_REG_R15),
+            ],
+            0x10,
+            0x50,
+        )
+
+    def save_jump_buffer(self, emu, buf):
+        regs, sp_off, pc_off = self.jump_buffer_layout(emu)
+        for off, reg in regs:
+            self.write_ptr(buf + off, emu.reg_read(reg))
+        sp = emu.get_stack_ptr()
+        self.write_ptr(buf + sp_off, sp + emu.get_ptr_size())
+        self.write_ptr(buf + pc_off, self.read_ptr(sp))
+        if emu.get_arch() == e_arch.ARCH_X86:
+            self.write_ptr(buf + 0x18, self.read_ptr(emu.fs_addr))
+            self.write_ptr(buf + 0x1C, 0xFFFFFFFF)
+        else:
+            self.write_ptr(buf, 0)
+        return 0
+
+    @apihook("_setjmp", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _setjmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _setjmp(
+            jmp_buf env
+        );
+        """
+        return self.save_jump_buffer(emu, argv[0])
+
+    @apihook("_setjmp3", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def _setjmp3(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _setjmp3(
+            jmp_buf env,
+            int count,
+            ...
+        );
+        """
+        return self.save_jump_buffer(emu, self.read_ptr(emu.get_stack_ptr() + 4))
+
+    @apihook("_setjmpex", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _setjmpex(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _setjmpex(
+            jmp_buf env,
+            void *frame
+        );
+        """
+        return self.save_jump_buffer(emu, argv[0])
+
+    @apihook("__intrinsic_setjmp", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def __intrinsic_setjmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __intrinsic_setjmp(
+            jmp_buf env,
+            void *frame
+        );
+        """
+        return self.save_jump_buffer(emu, argv[0])
+
+    @apihook("__intrinsic_setjmpex", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def __intrinsic_setjmpex(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __intrinsic_setjmpex(
+            jmp_buf env,
+            void *frame
+        );
+        """
+        return self.save_jump_buffer(emu, argv[0])
+
+    @apihook("longjmp", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def longjmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void longjmp(
+            jmp_buf env,
+            int value
+        );
+        """
+        env, value = argv
+        value = (value & 0xFFFFFFFF) or 1
+        regs, sp_off, pc_off = self.jump_buffer_layout(emu)
+        for off, reg in regs:
+            emu.reg_write(reg, self.read_ptr(env + off))
+        if emu.get_arch() == e_arch.ARCH_X86:
+            self.write_ptr(emu.fs_addr, self.read_ptr(env + 0x18))
+            emu.reg_write(e_arch.X86_REG_EAX, value)
+        else:
+            emu.reg_write(e_arch.AMD64_REG_RAX, value)
+        emu.set_stack_ptr(self.read_ptr(env + sp_off))
+        emu.set_pc(self.read_ptr(env + pc_off))
+        return value
 
     @apihook("wcstombs", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def wcstombs(self, emu, argv, ctx: api.ApiContext = None):
+    def wcstombs(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         size_t wcstombs(
             char *mbstr,
@@ -1951,17 +6479,146 @@ class Msvcrt(api.ApiHandler):
         """
         mbstr, wcstr, count = argv
 
-        s = self.read_wide_string(wcstr, count)
-        self.write_string(s, mbstr)
-        return len(s.encode("ascii"))
+        ws = self.read_cstr(wcstr, max_chars=count if mbstr else 0, width=2).decode("utf-16le", "surrogatepass")
+        ctx.args[1].display = ws
+        # The C locale has no multibyte character for a wide character above 0xFF.
+        try:
+            s = ws.encode("latin-1")
+        except UnicodeEncodeError:
+            return self.get_max_int()
+
+        if not mbstr:
+            return len(s)
+        if len(s) < count:
+            self.mem_write(mbstr, s + b"\x00")
+        else:
+            self.mem_write(mbstr, s[:count])
+        return min(len(s), count)
+
+    @apihook("wcstombs_s", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def wcstombs_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t wcstombs_s(
+            size_t *pReturnValue,
+            char *mbstr,
+            size_t sizeInBytes,
+            const wchar_t *wcstr,
+            size_t count
+        );
+        """
+        pReturnValue, mbstr, sizeInBytes, wcstr, count = argv
+
+        if bool(mbstr) != bool(sizeInBytes):
+            return EINVAL
+        if mbstr:
+            self.mem_write(mbstr, b"\x00")
+        if pReturnValue:
+            self.write_ptr(pReturnValue, 0)
+        if not wcstr:
+            return EINVAL
+
+        max_chars = min(count, sizeInBytes)
+        if mbstr and not max_chars:
+            ws = ""
+        else:
+            ws = self.read_cstr(wcstr, max_chars=max_chars, width=2).decode("utf-16le", "surrogatepass")
+        ctx.args[3].display = ws
+        # The C locale has no multibyte character for a wide character above 0xFF.
+        try:
+            s = ws.encode("latin-1")
+        except UnicodeEncodeError:
+            return EILSEQ
+
+        rv = 0
+        n = len(s) + 1
+        if mbstr:
+            if n > sizeInBytes:
+                if count != self.get_max_int():
+                    return ERANGE
+                n = sizeInBytes
+                rv = STRUNCATE
+            self.mem_write(mbstr, s[: n - 1] + b"\x00")
+        if pReturnValue:
+            self.write_ptr(pReturnValue, n)
+        return rv
+
+    @apihook("mbstowcs", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def mbstowcs(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t mbstowcs(
+            wchar_t *wcstr,
+            const char *mbstr,
+            size_t count
+        );
+        """
+        wcstr, mbstr, count = argv
+
+        if wcstr and not count:
+            return 0
+        s = self.read_cstr(mbstr, max_chars=count if wcstr else 0)
+        # The C locale maps each byte to the wide character with the same value.
+        ctx.args[1].display = s.decode("latin-1")
+        if not wcstr:
+            return len(s)
+        ws = s.decode("latin-1").encode("utf-16le")
+        self.mem_write(wcstr, ws + b"\x00\x00" if len(s) < count else ws)
+        return len(s)
+
+    @apihook("mbrtowc", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def mbrtowc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t mbrtowc(
+            wchar_t *wchar,
+            const char *mbchar,
+            size_t count,
+            mbstate_t *mbstate
+        );
+
+        A byte is one character, as in the "C" locale.
+        """
+        wchar, mbchar, count, mbstate = argv
+        if not mbchar:
+            return 0
+        if not count:
+            return -2
+        char = self.mem_read(mbchar, 1)
+        if wchar:
+            self.mem_write(wchar, char + b"\x00")
+        return 1 if char != b"\x00" else 0
+
+    @apihook("mbsrtowcs", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def mbsrtowcs(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t mbsrtowcs(
+            wchar_t *wcstr,
+            const char **mbstr,
+            size_t count,
+            mbstate_t *mbstate
+        );
+        """
+        wcstr, mbstr, count, mbstate = argv
+        src = self.read_ptr(mbstr)
+        s = self.read_cstr(src, max_chars=count if wcstr else 0)
+        # The C locale maps each byte to the wide character with the same value.
+        ctx.args[1].display = s.decode("latin-1")
+        if not wcstr:
+            return len(s)
+        ws = s.decode("latin-1").encode("utf-16le")
+        if len(s) < count:
+            self.mem_write(wcstr, ws + b"\x00\x00")
+            self.write_ptr(mbstr, 0)
+        else:
+            self.mem_write(wcstr, ws)
+            self.write_ptr(mbstr, src + len(s))
+        return len(s)
 
     @apihook("_stricmp", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _stricmp(self, emu, argv, ctx: api.ApiContext = None):
+    def _stricmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _stricmp(
-                const char *string1,
-                const char *string2
-                );
+            const char *string1,
+            const char *string2
+        );
         """
         string1, string2 = argv
         rv = 1
@@ -1969,19 +6626,17 @@ class Msvcrt(api.ApiHandler):
         if not string1 or not string2:
             return rv
 
-        cs1 = self.read_string(string1)
-        cs2 = self.read_string(string2)
+        cs1 = self.read_cstr(string1)
+        cs2 = self.read_cstr(string2)
 
-        argv[0] = cs1
-        argv[1] = cs2
+        ctx.args[0].display = decode_ansi(cs1)
+        ctx.args[1].display = decode_ansi(cs2)
 
-        if cs1.lower() == cs2.lower():
-            rv = 0
-
-        return rv
+        cs1, cs2 = cs1.lower(), cs2.lower()
+        return (cs1 > cs2) - (cs1 < cs2)
 
     @apihook("_strnicmp", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def _strnicmp(self, emu, argv, ctx: api.ApiContext = None):
+    def _strnicmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _strnicmp(
             const char *string1,
@@ -1995,106 +6650,529 @@ class Msvcrt(api.ApiHandler):
         if not string1 or not string2:
             return rv
 
-        cs1 = self.read_string(string1)
-        cs2 = self.read_string(string2)
+        if not count:
+            return 0
 
-        argv[0] = cs1
-        argv[1] = cs2
+        cs1 = self.read_cstr(string1, count)
+        cs2 = self.read_cstr(string2, count)
 
-        if cs1[:count].lower() == cs2[:count].lower():
-            rv = 0
+        ctx.args[0].display = decode_ansi(cs1)
+        ctx.args[1].display = decode_ansi(cs2)
 
-        return rv
+        cs1, cs2 = cs1.lower(), cs2.lower()
+        return (cs1 > cs2) - (cs1 < cs2)
 
-    @apihook("_wcsicmp", argc=2, conv=e_arch.CALL_CONV_CDECL)  # type: ignore[no-redef]
-    def _wcsicmp(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("_wcsicmp", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _wcsicmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int wcsicmp(
+        int _wcsicmp(
             const wchar_t *string1,
             const wchar_t *string2
-            );
+        );
         """
         string1, string2 = argv
-        rv = 1
 
-        ws1 = self.read_wide_string(string1)
-        ws2 = self.read_wide_string(string2)
+        if not string1 or not string2:
+            return 1
 
-        argv[0] = ws1
-        argv[1] = ws2
+        cs1 = self.read_wide_string(string1)
+        cs2 = self.read_wide_string(string2)
 
-        if ws1.lower() == ws2.lower():
-            rv = 0
+        ctx.args[0].display = cs1
+        ctx.args[1].display = cs2
 
-        return rv
+        return get_string_order(cs1, cs2, Fold.ASCII_LOWER)
 
     @apihook("wcscmp", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def wcscmp(self, emu, argv, ctx: api.ApiContext = None):
+    def wcscmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int wcscmp(
             const wchar_t *string1,
-            const wchar_t *string2,
+            const wchar_t *string2
         );
         """
-        s1, s2 = argv
-        rv = 1
+        string1, string2 = argv
 
-        string1 = self.read_wide_string(s1)
-        string2 = self.read_wide_string(s2)
-        if string1 == string2:
-            rv = 0
-        argv[0] = string1
-        argv[1] = string2
+        s1 = self.read_wide_string(string1)
+        s2 = self.read_wide_string(string2)
+        ctx.args[0].display = s1
+        ctx.args[1].display = s2
 
-        return rv
+        return get_string_order(s1, s2, Fold.NONE)
 
     @apihook("_snwprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
-    def _snwprintf(self, emu, argv, ctx: api.ApiContext = None):
+    def _snwprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int _snwprintf(
             wchar_t *buffer,
             size_t count,
-            const wchar_t *format [,
-            argument] ...
-            );
+            const wchar_t *format,
+            ...
+        );
         """
         buf, cnt, fmt = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 3)
-        # the internal printf implementation requires uppercase S for wide string formatting,
-        # otherwise the function replaces a latin1 string into an utf-16 string
-        fmt_str = self.read_wide_string(fmt).replace(r"%s", r"%S")
+        fmt_str = self.read_wide_string(fmt)
         fmt_cnt = self.get_va_arg_count(fmt_str)
 
-        if not fmt_cnt:
-            self.write_wide_string(fmt_str, buf)
-            return len(fmt_str)
-
         argv = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 3 + fmt_cnt)[3:]
-        fin = self.do_str_format(fmt_str, argv)
+        fin = self.do_str_format(fmt_str, argv, wide=True)
+        ctx.args.clear()
+        ctx.args.append(fin)
 
-        self.write_wide_string(fin, buf)
+        out = fin[:cnt].encode("utf-16le")
+        if len(fin) < cnt:
+            out += b"\x00\x00"
+        self.mem_write(buf, out)
+        return len(fin) if len(fin) <= cnt else -1
 
-        argv = [buf, cnt, fmt] + argv
-        argv[2] = fmt_str
+    def format_var_args(self, emu, fixed, width):
+        """
+        Read the fixed arguments of a variadic printf function, where the
+        last fixed argument is the format, and format the variable arguments.
+        """
+        head = emu.get_func_argv(e_arch.CALL_CONV_CDECL, fixed)
+        fmt_str = self.read_mem_string(head[-1], width)
+        args = emu.get_func_argv(e_arch.CALL_CONV_CDECL, fixed + self.get_va_arg_count(fmt_str))[fixed:]
+        return head, self.do_str_format(fmt_str, args, wide=width == 2)
+
+    def format_va_list(self, _format, argptr, width):
+        fmt_str = self.read_mem_string(_format, width)
+        return self.do_str_format(fmt_str, self.va_args(argptr, self.get_va_arg_count(fmt_str)), wide=width == 2)
+
+    @apihook("swprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def swprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int swprintf(
+            wchar_t *buffer,
+            const wchar_t *format,
+            ...
+        );
+
+        msvcrt.dll exports the form without a count.
+        """
+        (buf, _), fin = self.format_var_args(emu, 2, 2)
+        self.mem_write(buf, (fin + "\x00").encode("utf-16le"))
+        ctx.args.clear()
+        ctx.args.append(fin)
         return len(fin)
 
+    @apihook("_swprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def _swprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _swprintf(
+            wchar_t *buffer,
+            const wchar_t *format,
+            ...
+        );
+        """
+        return self.swprintf(emu, argv, ctx)
+
+    @apihook("vswprintf", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def vswprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int vswprintf(
+            wchar_t *buffer,
+            const wchar_t *format,
+            va_list argptr
+        );
+
+        msvcrt.dll exports the form without a count.
+        """
+        buffer, format, argptr = argv
+        fin = self.format_va_list(format, argptr, 2)
+        self.mem_write(buffer, (fin + "\x00").encode("utf-16le"))
+        ctx.args[0].display = fin
+        return len(fin)
+
+    @apihook("_vswprintf", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _vswprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _vswprintf(
+            wchar_t *buffer,
+            const wchar_t *format,
+            va_list argptr
+        );
+        """
+        return self.vswprintf(emu, argv, ctx)
+
+    @apihook("_vsnwprintf", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _vsnwprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _vsnwprintf(
+            wchar_t *buffer,
+            size_t count,
+            const wchar_t *format,
+            va_list argptr
+        );
+        """
+        buffer, count, format, argptr = argv
+        fin = self.format_va_list(format, argptr, 2)
+        out = fin[:count]
+        if len(fin) < count:
+            out += "\x00"
+        self.mem_write(buffer, out.encode("utf-16le"))
+        ctx.args[0].display = fin[:count]
+        return len(fin) if len(fin) <= count else -1
+
+    @apihook("sprintf_s", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def sprintf_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int sprintf_s(
+            char *buffer,
+            size_t sizeOfBuffer,
+            const char *format,
+            ...
+        );
+        """
+        (buf, size, _), fin = self.format_var_args(emu, 3, 1)
+        return self.write_secure_format(buf, size, None, fin, 1, ctx.args[0])
+
+    @apihook("swprintf_s", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def swprintf_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int swprintf_s(
+            wchar_t *buffer,
+            size_t sizeOfBuffer,
+            const wchar_t *format,
+            ...
+        );
+        """
+        (buf, size, _), fin = self.format_var_args(emu, 3, 2)
+        return self.write_secure_format(buf, size, None, fin, 2, ctx.args[0])
+
+    @apihook("_snprintf_s", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def _snprintf_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _snprintf_s(
+            char *buffer,
+            size_t sizeOfBuffer,
+            size_t count,
+            const char *format,
+            ...
+        );
+        """
+        (buf, size, count, _), fin = self.format_var_args(emu, 4, 1)
+        return self.write_secure_format(buf, size, count, fin, 1, ctx.args[0])
+
+    @apihook("_snwprintf_s", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def _snwprintf_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _snwprintf_s(
+            wchar_t *buffer,
+            size_t sizeOfBuffer,
+            size_t count,
+            const wchar_t *format,
+            ...
+        );
+        """
+        (buf, size, count, _), fin = self.format_var_args(emu, 4, 2)
+        return self.write_secure_format(buf, size, count, fin, 2, ctx.args[0])
+
+    @apihook("vsprintf_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def vsprintf_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int vsprintf_s(
+            char *buffer,
+            size_t numberOfElements,
+            const char *format,
+            va_list argptr
+        );
+        """
+        buffer, numberOfElements, format, argptr = argv
+        fin = self.format_va_list(format, argptr, 1)
+        return self.write_secure_format(buffer, numberOfElements, None, fin, 1, ctx.args[0])
+
+    @apihook("vswprintf_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def vswprintf_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int vswprintf_s(
+            wchar_t *buffer,
+            size_t numberOfElements,
+            const wchar_t *format,
+            va_list argptr
+        );
+        """
+        buffer, numberOfElements, format, argptr = argv
+        fin = self.format_va_list(format, argptr, 2)
+        return self.write_secure_format(buffer, numberOfElements, None, fin, 2, ctx.args[0])
+
+    @apihook("_scprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def _scprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _scprintf(
+            const char *format,
+            ...
+        );
+        """
+        _, fin = self.format_var_args(emu, 1, 1)
+        return len(fin)
+
+    @apihook("_scwprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
+    def _scwprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _scwprintf(
+            const wchar_t *format,
+            ...
+        );
+        """
+        _, fin = self.format_var_args(emu, 1, 2)
+        return len(fin)
+
+    @apihook("_vscprintf", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _vscprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _vscprintf(
+            const char *format,
+            va_list argptr
+        );
+        """
+        format, argptr = argv
+        return len(self.format_va_list(format, argptr, 1))
+
+    @apihook("_vscwprintf", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _vscwprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _vscwprintf(
+            const wchar_t *format,
+            va_list argptr
+        );
+        """
+        format, argptr = argv
+        return len(self.format_va_list(format, argptr, 2))
+
     @apihook("_errno", argc=0)
-    def _errno(self, emu, argv, ctx: api.ApiContext = None):
-        """ """
+    def _errno(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int *_errno();
+
+        Return the address of a per-process errno value.
+        """
         _VAL = 0x0C
 
         if not self.errno_t:
             self.errno_t = self.mem_alloc(4, tag="api.msvcrt._errno")
-            self.mem_write(self.errno_t, _VAL.to_bytes(4, "little"))
+            self.write_dword(self.errno_t, _VAL)
 
         return self.errno_t
 
+    @impdata("_sys_nerr")
+    def _sys_nerr(self, ptr):
+        """
+        int _sys_nerr;
+
+        Number of messages in _sys_errlist.
+        """
+        self.write_dword(ptr, len(SYS_ERRLIST))
+        return ptr
+
+    @apihook("strerror", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def strerror(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char *strerror(
+            int errnum
+        );
+
+        Each call writes the message to the same buffer.
+        """
+        (errnum,) = argv
+        errnum &= 0xFFFFFFFF
+        message = SYS_ERRLIST[errnum] if errnum < len(SYS_ERRLIST) else "Unknown error"
+
+        if not self.strerror_buf:
+            self.strerror_buf = self.mem_alloc(0x100, tag="api.msvcrt.strerror")
+        self.mem_write(self.strerror_buf, message.encode("ascii") + b"\x00")
+        ctx.args[0].display = f"{errnum} ({message})"
+        return self.strerror_buf
+
+    @apihook("___lc_codepage_func", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def ___lc_codepage_func(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        UINT ___lc_codepage_func();
+
+        The C locale has code page 0.
+        """
+        return 0
+
+    @apihook("___lc_locale_name_func", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def ___lc_locale_name_func(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wchar_t **___lc_locale_name_func();
+
+        The C locale has no name for any category.
+        """
+        if not self.lc_locale_names:
+            self.lc_locale_names = self.mem_alloc(6 * emu.get_ptr_size(), tag="api.msvcrt.lc_locale_names")
+        return self.lc_locale_names
+
+    @apihook("___mb_cur_max_func", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def ___mb_cur_max_func(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int ___mb_cur_max_func();
+
+        The C locale has single-byte characters.
+        """
+        return 1
+
+    @apihook("_ismbblead", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _ismbblead(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _ismbblead(
+            unsigned int c
+        );
+
+        The C locale has no lead bytes.
+        """
+        return 0
+
+    @apihook("localeconv", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def localeconv(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        struct lconv *localeconv();
+
+        The struct has 10 char pointers, 8 chars, and 8 wchar_t pointers. The
+        C locale has "." as the decimal point, empty strings for the other
+        strings, and CHAR_MAX for the chars.
+        """
+        if self.lconv:
+            return self.lconv
+
+        ptr_size = self.get_ptr_size()
+        fmt = "<" + ("Q" if ptr_size == 8 else "I")
+        size = 18 * ptr_size + 8
+        self.lconv = self.mem_alloc(size + 10, tag="api.msvcrt.localeconv")
+        dot, empty, wdot, wempty = (self.lconv + size + off for off in (0, 2, 4, 8))
+        narrow = [dot] + [empty] * 9
+        wide = [wdot] + [wempty] * 7
+        data = b"".join(struct.pack(fmt, p) for p in narrow)
+        data += b"\x7f" * 8
+        data += b"".join(struct.pack(fmt, p) for p in wide)
+        data += b".\x00\x00\x00" + ".".encode("utf-16le") + b"\x00\x00" + b"\x00\x00"
+        self.mem_write(self.lconv, data)
+        return self.lconv
+
+    @apihook("__initialize_lconv_for_unsigned_char", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __initialize_lconv_for_unsigned_char(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        int __initialize_lconv_for_unsigned_char();
+        """
+        return 0
+
+    @apihook("__uninitialize_lconv_for_unsigned_char", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __uninitialize_lconv_for_unsigned_char(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        int __uninitialize_lconv_for_unsigned_char();
+        """
+        return 0
+
+    @apihook("__lconv_init", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def __lconv_init(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int __lconv_init();
+        """
+        return 0
+
+    @apihook("_lock_locales", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _lock_locales(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _lock_locales();
+        """
+        return
+
+    @apihook("_unlock_locales", argc=0, conv=e_arch.CALL_CONV_CDECL)
+    def _unlock_locales(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _unlock_locales();
+        """
+        return
+
+    @apihook("setlocale", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def setlocale(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char *setlocale(
+            int category,
+            const char *locale
+        );
+
+        The emulated CRT stays in the C locale, so every call returns "C".
+        """
+        category, locale = argv
+        if locale:
+            ctx.args[1].display = decode_ansi(self.read_cstr(locale))
+        if not self.locale_name:
+            self.locale_name = self.mem_alloc(2, tag="api.msvcrt.setlocale")
+            self.mem_write(self.locale_name, b"C\x00")
+        return self.locale_name
+
+    def get_c_locale(self) -> int:
+        """
+        Return the _locale_t of the C locale, in the UCRT layout.
+
+        The locale data has the _pctype table, an MB_CUR_MAX of 1 and code page 0, which
+        the inline functions of the CRT headers read. Its other fields and the multibyte
+        data are zero.
+        """
+        if not self.c_locale:
+            locale = self.mem_alloc(C_LOCALE_SIZE, tag="api.msvcrt._create_locale")
+            locinfo = locale + C_LOCALE_LOCINFO
+            self.write_ptr(locale, locinfo)
+            self.write_ptr(locale + self.get_ptr_size(), locale + C_LOCALE_MBCINFO)
+            self.write_ptr(locinfo, self.get_pctype_table())
+            self.write_dword(locinfo + self.get_ptr_size(), 1)
+            self.c_locale = locale
+        return self.c_locale
+
+    @apihook("_create_locale", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _create_locale(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _locale_t _create_locale(
+            int category,
+            const char *locale
+        );
+
+        The emulated CRT stays in the C locale, so every call returns the same C locale.
+        """
+        category, locale = argv
+        if locale:
+            ctx.args[1].display = decode_ansi(self.read_cstr(locale))
+        return self.get_c_locale()
+
+    @apihook("_wcreate_locale", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _wcreate_locale(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _locale_t _wcreate_locale(
+            int category,
+            const wchar_t *locale
+        );
+
+        The emulated CRT stays in the C locale, so every call returns the same C locale.
+        """
+        category, locale = argv
+        if locale:
+            ctx.args[1].display = self.read_wide_string(locale)
+        return self.get_c_locale()
+
+    @apihook("_free_locale", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _free_locale(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _free_locale(
+            _locale_t locale
+        );
+
+        The C locale of _create_locale is not freed, because later calls return it again.
+        """
+        return
+
     @apihook("fopen", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def fopen(self, emu, argv, ctx: api.ApiContext = None):
+    def fopen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         FILE *fopen(
             const char *filename,
             const char *mode
-            );
+        );
         """
         filename, mode = argv
 
@@ -2104,28 +7182,18 @@ class Msvcrt(api.ApiHandler):
         path = self.read_string(filename)
         mode_str = self.read_string(mode)
 
-        argv[0] = path
-        argv[1] = mode_str
+        ctx.args[0].display = path
+        ctx.args[1].display = mode_str
 
-        create = any(flag in mode_str for flag in ("w", "a", "+"))
-        truncate = "w" in mode_str and "a" not in mode_str
-
-        hfile = self.file_open(path, create=create, truncate=truncate)
-        if hfile is None:
-            return 0
-
-        stream = self.mem_alloc(self.get_ptr_size(), tag="api.msvcrt.fopen")
-        self.mem_write(stream, int(hfile).to_bytes(self.get_ptr_size(), "little"))
-        self.file_streams[stream] = hfile
-        return stream
+        return self.open_stream(path, mode_str, "api.msvcrt.fopen")
 
     @apihook("_wfopen", argc=2, conv=e_arch.CALL_CONV_CDECL)
-    def _wfopen(self, emu, argv, ctx: api.ApiContext = None):
+    def _wfopen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         FILE *_wfopen(
             const wchar_t *filename,
             const wchar_t *mode
-            );
+        );
         """
         filename, mode = argv
 
@@ -2135,71 +7203,621 @@ class Msvcrt(api.ApiHandler):
         path = self.read_wide_string(filename)
         mode_str = self.read_wide_string(mode)
 
-        argv[0] = path
-        argv[1] = mode_str
+        ctx.args[0].display = path
+        ctx.args[1].display = mode_str
 
-        create = any(flag in mode_str for flag in ("w", "a", "+"))
-        truncate = "w" in mode_str and "a" not in mode_str
+        return self.open_stream(path, mode_str, "api.msvcrt._wfopen")
 
-        hfile = self.file_open(path, create=create, truncate=truncate)
+    def open_stream(self, path, mode_str, tag):
+        """Open a FILE stream for ``path``. Return the stream, or 0."""
+        hfile = self.open_stream_file(path, mode_str)
         if hfile is None:
             return 0
 
-        stream = self.mem_alloc(self.get_ptr_size(), tag="api.msvcrt._wfopen")
-        self.mem_write(stream, int(hfile).to_bytes(self.get_ptr_size(), "little"))
+        return self.new_stream(self.new_fd(hfile), hfile, tag)
+
+    def open_stream_args(self, filename, mode, width, ctx, first=0):
+        """Read the path and mode of an fopen-style call. Return the stream, or 0."""
+        if not filename or not mode:
+            return 0
+        path = self.read_mem_string(filename, width)
+        mode_str = self.read_mem_string(mode, width)
+        ctx.args[first].display = path
+        ctx.args[first + 1].display = mode_str
+        return self.open_stream(path, mode_str, "api.msvcrt.fopen")
+
+    @apihook("_fsopen", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _fsopen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *_fsopen(
+            const char *filename,
+            const char *mode,
+            int shflag
+        );
+        """
+        filename, mode, shflag = argv
+        return self.open_stream_args(filename, mode, 1, ctx)
+
+    @apihook("_wfsopen", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _wfsopen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *_wfsopen(
+            const wchar_t *filename,
+            const wchar_t *mode,
+            int shflag
+        );
+        """
+        filename, mode, shflag = argv
+        return self.open_stream_args(filename, mode, 2, ctx)
+
+    def open_stream_s(self, argv, width, ctx):
+        pFile, filename, mode = argv
+        if not pFile:
+            return EINVAL
+        if not filename or not mode:
+            self.mem_write(pFile, b"\x00" * self.get_ptr_size())
+            return EINVAL
+        stream = self.open_stream_args(filename, mode, width, ctx, first=1)
+        self.write_ptr(pFile, stream)
+        return 0 if stream else ENOENT
+
+    @apihook("fopen_s", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def fopen_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t fopen_s(
+            FILE **pFile,
+            const char *filename,
+            const char *mode
+        );
+        """
+        return self.open_stream_s(argv, 1, ctx)
+
+    @apihook("_wfopen_s", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _wfopen_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _wfopen_s(
+            FILE **pFile,
+            const wchar_t *filename,
+            const wchar_t *mode
+        );
+        """
+        return self.open_stream_s(argv, 2, ctx)
+
+    def open_stream_file(self, path, mode_str):
+        """
+        Open ``path`` as the C runtime does for ``mode_str``: "w" creates or
+        truncates, "a" keeps the content and writes at the end, and "r" opens
+        only a file that exists. Return the file handle, or None.
+        """
+        if "w" in mode_str:
+            return self.file_open(path, create=True, truncate=True)
+        if "a" in mode_str and not self.does_file_exist(path):
+            hfile = self.file_open(path, create=True)
+        else:
+            hfile = self.file_open(path)
+        if hfile is not None and "a" in mode_str:
+            self.file_get(hfile).append = True
+        return hfile
+
+    def reopen_stream(self, path, mode, stream, ctx):
+        """
+        Point ``stream`` at the file ``path`` and return ``stream``, or 0 when
+        the file cannot be opened. The console devices keep the stream as it is.
+        """
+        path = self.read_string(path) if path else ""
+        mode_str = self.read_string(mode)
+        ctx.args["filename"].display = path
+        ctx.args["mode"].display = mode_str
+        if not path or path.upper() in ("CONOUT$", "CONIN$"):
+            return stream
+
+        fd = self.get_stream_fd(stream)
+        hfile = self.open_stream_file(path, mode_str)
+        if hfile is None:
+            self.file_streams.pop(stream, None)
+            if fd is not None:
+                self.fds.pop(fd, None)
+            return 0
         self.file_streams[stream] = hfile
+        if fd is not None:
+            self.fds[fd] = hfile
         return stream
 
+    @apihook("freopen", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def freopen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FILE *freopen(
+            const char *path,
+            const char *mode,
+            FILE *stream
+        );
+        """
+        path, mode, stream = argv
+        if not mode or not stream:
+            return 0
+        return self.reopen_stream(path, mode, stream, ctx)
+
+    @apihook("freopen_s", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def freopen_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t freopen_s(
+            FILE **stream,
+            const char *fileName,
+            const char *mode,
+            FILE *oldStream
+        );
+        """
+        stream, fileName, mode, oldStream = argv
+        if not stream or not mode or not oldStream:
+            return EINVAL
+        new = self.reopen_stream(fileName, mode, oldStream, ctx)
+        self.write_ptr(stream, new)
+        return 0 if new else ENOENT
+
     @apihook("fclose", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def fclose(self, emu, argv, ctx: api.ApiContext = None):
+    def fclose(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int fclose(
             FILE *stream
-            );
+        );
         """
         (stream,) = argv
 
         if not stream:
             return -1
 
+        fd = self.get_stream_fd(stream)
+        if fd is not None:
+            self.fds.pop(fd, None)
         self.file_streams.pop(stream, None)
-        self.mem_free(stream)
+        if stream in self.crt_streams:
+            self.crt_streams.discard(stream)
+            self.mem_free(stream)
+        return 0
+
+    def set_errno(self, value):
+        self.write_dword(self._errno(self.emu, []), value)
+
+    def stat_file(self, argv, ctx, wide, size64, time64):
+        """
+        Fill a struct _stat* for an emulated file.
+        """
+        path_ptr, buf = argv
+        path = self.read_wide_string(path_ptr) if wide else self.read_string(path_ptr)
+        ctx.args[0].display = path
+
+        size = self.emu.get_file_manager().get_file_size(path)
+        if size is None:
+            self.set_errno(ENOENT)
+            return -1
+        self.mem_write(buf, render_stat(size, size64, time64))
+        return 0
+
+    def stat_fd(self, argv, size64, time64):
+        """Fill a struct _stat* for a descriptor, as stat_file does for a path."""
+        fd, buf = argv
+        fobj = self.get_fd_file(fd)
+        if fobj is None and fd not in (self.stdin, self.stdout, self.stderr):
+            self.set_errno(EBADF)
+            return -1
+        self.mem_write(buf, render_stat(fobj.get_size() if fobj else 0, size64, time64))
+        return 0
+
+    @apihook("_fstat", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _fstat(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _fstat(
+            int fd,
+            struct _stat *buffer
+        );
+        """
+        return self.stat_fd(argv, False, self.get_ptr_size() == 8)
+
+    @apihook("_fstati64", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _fstati64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _fstati64(
+            int fd,
+            struct _stati64 *buffer
+        );
+        """
+        return self.stat_fd(argv, True, self.get_ptr_size() == 8)
+
+    @apihook("_fstat64", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _fstat64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _fstat64(
+            int fd,
+            struct _stat64 *buffer
+        );
+        """
+        return self.stat_fd(argv, True, True)
+
+    def write_next_find_entry(self, search, fileinfo):
+        try:
+            name, is_dir = next(search)
+        except StopIteration:
+            return False
+        self.mem_write(fileinfo, render_finddata(name, is_dir, self.get_ptr_size() == 8))
+        return True
+
+    @apihook("_findfirst", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _findfirst(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        intptr_t _findfirst(
+            const char *filespec,
+            struct _finddata_t *fileinfo
+        );
+        """
+        filespec, fileinfo = argv
+        if not filespec or not fileinfo:
+            self.set_errno(EINVAL)
+            return -1
+        spec = self.read_string(filespec)
+        ctx.args[0].display = spec
+        search = emu.get_file_manager().find_matching_entries(spec)
+        if not self.write_next_find_entry(search, fileinfo):
+            self.set_errno(ENOENT)
+            return -1
+        hnd = emu.handle_allocator.allocate_handle()
+        self.find_searches[hnd] = search
+        return hnd
+
+    @apihook("_findnext", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _findnext(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _findnext(
+            intptr_t handle,
+            struct _finddata_t *fileinfo
+        );
+        """
+        handle, fileinfo = argv
+        search = self.find_searches.get(handle)
+        if search is None or not fileinfo:
+            self.set_errno(EINVAL)
+            return -1
+        if not self.write_next_find_entry(search, fileinfo):
+            self.set_errno(ENOENT)
+            return -1
+        return 0
+
+    @apihook("_findclose", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _findclose(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _findclose(
+            intptr_t handle
+        );
+        """
+        if self.find_searches.pop(argv[0], None) is None:
+            self.set_errno(ENOENT)
+            return -1
+        return 0
+
+    @apihook("_stat", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _stat(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _stat(
+            const char *path,
+            struct _stat *buffer
+        );
+        """
+        return self.stat_file(argv, ctx, False, False, self.get_ptr_size() == 8)
+
+    @apihook("_stati64", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _stati64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _stati64(
+            const char *path,
+            struct _stati64 *buffer
+        );
+        """
+        return self.stat_file(argv, ctx, False, True, self.get_ptr_size() == 8)
+
+    @apihook("_stat64", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _stat64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _stat64(
+            const char *path,
+            struct __stat64 *buffer
+        );
+        """
+        return self.stat_file(argv, ctx, False, True, True)
+
+    @apihook("_wstat", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _wstat(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _wstat(
+            const wchar_t *path,
+            struct _stat *buffer
+        );
+        """
+        return self.stat_file(argv, ctx, True, False, self.get_ptr_size() == 8)
+
+    @apihook("_wstati64", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _wstati64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _wstati64(
+            const wchar_t *path,
+            struct _stati64 *buffer
+        );
+        """
+        return self.stat_file(argv, ctx, True, True, self.get_ptr_size() == 8)
+
+    @apihook("_wstat64", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _wstat64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _wstat64(
+            const wchar_t *path,
+            struct __stat64 *buffer
+        );
+        """
+        return self.stat_file(argv, ctx, True, True, True)
+
+    @apihook("_access", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _access(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _access(
+            const char *path,
+            int mode
+        );
+        """
+        return self.access_path(argv, 1, ctx)
+
+    @apihook("_waccess", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def _waccess(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _waccess(
+            const wchar_t *path,
+            int mode
+        );
+        """
+        return self.access_path(argv, 2, ctx)
+
+    def access_path(self, argv, width, ctx):
+        """
+        Return 0 when the file or directory exists, else -1 with errno set. The mode is 0
+        (existence), 2 (write), 4 (read) or 6 (read and write).
+        """
+        path_ptr, mode = argv
+        if not path_ptr or mode & 0xFFFFFFFF & ~6:
+            self.set_errno(EINVAL)
+            return -1
+        path = self.read_mem_string(path_ptr, width)
+        ctx.args[0].display = path
+        if not self.emu.get_file_manager().is_directory(path) and not self.does_file_exist(path):
+            self.set_errno(ENOENT)
+            return -1
+        return 0
+
+    def delete_file(self, emu, argv, ctx, wide):
+        (path_ptr,) = argv
+        if not path_ptr:
+            self.set_errno(EINVAL)
+            return -1
+        path = self.read_wide_string(path_ptr) if wide else self.read_string(path_ptr)
+        ctx.args[0].display = path
+
+        if not emu.does_file_exist(path):
+            self.set_errno(ENOENT)
+            return -1
+        emu.file_delete(path)
+        return 0
+
+    def change_directory(self, argv, ctx, wide, remove):
+        (path_ptr,) = argv
+        if not path_ptr:
+            self.set_errno(EINVAL)
+            return -1
+        path = self.read_wide_string(path_ptr) if wide else self.read_string(path_ptr)
+        ctx.args[0].display = path
+        fm = self.emu.get_file_manager()
+        if remove:
+            fm.remove_directory(path)
+        else:
+            fm.create_directory(path)
+        return 0
+
+    @apihook("_mkdir", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _mkdir(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _mkdir(
+            const char *dirname
+        );
+        """
+        return self.change_directory(argv, ctx, False, remove=False)
+
+    @apihook("_wmkdir", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _wmkdir(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _wmkdir(
+            const wchar_t *dirname
+        );
+        """
+        return self.change_directory(argv, ctx, True, remove=False)
+
+    @apihook("_rmdir", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _rmdir(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _rmdir(
+            const char *dirname
+        );
+        """
+        return self.change_directory(argv, ctx, False, remove=True)
+
+    @apihook("_wrmdir", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _wrmdir(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _wrmdir(
+            const wchar_t *dirname
+        );
+        """
+        return self.change_directory(argv, ctx, True, remove=True)
+
+    @apihook("rename", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def rename(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int rename(
+            const char *oldname,
+            const char *newname
+        );
+        """
+        oldname, newname = argv
+        if not oldname or not newname:
+            self.set_errno(EINVAL)
+            return -1
+        old, new = self.read_string(oldname), self.read_string(newname)
+        ctx.args[0].display = old
+        ctx.args[1].display = new
+        if emu.get_file_manager().move_file(old, new) is None:
+            self.set_errno(ENOENT)
+            return -1
+        return 0
+
+    @apihook("_unlink", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _unlink(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _unlink(
+            const char *filename
+        );
+        """
+        return self.delete_file(emu, argv, ctx, False)
+
+    @apihook("_wunlink", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _wunlink(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _wunlink(
+            const wchar_t *filename
+        );
+        """
+        return self.delete_file(emu, argv, ctx, True)
+
+    @apihook("remove", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def remove(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int remove(
+            const char *path
+        );
+        """
+        return self.delete_file(emu, argv, ctx, False)
+
+    @apihook("_wremove", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def _wremove(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _wremove(
+            const wchar_t *path
+        );
+        """
+        return self.delete_file(emu, argv, ctx, True)
+
+    @apihook("fflush", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def fflush(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int fflush(
+            FILE *stream
+        );
+        """
         return 0
 
     @apihook("fseek", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def fseek(self, emu, argv, ctx: api.ApiContext = None):
+    def fseek(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int fseek(
             FILE *stream,
             long offset,
             int origin
-            );
+        );
         """
         stream, offset, origin = argv
-        hfile = self.file_streams.get(stream)
-        argv[0] = hfile or 0
-        argv[1] = offset
-        argv[2] = origin
-        if hfile is None:
-            return -1
+        ctx.args[0].display = hex(self.file_streams.get(stream) or 0)
+        offset &= 0xFFFFFFFF
+        offset -= (offset & 0x80000000) << 1
+        return self.seek_stream(stream, offset, origin)
 
-        fobj = self.file_get(hfile)
+    @apihook("_fseeki64", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def _fseeki64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int _fseeki64(
+            FILE *stream,
+            __int64 offset,
+            int origin
+        );
+
+        The offset takes two stack slots on x86 and one register on x64.
+        """
+        if self.get_ptr_size() == 4:
+            stream, lo, hi, origin = argv
+            offset = (hi << 32) | lo
+        else:
+            stream, offset, origin = argv[:3]
+        ctx.args[0].display = hex(self.file_streams.get(stream) or 0)
+        offset &= 0xFFFFFFFFFFFFFFFF
+        offset -= (offset & (1 << 63)) << 1
+        return self.seek_stream(stream, offset, origin)
+
+    def seek_stream(self, stream, offset, origin):
+        """Move the file pointer of a stream from fopen. Return 0, or -1 on failure."""
+        fobj = self.get_stream_file(stream)
         if not fobj:
             return -1
-
-        fobj.seek(offset, origin)
+        if origin == io.SEEK_SET:
+            pos = offset
+        elif origin == io.SEEK_CUR:
+            pos = (fobj.tell() or 0) + offset
+        elif origin == io.SEEK_END:
+            pos = fobj.get_size() + offset
+        else:
+            return -1
+        if pos < 0:
+            return -1
+        fobj.seek(pos, io.SEEK_SET)
         return 0
 
+    def get_stream_file(self, stream):
+        """Return the file object of a stream from fopen, or None."""
+        hfile = self.file_streams.get(stream)
+        return self.file_get(hfile) if hfile is not None else None
+
+    @apihook("fgetpos", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def fgetpos(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int fgetpos(
+            FILE *stream,
+            fpos_t *pos
+        );
+        """
+        stream, pos = argv
+        fobj = self.get_stream_file(stream)
+        if not fobj or not pos:
+            self.set_errno(EINVAL)
+            return -1
+        self.write_qword(pos, fobj.tell() or 0)
+        return 0
+
+    @apihook("fsetpos", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def fsetpos(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int fsetpos(
+            FILE *stream,
+            const fpos_t *pos
+        );
+        """
+        stream, pos = argv
+        if not pos:
+            self.set_errno(EINVAL)
+            return -1
+        offset = int.from_bytes(self.mem_read(pos, 8), "little", signed=True)
+        return self.seek_stream(stream, offset, io.SEEK_SET)
+
     @apihook("ftell", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def ftell(self, emu, argv, ctx: api.ApiContext = None):
+    def ftell(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         long ftell(
             FILE *stream
-            );
+        );
         """
         (stream,) = argv
         hfile = self.file_streams.get(stream)
-        argv[0] = hfile or 0
+        ctx.args[0].display = hex(hfile or 0)
         if hfile is None:
             return -1
 
@@ -2213,20 +7831,20 @@ class Msvcrt(api.ApiHandler):
         return pos
 
     @apihook("fread", argc=4, conv=e_arch.CALL_CONV_CDECL)
-    def fread(self, emu, argv, ctx: api.ApiContext = None):
+    def fread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         size_t fread(
-            void *ptr,
+            void *buffer,
             size_t size,
             size_t count,
             FILE *stream
-            );
+        );
         """
-        ptr, size, count, stream = argv
+        buffer, size, count, stream = argv
         hfile = self.file_streams.get(stream)
-        argv[3] = hfile or 0
+        ctx.args[3].display = hex(hfile or 0)
 
-        if not ptr or size == 0 or count == 0 or hfile is None:
+        if not buffer or size == 0 or count == 0 or hfile is None:
             return 0
 
         fobj = self.file_get(hfile)
@@ -2234,56 +7852,415 @@ class Msvcrt(api.ApiHandler):
             return 0
 
         total = size * count
-        data = fobj.get_data(size=total)
+        data = self.emu.get_file_manager().read_file(fobj, total, buffer=buffer)
         if not data:
             return 0
 
-        self.mem_write(ptr, data)
+        self.mem_write(buffer, data)
         return len(data) // size
 
-    @apihook("fputc", argc=2)
-    def fputc(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("fgets", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def fgets(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char *fgets(
+            char *str,
+            int numChars,
+            FILE *stream
+        );
+
+        A stream that is not from fopen, such as stdin, is at end of file.
+        """
+        str, numChars, stream = argv
+        numChars &= 0xFFFFFFFF
+        hfile = self.file_streams.get(stream)
+        fobj = self.file_get(hfile) if hfile is not None else None
+        if not str or not 1 < numChars < 0x80000000 or not fobj:
+            return 0
+
+        pos = fobj.tell()
+        data = fobj.get_data(size=numChars - 1)
+        if not data:
+            return 0
+
+        newline = data.find(b"\n")
+        if newline != -1:
+            data = data[: newline + 1]
+        fobj.seek(pos + len(data), io.SEEK_SET)
+        self.mem_write(str, data + b"\x00")
+        ctx.args[0].display = decode_ansi(data)
+        return str
+
+    @apihook("fgetc", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def fgetc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int fgetc(
+            FILE *stream
+        );
+
+        A stream that is not from fopen, such as stdin, is at end of file.
+        """
+        (stream,) = argv
+        hfile = self.file_streams.get(stream)
+        fobj = self.file_get(hfile) if hfile is not None else None
+        data = fobj.get_data(size=1) if fobj else b""
+        return data[0] if data else -1
+
+    @apihook("getc", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def getc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int getc(
+            FILE *stream
+        );
+        """
+        return self.fgetc(emu, argv, ctx)
+
+    @apihook("ungetc", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def ungetc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int ungetc(
+            int c,
+            FILE *stream
+        );
+
+        Only the character that was read last can go back, because the stream
+        has no pushback buffer.
+        """
+        c, stream = argv
+        c &= 0xFFFFFFFF
+        fobj = self.get_stream_file(stream)
+        if c == 0xFFFFFFFF or not fobj:
+            return -1
+        pos = fobj.tell() or 0
+        if not pos:
+            return -1
+        fobj.seek(pos - 1, io.SEEK_SET)
+        if fobj.get_data(size=1) != bytes([c & 0xFF]):
+            return -1
+        fobj.seek(pos - 1, io.SEEK_SET)
+        return c & 0xFF
+
+    @apihook("fwrite", argc=4, conv=e_arch.CALL_CONV_CDECL)
+    def fwrite(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        size_t fwrite(
+            const void *buffer,
+            size_t size,
+            size_t count,
+            FILE *stream
+        );
+        """
+        buffer, size, count, stream = argv
+        if not buffer or size == 0 or count == 0:
+            return 0
+
+        data = self.mem_read(buffer, size * count)
+        hfile = self.write_stream(stream, data, buffer)
+        if hfile is None:
+            ctx.args[0].display = decode_ansi(data)
+            return count
+
+        ctx.args[0].display = f"{hex(buffer)} ({data.hex()[:0x20]})"
+        ctx.args[3].display = hex(hfile)
+        return count
+
+    def write_stream(self, stream, data, buffer=0):
+        """
+        Append ``data`` to the file that ``stream`` writes to.
+        Return the file handle, or None when the stream has no file.
+        """
+        hfile = self.file_streams.get(stream)
+        fobj = self.file_get(hfile) if hfile is not None else None
+        if hfile is None or not fobj:
+            return None
+        self.emu.get_file_manager().write_file(fobj, data, buffer=buffer, at_end=True)
+        return hfile
+
+    @apihook("fputc", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def fputc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int fputc(
             int c,
             FILE *stream
         );
         """
-        c, _ = argv
+        c, stream = argv
+        c &= 0xFF
+        ctx.args[0].display = chr(c) if c < 0x80 else f"\\x{c:02x}"
+        self.write_stream(stream, bytes([c]))
         return c
 
-    @apihook("signal", argc=2)
-    def signal(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("fputs", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def fputs(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void __cdecl *signal(
-            int sig,
-            int (*func)(int, int)
+        int fputs(
+            const char *str,
+            FILE *stream
         );
         """
-        sig, handler = argv
-        valid_signals = {
-            SIGINT,
-            SIGILL,
-            SIGFPE,
-            SIGSEGV,
-            SIGTERM,
-            SIGBREAK,
-            SIGABRT,
-        }
-        if sig not in valid_signals:
-            return SIG_ERR
-        if handler == SIG_ERR:
-            return SIG_ERR
+        str, stream = argv
+        data = self.read_cstr(str)
+        ctx.args[0].display = decode_ansi(data)
+        self.write_stream(stream, data, str)
+        return 0
 
+    @apihook("fputwc", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def fputwc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        wint_t fputwc(
+            wchar_t c,
+            FILE *stream
+        );
+        """
+        c, stream = argv
+        c &= 0xFFFF
+        ctx.args[0].display = chr(c)
+        self.write_stream(stream, encode_ansi(chr(c)))
+        return c
+
+    @apihook("fputws", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def fputws(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int fputws(
+            const wchar_t *str,
+            FILE *stream
+        );
+        """
+        str, stream = argv
+        text = self.read_wide_string(str)
+        ctx.args[0].display = text
+        self.write_stream(stream, encode_ansi(text), str)
+        return 0
+
+    @apihook("_fullpath", argc=3, conv=e_arch.CALL_CONV_CDECL)
+    def _fullpath(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        char *_fullpath(
+            char *absPath,
+            const char *relPath,
+            size_t maxLength
+        );
+        """
+        absPath, relPath, maxLength = argv
+        rel = decode_ansi(self.read_cstr(relPath)) if relPath else ""
+        ctx.args[1].display = rel
+        full = encode_ansi(get_full_path(emu.get_cd(), rel or ".") + "\x00")
+        if not absPath:
+            absPath = self.heap_alloc(len(full), heap="HeapAlloc")
+        elif len(full) > maxLength:
+            return 0
+        self.mem_write(absPath, full)
+        return absPath
+
+    def read_path_part(self, addr, width):
+        if not addr:
+            return None
+        data = self.read_cstr(addr, width=width)
+        return decode_ansi(data) if width == 1 else data.decode("utf-16le", "surrogatepass")
+
+    def write_path_part(self, addr, text, width):
+        text += "\x00"
+        self.mem_write(addr, encode_ansi(text) if width == 1 else text.encode("utf-16le", "surrogatepass"))
+
+    def make_path(self, ctx, path, size, parts, width):
+        """
+        Join the parts as _makepath_s does. ``size`` is None for _makepath,
+        which does not check the buffer.
+        """
+        if not path or size == 0:
+            return EINVAL
+        made = get_made_path(*(self.read_path_part(addr, width) for addr in parts))
+        ctx.args[0].display = made
+        if size is not None and len(made) >= size:
+            self.write_path_part(path, "", width)
+            return ERANGE
+        self.write_path_part(path, made, width)
+        return 0
+
+    def split_path(self, ctx, path, outputs, width):
+        text = self.read_path_part(path, width) or ""
+        ctx.args[0].display = text
+        for addr, part in zip(outputs, get_split_path(text)):
+            if addr:
+                self.write_path_part(addr, part, width)
+
+    def split_path_s(self, ctx, path, outputs, width):
+        """
+        Split as _splitpath_s and _wsplitpath_s do. ``outputs`` holds a
+        buffer and its size in characters for each part. Clear all the
+        buffers on error.
+        """
+        buffers = list(zip(outputs[::2], outputs[1::2]))
+        text = self.read_path_part(path, width)
+        if text is None or any(bool(addr) != bool(size) for addr, size in buffers):
+            rv = EINVAL
+        else:
+            ctx.args[0].display = text
+            parts = get_split_path(text)
+            if not any(addr and len(part) >= size for (addr, size), part in zip(buffers, parts)):
+                for (addr, _), part in zip(buffers, parts):
+                    if addr:
+                        self.write_path_part(addr, part, width)
+                return 0
+            rv = ERANGE
+        for addr, size in buffers:
+            if addr and size:
+                self.write_path_part(addr, "", width)
+        return rv
+
+    @apihook("_makepath", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def _makepath(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _makepath(
+            char *path,
+            const char *drive,
+            const char *dir,
+            const char *fname,
+            const char *ext
+        );
+        """
+        self.make_path(ctx, argv[0], None, argv[1:], 1)
+
+    @apihook("_wmakepath", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def _wmakepath(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _wmakepath(
+            wchar_t *path,
+            const wchar_t *drive,
+            const wchar_t *dir,
+            const wchar_t *fname,
+            const wchar_t *ext
+        );
+        """
+        self.make_path(ctx, argv[0], None, argv[1:], 2)
+
+    @apihook("_makepath_s", argc=6, conv=e_arch.CALL_CONV_CDECL)
+    def _makepath_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _makepath_s(
+            char *path,
+            size_t sizeInBytes,
+            const char *drive,
+            const char *dir,
+            const char *fname,
+            const char *ext
+        );
+        """
+        return self.make_path(ctx, argv[0], argv[1], argv[2:], 1)
+
+    @apihook("_wmakepath_s", argc=6, conv=e_arch.CALL_CONV_CDECL)
+    def _wmakepath_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _wmakepath_s(
+            wchar_t *path,
+            size_t sizeInWords,
+            const wchar_t *drive,
+            const wchar_t *dir,
+            const wchar_t *fname,
+            const wchar_t *ext
+        );
+        """
+        return self.make_path(ctx, argv[0], argv[1], argv[2:], 2)
+
+    @apihook("_splitpath", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def _splitpath(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _splitpath(
+            const char *path,
+            char *drive,
+            char *dir,
+            char *fname,
+            char *ext
+        );
+        """
+        self.split_path(ctx, argv[0], argv[1:], 1)
+
+    @apihook("_wsplitpath", argc=5, conv=e_arch.CALL_CONV_CDECL)
+    def _wsplitpath(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void _wsplitpath(
+            const wchar_t *path,
+            wchar_t *drive,
+            wchar_t *dir,
+            wchar_t *fname,
+            wchar_t *ext
+        );
+        """
+        self.split_path(ctx, argv[0], argv[1:], 2)
+
+    @apihook("_splitpath_s", argc=9, conv=e_arch.CALL_CONV_CDECL)
+    def _splitpath_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _splitpath_s(
+            const char *path,
+            char *drive,
+            size_t driveNumberOfElements,
+            char *dir,
+            size_t dirNumberOfElements,
+            char *fname,
+            size_t nameNumberOfElements,
+            char *ext,
+            size_t extNumberOfElements
+        );
+        """
+        return self.split_path_s(ctx, argv[0], argv[1:], 1)
+
+    @apihook("_wsplitpath_s", argc=9, conv=e_arch.CALL_CONV_CDECL)
+    def _wsplitpath_s(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        errno_t _wsplitpath_s(
+            const wchar_t *path,
+            wchar_t *drive,
+            size_t driveNumberOfElements,
+            wchar_t *dir,
+            size_t dirNumberOfElements,
+            wchar_t *fname,
+            size_t nameNumberOfElements,
+            wchar_t *ext,
+            size_t extNumberOfElements
+        );
+        """
+        return self.split_path_s(ctx, argv[0], argv[1:], 2)
+
+    @apihook("signal", argc=2, conv=e_arch.CALL_CONV_CDECL)
+    def signal(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        _crt_signal_t signal(
+            int sig,
+            _crt_signal_t func
+        );
+
+        Return the previous handler. ``SIG_GET`` returns the current handler
+        without changing it, and ``SIG_ERR`` is rejected.
+        """
+        sig, func = argv
+
+        if sig not in SIGNALS:
+            return SIG_ERR
+        if func == SIG_ERR:
+            return SIG_ERR
         previous = self.signal_handlers.get(sig, SIG_DFL)
-        if handler != SIG_GET:
-            self.signal_handlers[sig] = handler
+        if func != SIG_GET:
+            self.signal_handlers[sig] = func
         return previous
 
-    @apihook("atexit", argc=1, conv=e_arch.CALL_CONV_CDECL)
-    def atexit(self, emu, argv, ctx: api.ApiContext = None):
-        """Register a process-exit callback without executing it early."""
-        callback = int(argv[0])
-        if not callback:
-            return 1
-        return 0
+    @apihook("raise", argc=1, conv=e_arch.CALL_CONV_CDECL)
+    def raise_(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int raise(
+            int sig
+        );
+
+        A signal without a handler ends the process, as the default action does.
+        """
+        (sig,) = argv
+        if sig not in SIGNALS:
+            self.set_errno(EINVAL)
+            return -1
+        action = self.signal_handlers.get(sig, SIG_DFL)
+        if action == SIG_IGN:
+            return 0
+        if action == SIG_DFL:
+            self.exit_process()
+            return 0
+        self.signal_handlers[sig] = SIG_DFL
+        return self.call_signal_handler(action, (sig, FPE_EXPLICITGEN) if sig == SIGFPE else (sig,), 0)

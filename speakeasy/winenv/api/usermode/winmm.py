@@ -1,6 +1,16 @@
-import time
+from typing import TYPE_CHECKING
 
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
+
+DRV_LOAD = 0x0001
+DRV_ENABLE = 0x0002
+DRV_DISABLE = 0x0005
+DRV_FREE = 0x0006
+DRV_INSTALL = 0x0009
+DRV_REMOVE = 0x000A
 
 
 class Winmm(api.ApiHandler):
@@ -16,23 +26,45 @@ class Winmm(api.ApiHandler):
         super().__init__(emu)
         super().__get_hook_attrs__(self)
 
-    @apihook("timeBeginPeriod", argc=1)
-    def timeBeginPeriod(self, emu, argv, ctx={}):
+    @apihook("DefDriverProc", argc=5)
+    def DefDriverProc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        MMRESULT timeBeginPeriod(UINT uPeriod);
+        LRESULT DefDriverProc(
+            DWORD_PTR dwDriverIdentifier,
+            HDRVR hdrvr,
+            UINT uMsg,
+            LPARAM lParam1,
+            LPARAM lParam2
+        );
+        """
+        dwDriverIdentifier, hdrvr, uMsg, lParam1, lParam2 = argv
+        if uMsg in (DRV_LOAD, DRV_ENABLE, DRV_DISABLE, DRV_FREE, DRV_INSTALL, DRV_REMOVE):
+            return 1
+        return 0
+
+    @apihook("timeBeginPeriod", argc=1)
+    def timeBeginPeriod(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        MMRESULT timeBeginPeriod(
+            UINT uPeriod
+        );
         """
         return 0  # TIMERR_NOERROR
 
     @apihook("timeEndPeriod", argc=1)
-    def timeEndPeriod(self, emu, argv, ctx={}):
+    def timeEndPeriod(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        MMRESULT timeEndPeriod(UINT uPeriod);
+        MMRESULT timeEndPeriod(
+            UINT uPeriod
+        );
         """
         return 0  # TIMERR_NOERROR
 
     @apihook("timeGetTime", argc=0)
-    def timeGetTime(self, emu, argv, ctx: api.ApiContext = None):
+    def timeGetTime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DWORD timeGetTime(); // return the system time, in milliseconds
+        DWORD timeGetTime();
+
+        Returns the system time in milliseconds.
         """
-        return int(time.monotonic() * 1000) & 0xFFFFFFFF
+        return emu.api.load_api_handler("kernel32").get_tick_count() & 0xFFFFFFFF

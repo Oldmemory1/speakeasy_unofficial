@@ -1,26 +1,60 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+import base64
 import hashlib
-from typing import Any
+import logging
+import struct
+from typing import TYPE_CHECKING
 
-from Crypto.Cipher import ARC4
-
-import speakeasy.windows.objman as objman
-import speakeasy.windows.token_groups as token_groups
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.registry.reg as regdefs
-import speakeasy.winenv.defs.windows.advapi32 as adv32
-import speakeasy.winenv.defs.windows.kernel32 as k32
+import speakeasy.winenv.defs.windows.advapi32 as adv32defs
+import speakeasy.winenv.defs.windows.kernel32 as k32defs
 import speakeasy.winenv.defs.windows.windows as windefs
-from speakeasy.profiler_events import PROC_CREATE, REG_CREATE, REG_LIST, REG_OPEN, REG_READ, REG_WRITE
+from speakeasy.errors import FileSystemEmuError
+from speakeasy.profiler_events import EventType
+from speakeasy.report import RunType
+from speakeasy.windows import objman, token_groups
 from speakeasy.windows.child_execution import ChildTargetResolver
+from speakeasy.windows.cryptman import CIPHER_MODES, CryptoApiError, CryptoApiKey
+from speakeasy.winenv.codepage import encode_ansi
+from speakeasy.winenv.defs.enums import (
+    ENUM_SERVICE_STATE,
+    ENUM_SERVICE_TYPE,
+    PROCESS_CREATION_FLAGS,
+    REG_VALUE_TYPE,
+    SERVICE_STATUS_CURRENT_STATE,
+)
+from speakeasy.winenv.defs.lookup import decode
 
 from .. import api
 
-SERVICE_STATUS_HANDLE_BASE = 0x1000
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
+
+logger = logging.getLogger(__name__)
+
+MD5_INITIAL_STATE = (0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476)
+# TOKEN_INFORMATION_CLASS values handled by GetTokenInformation.
 TOKEN_USER_INFORMATION_CLASS = 1
 TOKEN_ELEVATION_INFORMATION_CLASS = 20
 TOKEN_INTEGRITY_LEVEL_INFORMATION_CLASS = 25
+
+
+def _set_arg_display(ctx, key: int | str, value: object) -> None:
+    """Render one API argument in the report without requiring an ApiContext.
+
+    Handlers are also called directly (and with a plain dict context) from the
+    handler contract tests; a missing argument table must never change the
+    handler result.
+    """
+    args = getattr(ctx, "args", None)
+    if args is None:
+        return
+    try:
+        args[key].display = value
+    except Exception:
+        logger.debug("advapi32: argument display failed", exc_info=True)
 
 
 class AdvApi32(api.ApiHandler):
@@ -34,211 +68,164 @@ class AdvApi32(api.ApiHandler):
 
     def __init__(self, emu):
         super().__init__(emu)
-        self.funcs: dict[str, Any] = {}
-        self.data: dict[str, Any] = {}
-        self.hash_objects: dict[int, Any] = {}
-        self.key_objects: dict[int, Any] = {}
-        self.k32types = k32
-        self.win = adv32
-        self.curr_rand: int = 0
-        self.curr_handle: int = 0x2800
-        self.service_status_handle: int = SERVICE_STATUS_HANDLE_BASE
-
-        self.rc4: Any | None = None
+        self.funcs = {}
+        self.data = {}
+        self.md5_contexts: dict[int, hashlib._Hash] = {}
+        self.k32types = k32defs
+        self.win = adv32defs
 
         super().__get_hook_attrs__(self)
 
-    def get_handle(self):
-        self.curr_handle += 4
-        return self.curr_handle
-
     @apihook("RegOpenKey", argc=3, conv=_arch.CALL_CONV_STDCALL)
-    def RegOpenKey(self, emu, argv, ctx: api.ApiContext = None):
+    def RegOpenKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LSTATUS RegOpenKeyA(
-          HKEY   hKey,
-          LPCSTR lpSubKey,
-          PHKEY  phkResult
+        LSTATUS RegOpenKey(
+            HKEY hKey,
+            LPCTSTR lpSubKey,
+            PHKEY phkResult
         );
         """
-        ctx = ctx or {}
-
         hKey, lpSubKey, phkResult = argv
-        rv = windefs.ERROR_SUCCESS
-        hnd = 0
 
-        hkey_name = regdefs.get_hkey_type(hKey)
-        if hkey_name:
-            argv[0] = hkey_name
-            if not hnd and not lpSubKey:
-                hnd = hKey
-        else:
-            key_obj = emu.regman.get_key_from_handle(hKey)
-            if not key_obj:
-                return windefs.ERROR_PATH_NOT_FOUND
-            hkey_name = key_obj.path
-
-        cw = self.get_char_width(ctx)
-        if lpSubKey:
-            lpSubKey = self.read_mem_string(lpSubKey, cw)
-            argv[1] = lpSubKey
-
-            if hkey_name and lpSubKey:
-                if not lpSubKey.startswith("\\"):
-                    lpSubKey = "\\" + lpSubKey
-                lpSubKey = hkey_name + lpSubKey
-
-            hnd = self.reg_open_key(lpSubKey, create=False)
-            if not hnd:
-                rv = windefs.ERROR_PATH_NOT_FOUND
-
-            self.record_registry_access_event(lpSubKey, REG_OPEN, handle=hnd)
-
-        if phkResult and hnd:
-            self.mem_write(phkResult, hnd.to_bytes(self.get_ptr_size(), "little"))
-
-        return rv
+        return self.open_key(hKey, lpSubKey, phkResult, ctx)
 
     @apihook("RegOpenKeyEx", argc=5, conv=_arch.CALL_CONV_STDCALL)
-    def RegOpenKeyEx(self, emu, argv, ctx: api.ApiContext = None):
+    def RegOpenKeyEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LSTATUS RegOpenKeyEx(
-          HKEY   hKey,
-          LPTSTR lpSubKey,
-          DWORD  ulOptions,
-          REGSAM samDesired,
-          PHKEY  phkResult
+            HKEY hKey,
+            LPCTSTR lpSubKey,
+            DWORD ulOptions,
+            REGSAM samDesired,
+            PHKEY phkResult
         );
         """
-        ctx = ctx or {}
-
         hKey, lpSubKey, ulOptions, samDesired, phkResult = argv
-        rv = windefs.ERROR_SUCCESS
 
-        hnd = 0
+        return self.open_key(hKey, lpSubKey, phkResult, ctx, new_handle=True, access=samDesired)
+
+    def open_key(self, hKey, lpSubKey, phkResult, ctx, new_handle=False, access=None):
+        """
+        Open ``lpSubKey`` below ``hKey`` and write the new handle to
+        ``phkResult``. Without a subkey, the handle is ``hKey`` itself, or
+        a new handle to the same key when ``new_handle`` is set.
+        ``access`` is the REGSAM value of the call, for the event.
+        """
+        rv = windefs.ERROR_SUCCESS
 
         hkey_name = regdefs.get_hkey_type(hKey)
         if hkey_name:
-            argv[0] = hkey_name
-            if not hnd and not lpSubKey:
-                hnd = hKey
+            ctx.args["hKey"].display = hkey_name
+        else:
+            key_obj = self.get_reg_key(hKey)
+            if not key_obj:
+                return windefs.ERROR_INVALID_HANDLE
+            hkey_name = key_obj.get_path()
 
+        hnd = hKey
         cw = self.get_char_width(ctx)
         if lpSubKey:
             lpSubKey = self.read_mem_string(lpSubKey, cw)
-            argv[1] = lpSubKey
+            ctx.args["lpSubKey"].display = lpSubKey
 
-            if hkey_name and lpSubKey:
-                if not lpSubKey.startswith("\\"):
-                    lpSubKey = "\\" + lpSubKey
-                lpSubKey = hkey_name + lpSubKey
+        if lpSubKey:
+            if not lpSubKey.startswith("\\"):
+                lpSubKey = "\\" + lpSubKey
+            lpSubKey = hkey_name + lpSubKey
 
-            hnd = self.reg_open_key(lpSubKey, create=False)
+            hnd = self.reg_open_key(lpSubKey, create=False, access=access)
             if not hnd:
-                rv = windefs.ERROR_PATH_NOT_FOUND
+                rv = windefs.ERROR_FILE_NOT_FOUND
+        elif new_handle:
+            hnd = self.reg_open_key(hkey_name, create=False, access=access)
 
-            self.record_registry_access_event(lpSubKey, REG_OPEN, handle=hnd)
-
-        if phkResult and hnd:
-            self.mem_write(phkResult, hnd.to_bytes(self.get_ptr_size(), "little"))
+        if phkResult:
+            self.write_ptr(phkResult, hnd or 0)
 
         return rv
 
+    def write_value_type(self, val, lpType, arg):
+        code = val.get_type()
+        if not lpType or not isinstance(code, int):
+            return
+        self.write_dword(lpType, code)
+        arg.display = decode(REG_VALUE_TYPE, code)
+
     @apihook("RegQueryValueEx", argc=6, conv=_arch.CALL_CONV_STDCALL)
-    def RegQueryValueEx(self, emu, argv, ctx: api.ApiContext = None):
+    def RegQueryValueEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LSTATUS RegQueryValueEx(
-          HKEY    hKey,
-          LPTSTR  lpValueName,
-          LPDWORD lpReserved,
-          LPDWORD lpType,
-          LPBYTE  lpData,
-          LPDWORD lpcbData
+            HKEY hKey,
+            LPCTSTR lpValueName,
+            LPDWORD lpReserved,
+            LPDWORD lpType,
+            LPBYTE lpData,
+            LPDWORD lpcbData
         );
         """
-        ctx = ctx or {}
-
         hKey, lpValueName, lpReserved, lpType, lpData, lpcbData = argv
         rv = windefs.ERROR_SUCCESS
 
         cw = self.get_char_width(ctx)
+        value_name = ""
         if lpValueName:
-            lpValueName = self.read_mem_string(lpValueName, cw)
-            argv[1] = lpValueName
-
-        type_name = regdefs.get_value_type(lpType)
-        if type_name:
-            argv[3] = type_name
+            value_name = self.read_mem_string(lpValueName, cw)
+            ctx.args["lpValueName"].display = value_name
 
         length = 0
         if lpcbData:
             length = self.mem_read(lpcbData, 4)
             length = int.from_bytes(length, "little")
-            argv[5] = length
+            ctx.args["lpcbData"].display = hex(length)
 
-        key = self.reg_get_key(hKey)
-        if key:
-            val = key.get_value(lpValueName)
-            if val:
-                output = b""
-                typ = val.get_type()
-                data = val.get_data()
-                if typ == "REG_SZ":
-                    output = data.encode("utf-8")
-
-                if not lpData and not lpcbData:
-                    rv = windefs.ERROR_SUCCESS
+        key = self.get_reg_key(hKey)
+        if not key:
+            return windefs.ERROR_INVALID_HANDLE
+        val = emu.regman.read_value(key, value_name, cw, handle=hKey, buffer=lpData, size=length)
+        if val:
+            self.write_value_type(val, lpType, ctx.args["lpType"])
+            output = val.get_bytes(cw)
+            if lpcbData:
+                self.write_dword(lpcbData, len(output))
+            if lpData:
+                if not lpcbData:
+                    rv = windefs.ERROR_INVALID_PARAMETER
+                elif len(output) > length:
+                    rv = windefs.ERROR_MORE_DATA
                 else:
-                    if lpcbData:
-                        self.mem_write(lpcbData, len(output).to_bytes(4, "little"))
+                    self.mem_write(lpData, output)
 
-                    if len(output) > length:
-                        rv = windefs.ERROR_INSUFFICIENT_BUFFER
-                    else:
-                        if lpData:
-                            self.mem_write(lpData, output)
-
-            # For now, return an empty buffer
-            else:
-                output = b"\x00" * length
-                if lpData:
-                    try:
-                        self.mem_write(lpData, output)
-                    except Exception:
-                        return windefs.ERROR_INVALID_PARAMETER
-                if lpcbData:
-                    self.mem_write(lpcbData, len(output).to_bytes(4, "little"))
-                rv = windefs.ERROR_SUCCESS
-
-            kp = key.get_path()
-            self.record_registry_access_event(
-                kp,
-                REG_READ,
-                value_name=lpValueName,
-                data=output,
-                size=length,
-                buffer=lpData,
-            )
+        # For now, return an empty buffer
+        else:
+            output = b"\x00" * length
+            if lpData:
+                try:
+                    self.mem_write(lpData, output)
+                except Exception:
+                    return windefs.ERROR_INVALID_PARAMETER
+            if lpcbData:
+                self.write_dword(lpcbData, len(output))
+            rv = windefs.ERROR_SUCCESS
 
         return rv
 
     @apihook("RegSetValueEx", argc=6, conv=_arch.CALL_CONV_STDCALL)
-    def RegSetValueEx(self, emu, argv, ctx: api.ApiContext = None):
+    def RegSetValueEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LSTATUS RegSetValueEx(
-          HKEY       hKey,
-          LPCSTR     lpValueName,
-          DWORD      Reserved,
-          DWORD      dwType,
-          const BYTE *lpData,
-          DWORD      cbData
+            HKEY hKey,
+            LPCTSTR lpValueName,
+            DWORD Reserved,
+            DWORD dwType,
+            const BYTE *lpData,
+            DWORD cbData
         );
         """
-        ctx = ctx or {}
+        hKey, lpValueName, Reserved, dwType, lpData, cbData = argv
+        dwType &= 0xFFFFFFFF
+        cbData &= 0xFFFFFFFF
 
-        hKey, lpValueName, _reserved, dwType, lpData, cbData = argv
-
-        key = self.reg_get_key(hKey)
+        key = self.get_reg_key(hKey)
         if not key:
             return windefs.ERROR_INVALID_HANDLE
 
@@ -246,176 +233,164 @@ class AdvApi32(api.ApiHandler):
         value_name = ""
         if lpValueName:
             value_name = self.read_mem_string(lpValueName, cw)
-            argv[1] = value_name
+            ctx.args["lpValueName"].display = value_name
 
-        value_data = ""
+        value_data: str | int | bytes = ""
+        raw = b""
         if lpData and cbData:
             raw = self.mem_read(lpData, cbData)
-            if dwType in (regdefs.REG_SZ, regdefs.REG_EXPAND_SZ):
-                value_data = raw.decode("utf-16le" if cw == 2 else "utf-8", errors="ignore").rstrip("\x00")
-            elif dwType == regdefs.REG_MULTI_SZ:
-                value_data = raw.decode("utf-16le" if cw == 2 else "utf-8", errors="ignore").rstrip("\x00")
-            elif dwType == regdefs.REG_DWORD:
+            if dwType in (REG_VALUE_TYPE.REG_SZ, REG_VALUE_TYPE.REG_EXPAND_SZ, REG_VALUE_TYPE.REG_MULTI_SZ):
+                value_data = self.decode_string(raw, cw).rstrip("\x00")
+            elif dwType == REG_VALUE_TYPE.REG_DWORD:
                 value_data = int.from_bytes(raw[:4].ljust(4, b"\x00"), "little")
-            elif dwType == regdefs.REG_QWORD:
+            elif dwType == REG_VALUE_TYPE.REG_QWORD:
                 value_data = int.from_bytes(raw[:8].ljust(8, b"\x00"), "little")
             else:
                 value_data = raw
+            if isinstance(value_data, str):
+                ctx.args["lpData"].display = value_data
 
-        value = key.get_value(value_name)
-        if value:
-            value.type = dwType
-            value.data = value.normalize_value(dwType, value_data)
-        else:
-            key.create_value(value_name, dwType, value_data)
-
-        self.record_registry_access_event(
-            key.get_path(),
-            REG_WRITE,
-            value_name=value_name,
-            data=raw if lpData and cbData else b"",
-            handle=hKey,
-            size=cbData,
-            buffer=lpData,
-        )
+        emu.regman.write_value(key, value_name, dwType, value_data, raw=raw, handle=hKey, buffer=lpData)
 
         return windefs.ERROR_SUCCESS
 
     @apihook("RegCloseKey", argc=1, conv=_arch.CALL_CONV_STDCALL)
-    def RegCloseKey(self, emu, argv, ctx: api.ApiContext = None):
+    def RegCloseKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LSTATUS RegCloseKey(
-          HKEY hKey
+            HKEY hKey
         );
         """
-
         (hKey,) = argv
-        rv = windefs.ERROR_SUCCESS
 
-        key = self.reg_get_key(hKey)
-        if not key:
-            rv = windefs.ERROR_INVALID_HANDLE
+        if not emu.regman.close_key(hKey):
+            return windefs.ERROR_INVALID_HANDLE
 
-        return rv
+        return windefs.ERROR_SUCCESS
 
     @apihook("RegEnumKey", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def RegEnumKey(self, emu, argv, ctx: api.ApiContext = None):
+    def RegEnumKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LSTATUS RegEnumKey(
-          HKEY  hKey,
-          DWORD dwIndex,
-          LPTSTR lpName,
-          DWORD cchName
+            HKEY hKey,
+            DWORD dwIndex,
+            LPTSTR lpName,
+            DWORD cchName
         );
         """
-        ctx = ctx or {}
-
         hKey, dwIndex, lpName, cchName = argv
 
-        _argv = argv + [0, 0, 0, 0]
-        rv = self.RegEnumKeyEx(emu, _argv, ctx)
-        argv[:] = _argv[:4]
+        rv, _ = self.enum_key(hKey, dwIndex & 0xFFFFFFFF, lpName, cchName & 0xFFFFFFFF, ctx)
 
         return rv
 
     @apihook("RegEnumKeyEx", argc=8, conv=_arch.CALL_CONV_STDCALL)
-    def RegEnumKeyEx(self, emu, argv, ctx: api.ApiContext = None):
+    def RegEnumKeyEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LSTATUS RegEnumKeyEx(
-            HKEY      hKey,
-            DWORD     dwIndex,
-            LPSTR     lpName,
-            LPDWORD   lpcchName,
-            LPDWORD   lpReserved,
-            LPSTR     lpClass,
-            LPDWORD   lpcchClass,
+            HKEY hKey,
+            DWORD dwIndex,
+            LPTSTR lpName,
+            LPDWORD lpcchName,
+            LPDWORD lpReserved,
+            LPTSTR lpClass,
+            LPDWORD lpcchClass,
             PFILETIME lpftLastWriteTime
         );
         """
-        ctx = ctx or {}
+        hKey, dwIndex, lpName, lpcchName, lpReserved, lpClass, lpcchClass, lpftLastWriteTime = argv
 
-        hKey, dwIndex, lpName, cchName, res, pcls, cchcls, last_write = argv
-
-        cw = self.get_char_width(ctx)
-        rv = windefs.ERROR_INVALID_HANDLE
-        if hKey:
-            key = self.reg_get_key(hKey)
-            argv[0] = key.get_path()
-            if not key:
-                rv = windefs.ERROR_INVALID_HANDLE
-            else:
-                subkeys = self.reg_get_subkeys(key)
-                if (dwIndex + 1) > len(subkeys):
-                    rv = windefs.ERROR_NO_MORE_ITEMS
-                else:
-                    if lpName:
-                        sk = subkeys[dwIndex]
-                        name = sk.get_path()
-                        if cw == 2:
-                            name = name.encode("utf-16le")
-                        else:
-                            name = name.encode("utf-8")
-                        self.mem_write(lpName, name)
-                        rv = windefs.ERROR_SUCCESS
-            self.record_registry_access_event(key.get_path(), REG_LIST)
+        cch = self.read_dword(lpcchName) if lpcchName else 0
+        rv, name = self.enum_key(hKey, dwIndex & 0xFFFFFFFF, lpName, cch, ctx)
+        if rv == windefs.ERROR_SUCCESS:
+            self.write_dword(lpcchName, len(name))
         return rv
 
-    @apihook("RegCreateKey", argc=3)
-    def RegCreateKey(self, emu, argv, ctx: api.ApiContext = None):
+    def enum_key(self, hKey, dwIndex, lpName, cch, ctx):
         """
-        LSTATUS RegCreateKey(
-            HKEY    hKey,
-            LPCWSTR lpSubKey,
-            PHKEY   phkResult
-        );
+        Write the name of subkey ``dwIndex`` to ``lpName``, a buffer of
+        ``cch`` characters. Return the status and the name.
         """
-        ctx = ctx or {}
-        hkey, lpSubKey, phkResult = argv
+        cw = self.get_char_width(ctx)
         rv = windefs.ERROR_INVALID_HANDLE
-        if hkey:
-            key = self.reg_get_key(hkey)
-            argv[0] = key.get_path()
+        name = ""
+        if hKey:
+            key = self.get_reg_key(hKey)
             if not key:
                 rv = windefs.ERROR_INVALID_HANDLE
             else:
-                cw = self.get_char_width(ctx)
-                if lpSubKey:
-                    lpSubKey = self.read_mem_string(lpSubKey, cw)
-                    argv[1] = lpSubKey
-                    sub_key_path = key.get_path() + "\\" + lpSubKey
-                    self.emu.reg_create_key(sub_key_path)
-                    self.record_registry_access_event(sub_key_path, REG_CREATE)
+                ctx.args["hKey"].display = key.get_path()
+                subkeys = self.emu.regman.list_subkeys(key, handle=hKey)
+                if (dwIndex + 1) > len(subkeys):
+                    rv = windefs.ERROR_NO_MORE_ITEMS
+                elif not lpName:
+                    rv = windefs.ERROR_INVALID_PARAMETER
                 else:
-                    hkey = (hkey).to_bytes(self.get_ptr_size(), "little")
-                    self.mem_write(phkResult, hkey)
-                    rv = windefs.ERROR_SUCCESS
+                    name = subkeys[dwIndex]
+                    if cch < len(name) + 1:
+                        rv = windefs.ERROR_MORE_DATA
+                    else:
+                        self.write_mem_string(name, lpName, cw)
+                        rv = windefs.ERROR_SUCCESS
+        return rv, name
+
+    @apihook("RegCreateKey", argc=3)
+    def RegCreateKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        LSTATUS RegCreateKey(
+            HKEY hKey,
+            LPCTSTR lpSubKey,
+            PHKEY phkResult
+        );
+        """
+        hKey, lpSubKey, phkResult = argv
+        rv = windefs.ERROR_INVALID_HANDLE
+        if hKey:
+            key = self.get_reg_key(hKey)
+            if not key:
+                rv = windefs.ERROR_INVALID_HANDLE
+            else:
+                ctx.args["hKey"].display = key.get_path()
+                cw = self.get_char_width(ctx)
+                sub_key = ""
+                if lpSubKey:
+                    sub_key = self.read_mem_string(lpSubKey, cw)
+                    ctx.args["lpSubKey"].display = sub_key
+                hnd = hKey
+                if sub_key:
+                    sub_key_path = key.get_path() + "\\" + sub_key.lstrip("\\")
+                    hnd = self.reg_open_key(sub_key_path, create=True)
+                if phkResult:
+                    self.write_ptr(phkResult, hnd)
+                rv = windefs.ERROR_SUCCESS
         return rv
 
     @apihook("RegCreateKeyEx", argc=9, conv=_arch.CALL_CONV_STDCALL)
-    def RegCreateKeyEx(self, emu, argv, ctx: api.ApiContext = None):
+    def RegCreateKeyEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LSTATUS RegCreateKeyExA(
-          HKEY                  hKey,
-          LPCSTR                lpSubKey,
-          DWORD                 Reserved,
-          LPSTR                 lpClass,
-          DWORD                 dwOptions,
-          REGSAM                samDesired,
-          const LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-          PHKEY                 phkResult,
-          LPDWORD               lpdwDisposition
+        LSTATUS RegCreateKeyEx(
+            HKEY hKey,
+            LPCTSTR lpSubKey,
+            DWORD Reserved,
+            LPTSTR lpClass,
+            DWORD dwOptions,
+            REGSAM samDesired,
+            const LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+            PHKEY phkResult,
+            LPDWORD lpdwDisposition
         );
         """
-        ctx = ctx or {}
-        hKey, lpSubKey, _reserved, _lpClass, _dwOptions, _samDesired, _sa, phkResult, lpdwDisposition = argv
+        hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired, lpSecurityAttributes, phkResult, lpdwDisposition = (
+            argv
+        )
 
         key_path = ""
         hkey_name = regdefs.get_hkey_type(hKey)
         if hkey_name:
-            argv[0] = hkey_name
+            ctx.args["hKey"].display = hkey_name
             key_path = hkey_name
         else:
-            key_obj = self.reg_get_key(hKey)
+            key_obj = self.get_reg_key(hKey)
             if not key_obj:
                 return windefs.ERROR_INVALID_HANDLE
             key_path = key_obj.get_path()
@@ -423,39 +398,37 @@ class AdvApi32(api.ApiHandler):
         cw = self.get_char_width(ctx)
         if lpSubKey:
             sub_key = self.read_mem_string(lpSubKey, cw)
-            argv[1] = sub_key
+            ctx.args["lpSubKey"].display = sub_key
             if key_path and sub_key:
                 if not sub_key.startswith("\\"):
                     sub_key = "\\" + sub_key
                 key_path = key_path + sub_key
 
         existing = self.emu.reg_get_key(path=key_path)
-        hnd = self.reg_open_key(key_path, create=True)
+        disp = regdefs.REG_OPENED_EXISTING_KEY if existing else regdefs.REG_CREATED_NEW_KEY
+        hnd = self.reg_open_key(key_path, create=True, disposition=disp, access=samDesired)
         if not hnd:
             return windefs.ERROR_PATH_NOT_FOUND
 
         if phkResult:
-            self.mem_write(phkResult, hnd.to_bytes(self.get_ptr_size(), "little"))
+            self.write_ptr(phkResult, hnd)
 
         if lpdwDisposition:
-            disp = 2 if existing else 1
-            self.mem_write(lpdwDisposition, disp.to_bytes(4, "little"))
+            self.write_dword(lpdwDisposition, disp)
 
-        self.record_registry_access_event(key_path, REG_CREATE, handle=hnd)
         return windefs.ERROR_SUCCESS
 
     @apihook("RegDeleteValue", argc=2, conv=_arch.CALL_CONV_STDCALL)
-    def RegDeleteValue(self, emu, argv, ctx: api.ApiContext = None):
+    def RegDeleteValue(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LSTATUS RegDeleteValueA(
-          HKEY   hKey,
-          LPCSTR lpValueName
+        LSTATUS RegDeleteValue(
+            HKEY hKey,
+            LPCTSTR lpValueName
         );
         """
-        ctx = ctx or {}
         hKey, lpValueName = argv
 
-        key = self.reg_get_key(hKey)
+        key = self.get_reg_key(hKey)
         if not key:
             return windefs.ERROR_INVALID_HANDLE
 
@@ -463,148 +436,157 @@ class AdvApi32(api.ApiHandler):
         value_name = ""
         if lpValueName:
             value_name = self.read_mem_string(lpValueName, cw)
-            argv[1] = value_name
+            ctx.args["lpValueName"].display = value_name
 
-        value = key.get_value(value_name)
-        if not value:
+        if not emu.regman.delete_value(key, value_name, handle=hKey):
             return windefs.ERROR_FILE_NOT_FOUND
-
-        key.values.remove(value)
         return windefs.ERROR_SUCCESS
 
     @apihook("RegQueryInfoKey", argc=12, conv=_arch.CALL_CONV_STDCALL)
-    def RegQueryInfoKey(self, emu, argv, ctx: api.ApiContext = None):
+    def RegQueryInfoKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         # TODO: stub
         """
-        LSTATUS RegQueryInfoKeyA(
-          HKEY      hKey,
-          LPSTR     lpClass,
-          LPDWORD   lpcchClass,
-          LPDWORD   lpReserved,
-          LPDWORD   lpcSubKeys,
-          LPDWORD   lpcbMaxSubKeyLen,
-          LPDWORD   lpcbMaxClassLen,
-          LPDWORD   lpcValues,
-          LPDWORD   lpcbMaxValueNameLen,
-          LPDWORD   lpcbMaxValueLen,
-          LPDWORD   lpcbSecurityDescriptor,
-          PFILETIME lpftLastWriteTime
+        LSTATUS RegQueryInfoKey(
+            HKEY hKey,
+            LPTSTR lpClass,
+            LPDWORD lpcchClass,
+            LPDWORD lpReserved,
+            LPDWORD lpcSubKeys,
+            LPDWORD lpcbMaxSubKeyLen,
+            LPDWORD lpcbMaxClassLen,
+            LPDWORD lpcValues,
+            LPDWORD lpcbMaxValueNameLen,
+            LPDWORD lpcbMaxValueLen,
+            LPDWORD lpcbSecurityDescriptor,
+            PFILETIME lpftLastWriteTime
         );
         """
-
         (
             hKey,
             lpClass,
             lpcchClass,
-            _,
-            subkeys,
-            max_subkey_len,
-            max_class_len,
-            values,
-            max_value_name_len,
-            max_value_len,
-            sec_desc,
-            last_write,
+            lpReserved,
+            lpcSubKeys,
+            lpcbMaxSubKeyLen,
+            lpcbMaxClassLen,
+            lpcValues,
+            lpcbMaxValueNameLen,
+            lpcbMaxValueLen,
+            lpcbSecurityDescriptor,
+            lpftLastWriteTime,
         ) = argv
 
         rv = windefs.ERROR_SUCCESS
 
         hkey_name = regdefs.get_hkey_type(hKey)
         if hkey_name:
-            argv[0] = hkey_name
+            ctx.args["hKey"].display = hkey_name
 
-        key = self.reg_get_key(hKey)
+        key = self.get_reg_key(hKey)
         if not key:
-            rv = windefs.ERROR_INVALID_HANDLE
+            return windefs.ERROR_INVALID_HANDLE
+
+        cw = self.get_char_width(ctx)
+        subkey_names = self.reg_get_subkeys(key)
+        key_values = key.get_values()
+        if lpClass:
+            self.write_mem_string("", lpClass, cw)
+        for ptr, val in (
+            (lpcchClass, 0),
+            (lpcSubKeys, len(subkey_names)),
+            (lpcbMaxSubKeyLen, max((len(n) for n in subkey_names), default=0)),
+            (lpcbMaxClassLen, 0),
+            (lpcValues, len(key_values)),
+            (lpcbMaxValueNameLen, max((len(v.get_name()) for v in key_values), default=0)),
+            (lpcbMaxValueLen, max((len(v.get_bytes(cw)) for v in key_values), default=0)),
+            (lpcbSecurityDescriptor, 0),
+        ):
+            if ptr:
+                self.write_dword(ptr, val)
+        if lpftLastWriteTime:
+            self.mem_write(lpftLastWriteTime, b"\x00" * 8)
 
         return rv
 
     @apihook("OpenProcessToken", argc=3, conv=_arch.CALL_CONV_STDCALL)
-    def OpenProcessToken(self, emu, argv, ctx: api.ApiContext = None):
+    def OpenProcessToken(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL OpenProcessToken(
-          HANDLE  ProcessHandle,
-          DWORD   DesiredAccess,
-          PHANDLE pTokenHandle
+            HANDLE ProcessHandle,
+            DWORD DesiredAccess,
+            PHANDLE TokenHandle
         );
         """
-
-        hProcess, DesiredAccess, pTokenHandle = argv
+        ProcessHandle, DesiredAccess, TokenHandle = argv
         rv = 0
 
-        if hProcess == self.get_max_int():
-            obj = emu.get_current_process()
-        else:
-            obj = self.get_object_from_handle(hProcess)
+        obj = emu.get_handle_table().get(ProcessHandle, objman.Process)
 
         if obj:
-            token = obj.token
-            hToken = token.get_handle()
+            hToken = emu.get_object_manager(ctx.func_name).new_handle(obj.token)
 
-            if pTokenHandle:
+            if TokenHandle:
                 hnd = (hToken).to_bytes(self.get_ptr_size(), "little")
-                self.mem_write(pTokenHandle, hnd)
+                self.mem_write(TokenHandle, hnd)
                 rv = 1
                 emu.set_last_error(windefs.ERROR_SUCCESS)
             else:
                 emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+        else:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
 
         return rv
 
     @apihook("OpenThreadToken", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def OpenThreadToken(self, emu, argv, ctx: api.ApiContext = None):
+    def OpenThreadToken(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL OpenThreadToken(
-            HANDLE  ThreadHandle,
-            DWORD   DesiredAccess,
-            BOOL    OpenAsSelf,
+            HANDLE ThreadHandle,
+            DWORD DesiredAccess,
+            BOOL OpenAsSelf,
             PHANDLE TokenHandle
         );
         """
-
-        ThreadHandle, DesiredAccess, OpenAsSelf, pTokenHandle = argv
+        ThreadHandle, DesiredAccess, OpenAsSelf, TokenHandle = argv
         rv = 0
 
-        if ThreadHandle == self.get_max_int():
-            obj = emu.get_current_thread()
-        else:
-            obj = self.get_object_from_handle(ThreadHandle)
+        obj = emu.get_handle_table().get(ThreadHandle, objman.Thread)
 
         if obj:
-            token = obj.token
-            hToken = token.get_handle()
+            hToken = emu.get_object_manager(ctx.func_name).new_handle(obj.token)
 
-            if pTokenHandle:
+            if TokenHandle:
                 hnd = (hToken).to_bytes(self.get_ptr_size(), "little")
-                self.mem_write(pTokenHandle, hnd)
+                self.mem_write(TokenHandle, hnd)
                 rv = 1
                 emu.set_last_error(windefs.ERROR_SUCCESS)
             else:
                 emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+        else:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
 
         return rv
 
     @apihook("DuplicateTokenEx", argc=6, conv=_arch.CALL_CONV_STDCALL)
-    def DuplicateTokenEx(self, emu, argv, ctx: api.ApiContext = None):
+    def DuplicateTokenEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL DuplicateTokenEx(
-          HANDLE                       hExistingToken,
-          DWORD                        dwDesiredAccess,
-          LPSECURITY_ATTRIBUTES        lpTokenAttributes,
-          SECURITY_IMPERSONATION_LEVEL ImpersonationLevel,
-          TOKEN_TYPE                   TokenType,
-          PHANDLE                      phNewToken
+            HANDLE hExistingToken,
+            DWORD dwDesiredAccess,
+            LPSECURITY_ATTRIBUTES lpTokenAttributes,
+            SECURITY_IMPERSONATION_LEVEL ImpersonationLevel,
+            TOKEN_TYPE TokenType,
+            PHANDLE phNewToken
         );
         """
-
-        (hExistingToken, access, token_attrs, imp_level, toktype, phNewToken) = argv
+        (hExistingToken, dwDesiredAccess, lpTokenAttributes, ImpersonationLevel, TokenType, phNewToken) = argv
         rv = 0
 
-        obj = self.get_object_from_handle(hExistingToken)
+        obj = emu.get_handle_table().get(hExistingToken, objman.Token)
 
         if obj:
             new_token = emu.new_object(objman.Token)
-            hnd_new_token = new_token.get_handle()
+            hnd_new_token = emu.get_object_manager(ctx.func_name).new_handle(new_token)
 
             if phNewToken:
                 hnd = (hnd_new_token).to_bytes(self.get_ptr_size(), "little")
@@ -613,67 +595,62 @@ class AdvApi32(api.ApiHandler):
                 emu.set_last_error(windefs.ERROR_SUCCESS)
             else:
                 emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+        else:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
 
         return rv
 
     @apihook("SetTokenInformation", argc=4, conv=_arch.CALL_CONV_STDCALL)
-    def SetTokenInformation(self, emu, argv, ctx: api.ApiContext = None):
+    def SetTokenInformation(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetTokenInformation(
-          HANDLE                  TokenHandle,
-          TOKEN_INFORMATION_CLASS TokenInformationClass,
-          LPVOID                  TokenInformation,
-          DWORD                   TokenInformationLength
+            HANDLE TokenHandle,
+            TOKEN_INFORMATION_CLASS TokenInformationClass,
+            LPVOID TokenInformation,
+            DWORD TokenInformationLength
         );
         """
-
-        handle, info_class, info, info_len = argv
+        TokenHandle, TokenInformationClass, TokenInformation, TokenInformationLength = argv
 
         rv = 1
 
         return rv
 
     @apihook("StartServiceCtrlDispatcher", argc=1)
-    def StartServiceCtrlDispatcher(self, emu, argv, ctx: api.ApiContext = None):
+    def StartServiceCtrlDispatcher(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL StartServiceCtrlDispatcher(
-          const SERVICE_TABLE_ENTRY *lpServiceStartTable
+            const SERVICE_TABLE_ENTRY *lpServiceStartTable
         );
         """
-        ctx = ctx or {}
         (lpServiceStartTable,) = argv
 
-        try:
-            cw = self.get_char_width(ctx)
-        except Exception:
-            cw = 1
+        cw = self.get_char_width(ctx)
 
         ste = self.win.SERVICE_TABLE_ENTRY(emu.get_ptr_size())
         entry = self.mem_cast(ste, lpServiceStartTable)
 
-        argv[0] = "lpServiceStartTable=["
+        table = "lpServiceStartTable=["
 
-        while entry.lpServiceName != windefs.NULL or entry.lpServiceProc != windefs.NULL:
-            service_name = "Service"
-            if entry.lpServiceName != windefs.NULL:
-                service_name = self.read_mem_string(entry.lpServiceName, cw)
-                argv[0] += f" {{ lpServiceName={service_name}"
-            else:
-                argv[0] += " { lpServiceName=NULL"
+        # The table ends at a NULL name; a name that cannot be read ends it too
+        while entry.lpServiceName != windefs.NULL and emu.is_address_valid(entry.lpServiceName):
+            service_name = self.read_mem_string(entry.lpServiceName, cw)
+            table += f" {{ lpServiceName={service_name}"
 
             if entry.lpServiceProc != windefs.NULL:
                 service_main = entry.lpServiceProc
-                argv[0] += f", lpServiceProc={hex(service_main)} }} "
+                table += f", lpServiceProc={hex(service_main)} }} "
                 argc, svc_argv = emu.build_service_main_args(service_name, char_width=cw)
-                self.queue_run("thread.service", service_main, [argc, svc_argv])
+                self.queue_run(RunType.SERVICE_MAIN, service_main, [argc, svc_argv], name=service_name)
             else:
-                argv[0] += ", lpServiceProc=NULL } "
+                table += ", lpServiceProc=NULL } "
 
             lpServiceStartTable += self.sizeof(ste)
             ste = self.win.SERVICE_TABLE_ENTRY(emu.get_ptr_size())
             entry = self.mem_cast(ste, lpServiceStartTable)
 
-        argv[0] += "]"
+        table += "]"
+        ctx.args["lpServiceStartTable"].display = table
 
         rv = True
         emu.set_last_error(windefs.ERROR_SUCCESS)
@@ -681,46 +658,43 @@ class AdvApi32(api.ApiHandler):
         return rv
 
     @apihook("RegisterServiceCtrlHandler", argc=2)
-    def RegisterServiceCtrlHandler(self, emu, argv, ctx: api.ApiContext = None):
+    def RegisterServiceCtrlHandler(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        SERVICE_STATUS_HANDLE RegisterServiceCtrlHandlerA(
-            LPCSTR             lpServiceName,
+        SERVICE_STATUS_HANDLE RegisterServiceCtrlHandler(
+            LPCTSTR lpServiceName,
             LPHANDLER_FUNCTION lpHandlerProc
-            );
+        );
         """
-
         lpServiceName, lpHandlerProc = argv
 
         # dummy SERVICE_STATUS_HANDLE
-        self.service_status_handle += 1
+        hnd = emu.handle_allocator.allocate_handle()
 
         emu.set_last_error(windefs.ERROR_SUCCESS)
 
-        return self.service_status_handle
+        return hnd
 
     @apihook("RegisterServiceCtrlHandlerEx", argc=3)
-    def RegisterServiceCtrlHandlerEx(self, emu, argv, ctx: api.ApiContext = None):
+    def RegisterServiceCtrlHandlerEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        SERVICE_STATUS_HANDLE RegisterServiceCtrlHandlerExA(
-            LPCSTR                lpServiceName,
+        SERVICE_STATUS_HANDLE RegisterServiceCtrlHandlerEx(
+            LPCTSTR lpServiceName,
             LPHANDLER_FUNCTION_EX lpHandlerProc,
-            LPVOID                lpContext
+            LPVOID lpContext
         );
         """
-        ctx = ctx or {}
         lpServiceName, lpHandlerProc, lpContext = argv
 
-        return self.RegisterServiceCtrlHandler(self, emu, [lpServiceName, lpHandlerProc], ctx)
+        return self.RegisterServiceCtrlHandler(emu, [lpServiceName, lpHandlerProc], ctx)
 
     @apihook("SetServiceStatus", argc=2)
-    def SetServiceStatus(self, emu, argv, ctx: api.ApiContext = None):
+    def SetServiceStatus(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetServiceStatus(
             SERVICE_STATUS_HANDLE hServiceStatus,
-            LPSERVICE_STATUS      lpServiceStatus
-            );
+            LPSERVICE_STATUS lpServiceStatus
+        );
         """
-
         hServiceStatus, lpServiceStatus = argv
 
         emu.set_last_error(windefs.ERROR_SUCCESS)
@@ -728,28 +702,28 @@ class AdvApi32(api.ApiHandler):
         return 0x1
 
     @apihook("RevertToSelf", argc=0)
-    def RevertToSelf(self, emu, argv, ctx: api.ApiContext = None):
+    def RevertToSelf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL RevertToSelf();
         """
         return 1
 
     @apihook("ImpersonateLoggedOnUser", argc=1)
-    def ImpersonateLoggedOnUser(self, emu, argv, ctx: api.ApiContext = None):
+    def ImpersonateLoggedOnUser(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL ImpersonateLoggedOnUser(
-        HANDLE hToken
+            HANDLE hToken
         );
         """
         return 1
 
     @apihook("OpenSCManager", argc=3)
-    def OpenSCManager(self, emu, argv, ctx: api.ApiContext = None):
+    def OpenSCManager(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SC_HANDLE OpenSCManager(
-          LPCSTR lpMachineName,
-          LPCSTR lpDatabaseName,
-          DWORD  dwDesiredAccess
+            LPCTSTR lpMachineName,
+            LPCTSTR lpDatabaseName,
+            DWORD dwDesiredAccess
         );
         """
         lpMachineName, lpDatabaseName, dwDesiredAccess = argv
@@ -760,52 +734,61 @@ class AdvApi32(api.ApiHandler):
         return hScm
 
     @apihook("CreateService", argc=13)
-    def CreateService(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateService(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        SC_HANDLE CreateServiceA(
-          SC_HANDLE hSCManager,
-          LPCSTR    lpServiceName,
-          LPCSTR    lpDisplayName,
-          DWORD     dwDesiredAccess,
-          DWORD     dwServiceType,
-          DWORD     dwStartType,
-          DWORD     dwErrorControl,
-          LPCSTR    lpBinaryPathName,
-          LPCSTR    lpLoadOrderGroup,
-          LPDWORD   lpdwTagId,
-          LPCSTR    lpDependencies,
-          LPCSTR    lpServiceStartName,
-          LPCSTR    lpPassword
+        SC_HANDLE CreateService(
+            SC_HANDLE hSCManager,
+            LPCTSTR lpServiceName,
+            LPCTSTR lpDisplayName,
+            DWORD dwDesiredAccess,
+            DWORD dwServiceType,
+            DWORD dwStartType,
+            DWORD dwErrorControl,
+            LPCTSTR lpBinaryPathName,
+            LPCTSTR lpLoadOrderGroup,
+            LPDWORD lpdwTagId,
+            LPCTSTR lpDependencies,
+            LPCTSTR lpServiceStartName,
+            LPCTSTR lpPassword
         );
         """
-        ctx = ctx or {}
         (
-            hScm,
-            svc_name,
-            disp_name,
-            access,
-            svc_type,
-            start_type,
-            error_ctrl,
-            bin_path,
-            load_group,
-            tag_id,
-            deps,
-            svc_start_name,
-            password,
+            hSCManager,
+            lpServiceName,
+            lpDisplayName,
+            dwDesiredAccess,
+            dwServiceType,
+            dwStartType,
+            dwErrorControl,
+            lpBinaryPathName,
+            lpLoadOrderGroup,
+            lpdwTagId,
+            lpDependencies,
+            lpServiceStartName,
+            lpPassword,
         ) = argv
 
         cw = self.get_char_width(ctx)
 
-        if svc_name:
-            _sname = self.read_mem_string(svc_name, cw)
-            argv[1] = _sname
-        if disp_name:
-            _dname = self.read_mem_string(disp_name, cw)
-            argv[2] = _dname
-        if bin_path:
-            _bpname = self.read_mem_string(bin_path, cw)
-            argv[7] = _bpname
+        if lpServiceName:
+            _sname = self.read_mem_string(lpServiceName, cw)
+            ctx.args["lpServiceName"].display = _sname
+        if lpDisplayName:
+            _dname = self.read_mem_string(lpDisplayName, cw)
+            ctx.args["lpDisplayName"].display = _dname
+        _bpname = ""
+        if lpBinaryPathName:
+            _bpname = self.read_mem_string(lpBinaryPathName, cw)
+            ctx.args["lpBinaryPathName"].display = _bpname
+
+        if lpServiceName:
+            key = emu.regman.create_key(f"HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\{_sname}")
+            key.create_value("Type", REG_VALUE_TYPE.REG_DWORD, dwServiceType)
+            key.create_value("Start", REG_VALUE_TYPE.REG_DWORD, dwStartType)
+            key.create_value("ErrorControl", REG_VALUE_TYPE.REG_DWORD, dwErrorControl)
+            key.create_value("ImagePath", REG_VALUE_TYPE.REG_EXPAND_SZ, _bpname)
+            if lpDisplayName:
+                key.create_value("DisplayName", REG_VALUE_TYPE.REG_SZ, _dname)
 
         hSvc = self.mem_alloc(size=8)
         emu.set_last_error(windefs.ERROR_SUCCESS)
@@ -813,13 +796,15 @@ class AdvApi32(api.ApiHandler):
         return hSvc
 
     @apihook("StartService", argc=3)
-    def StartService(self, emu, argv, ctx: api.ApiContext = None):
+    def StartService(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL StartService(
-          SC_HANDLE hService,
-          DWORD     dwNumServiceArgs,
-          LPCSTR    *lpServiceArgVectors
+            SC_HANDLE hService,
+            DWORD dwNumServiceArgs,
+            LPCTSTR *lpServiceArgVectors
         );
+
+        Speakeasy does not model the state of services. StartService only returns success.
         """
         hService, dwNumServiceArgs, lpServiceArgVectors = argv
 
@@ -830,18 +815,26 @@ class AdvApi32(api.ApiHandler):
         return rv
 
     @apihook("StartServiceA", argc=3)
-    def StartServiceA(self, emu, argv, ctx: api.ApiContext = None):
-        ctx = ctx or {}
+    def StartServiceA(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL StartServiceA(
+            SC_HANDLE hService,
+            DWORD dwNumServiceArgs,
+            LPCSTR *lpServiceArgVectors
+        );
+        """
         return self.StartService(emu, argv, ctx)
 
     @apihook("ControlService", argc=3)
-    def ControlService(self, emu, argv, ctx: api.ApiContext = None):
+    def ControlService(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL ControlService(
-          [in]  SC_HANDLE        hService,
-          [in]  DWORD            dwControl,
-          [out] LPSERVICE_STATUS lpServiceStatus
+            SC_HANDLE hService,
+            DWORD dwControl,
+            LPSERVICE_STATUS lpServiceStatus
         );
+
+        Speakeasy does not model the state of services. ControlService only returns success.
         """
         hService, dwControl, lpServiceStatus = argv
 
@@ -852,12 +845,14 @@ class AdvApi32(api.ApiHandler):
         return rv
 
     @apihook("QueryServiceStatus", argc=2)
-    def QueryServiceStatus(self, emu, argv, ctx: api.ApiContext = None):
+    def QueryServiceStatus(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL QueryServiceStatus(
-          SC_HANDLE        hService,
-          LPSERVICE_STATUS lpServiceStatus
+            SC_HANDLE hService,
+            LPSERVICE_STATUS lpServiceStatus
         );
+
+        Speakeasy does not model the state of services. Each service is SERVICE_RUNNING.
         """
         hService, lpServiceStatus = argv
 
@@ -881,15 +876,13 @@ class AdvApi32(api.ApiHandler):
         return 1
 
     @apihook("QueryServiceConfig", argc=4)
-    @apihook("QueryServiceConfigA", argc=4)
-    @apihook("QueryServiceConfigW", argc=4)
-    def QueryServiceConfig(self, emu, argv, ctx: api.ApiContext = None):
+    def QueryServiceConfig(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL QueryServiceConfigA(
-          SC_HANDLE               hService,
-          LPQUERY_SERVICE_CONFIGA lpServiceConfig,
-          DWORD                   cbBufSize,
-          LPDWORD                 pcbBytesNeeded
+        BOOL QueryServiceConfig(
+            SC_HANDLE hService,
+            LPQUERY_SERVICE_CONFIG lpServiceConfig,
+            DWORD cbBufSize,
+            LPDWORD pcbBytesNeeded
         );
         """
         hService, lpServiceConfig, cbBufSize, pcbBytesNeeded = argv
@@ -902,7 +895,7 @@ class AdvApi32(api.ApiHandler):
         required = (4 * 4) + (5 * ptr_size)
 
         if pcbBytesNeeded:
-            self.mem_write(pcbBytesNeeded, required.to_bytes(4, "little"))
+            self.write_dword(pcbBytesNeeded, required)
 
         if not lpServiceConfig or cbBufSize < required:
             emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
@@ -924,16 +917,15 @@ class AdvApi32(api.ApiHandler):
         return 1
 
     @apihook("CloseServiceHandle", argc=1)
-    def CloseServiceHandle(self, emu, argv, ctx: api.ApiContext = None):
+    def CloseServiceHandle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CloseServiceHandle(
-          SC_HANDLE hSCObject
+            SC_HANDLE hSCObject
         );
+
+        Speakeasy does not model the state of services, so it does not free the handle. A free with mem_free would
+        free any guest allocation that contains the value.
         """
-        (CloseServiceHandle,) = argv
-
-        self.mem_free(CloseServiceHandle)
-
         rv = 1
 
         emu.set_last_error(windefs.ERROR_SUCCESS)
@@ -941,31 +933,30 @@ class AdvApi32(api.ApiHandler):
         return rv
 
     @apihook("ChangeServiceConfig", argc=11)
-    def ChangeServiceConfig(self, emu, argv, ctx: api.ApiContext = None):
+    def ChangeServiceConfig(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL ChangeServiceConfigA(
-          SC_HANDLE hService,
-          DWORD     dwServiceType,
-          DWORD     dwStartType,
-          DWORD     dwErrorControl,
-          LPCSTR    lpBinaryPathName,
-          LPCSTR    lpLoadOrderGroup,
-          LPDWORD   lpdwTagId,
-          LPCSTR    lpDependencies,
-          LPCSTR    lpServiceStartName,
-          LPCSTR    lpPassword,
-          LPCSTR    lpDisplayName
+        BOOL ChangeServiceConfig(
+            SC_HANDLE hService,
+            DWORD dwServiceType,
+            DWORD dwStartType,
+            DWORD dwErrorControl,
+            LPCTSTR lpBinaryPathName,
+            LPCTSTR lpLoadOrderGroup,
+            LPDWORD lpdwTagId,
+            LPCTSTR lpDependencies,
+            LPCTSTR lpServiceStartName,
+            LPCTSTR lpPassword,
+            LPCTSTR lpDisplayName
         );
         """
-        ctx = ctx or {}
         (
-            _hService,
-            _dwServiceType,
-            _dwStartType,
-            _dwErrorControl,
+            hService,
+            dwServiceType,
+            dwStartType,
+            dwErrorControl,
             lpBinaryPathName,
             lpLoadOrderGroup,
-            _lpdwTagId,
+            lpdwTagId,
             lpDependencies,
             lpServiceStartName,
             lpPassword,
@@ -975,28 +966,28 @@ class AdvApi32(api.ApiHandler):
         cw = self.get_char_width(ctx)
 
         if lpBinaryPathName:
-            argv[4] = self.read_mem_string(lpBinaryPathName, cw)
+            ctx.args["lpBinaryPathName"].display = self.read_mem_string(lpBinaryPathName, cw)
         if lpLoadOrderGroup:
-            argv[5] = self.read_mem_string(lpLoadOrderGroup, cw)
+            ctx.args["lpLoadOrderGroup"].display = self.read_mem_string(lpLoadOrderGroup, cw)
         if lpDependencies:
-            argv[7] = self.read_mem_string(lpDependencies, cw)
+            ctx.args["lpDependencies"].display = self.read_mem_string(lpDependencies, cw)
         if lpServiceStartName:
-            argv[8] = self.read_mem_string(lpServiceStartName, cw)
+            ctx.args["lpServiceStartName"].display = self.read_mem_string(lpServiceStartName, cw)
         if lpPassword:
-            argv[9] = self.read_mem_string(lpPassword, cw)
+            ctx.args["lpPassword"].display = self.read_mem_string(lpPassword, cw)
         if lpDisplayName:
-            argv[10] = self.read_mem_string(lpDisplayName, cw)
+            ctx.args["lpDisplayName"].display = self.read_mem_string(lpDisplayName, cw)
 
         emu.set_last_error(windefs.ERROR_SUCCESS)
         return 1
 
     @apihook("ChangeServiceConfig2", argc=3)
-    def ChangeServiceConfig2(self, emu, argv, ctx: api.ApiContext = None):
+    def ChangeServiceConfig2(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL ChangeServiceConfig2(
-          SC_HANDLE hService,
-          DWORD     dwInfoLevel,
-          LPVOID    lpInfo
+            SC_HANDLE hService,
+            DWORD dwInfoLevel,
+            LPVOID lpInfo
         );
         """
         hService, dwInfoLevel, lpInfo = argv
@@ -1008,35 +999,35 @@ class AdvApi32(api.ApiHandler):
         return rv
 
     @apihook("SystemFunction036", argc=2)
-    def RtlGenRandom(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlGenRandom(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOLEAN RtlGenRandom(
+        BOOLEAN SystemFunction036(
             PVOID RandomBuffer,
             ULONG RandomBufferLength
         );
+
+        Exported as RtlGenRandom.
         """
         RandomBuffer, RandomBufferLength = argv
 
         rv = False
         if RandomBuffer and RandomBufferLength:
-            buf = bytes([i for i in range(RandomBufferLength)])
-            self.mem_write(RandomBuffer, buf)
+            self.mem_write(RandomBuffer, emu.rng.randbytes(RandomBufferLength))
             rv = True
 
         return rv
 
     @apihook("CryptAcquireContext", argc=5)
-    def CryptAcquireContext(self, emu, argv, ctx: api.ApiContext = None):
+    def CryptAcquireContext(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CryptAcquireContext(
             HCRYPTPROV *phProv,
-            LPCSTR     szContainer,
-            LPCSTR     szProvider,
-            DWORD      dwProvType,
-            DWORD      dwFlags
+            LPCTSTR szContainer,
+            LPCTSTR szProvider,
+            DWORD dwProvType,
+            DWORD dwFlags
         );
         """
-        ctx = ctx or {}
         phProv, szContainer, szProvider, dwProvType, dwFlags = argv
         cont_str, prov_str = "", ""
         cw = self.get_char_width(ctx)
@@ -1044,86 +1035,163 @@ class AdvApi32(api.ApiHandler):
 
         if szContainer:
             cont_str = self.read_mem_string(szContainer, cw)
-            argv[1] = cont_str
+            ctx.args["szContainer"].display = cont_str
         if szProvider:
             prov_str = self.read_mem_string(szProvider, cw)
-            argv[2] = prov_str
+            ctx.args["szProvider"].display = prov_str
 
         cm = emu.get_crypt_manager()
         hnd = cm.crypt_open(cname=cont_str, pname=prov_str, ptype=dwProvType, flags=dwFlags)
 
         if hnd and phProv:
-            self.mem_write(phProv, hnd.to_bytes(emu.get_ptr_size(), "little"))
+            self.write_ptr(phProv, hnd)
             rv = True
             emu.set_last_error(windefs.ERROR_SUCCESS)
 
         return rv
 
     @apihook("CryptGenRandom", argc=3)
-    def CryptGenRandom(self, emu, argv, ctx: api.ApiContext = None):
+    def CryptGenRandom(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CryptGenRandom(
             HCRYPTPROV hProv,
-            DWORD      dwLen,
-            BYTE       *pbBuffer
+            DWORD dwLen,
+            BYTE *pbBuffer
         );
         """
         hProv, dwLen, pbBuffer = argv
         rv = False
 
         if pbBuffer:
-            out = b"A" * dwLen
-            self.mem_write(pbBuffer, out)
+            self.mem_write(pbBuffer, emu.rng.randbytes(dwLen))
             rv = True
 
         return rv
 
     @apihook("AllocateAndInitializeSid", argc=11)
-    def AllocateAndInitializeSid(self, emu, argv, ctx: api.ApiContext = None):
+    def AllocateAndInitializeSid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL AllocateAndInitializeSid(
             PSID_IDENTIFIER_AUTHORITY pIdentifierAuthority,
-            BYTE                      nSubAuthorityCount,
-            DWORD                     nSubAuthority0,
-            DWORD                     nSubAuthority1,
-            DWORD                     nSubAuthority2,
-            DWORD                     nSubAuthority3,
-            DWORD                     nSubAuthority4,
-            DWORD                     nSubAuthority5,
-            DWORD                     nSubAuthority6,
-            DWORD                     nSubAuthority7,
-            PSID                      *pSid
+            BYTE nSubAuthorityCount,
+            DWORD nSubAuthority0,
+            DWORD nSubAuthority1,
+            DWORD nSubAuthority2,
+            DWORD nSubAuthority3,
+            DWORD nSubAuthority4,
+            DWORD nSubAuthority5,
+            DWORD nSubAuthority6,
+            DWORD nSubAuthority7,
+            PSID *pSid
         );
         """
-        auth, count, sa0, sa1, sa2, sa3, sa4, sa5, sa6, sa7, pSid = argv
-        rv = False
+        pIdentifierAuthority, nSubAuthorityCount, *subauthorities, pSid = argv
+        nSubAuthorityCount &= 0xFF
+        if not pSid or not pIdentifierAuthority or nSubAuthorityCount > 8:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return False
 
-        if pSid:
-            sid = self.mem_alloc(0x100, tag="api.struct.SID")
-            self.mem_write(pSid, sid.to_bytes(emu.get_ptr_size(), "little"))
-            rv = True
+        sid = self.mem_alloc(0x100, tag="api.struct.SID")
+        data = bytes([1, nSubAuthorityCount]) + self.mem_read(pIdentifierAuthority, 6)
+        data += b"".join((sa & 0xFFFFFFFF).to_bytes(4, "little") for sa in subauthorities[:nSubAuthorityCount])
+        self.mem_write(sid, data)
+        self.write_ptr(pSid, sid)
+        return True
 
-        return rv
+    @apihook("InitializeSid", argc=3)
+    def InitializeSid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL InitializeSid(
+            PSID Sid,
+            PSID_IDENTIFIER_AUTHORITY pIdentifierAuthority,
+            BYTE nSubAuthorityCount
+        );
+        """
+        Sid, pIdentifierAuthority, nSubAuthorityCount = argv
+        nSubAuthorityCount &= 0xFF
+        if not Sid or not pIdentifierAuthority or nSubAuthorityCount > 15:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return False
+        self.mem_write(Sid, bytes([1, nSubAuthorityCount]) + self.mem_read(pIdentifierAuthority, 6))
+        return True
+
+    @apihook("GetSidLengthRequired", argc=1)
+    def GetSidLengthRequired(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetSidLengthRequired(
+            UCHAR nSubAuthorityCount
+        );
+        """
+        (nSubAuthorityCount,) = argv
+        return 8 + 4 * (nSubAuthorityCount & 0xFF)
+
+    def get_sid_length(self, emu, sid):
+        if not sid or not emu.is_address_valid(sid + 1):
+            return 0
+        return 8 + 4 * self.mem_read(sid + 1, 1)[0]
+
+    @apihook("GetLengthSid", argc=1)
+    def GetLengthSid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetLengthSid(
+            PSID pSid
+        );
+        """
+        (pSid,) = argv
+        return self.get_sid_length(emu, pSid)
+
+    @apihook("IsValidSid", argc=1)
+    def IsValidSid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL IsValidSid(
+            PSID pSid
+        );
+        """
+        (pSid,) = argv
+        if not self.get_sid_length(emu, pSid):
+            return False
+        revision, count = self.mem_read(pSid, 2)
+        return revision == 1 and count <= 15
+
+    @apihook("CopySid", argc=3)
+    def CopySid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CopySid(
+            DWORD nDestinationSidLength,
+            PSID pDestinationSid,
+            PSID pSourceSid
+        );
+        """
+        nDestinationSidLength, pDestinationSid, pSourceSid = argv
+        size = self.get_sid_length(emu, pSourceSid)
+        if not size:
+            emu.set_last_error(windefs.ERROR_INVALID_SID)
+            return False
+        if nDestinationSidLength < size:
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            return False
+        self.mem_write(pDestinationSid, self.mem_read(pSourceSid, size))
+        return True
 
     @apihook("CheckTokenMembership", argc=3)
-    def CheckTokenMembership(self, emu, argv, ctx: api.ApiContext = None):
+    def CheckTokenMembership(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CheckTokenMembership(
             HANDLE TokenHandle,
-            PSID   SidToCheck,
-            PBOOL  IsMember
+            PSID SidToCheck,
+            PBOOL IsMember
         );
         """
         TokenHandle, SidToCheck, IsMember = argv
         rv = False
 
         if IsMember:
-            self.mem_write(IsMember, (1).to_bytes(4, "little"))
+            self.write_dword(IsMember, 1)
             rv = True
         return rv
 
     @apihook("FreeSid", argc=1)
-    def FreeSid(self, emu, argv, ctx: api.ApiContext = None):
+    def FreeSid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PVOID FreeSid(
             PSID pSid
@@ -1137,30 +1205,71 @@ class AdvApi32(api.ApiHandler):
             rv = 0
         return rv
 
+    @apihook("GetSecurityInfo", argc=8)
+    def GetSecurityInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetSecurityInfo(
+            HANDLE handle,
+            SE_OBJECT_TYPE ObjectType,
+            SECURITY_INFORMATION SecurityInfo,
+            PSID *ppsidOwner,
+            PSID *ppsidGroup,
+            PACL *ppDacl,
+            PACL *ppSacl,
+            PSECURITY_DESCRIPTOR *ppSecurityDescriptor
+        );
+        """
+        handle = argv[0]
+        if not handle:
+            return windefs.ERROR_INVALID_HANDLE
+        # Objects carry no security descriptor, so every requested part is NULL
+        for out in argv[3:]:
+            if out:
+                self.mem_write(out, b"\x00" * self.get_ptr_size())
+        return windefs.ERROR_SUCCESS
+
+    @apihook("SetSecurityInfo", argc=7)
+    def SetSecurityInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD SetSecurityInfo(
+            HANDLE handle,
+            SE_OBJECT_TYPE ObjectType,
+            SECURITY_INFORMATION SecurityInfo,
+            PSID psidOwner,
+            PSID psidGroup,
+            PACL pDacl,
+            PACL pSacl
+        );
+        """
+        handle = argv[0]
+        if not handle:
+            return windefs.ERROR_INVALID_HANDLE
+        return windefs.ERROR_SUCCESS
+
     @apihook("CryptReleaseContext", argc=2)
-    def CryptReleaseContext(self, emu, argv, ctx: api.ApiContext = None):
+    def CryptReleaseContext(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CryptReleaseContext(
             HCRYPTPROV hProv,
-            DWORD      dwFlags
+            DWORD dwFlags
         );
         """
         hProv, dwFlags = argv
         rv = True
 
-        cm = emu.get_crypt_manager()
-        cm.crypt_close(hProv)
+        if not emu.get_crypt_manager().crypt_close(hProv):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
 
         return rv
 
     @apihook("GetCurrentHwProfile", argc=1)
-    def GetCurrentHwProfile(self, emu, argv, ctx: api.ApiContext = None):
+    def GetCurrentHwProfile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL GetCurrentHwProfileA(
-          LPHW_PROFILE_INFOA lpHwProfileInfo
+        BOOL GetCurrentHwProfile(
+            LPHW_PROFILE_INFO lpHwProfileInfo
         );
         """
-        ctx = ctx or {}
         (lpHwProfileInfo,) = argv
 
         if not lpHwProfileInfo:
@@ -1177,8 +1286,8 @@ class AdvApi32(api.ApiHandler):
             guid_bytes = guid_bytes.ljust(39 * 2, b"\x00")[: 39 * 2]
             name_bytes = name_bytes.ljust(80 * 2, b"\x00")[: 80 * 2]
         else:
-            guid_bytes = (guid + "\x00").encode("utf-8")
-            name_bytes = (profile_name + "\x00").encode("utf-8")
+            guid_bytes = encode_ansi(guid + "\x00")
+            name_bytes = encode_ansi(profile_name + "\x00")
             guid_bytes = guid_bytes.ljust(39, b"\x00")[:39]
             name_bytes = name_bytes.ljust(80, b"\x00")[:80]
 
@@ -1188,59 +1297,56 @@ class AdvApi32(api.ApiHandler):
         return 1
 
     @apihook("GetUserName", argc=2)
-    def GetUserName(self, emu, argv, ctx: api.ApiContext = None):
+    def GetUserName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetUserName(
-            LPSTR   lpBuffer,
+            LPTSTR lpBuffer,
             LPDWORD pcbBuffer
         );
         """
-        ctx = ctx or {}
         lpBuffer, pcbBuffer = argv
         rv = False
         cw = self.get_char_width(ctx)
 
         user_name = emu.config.user.name
-        argv[0] = user_name
+        ctx.args["lpBuffer"].display = user_name
 
-        if lpBuffer:
-            if cw == 2:
-                out = user_name.encode("utf-16le")
-            elif cw == 1:
-                out = user_name.encode("utf-8")
-            self.mem_write(lpBuffer, out)
-            rv = True
+        need = len(user_name) + 1
+        size = self.read_dword(pcbBuffer) if pcbBuffer else 0
         if pcbBuffer:
-            self.mem_write(pcbBuffer, (len(user_name)).to_bytes(4, "little"))
+            self.write_dword(pcbBuffer, need)
+        if not lpBuffer or size < need:
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            return rv
+
+        self.write_mem_string(user_name, lpBuffer, cw)
+        rv = True
 
         return rv
 
     @apihook("LookupPrivilegeValue", argc=3)
-    def LookupPrivilegeValue(self, emu, argv, ctx: api.ApiContext = None):
+    def LookupPrivilegeValue(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL LookupPrivilegeValue(
-            LPCSTR lpSystemName,
-            LPCSTR lpName,
-            PLUID  lpLuid
+            LPCTSTR lpSystemName,
+            LPCTSTR lpName,
+            PLUID lpLuid
         );
         """
-        ctx = ctx or {}
-        sysname, name, luid = argv
+        lpSystemName, lpName, lpLuid = argv
         rv = False
         cw = self.get_char_width(ctx)
 
-        if sysname:
-            sysname = self.read_mem_string(sysname, cw)
-            argv[0] = sysname
-        if name:
-            name = self.read_mem_string(name, cw)
-            argv[1] = name
+        if lpSystemName:
+            ctx.args["lpSystemName"].display = self.read_mem_string(lpSystemName, cw)
+        if lpName:
+            ctx.args["lpName"].display = self.read_mem_string(lpName, cw)
             rv = True
 
         return rv
 
     @apihook("AdjustTokenGroups", argc=6, conv=_arch.CALL_CONV_STDCALL)
-    def AdjustTokenGroups(self, emu, argv, ctx: api.ApiContext = None):
+    def AdjustTokenGroups(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL AdjustTokenGroups(
             HANDLE        TokenHandle,
@@ -1270,7 +1376,7 @@ class AdvApi32(api.ApiHandler):
             return_length,
         ) = argv
 
-        token = self.get_object_from_handle(token_handle)
+        token = emu.get_object_from_handle(token_handle)
         if not isinstance(token, objman.Token):
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
@@ -1309,15 +1415,15 @@ class AdvApi32(api.ApiHandler):
         return 1
 
     @apihook("AdjustTokenPrivileges", argc=6)
-    def AdjustTokenPrivileges(self, emu, argv, ctx: api.ApiContext = None):
+    def AdjustTokenPrivileges(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL AdjustTokenPrivileges(
-            HANDLE            TokenHandle,
-            BOOL              DisableAllPrivileges,
+            HANDLE TokenHandle,
+            BOOL DisableAllPrivileges,
             PTOKEN_PRIVILEGES NewState,
-            DWORD             BufferLength,
+            DWORD BufferLength,
             PTOKEN_PRIVILEGES PreviousState,
-            PDWORD            ReturnLength
+            PDWORD ReturnLength
         );
         """
         rv = True
@@ -1325,14 +1431,14 @@ class AdvApi32(api.ApiHandler):
         return rv
 
     @apihook("GetTokenInformation", argc=5)
-    def GetTokenInformation(self, emu, argv, ctx: api.ApiContext = None):
+    def GetTokenInformation(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetTokenInformation(
-            HANDLE                  TokenHandle,
+            HANDLE TokenHandle,
             TOKEN_INFORMATION_CLASS TokenInformationClass,
-            LPVOID                  TokenInformation,
-            DWORD                   TokenInformationLength,
-            PDWORD                  ReturnLength
+            LPVOID TokenInformation,
+            DWORD TokenInformationLength,
+            PDWORD ReturnLength
         );
         """
         _hnd, info_class, info, info_len, ret_len = argv
@@ -1350,7 +1456,7 @@ class AdvApi32(api.ApiHandler):
         if info_class == TOKEN_INTEGRITY_LEVEL_INFORMATION_CLASS:
             integrity_sid = (
                 "S-1-16-12288"
-                if emu.config.user.is_admin
+                if emu.config.user.admin
                 else "S-1-16-8192"
             )
             return self._write_token_sid_structure(
@@ -1359,23 +1465,23 @@ class AdvApi32(api.ApiHandler):
                 info_len,
                 ret_len,
                 integrity_sid,
-                attributes=0x20,
+                attributes=windefs.SE_GROUP_INTEGRITY,
             )
 
         if info_class == TOKEN_ELEVATION_INFORMATION_CLASS:
             required = 4
             if ret_len:
-                self.mem_write(ret_len, required.to_bytes(4, "little"))
+                self.write_dword(ret_len, required)
             if not info or info_len < required:
                 emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
                 return 0
-            elevation = int(emu.config.user.is_admin)
-            self.mem_write(info, elevation.to_bytes(4, "little"))
+            elevation = int(emu.config.user.admin)
+            self.write_dword(info, elevation)
             emu.set_last_error(windefs.ERROR_SUCCESS)
             return 1
 
         if ret_len:
-            self.mem_write(ret_len, (0).to_bytes(4, "little"))
+            self.write_dword(ret_len, 0)
         emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
         return 0
 
@@ -1396,7 +1502,7 @@ class AdvApi32(api.ApiHandler):
         sid_address = header_size
         required = sid_address + len(sid)
         if ret_len:
-            self.mem_write(ret_len, required.to_bytes(4, "little"))
+            self.write_dword(ret_len, required)
         if not info or info_len < required:
             emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
             return 0
@@ -1411,94 +1517,111 @@ class AdvApi32(api.ApiHandler):
         emu.set_last_error(windefs.ERROR_SUCCESS)
         return 1
 
+    @apihook("ConvertSidToStringSid", argc=2)
+    def ConvertSidToStringSid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL ConvertSidToStringSid(
+            PSID Sid,
+            LPTSTR *StringSid
+        );
+        """
+        Sid, StringSid = argv
+        length = self.get_sid_length(emu, Sid)
+        if not length or not StringSid:
+            emu.set_last_error(windefs.ERROR_INVALID_SID if not length else windefs.ERROR_INVALID_PARAMETER)
+            return False
+
+        data = self.mem_read(Sid, length)
+        subauthorities = struct.unpack_from(f"<{data[1]}I", data, 8)
+        text = "-".join(["S", str(data[0]), str(int.from_bytes(data[2:8], "big")), *map(str, subauthorities)])
+        cw = self.get_char_width(ctx)
+        buf = self.heap_alloc((len(text) + 1) * cw, heap="LocalAlloc")
+        self.write_mem_string(text, buf, cw)
+        self.write_ptr(StringSid, buf)
+        ctx.args["Sid"].display = text
+        return True
+
     @apihook("EqualSid", argc=2)
-    def EqualSid(self, emu, argv, ctx: api.ApiContext = None):
+    def EqualSid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL EqualSid(
             PSID pSid1,
             PSID pSid2
         );
         """
-        sid1, sid2 = argv
-        rv = False
-
-        if sid1 and sid2:
-            s1 = self.mem_read(sid1, 10)
-            s2 = self.mem_read(sid2, 10)
-            if s1 == s2:
-                rv = True
-
-        return rv
+        pSid1, pSid2 = argv
+        len1, len2 = self.get_sid_length(emu, pSid1), self.get_sid_length(emu, pSid2)
+        if not len1 or len1 != len2:
+            return False
+        return self.mem_read(pSid1, len1) == self.mem_read(pSid2, len2)
 
     @apihook("GetSidIdentifierAuthority", argc=1)
-    def GetSidIdentifierAuthority(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSidIdentifierAuthority(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PSID_IDENTIFIER_AUTHORITY GetSidIdentifierAuthority(
-          [in] PSID pSid
+            PSID pSid
         );
         """
-        (sid,) = argv
+        (pSid,) = argv
 
         # IdentifierAuthority is at offset 0x02 in the SID structure
-        return sid + 2
+        return pSid + 2
 
     @apihook("GetSidSubAuthorityCount", argc=1)
-    def GetSidSubAuthorityCount(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSidSubAuthorityCount(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PUCHAR GetSidSubAuthorityCount(
             PSID pSid
         );
         """
-        (sid,) = argv
+        (pSid,) = argv
         rv = 0
 
-        if sid:
-            rv = sid + 1
+        if pSid:
+            rv = pSid + 1
 
         return rv
 
     @apihook("GetSidSubAuthority", argc=2)
-    def GetSidSubAuthority(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSidSubAuthority(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PDWORD GetSidSubAuthority(
-          [in] PSID  pSid,
-          [in] DWORD nSubAuthority
+            PSID pSid,
+            DWORD nSubAuthority
         );
         """
-        sid, nsub = argv
+        pSid, nSubAuthority = argv
 
         # SubAuthorities begin at offset 0x8
-        return sid + 8 + (nsub * 4)
+        return pSid + 8 + (nSubAuthority * 4)
 
     @apihook("LookupAccountName", argc=7)
-    def LookupAccountName(self, emu, argv, ctx: api.ApiContext = None):
+    def LookupAccountName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL LookupAccountNameA(
-          [in, optional]  LPCSTR        lpSystemName,
-          [in]            LPCSTR        lpAccountName,
-          [out, optional] PSID          Sid,
-          [in, out]       LPDWORD       cbSid,
-          [out, optional] LPSTR         ReferencedDomainName,
-          [in, out]       LPDWORD       cchReferencedDomainName,
-          [out]           PSID_NAME_USE peUse
+        BOOL LookupAccountName(
+            LPCTSTR lpSystemName,
+            LPCTSTR lpAccountName,
+            PSID Sid,
+            LPDWORD cbSid,
+            LPTSTR ReferencedDomainName,
+            LPDWORD cchReferencedDomainName,
+            PSID_NAME_USE peUse
         );
         """
-        ctx = ctx or {}
-
-        ptr_sysname, ptr_acctname, ptr_sid, ptr_cbsid, ptr_domname, ptr_cchdomname, ptr_peuse = argv
+        lpSystemName, lpAccountName, Sid, cbSid, ReferencedDomainName, cchReferencedDomainName, peUse = argv
         rv = 0
 
         cw = self.get_char_width(ctx)
 
-        if ptr_sysname:
-            sn = self.read_mem_string(ptr_sysname, cw)
-            argv[0] = sn
+        if lpSystemName:
+            sn = self.read_mem_string(lpSystemName, cw)
+            ctx.args["lpSystemName"].display = sn
 
-        if not ptr_acctname:
+        if not lpAccountName:
             return rv
 
-        acctname = self.read_mem_string(ptr_acctname, cw)
-        argv[1] = acctname
+        acctname = self.read_mem_string(lpAccountName, cw)
+        ctx.args["lpAccountName"].display = acctname
 
         user = emu.config.user.name
         # Currently only supporting user SIDs specified in the config
@@ -1509,153 +1632,184 @@ class AdvApi32(api.ApiHandler):
         if not str_sid:
             return rv
 
-        argv[2] = str_sid
+        ctx.args["Sid"].display = str_sid
         sid_struct = windefs.convert_sid_str_to_struct(emu.get_ptr_size(), str_sid)
         side_struct_size = sid_struct.sizeof()
 
-        cbsid = self.mem_read(ptr_cbsid, 4)
+        cbsid = self.mem_read(cbSid, 4)
         cbsid = int.from_bytes(cbsid, "little")
-        argv[3] = cbsid
-        if not cbsid:
-            self.mem_write(ptr_cbsid, side_struct_size.to_bytes(4, "little"))
-            return rv
+        ctx.args["cbSid"].display = hex(cbsid)
 
-        if cbsid < side_struct_size:
-            return rv
-
-        domain = emu.config.domain
-        cchdomname = self.mem_read(ptr_cchdomname, 4)
+        domain = emu.config.system.domain or ""
+        cchdomname = self.mem_read(cchReferencedDomainName, 4)
         cbcchdomname = int.from_bytes(cchdomname, "little")
-        argv[5] = cbcchdomname
-        if not cbcchdomname:
-            buf_size = len(domain) + 1
-            self.mem_write(ptr_cchdomname, buf_size.to_bytes(4, "little"))
+        ctx.args["cchReferencedDomainName"].display = hex(cbcchdomname)
+
+        if not Sid or cbsid < side_struct_size or not ReferencedDomainName or cbcchdomname < len(domain) + 1:
+            self.write_dword(cbSid, side_struct_size)
+            self.write_dword(cchReferencedDomainName, len(domain) + 1)
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
             return rv
 
         rv = 1
 
-        self.mem_write(ptr_sid, self.get_bytes(sid_struct))
+        self.mem_write(Sid, self.get_bytes(sid_struct))
 
-        self.write_mem_string(domain, ptr_domname, cw)
-        argv[4] = domain
+        self.write_mem_string(domain, ReferencedDomainName, cw)
+        self.write_dword(cchReferencedDomainName, len(domain))
+        ctx.args["ReferencedDomainName"].display = domain
 
         # Currently only supporting user SIDs (SidTypeUser = 1)
-        self.mem_write(ptr_peuse, (1).to_bytes(4, "little"))
-        argv[6] = 1
+        self.write_dword(peUse, 1)
+        ctx.args["peUse"].display = hex(1)
 
         return rv
 
     @apihook("LookupAccountSid", argc=7)
-    def LookupAccountSid(self, emu, argv, ctx: api.ApiContext = None):
+    def LookupAccountSid(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL LookupAccountSid(
-            LPCSTR        lpSystemName,
-            PSID          Sid,
-            LPSTR         Name,
-            LPDWORD       cchName,
-            LPSTR         ReferencedDomainName,
-            LPDWORD       cchReferencedDomainName,
+            LPCTSTR lpSystemName,
+            PSID Sid,
+            LPTSTR Name,
+            LPDWORD cchName,
+            LPTSTR ReferencedDomainName,
+            LPDWORD cchReferencedDomainName,
             PSID_NAME_USE peUse
         );
         """
-        ctx = ctx or {}
-        sysname, sid, name, cchname, domname, cchdomname, peuse = argv
+        lpSystemName, Sid, Name, cchName, ReferencedDomainName, cchReferencedDomainName, peUse = argv
         rv = False
 
         cw = self.get_char_width(ctx)
 
-        if not cchname or not cchdomname:
+        if lpSystemName:
+            sn = self.read_mem_string(lpSystemName, cw)
+            ctx.args["lpSystemName"].display = sn
+
+        if not cchName or not cchReferencedDomainName:
             return rv
 
-        name_size = self.mem_read(cchname, 4)
+        name_size = self.mem_read(cchName, 4)
         name_size = int.from_bytes(name_size, "little")
 
-        dom_size = self.mem_read(cchdomname, 4)
+        dom_size = self.mem_read(cchReferencedDomainName, 4)
         dom_size = int.from_bytes(dom_size, "little")
 
-        self.write_mem_string("myuser", name, cw)
-        self.write_mem_string("mydomain", domname, cw)
-        rv = True
+        user, domain = "myuser", "mydomain"
+        if not Name or not ReferencedDomainName or name_size < len(user) + 1 or dom_size < len(domain) + 1:
+            self.write_dword(cchName, len(user) + 1)
+            self.write_dword(cchReferencedDomainName, len(domain) + 1)
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            return rv
 
-        if sysname:
-            sn = self.read_mem_string(sysname, cw)
-            argv[0] = sn
+        self.write_mem_string(user, Name, cw)
+        self.write_mem_string(domain, ReferencedDomainName, cw)
+        self.write_dword(cchName, len(user))
+        self.write_dword(cchReferencedDomainName, len(domain))
+        if peUse:
+            self.write_dword(peUse, 1)
+        rv = True
 
         return rv
 
     @apihook("CreateProcessAsUser", argc=11, conv=_arch.CALL_CONV_STDCALL)
-    def CreateProcessAsUser(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateProcessAsUser(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CreateProcessAsUser(
-          HANDLE                hToken,
-          LPCSTR                lpApplicationName,
-          LPSTR                 lpCommandLine,
-          LPSECURITY_ATTRIBUTES lpProcessAttributes,
-          LPSECURITY_ATTRIBUTES lpThreadAttributes,
-          BOOL                  bInheritHandles,
-          DWORD                 dwCreationFlags,
-          LPVOID                lpEnvironment,
-          LPCSTR                lpCurrentDirectory,
-          LPSTARTUPINFOA        lpStartupInfo,
-          LPPROCESS_INFORMATION lpProcessInformation
+            HANDLE hToken,
+            LPCTSTR lpApplicationName,
+            LPTSTR lpCommandLine,
+            LPSECURITY_ATTRIBUTES lpProcessAttributes,
+            LPSECURITY_ATTRIBUTES lpThreadAttributes,
+            BOOL bInheritHandles,
+            DWORD dwCreationFlags,
+            LPVOID lpEnvironment,
+            LPCTSTR lpCurrentDirectory,
+            LPSTARTUPINFO lpStartupInfo,
+            LPPROCESS_INFORMATION lpProcessInformation
         );
         """
-        ctx = ctx or {}
-        token, app, cmd, pa, ta, inherit, flags, env, cd, si, ppi = argv
+        (
+            hToken,
+            lpApplicationName,
+            lpCommandLine,
+            lpProcessAttributes,
+            lpThreadAttributes,
+            bInheritHandles,
+            dwCreationFlags,
+            lpEnvironment,
+            lpCurrentDirectory,
+            lpStartupInfo,
+            lpProcessInformation,
+        ) = argv
 
         cw = self.get_char_width(ctx)
         cmdstr = ""
         appstr = ""
         cwdstr = ""
-        if app:
-            appstr = self.read_mem_string(app, cw)
-            argv[1] = appstr
-        if cmd:
-            cmdstr = self.read_mem_string(cmd, cw)
+        if lpApplicationName:
+            appstr = self.read_mem_string(lpApplicationName, cw)
+            _set_arg_display(ctx, "lpApplicationName", appstr)
+        if lpCommandLine:
+            cmdstr = self.read_mem_string(lpCommandLine, cw)
+            _set_arg_display(ctx, "lpCommandLine", cmdstr)
+            # The local target resolver keeps the quoted executable path that
+            # create_process would otherwise have to recover from the command line.
             if not appstr:
                 appstr = ChildTargetResolver.command_target(cmdstr)
-            argv[2] = cmdstr
-        if cd:
-            cwdstr = self.read_mem_string(cd, cw)
-            argv[8] = cwdstr
+        else:
+            cmdstr = appstr
+        if lpCurrentDirectory:
+            cwdstr = self.read_mem_string(lpCurrentDirectory, cw)
+            _set_arg_display(ctx, "lpCurrentDirectory", cwdstr)
 
-        proc, _request = emu.request_child_process(
-            source_api="CreateProcessAsUser",
-            path=appstr,
-            cmdline=cmdstr,
-            cwd=cwdstr or None,
-        )
+        try:
+            proc, _request = emu.request_child_process(
+                source_api="CreateProcessAsUser",
+                path=appstr,
+                cmdline=cmdstr,
+                cwd=cwdstr or None,
+            )
+        except IsADirectoryError:
+            emu.set_last_error(windefs.ERROR_ACCESS_DENIED)
+            return 0
+        except FileSystemEmuError:
+            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
+            return 0
         proc_hnd = self.get_object_handle(proc)
 
         thread = proc.threads[0]
         thread_hnd = self.get_object_handle(thread)
 
+        if dwCreationFlags & PROCESS_CREATION_FLAGS.CREATE_SUSPENDED:
+            thread.suspend_count = 1
+
         _pi = self.k32types.PROCESS_INFORMATION(emu.get_ptr_size())
-        data = self.mem_cast(_pi, ppi)
+        data = self.mem_cast(_pi, lpProcessInformation)
         _pi.hProcess = proc_hnd
         _pi.hThread = thread_hnd
         _pi.dwProcessId = proc.pid
         _pi.dwThreadId = thread.tid
 
-        self.mem_write(ppi, self.get_bytes(data))
+        self.mem_write(lpProcessInformation, self.get_bytes(data))
 
         rv = 1
 
-        self.record_process_event(proc, PROC_CREATE)
+        self.record_process_event(proc, EventType.PROCESS_CREATE)
         return rv
 
     @apihook("CryptCreateHash", argc=5)
-    def CryptCreateHash(self, emu, argv, ctx: api.ApiContext = None):
+    def CryptCreateHash(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CryptCreateHash(
-          HCRYPTPROV hProv,
-          ALG_ID     Algid,
-          HCRYPTKEY  hKey,
-          DWORD      dwFlags,
-          HCRYPTHASH *phHash
+            HCRYPTPROV hProv,
+            ALG_ID Algid,
+            HCRYPTKEY hKey,
+            DWORD dwFlags,
+            HCRYPTHASH *phHash
         );
         """
-
         hash_algs = {
             0x00008004: ("CALG_SHA1", hashlib.sha1),
             0x0000800C: ("CALG_SHA_256", hashlib.sha256),
@@ -1665,53 +1819,52 @@ class AdvApi32(api.ApiHandler):
         }
 
         hProv, Algid, hKey, dwFlags, phHash = argv
-        argv[1] = hash_algs.get(Algid, Algid)[0]
+        if Algid in hash_algs:
+            ctx.args["Algid"].display = hash_algs[Algid][0]
 
         if hKey != 0:
             return 0
 
         if Algid not in hash_algs:
-            emu.set_last_error(adv32.NTE_BAD_ALGID)
+            emu.set_last_error(adv32defs.NTE_BAD_ALGID)
             return 0
 
-        hnd = self.get_handle()
-        self.hash_objects.update({hnd: hash_algs[Algid][1]()})
-        self.mem_write(phHash, hnd.to_bytes(self.get_ptr_size(), "little"))
+        hnd = emu.get_crypt_manager().create_hash(hash_algs[Algid][1]())
+        self.write_ptr(phHash, hnd)
         return 1
 
     @apihook("CryptHashData", argc=4)
-    def CryptHashData(self, emu, argv, ctx: api.ApiContext = None):
+    def CryptHashData(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CryptHashData(
-          HCRYPTHASH hHash,
-          const BYTE *pbData,
-          DWORD      dwDataLen,
-          DWORD      dwFlags
+            HCRYPTHASH hHash,
+            const BYTE *pbData,
+            DWORD dwDataLen,
+            DWORD dwFlags
         );
         """
-
         hHash, pbData, dwDataLen, dwFlags = argv
-        hnd = self.hash_objects.get(hHash, None)
+        hnd = emu.get_crypt_manager().get_hash(hHash)
         if hnd is None:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
-        if dwDataLen <= 0:
-            return 0
+        if dwDataLen == 0:
+            return 1
 
         data = self.mem_read(pbData, dwDataLen)
         hnd.update(data)
         return 1
 
     @apihook("CryptGetHashParam", argc=5)
-    def CryptGetHashParam(self, emu, argv, ctx: api.ApiContext = None):
+    def CryptGetHashParam(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CryptGetHashParam(
-          HCRYPTHASH hHash,
-          DWORD      dwParam,
-          BYTE       *pbData,
-          DWORD      *pdwDataLen,
-          DWORD      dwFlags
+            HCRYPTHASH hHash,
+            DWORD dwParam,
+            BYTE *pbData,
+            DWORD *pdwDataLen,
+            DWORD dwFlags
         );
         """
         hHash, dwParam, pbData, pdwDataLen, dwFlags = argv
@@ -1719,192 +1872,430 @@ class AdvApi32(api.ApiHandler):
         param_enums = {1: "HP_ALGID", 2: "HP_HASHVAL", 4: "HP_HASHSIZE", 5: "HP_HMAC_INFO"}
 
         if dwParam in param_enums.keys():
-            argv[1] = param_enums[dwParam]
+            ctx.args["dwParam"].display = param_enums[dwParam]
 
-        return 1
-
-    @apihook("CryptDestroyHash", argc=1)
-    def CryptDestroyHash(self, emu, argv, ctx: api.ApiContext = None):
-        """
-        BOOL CryptDestroyHash(
-          HCRYPTHASH hHash
-        );
-        """
-        return 1
-
-    @apihook("CryptDeriveKey", argc=5)
-    def CryptDeriveKey(self, emu, argv, ctx: api.ApiContext = None):
-        """
-        BOOL CryptDeriveKey(
-          HCRYPTPROV hProv,
-          ALG_ID     Algid,
-          HCRYPTHASH hBaseData,
-          DWORD      dwFlags,
-          HCRYPTKEY  *phKey
-        );
-        """
-
-        hProv, Algid, hBaseData, dwFlags, phKey = argv
-
-        # Only RC4 supported right now
-        if Algid != 0x6801:
-            return 0
-
-        hnd = self.hash_objects.get(hBaseData, None)
-
+        hnd = emu.get_crypt_manager().get_hash(hHash)
         if hnd is None:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
-        # CryptDeriveKey zeroes out the last 11 bytes of the hash,
-        # so we gotta do the same before it is written to the
-        # phKey structure
-        fixed_digest = hnd.digest()[:5] + b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        if dwParam == adv32defs.HP_HASHVAL:
+            value = hnd.digest()
+        elif dwParam == adv32defs.HP_HASHSIZE:
+            value = hnd.digest_size.to_bytes(4, "little")
+        else:
+            return 1
 
-        ptrsz = emu.get_ptr_size()
+        size = self.read_dword(pdwDataLen)
+        self.write_dword(pdwDataLen, len(value))
+        if not pbData:
+            return 1
+        if size < len(value):
+            emu.set_last_error(windefs.ERROR_MORE_DATA)
+            return 0
+        self.mem_write(pbData, value)
+        return 1
 
-        hKey = self.win.HCRYPTKEY(ptrsz)
-        hKey.Algid = Algid
-        hKey.keylen = hnd.digest_size
-        hKey.keyp = self.mem_alloc(hKey.keylen)
+    def get_md5_context(self, ctx_addr):
+        md5 = self.md5_contexts.get(ctx_addr)
+        if md5 is None:
+            md5 = self.md5_contexts[ctx_addr] = hashlib.md5()
+        return md5
 
-        hKeyp = self.mem_alloc(hKey.sizeof())
+    @apihook("MD5Init", argc=1)
+    def MD5Init(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void MD5Init(
+            MD5_CTX *context
+        );
+        """
+        (context,) = argv
+        self.md5_contexts[context] = hashlib.md5()
+        self.mem_write(context, struct.pack("<2I4I", 0, 0, *MD5_INITIAL_STATE) + b"\x00" * 80)
 
-        self.mem_write(hKey.keyp, fixed_digest)
+    @apihook("MD5Update", argc=3)
+    def MD5Update(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void MD5Update(
+            MD5_CTX *context,
+            const unsigned char *input,
+            unsigned int inlen
+        );
 
-        self.mem_write(hKeyp, hKey.get_bytes())
-        self.mem_write(phKey, hKeyp.to_bytes(ptrsz, "little"))
+        Write the bit count and the input buffer into the context. The
+        handler keeps the hash state in a hashlib object.
+        """
+        context, input, inlen = argv
+        bits = int.from_bytes(self.mem_read(context, 8), "little")
+        block = self.mem_read(input, inlen) if inlen else b""
+        self.get_md5_context(context).update(block)
+        buffered = bits // 8 % 64
+        pending = (self.mem_read(context + 24, buffered) if buffered else b"") + block
+        partial = pending[len(pending) - (bits // 8 + inlen) % 64 :]
+        self.write_qword(context, (bits + inlen * 8) & 0xFFFFFFFFFFFFFFFF)
+        self.mem_write(context + 24, partial)
 
+    @apihook("MD5Final", argc=1)
+    def MD5Final(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void MD5Final(
+            MD5_CTX *context
+        );
+
+        Write the digest into the buf and digest members of the context.
+        """
+        (context,) = argv
+        digest = self.get_md5_context(context).digest()
+        self.mem_write(context + 8, digest)
+        self.mem_write(context + 88, digest)
+        self.md5_contexts.pop(context, None)
+
+    @apihook("CryptDestroyHash", argc=1)
+    def CryptDestroyHash(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CryptDestroyHash(
+            HCRYPTHASH hHash
+        );
+
+        Speakeasy does not model the lifetime of hash objects, so the handle stays valid.
+        """
+        return 1
+
+    @apihook("CryptDeriveKey", argc=5)
+    def CryptDeriveKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CryptDeriveKey(
+            HCRYPTPROV hProv,
+            ALG_ID Algid,
+            HCRYPTHASH hBaseData,
+            DWORD dwFlags,
+            HCRYPTKEY *phKey
+        );
+
+        Derive RC4 keys only.
+        """
+        hProv, Algid, hBaseData, dwFlags, phKey = argv
+
+        if Algid != adv32defs.CALG_RC4:
+            emu.set_last_error(adv32defs.NTE_BAD_ALGID)
+            return 0
+
+        cm = emu.get_crypt_manager()
+        prov = cm.get_context(hProv)
+        hnd = cm.get_hash(hBaseData)
+        if prov is None or hnd is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        # The upper 16 bits of dwFlags give the key length in bits.
+        digest = hnd.digest()
+        key_bits = dwFlags >> 16 or prov.get_default_rc4_bits()
+        secret = digest[: key_bits // 8] if 40 < key_bits <= len(digest) * 8 else digest[:5]
+        self.write_ptr(phKey, prov.add_key(CryptoApiKey(prov, Algid, dwFlags, secret=secret)))
+        return 1
+
+    @apihook("CryptImportKey", argc=6)
+    def CryptImportKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CryptImportKey(
+            HCRYPTPROV hProv,
+            const BYTE *pbData,
+            DWORD dwDataLen,
+            HCRYPTKEY hPubKey,
+            DWORD dwFlags,
+            HCRYPTKEY *phKey
+        );
+        """
+        hProv, pbData, dwDataLen, hPubKey, dwFlags, phKey = argv
+        dwDataLen &= 0xFFFFFFFF
+
+        prov = emu.get_crypt_manager().get_context(hProv)
+        if prov is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        blob = self.mem_read(pbData, dwDataLen) if dwDataLen else b""
+        try:
+            key = CryptoApiKey.from_blob(prov, blob, dwFlags)
+        except CryptoApiError as e:
+            emu.set_last_error(e.code)
+            return 0
+        self.write_ptr(phKey, prov.add_key(key))
+        return 1
+
+    @apihook("CryptGenKey", argc=4)
+    def CryptGenKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CryptGenKey(
+            HCRYPTPROV hProv,
+            ALG_ID Algid,
+            DWORD dwFlags,
+            HCRYPTKEY *phKey
+        );
+
+        The key bytes come from the random number generator of the emulator.
+        """
+        hProv, Algid, dwFlags, phKey = argv
+
+        prov = emu.get_crypt_manager().get_context(hProv)
+        if prov is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        try:
+            key = CryptoApiKey.from_random(prov, Algid, dwFlags, emu.rng.randbytes)
+        except CryptoApiError as e:
+            emu.set_last_error(e.code)
+            return 0
+        self.write_ptr(phKey, prov.add_key(key))
+        return 1
+
+    @apihook("CryptExportKey", argc=6)
+    def CryptExportKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CryptExportKey(
+            HCRYPTKEY hKey,
+            HCRYPTKEY hExpKey,
+            DWORD dwBlobType,
+            DWORD dwFlags,
+            BYTE *pbData,
+            DWORD *pdwDataLen
+        );
+        """
+        hKey, hExpKey, dwBlobType, dwFlags, pbData, pdwDataLen = argv
+
+        key = emu.get_crypt_manager().get_crypto_api_key(hKey)
+        if key is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        try:
+            blob = key.get_blob(dwBlobType)
+        except CryptoApiError as e:
+            emu.set_last_error(e.code)
+            return 0
+
+        size = self.read_dword(pdwDataLen)
+        self.write_dword(pdwDataLen, len(blob))
+        if not pbData:
+            return 1
+        if size < len(blob):
+            emu.set_last_error(windefs.ERROR_MORE_DATA)
+            return 0
+        self.mem_write(pbData, blob)
+        return 1
+
+    @apihook("CryptSetKeyParam", argc=4)
+    def CryptSetKeyParam(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CryptSetKeyParam(
+            HCRYPTKEY hKey,
+            DWORD dwParam,
+            const BYTE *pbData,
+            DWORD dwFlags
+        );
+
+        Set KP_IV, KP_MODE and KP_PADDING. Other parameters do not change the key.
+        """
+        hKey, dwParam, pbData, dwFlags = argv
+
+        key = emu.get_crypt_manager().get_crypto_api_key(hKey)
+        if key is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        if dwParam == adv32defs.KP_IV:
+            key.iv = self.mem_read(pbData, key.block_len) if key.block_len else b""
+        elif dwParam == adv32defs.KP_MODE:
+            mode = self.read_dword(pbData)
+            if mode not in CIPHER_MODES:
+                emu.set_last_error(adv32defs.NTE_BAD_DATA)
+                return 0
+            key.mode = mode
+        elif dwParam == adv32defs.KP_PADDING and self.read_dword(pbData) != adv32defs.PKCS5_PADDING:
+            emu.set_last_error(adv32defs.NTE_BAD_DATA)
+            return 0
+        else:
+            return 1
+        key.reset()
+        return 1
+
+    @apihook("CryptEncrypt", argc=7)
+    def CryptEncrypt(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CryptEncrypt(
+            HCRYPTKEY hKey,
+            HCRYPTHASH hHash,
+            BOOL Final,
+            DWORD dwFlags,
+            BYTE *pbData,
+            DWORD *pdwDataLen,
+            DWORD dwBufLen
+        );
+        """
+        hKey, hHash, Final, dwFlags, pbData, pdwDataLen, dwBufLen = argv
+        dwBufLen &= 0xFFFFFFFF
+        final = bool(Final & 0xFFFFFFFF)
+
+        cm = emu.get_crypt_manager()
+        key = cm.get_crypto_api_key(hKey)
+        hnd = cm.get_hash(hHash) if hHash else None
+        if key is None or (hHash and hnd is None):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        size = self.read_dword(pdwDataLen)
+        try:
+            out_size = key.get_encrypted_size(size, final)
+            if not pbData:
+                self.write_dword(pdwDataLen, out_size)
+                return 1
+            if dwBufLen < out_size:
+                self.write_dword(pdwDataLen, out_size)
+                emu.set_last_error(windefs.ERROR_MORE_DATA)
+                return 0
+            data = self.mem_read(pbData, size) if size else b""
+            out = key.encrypt(data, final, emu.rng.randbytes)
+        except CryptoApiError as e:
+            emu.set_last_error(e.code)
+            return 0
+
+        if hnd is not None:
+            hnd.update(data)
+        ctx.args["pbData"].display = base64.b64encode(data).decode("utf-8")
+        if out:
+            self.mem_write(pbData, out)
+        self.write_dword(pdwDataLen, len(out))
         return 1
 
     @apihook("CryptDecrypt", argc=6)
-    def CryptDecrypt(self, emu, argv, ctx: api.ApiContext = None):
+    def CryptDecrypt(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CryptDecrypt(
-          HCRYPTKEY  hKey,
-          HCRYPTHASH hHash,
-          BOOL       Final,
-          DWORD      dwFlags,
-          BYTE       *pbData,
-          DWORD      *pdwDataLen
+            HCRYPTKEY hKey,
+            HCRYPTHASH hHash,
+            BOOL Final,
+            DWORD dwFlags,
+            BYTE *pbData,
+            DWORD *pdwDataLen
         );
         """
-
         hKey, hHash, Final, dwFlags, pbData, pdwDataLen = argv
+        final = bool(Final & 0xFFFFFFFF)
 
-        # Hashing not supported
-        if hHash:
+        cm = emu.get_crypt_manager()
+        key = cm.get_crypto_api_key(hKey)
+        hnd = cm.get_hash(hHash) if hHash else None
+        if key is None or (hHash and hnd is None):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
-        ptrsz = emu.get_ptr_size()
-
-        hKey = self.mem_cast(self.win.HCRYPTKEY(ptrsz), hKey)
-
-        # Only RC4 supported right now
-        if hKey.Algid != 0x6801:
+        size = self.read_dword(pdwDataLen)
+        data = self.mem_read(pbData, size) if size else b""
+        try:
+            out = key.decrypt(data, final)
+        except CryptoApiError as e:
+            emu.set_last_error(e.code)
             return 0
 
-        encdatalen_b = self.mem_read(pdwDataLen, 4)
-        encdatalen = int.from_bytes(encdatalen_b, "little")
+        if hnd is not None:
+            hnd.update(out)
+        ctx.args["pbData"].display = base64.b64encode(out).decode("utf-8")
+        if out:
+            self.mem_write(pbData, out)
+        self.write_dword(pdwDataLen, len(out))
+        return 1
 
-        encdata = self.mem_read(pbData, encdatalen)
-
-        key = self.mem_read(hKey.keyp, hKey.keylen)
-
-        if self.rc4 is None:
-            self.rc4 = ARC4.new(key)
-
-        dec = self.rc4.decrypt(encdata)
-        declen = len(dec)
-
-        self.mem_write(pbData, dec)
-        self.mem_write(pdwDataLen, int.to_bytes(declen, 4, "little"))
-
-        if Final:
-            self.rc4 = None
-
+    @apihook("CryptDestroyKey", argc=1)
+    def CryptDestroyKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CryptDestroyKey(
+            HCRYPTKEY hKey
+        );
+        """
+        (hKey,) = argv
+        if not emu.get_crypt_manager().destroy_crypto_api_key(hKey):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
         return 1
 
     @apihook("RegGetValue", argc=7, conv=_arch.CALL_CONV_STDCALL)
-    def RegGetValue(self, emu, argv, ctx: api.ApiContext = None):
+    def RegGetValue(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LSTATUS RegGetValueW(
-            HKEY    hkey,
-            LPCWSTR lpSubKey,
-            LPCWSTR lpValue,
-            DWORD   dwFlags,
+        LSTATUS RegGetValue(
+            HKEY hkey,
+            LPCTSTR lpSubKey,
+            LPCTSTR lpValue,
+            DWORD dwFlags,
             LPDWORD pdwType,
-            PVOID   pvData,
+            PVOID pvData,
             LPDWORD pcbData
-            );
+        );
         """
-        ctx = ctx or {}
-
-        hKey, lpSubKey, lpValue, dwFlags, lpType, lpData, lpcbData = argv
+        lpSubKey: int | str
+        hkey, lpSubKey, lpValue, dwFlags, pdwType, pvData, pcbData = argv
         rv = windefs.ERROR_SUCCESS
 
         cw = self.get_char_width(ctx)
         if lpSubKey:
             lpSubKey = self.read_mem_string(lpSubKey, cw)
-            argv[1] = lpSubKey
+            ctx.args["lpSubKey"].display = lpSubKey
 
+        value_name = ""
         if lpValue:
-            lpValue = self.read_mem_string(lpValue, cw)
-            argv[2] = lpValue
-
-        type_name = regdefs.get_value_type(lpType)
-        if type_name:
-            argv[4] = type_name
+            value_name = self.read_mem_string(lpValue, cw)
+            ctx.args["lpValue"].display = value_name
 
         length = 0
-        if lpcbData:
-            length = self.mem_read(lpcbData, 4)
+        if pcbData:
+            length = self.mem_read(pcbData, 4)
             length = int.from_bytes(length, "little")
 
-        key = self.reg_get_key(hKey)
+        key = self.get_reg_key(hkey)
+        if not key:
+            return windefs.ERROR_INVALID_HANDLE
+        hnd = hkey
+        if lpSubKey:
+            hnd = self.reg_open_key(key.get_path() + "\\" + lpSubKey)
+            if not hnd:
+                return windefs.ERROR_FILE_NOT_FOUND
+            key = self.get_reg_key(hnd)
         if key:
-            val = key.get_value(lpValue)
+            val = emu.regman.read_value(key, value_name, cw, handle=hnd, buffer=pvData, size=length)
             if val:
-                output = b""
-
-                if lpcbData:
-                    self.mem_write(lpcbData, len(output).to_bytes(4, "little"))
-
-                if len(output) > length:
-                    rv = windefs.ERROR_INSUFFICIENT_BUFFER
-                else:
-                    self.mem_write(lpData, output)
+                self.write_value_type(val, pdwType, ctx.args["pdwType"])
+                output = val.get_bytes(cw)
+                if pcbData:
+                    self.write_dword(pcbData, len(output))
+                if pvData:
+                    if not pcbData:
+                        rv = windefs.ERROR_INVALID_PARAMETER
+                    elif len(output) > length:
+                        rv = windefs.ERROR_MORE_DATA
+                    else:
+                        self.mem_write(pvData, output)
 
             # For now, return an empty buffer
             else:
                 output = b"\x00" * length
-                self.mem_write(lpData, output)
+                if pvData:
+                    self.mem_write(pvData, output)
                 rv = windefs.ERROR_SUCCESS
-
-            kp = key.get_path()
-            self.record_registry_access_event(
-                kp,
-                REG_READ,
-                value_name=lpValue,
-                data=output,
-                size=length,
-                buffer=lpData,
-            )
 
         return rv
 
     @apihook("EnumServicesStatus", argc=8, conv=_arch.CALL_CONV_STDCALL)
-    def EnumServicesStatus(self, emu, argv, ctx: api.ApiContext = None):
+    def EnumServicesStatus(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL EnumServicesStatusA(
-          SC_HANDLE              hSCManager,
-          DWORD                  dwServiceType,
-          DWORD                  dwServiceState,
-          LPENUM_SERVICE_STATUSA lpServices,
-          DWORD                  cbBufSize,
-          LPDWORD                pcbBytesNeeded,
-          LPDWORD                lpServicesReturned,
-          LPDWORD                lpResumeHandle
+        BOOL EnumServicesStatus(
+            SC_HANDLE hSCManager,
+            DWORD dwServiceType,
+            DWORD dwServiceState,
+            LPENUM_SERVICE_STATUS lpServices,
+            DWORD cbBufSize,
+            LPDWORD pcbBytesNeeded,
+            LPDWORD lpServicesReturned,
+            LPDWORD lpResumeHandle
         );
         """
         (
@@ -1918,38 +2309,81 @@ class AdvApi32(api.ApiHandler):
             lpResumeHandle,
         ) = argv
 
-        service_type_str = adv32.get_define_int(dwServiceType, "SERVICE_")
-        if service_type_str:
-            argv[1] = service_type_str
+        ctx.args["dwServiceType"].display = decode(ENUM_SERVICE_TYPE, dwServiceType)
+        ctx.args["dwServiceState"].display = decode(ENUM_SERVICE_STATE, dwServiceState)
 
-        service_state_str = adv32.get_define_int(dwServiceState, "SERVICE_")
-        if service_state_str:
-            argv[2] = service_state_str
+        cw = self.get_char_width(ctx)
+        ptr_size = emu.get_ptr_size()
+        entry_size = (2 * ptr_size + 28 + ptr_size - 1) & ~(ptr_size - 1)
+        services = [
+            service
+            for service in adv32defs.EMULATED_SERVICES
+            if service[2] & dwServiceType
+            and dwServiceState
+            & (
+                ENUM_SERVICE_STATE.SERVICE_ACTIVE
+                if service[3] == SERVICE_STATUS_CURRENT_STATE.SERVICE_RUNNING
+                else ENUM_SERVICE_STATE.SERVICE_INACTIVE
+            )
+        ]
+        start = self.read_dword(lpResumeHandle) if lpResumeHandle else 0
+        services = services[start:]
 
-        # TODO: Populate service status output
+        def encode(text):
+            return self.encode_string(text + "\0", cw)
+
+        sizes = [entry_size + len(encode(name)) + len(encode(display)) for name, display, _, _ in services]
+        count = 0
+        while count < len(sizes) and sum(sizes[: count + 1]) <= cbBufSize:
+            count += 1
+
+        strings = lpServices + count * entry_size
+        for index, (name, display, service_type, state) in enumerate(services[:count]):
+            entry = bytearray(entry_size)
+            for offset, text in ((0, name), (ptr_size, display)):
+                data = encode(text)
+                self.mem_write(strings, data)
+                entry[offset : offset + ptr_size] = strings.to_bytes(ptr_size, "little")
+                strings += len(data)
+            accepted = adv32defs.SERVICE_ACCEPT_STOP if state == SERVICE_STATUS_CURRENT_STATE.SERVICE_RUNNING else 0
+            struct.pack_into("<7I", entry, 2 * ptr_size, service_type, state, accepted, 0, 0, 0, 0)
+            self.mem_write(lpServices + index * entry_size, bytes(entry))
+
+        needed = sum(sizes[count:])
+        for ptr, value in (
+            (pcbBytesNeeded, needed),
+            (lpServicesReturned, count),
+            (lpResumeHandle, start + count if needed else 0),
+        ):
+            if ptr:
+                self.write_dword(ptr, value)
+        if needed:
+            emu.set_last_error(windefs.ERROR_MORE_DATA)
+            return 0
         return 1
 
     @apihook("OpenService", argc=3, conv=_arch.CALL_CONV_STDCALL)
-    def OpenService(self, emu, argv, ctx: api.ApiContext = None):
+    def OpenService(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        SC_HANDLE OpenServiceA(
-          SC_HANDLE hSCManager,
-          LPCSTR    lpServiceName,
-          DWORD     dwDesiredAccess
+        SC_HANDLE OpenService(
+            SC_HANDLE hSCManager,
+            LPCTSTR lpServiceName,
+            DWORD dwDesiredAccess
         );
         """
-        ctx = ctx or {}
         hSCManager, lpServiceName, dwDesiredAccess = argv
         cw = self.get_char_width(ctx)
         svcname = self.read_mem_string(lpServiceName, cw)
-        argv[1] = svcname
-        return self.get_handle()
+        ctx.args["lpServiceName"].display = svcname
+        return emu.handle_allocator.allocate_handle()
 
     @apihook("DeleteService", argc=1, conv=_arch.CALL_CONV_STDCALL)
-    def DeleteService(self, emu, argv, ctx: api.ApiContext = None):
+    def DeleteService(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL DeleteService(
-          SC_HANDLE hService
+            SC_HANDLE hService
         );
+
+        Speakeasy does not model the state of services. DeleteService only returns success.
         """
         return 1

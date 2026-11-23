@@ -1,0 +1,3471 @@
+{
+  "$defs": {
+    "AccessType": {
+      "description": "Kind of memory access that faulted.",
+      "enum": [
+        "read",
+        "write",
+        "fetch"
+      ],
+      "title": "AccessType",
+      "type": "string"
+    },
+    "ApiArg": {
+      "description": "One argument of an API call, as passed by the caller and as shown in the trace.",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Parameter name from the API signature. Absent when the signature is not known.",
+          "title": "Name"
+        },
+        "type": {
+          "$ref": "#/$defs/ApiArgType",
+          "description": "How to read ``display``: ``int`` (hex), ``ptr`` (address, hex), ``handle`` (hex), ``str`` (decoded string, unquoted), ``bool`` (TRUE or FALSE), ``enum`` (a member name), ``flags`` (member names joined by ``|``, maybe with a hex remainder), ``struct`` (``{field: value, ...}`` display text, not JSON), ``bytes`` (hex dump), ``guid``, ``float`` (decimal), or ``text`` (a value decoded by a handler)."
+        },
+        "value": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Raw value as the caller passed it. A parameter that uses more than one argument slot has the combined value. A floating point argument that Win64 passes in an XMM register has the value of the integer register for the same position instead. Absent for an entry that a handler adds, such as the formatted output of a printf call.",
+          "title": "Value"
+        },
+        "display": {
+          "description": "Human readable rendering of the argument.",
+          "title": "Display",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "display"
+      ],
+      "title": "ApiArg",
+      "type": "object"
+    },
+    "ApiArgType": {
+      "description": "How to read the ``display`` of an API argument.",
+      "enum": [
+        "int",
+        "ptr",
+        "handle",
+        "str",
+        "bool",
+        "enum",
+        "flags",
+        "struct",
+        "bytes",
+        "guid",
+        "float",
+        "text"
+      ],
+      "title": "ApiArgType",
+      "type": "string"
+    },
+    "ApiEvent": {
+      "description": "One call to an API.\n\nThe profiler leaves out a call that repeats the API, pc, return address, shown arguments and\nreturn value of one of the last 3 events of the run, and adds 1 to ``calls`` of that event.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "api",
+          "default": "api",
+          "description": "Event type of an API call.",
+          "title": "Event",
+          "type": "string"
+        },
+        "api_name": {
+          "description": "API name in ``module.function`` form, such as ``kernel32.CreateFileA``.",
+          "title": "Api Name",
+          "type": "string"
+        },
+        "args": {
+          "description": "Arguments of the call. With a usable API signature, one entry for each parameter. Else, one entry for each argument slot. A variadic handler can add entries.",
+          "items": {
+            "$ref": "#/$defs/ApiArg"
+          },
+          "title": "Args",
+          "type": "array"
+        },
+        "return_value": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Return value of the API, when the handler gives one.",
+          "title": "Return Value"
+        },
+        "return_address": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Address where the call returns to the caller. Absent when the emulator does not know it.",
+          "title": "Return Address"
+        },
+        "calls": {
+          "default": 1,
+          "description": "Number of calls that the event stands for: this call and the repeats that the profiler leaves out. The event has the ``pos`` and the raw argument values of the first call.",
+          "title": "Calls",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pos",
+        "api_name",
+        "args"
+      ],
+      "title": "ApiEvent",
+      "type": "object"
+    },
+    "ApiLoop": {
+      "description": "The API calls of a run after its last call from a new call site.\n\nA call site is an API and a return address.",
+      "properties": {
+        "start": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the first API call of the loop."
+        },
+        "calls": {
+          "description": "Number of API calls in the loop.",
+          "title": "Calls",
+          "type": "integer"
+        },
+        "sites": {
+          "description": "Call sites of the loop, the site with the most calls first. At most 16 sites.",
+          "items": {
+            "$ref": "#/$defs/ApiLoopSite"
+          },
+          "title": "Sites",
+          "type": "array"
+        }
+      },
+      "required": [
+        "start",
+        "calls",
+        "sites"
+      ],
+      "title": "ApiLoop",
+      "type": "object"
+    },
+    "ApiLoopSite": {
+      "description": "One call site of an API loop.",
+      "properties": {
+        "api_name": {
+          "description": "Name of the API in ``module.function`` form.",
+          "title": "Api Name",
+          "type": "string"
+        },
+        "return_address": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Return address of the calls from this site.",
+          "title": "Return Address"
+        },
+        "calls": {
+          "description": "Number of calls from this site in the loop.",
+          "title": "Calls",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "api_name",
+        "calls"
+      ],
+      "title": "ApiLoopSite",
+      "type": "object"
+    },
+    "Arch": {
+      "description": "Architecture of the input.",
+      "enum": [
+        "x86",
+        "x64"
+      ],
+      "title": "Arch",
+      "type": "string"
+    },
+    "ArtifactCompression": {
+      "description": "Compression of a stored payload.",
+      "enum": [
+        "zlib"
+      ],
+      "title": "ArtifactCompression",
+      "type": "string"
+    },
+    "ArtifactEncoding": {
+      "description": "Text encoding of a stored payload.",
+      "enum": [
+        "base64"
+      ],
+      "title": "ArtifactEncoding",
+      "type": "string"
+    },
+    "DataArtifact": {
+      "description": "One payload of the report.\n\nThe top-level ``data`` of the report keys each payload by the SHA-256 of its bytes. A ``data_ref``\nfield elsewhere in the report holds such a key.",
+      "properties": {
+        "compression": {
+          "$ref": "#/$defs/ArtifactCompression",
+          "description": "Compression of the payload."
+        },
+        "encoding": {
+          "$ref": "#/$defs/ArtifactEncoding",
+          "description": "Text encoding of the compressed payload."
+        },
+        "size": {
+          "description": "Size of the payload before compression, in bytes.",
+          "title": "Size",
+          "type": "integer"
+        },
+        "data": {
+          "description": "Payload, compressed and then encoded.",
+          "title": "Data",
+          "type": "string"
+        }
+      },
+      "required": [
+        "compression",
+        "encoding",
+        "size",
+        "data"
+      ],
+      "title": "DataArtifact",
+      "type": "object"
+    },
+    "DirectoryCreateEvent": {
+      "description": "A directory that the guest creates.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "directory_create",
+          "default": "directory_create",
+          "description": "Event type of a directory creation.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Emulated path of the directory.",
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "DirectoryCreateEvent",
+      "type": "object"
+    },
+    "DirectoryDeleteEvent": {
+      "description": "A directory that the guest deletes.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "directory_delete",
+          "default": "directory_delete",
+          "description": "Event type of a directory deletion.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Emulated path of the directory.",
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "DirectoryDeleteEvent",
+      "type": "object"
+    },
+    "DroppedFile": {
+      "description": "A file that the guest wrote completely, up to the end of the run.",
+      "properties": {
+        "path": {
+          "description": "Emulated path of the file.",
+          "title": "Path",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size of the file in bytes.",
+          "title": "Size",
+          "type": "integer"
+        },
+        "sha256": {
+          "description": "SHA-256 of the file data.",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the file data. It is equal to ``sha256``. Absent for an empty file and for a file above ``MAX_EMBEDDED_FILE_SIZE`` (10 MiB).",
+          "title": "Data Ref"
+        }
+      },
+      "required": [
+        "path",
+        "size",
+        "sha256"
+      ],
+      "title": "DroppedFile",
+      "type": "object"
+    },
+    "DynamicCodeContents": {
+      "description": "The position and the data of a dynamic code region when code ran in it.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position when the emulator found code that ran in the region: the first time, or for a later snapshot, the first block in the region after the change. ``pc`` is in the region."
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the region data at ``pos``. Each snapshot of a region has different data from the snapshot before it. Absent when ``memory.dynamic_code_contents`` is off.",
+          "title": "Data Ref"
+        }
+      },
+      "required": [
+        "pos"
+      ],
+      "title": "DynamicCodeContents",
+      "type": "object"
+    },
+    "DynamicCodeRegion": {
+      "description": "A dynamic code region where code ran.\n\nThe emulator watches the memory that the guest allocates, for example with ``VirtualAlloc``, and\nadds a region when the guest runs code in the region. With ``memory.dynamic_code_contents``, the\nemulator adds one more snapshot to ``contents`` each time that code runs in the region after the\nregion changed, and control came from outside the region.",
+      "properties": {
+        "region": {
+          "description": "Base address of the region, as in ``memory.layout``.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Region",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size of the region in bytes.",
+          "title": "Size",
+          "type": "integer"
+        },
+        "tag": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Tag of the memory manager, such as ``api.VirtualAlloc``. Absent when the region has no tag.",
+          "title": "Tag"
+        },
+        "contents": {
+          "description": "With ``memory.dynamic_code_contents``, one snapshot for each time that code ran in the region with new data, in the order of ``pos.tick``. With the option off, one entry with the ``pos`` of the first time that code ran in the region.",
+          "items": {
+            "$ref": "#/$defs/DynamicCodeContents"
+          },
+          "title": "Contents",
+          "type": "array"
+        },
+        "limit_reached": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "True if the region changed and code ran in it again after the last snapshot that ``memory.dynamic_code_contents.limit`` allows. Absent when ``memory.dynamic_code_contents`` is off.",
+          "title": "Limit Reached"
+        }
+      },
+      "required": [
+        "region",
+        "size",
+        "contents"
+      ],
+      "title": "DynamicCodeRegion",
+      "type": "object"
+    },
+    "ErrorInfo": {
+      "description": "Why a run, or the emulation, ended with an error.\n\nThe emulator fills only the fields that apply to the error ``type``.",
+      "properties": {
+        "type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorType"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Kind of error, such as ``unsupported_api``, ``api_call_limit``, ``api_loop_limit`` or ``invalid_read``. A Python exception in Speakeasy itself, such as a bug in an API handler, is ``internal_error``. A string that is not an ``ErrorType`` comes from a report of a newer minor version.",
+          "title": "Type"
+        },
+        "pc": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Address of the instruction where the run stopped. For an error of an API call, such as ``unsupported_api`` or ``api_loop_limit``, the address of the call, the same as ``pos.pc`` of its ``api`` event.",
+          "title": "Pc"
+        },
+        "instruction": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Disassembly of the instruction at ``pc``. Absent when Speakeasy cannot disassemble it, for example when ``pc`` is not mapped.",
+          "title": "Instruction"
+        },
+        "address": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Memory address that the faulting access used. For ``unsupported_api``, the return address of the API call.",
+          "title": "Address"
+        },
+        "access_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccessType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Kind of the faulting access: read, write or fetch."
+        },
+        "registers": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "pattern": "^0x[0-9a-f]+$",
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Register values at the time of the error.",
+          "title": "Registers"
+        },
+        "stack": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/StackEntry"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Stack slots at the time of the error, from the stack pointer up.",
+          "title": "Stack"
+        },
+        "pc_module": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "File name of the module that contains the faulting PC, for example ``sample.exe``. The same as ``memory.modules[].name``.",
+          "title": "Pc Module"
+        },
+        "pc_offset": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Offset of the faulting PC from the base of ``pc_module``.",
+          "title": "Pc Offset"
+        },
+        "address_region": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegionInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Memory region that contains ``address``. Absent when ``address`` is not mapped."
+        },
+        "nearby_regions": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/RegionInfo"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The memory regions nearest to ``address`` when ``address`` is not mapped.",
+          "title": "Nearby Regions"
+        },
+        "tid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Thread ID at the time of the error.",
+          "title": "Tid"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Process ID at the time of the error. For ``child_process_skipped``, the ID of the child process.",
+          "title": "Pid"
+        },
+        "context_summary": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "One line of text that tells what went wrong.",
+          "title": "Context Summary"
+        },
+        "traceback": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Python traceback of an ``internal_error``.",
+          "title": "Traceback"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Text of the Python exception of an ``internal_error``.",
+          "title": "Message"
+        },
+        "api_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the API that has no handler, for ``unsupported_api``.",
+          "title": "Api Name"
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Limit that ended the run: ``limits.api_calls`` of the config for ``api_call_limit``, ``limits.api_loop_calls`` for ``api_loop_limit``, or ``limits.instructions`` for ``instruction_limit``.",
+          "title": "Limit"
+        },
+        "last_api": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the API of the last call before the run ended, for ``api_call_limit`` and ``api_loop_limit``.",
+          "title": "Last Api"
+        },
+        "loop": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApiLoop"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The API loop that ended the run, for ``api_loop_limit``."
+        },
+        "interrupt_num": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Interrupt number, for ``unhandled_interrupt``.",
+          "title": "Interrupt Num"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "ErrorInfo",
+      "type": "object"
+    },
+    "ErrorType": {
+      "description": "Reason why a run or the emulation ended with an error.",
+      "enum": [
+        "per_run_time_limit",
+        "total_time_limit",
+        "instruction_limit",
+        "api_call_limit",
+        "api_loop_limit",
+        "unsupported_api",
+        "internal_error",
+        "engine_stopped",
+        "invalid_image",
+        "child_process_skipped",
+        "dll_initialization_failed",
+        "api_handler_did_not_return",
+        "invalid_read",
+        "invalid_write",
+        "invalid_fetch",
+        "invalid_protect_read",
+        "invalid_protect_write",
+        "invalid_protect_fetch",
+        "guard_page_violation",
+        "privileged_instruction",
+        "invalid_instruction",
+        "unsupported_cpu_feature",
+        "unhandled_interrupt",
+        "unhandled_exception",
+        "hardware_breakpoint",
+        "bug_check"
+      ],
+      "title": "ErrorType",
+      "type": "string"
+    },
+    "ExceptionEvent": {
+      "description": "An exception that the emulator sends to a guest handler.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "exception",
+          "default": "exception",
+          "description": "Event type of an exception.",
+          "title": "Event",
+          "type": "string"
+        },
+        "instruction": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Disassembly of the instruction at ``pos.pc``. Absent when Speakeasy cannot disassemble it, for example when the address is not mapped.",
+          "title": "Instruction"
+        },
+        "exception_code": {
+          "description": "Exception code, such as ``0xc0000005``.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Exception Code",
+          "type": "string"
+        },
+        "handler_address": {
+          "description": "Address of the handler that gets the exception.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Handler Address",
+          "type": "string"
+        },
+        "registers": {
+          "additionalProperties": {
+            "pattern": "^0x[0-9a-f]+$",
+            "type": "string"
+          },
+          "description": "Register values at the time of the exception.",
+          "title": "Registers",
+          "type": "object"
+        },
+        "address": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Memory address that caused an access violation or a guard page violation.",
+          "title": "Address"
+        },
+        "pc_module": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "File name of the module that contains ``pos.pc``. The same as ``memory.modules[].name``.",
+          "title": "Pc Module"
+        },
+        "pc_offset": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Offset of ``pos.pc`` from the base of ``pc_module``.",
+          "title": "Pc Offset"
+        },
+        "stack": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/StackEntry"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Stack slots at the time of the exception.",
+          "title": "Stack"
+        }
+      },
+      "required": [
+        "pos",
+        "exception_code",
+        "handler_address",
+        "registers"
+      ],
+      "title": "ExceptionEvent",
+      "type": "object"
+    },
+    "FileCreateEvent": {
+      "description": "A file that the guest creates, or opens with a disposition that can create the file.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "file_create",
+          "default": "file_create",
+          "description": "Event type of a file creation.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Emulated path of the file.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "File handle that the API returns.",
+          "title": "Handle"
+        },
+        "open_flags": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Names of the disposition flags of the call, such as ``CREATE_ALWAYS``.",
+          "title": "Open Flags"
+        },
+        "access_flags": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Names of the access rights that the caller asks for, such as ``GENERIC_READ``.",
+          "title": "Access Flags"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "FileCreateEvent",
+      "type": "object"
+    },
+    "FileDeleteEvent": {
+      "description": "A file that the guest deletes.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "file_delete",
+          "default": "file_delete",
+          "description": "Event type of a file deletion.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Emulated path of the file.",
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "FileDeleteEvent",
+      "type": "object"
+    },
+    "FileOpenEvent": {
+      "description": "A file that the guest opens without a create disposition.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "file_open",
+          "default": "file_open",
+          "description": "Event type of a file open.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Emulated path of the file.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "File handle that the API returns.",
+          "title": "Handle"
+        },
+        "open_flags": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Names of the disposition flags of the call, such as ``OPEN_EXISTING``.",
+          "title": "Open Flags"
+        },
+        "access_flags": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Names of the access rights that the caller asks for, such as ``GENERIC_READ``.",
+          "title": "Access Flags"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "FileOpenEvent",
+      "type": "object"
+    },
+    "FileReadEvent": {
+      "description": "Data that the guest reads from a file.\n\nThe profiler merges all reads of one path in a run into one event.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "file_read",
+          "default": "file_read",
+          "description": "Event type of a file read.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Emulated path of the file.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "File handle of the first read.",
+          "title": "Handle"
+        },
+        "size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Total number of bytes that the guest read.",
+          "title": "Size"
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the first bytes that the guest read. Absent when there are no bytes.",
+          "title": "Data Ref"
+        },
+        "buffer": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Address of the buffer of the first read.",
+          "title": "Buffer"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "FileReadEvent",
+      "type": "object"
+    },
+    "FileType": {
+      "description": "Kind of input file.",
+      "enum": [
+        "exe",
+        "dll",
+        "driver",
+        "shellcode"
+      ],
+      "title": "FileType",
+      "type": "string"
+    },
+    "FileWriteEvent": {
+      "description": "Data that the guest writes to a file.\n\nThe profiler merges all writes to one path in a run into one event.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "file_write",
+          "default": "file_write",
+          "description": "Event type of a file write.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Emulated path of the file.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "File handle of the first write.",
+          "title": "Handle"
+        },
+        "size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Total number of bytes that the guest wrote.",
+          "title": "Size"
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the first bytes that the guest wrote. Absent when there are no bytes.",
+          "title": "Data Ref"
+        },
+        "buffer": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Address of the buffer of the first write.",
+          "title": "Buffer"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "FileWriteEvent",
+      "type": "object"
+    },
+    "LoadedModule": {
+      "description": "A module that is loaded at the end of a run.",
+      "properties": {
+        "name": {
+          "description": "File name of the module, such as ``sample.exe``. The ``module`` of the regions of its image.",
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "description": "Emulated path of the module.",
+          "title": "Path",
+          "type": "string"
+        },
+        "base": {
+          "description": "Base address of the module.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Base",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size of the module image in bytes.",
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "base",
+        "size"
+      ],
+      "title": "LoadedModule",
+      "type": "object"
+    },
+    "MemAllocEvent": {
+      "description": "Memory that the guest allocates with ``VirtualAlloc`` or ``VirtualAllocEx``.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "mem_alloc",
+          "default": "mem_alloc",
+          "description": "Event type of a memory allocation.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Image path of the target process.",
+          "title": "Path",
+          "type": "string"
+        },
+        "base": {
+          "description": "Base address of the allocation.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Base",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size that the caller asked for, in bytes.",
+          "title": "Size",
+          "type": "integer"
+        },
+        "permissions": {
+          "description": "Requested permissions, such as ``rw-``, in the format of ``memory.layout[].permissions``.",
+          "title": "Permissions",
+          "type": "string"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the target process. Absent when the target is the process in ``pos``.",
+          "title": "Pid"
+        }
+      },
+      "required": [
+        "pos",
+        "path",
+        "base",
+        "size",
+        "permissions"
+      ],
+      "title": "MemAllocEvent",
+      "type": "object"
+    },
+    "MemFreeEvent": {
+      "description": "Memory that the guest frees.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "mem_free",
+          "default": "mem_free",
+          "description": "Event type of a memory free.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Image path of the target process.",
+          "title": "Path",
+          "type": "string"
+        },
+        "base": {
+          "description": "Base address of the freed region.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Base",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size of the freed region in bytes.",
+          "title": "Size",
+          "type": "integer"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the target process. Absent when the target is the process in ``pos``.",
+          "title": "Pid"
+        }
+      },
+      "required": [
+        "pos",
+        "path",
+        "base",
+        "size"
+      ],
+      "title": "MemFreeEvent",
+      "type": "object"
+    },
+    "MemProtectEvent": {
+      "description": "A change of page permissions with ``VirtualProtect``, ``VirtualProtectEx`` or ``NtProtectVirtualMemory``.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "mem_protect",
+          "default": "mem_protect",
+          "description": "Event type of a change of page permissions.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Image path of the target process.",
+          "title": "Path",
+          "type": "string"
+        },
+        "base": {
+          "description": "Base address of the range.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Base",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size of the range in bytes.",
+          "title": "Size",
+          "type": "integer"
+        },
+        "permissions": {
+          "description": "Requested permissions, such as ``r-x``, in the format of ``memory.layout[].permissions``.",
+          "title": "Permissions",
+          "type": "string"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the target process. Absent when the target is the process in ``pos``.",
+          "title": "Pid"
+        }
+      },
+      "required": [
+        "pos",
+        "path",
+        "base",
+        "size",
+        "permissions"
+      ],
+      "title": "MemProtectEvent",
+      "type": "object"
+    },
+    "MemReadEvent": {
+      "description": "Data that the guest reads from process memory with an API, such as ``ReadProcessMemory``.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "mem_read",
+          "default": "mem_read",
+          "description": "Event type of a memory read.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Image path of the target process.",
+          "title": "Path",
+          "type": "string"
+        },
+        "base": {
+          "description": "Start address of the read.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Base",
+          "type": "string"
+        },
+        "size": {
+          "description": "Number of bytes read.",
+          "title": "Size",
+          "type": "integer"
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the bytes of the read. Absent for a read with no bytes and for a read above ``MAX_EMBEDDED_FILE_SIZE`` (10 MiB).",
+          "title": "Data Ref"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the target process. Absent when the target is the process in ``pos``.",
+          "title": "Pid"
+        }
+      },
+      "required": [
+        "pos",
+        "path",
+        "base",
+        "size"
+      ],
+      "title": "MemReadEvent",
+      "type": "object"
+    },
+    "MemWriteEvent": {
+      "description": "Data that the guest writes to process memory with an API, such as ``WriteProcessMemory``.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "mem_write",
+          "default": "mem_write",
+          "description": "Event type of a memory write.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Image path of the target process.",
+          "title": "Path",
+          "type": "string"
+        },
+        "base": {
+          "description": "Start address of the write.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Base",
+          "type": "string"
+        },
+        "size": {
+          "description": "Number of bytes written.",
+          "title": "Size",
+          "type": "integer"
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the bytes of the write. Absent for a write with no bytes and for a write above ``MAX_EMBEDDED_FILE_SIZE`` (10 MiB).",
+          "title": "Data Ref"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the target process. Absent when the target is the process in ``pos``.",
+          "title": "Pid"
+        }
+      },
+      "required": [
+        "pos",
+        "path",
+        "base",
+        "size"
+      ],
+      "title": "MemWriteEvent",
+      "type": "object"
+    },
+    "MemoryAccesses": {
+      "description": "Read, write and execute counts of the memory regions and the symbols that a run used.",
+      "properties": {
+        "regions": {
+          "description": "Counts of each region that the run read, wrote or ran code in, in the order of ``region``.",
+          "items": {
+            "$ref": "#/$defs/RegionAccesses"
+          },
+          "title": "Regions",
+          "type": "array"
+        },
+        "symbols": {
+          "description": "Counts of each symbol address that the run read, wrote or ran code at, in the order of the address. Only an access at the exact address of the symbol counts.",
+          "items": {
+            "$ref": "#/$defs/SymbolAccesses"
+          },
+          "title": "Symbols",
+          "type": "array"
+        }
+      },
+      "title": "MemoryAccesses",
+      "type": "object"
+    },
+    "MemoryLayout": {
+      "description": "Memory regions and loaded modules at the end of a run.",
+      "properties": {
+        "layout": {
+          "description": "Memory regions, with one region for the headers and one for each section of a module image.",
+          "items": {
+            "$ref": "#/$defs/MemoryRegion"
+          },
+          "title": "Layout",
+          "type": "array"
+        },
+        "modules": {
+          "description": "Modules that are loaded at the end of the run.",
+          "items": {
+            "$ref": "#/$defs/LoadedModule"
+          },
+          "title": "Modules",
+          "type": "array"
+        }
+      },
+      "title": "MemoryLayout",
+      "type": "object"
+    },
+    "MemoryRegion": {
+      "description": "One memory region at the end of a run.\n\nThe emulator splits the image of a module into one region for the headers and one region\nfor each section. Each part has the tag ``emu.module``, and ``module`` and ``section`` give\nthe image and the part.",
+      "properties": {
+        "base": {
+          "description": "Base address of the region.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Base",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size of the region in bytes.",
+          "title": "Size",
+          "type": "integer"
+        },
+        "permissions": {
+          "description": "Permissions, such as ``r-x`` or ``rw-``. For a part of a module image, the permissions from the section header, and ``r--`` for the headers.",
+          "title": "Permissions",
+          "type": "string"
+        },
+        "tag": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Tag of the memory manager, such as ``api.VirtualAlloc``, ``api.heap.HeapAlloc`` or ``emu.stack``. ``emu.module`` for a part of a module image. Absent when the region has no tag.",
+          "title": "Tag"
+        },
+        "module": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "File name of the module, such as ``sample.exe`` or ``kernel32.dll``, the same as ``memory.modules[].name``. Only for a part of a module image.",
+          "title": "Module"
+        },
+        "section": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the section, such as ``.text``, or ``headers`` for the PE headers. Absent for a region that is not part of a module image, for a module image with no sections, and for an address in a module image that is outside the headers and the sections. In the last two cases, the region is the full image.",
+          "title": "Section"
+        },
+        "freed": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "True if the guest freed the allocation of the region. Only with ``memory.freed_regions``, which keeps a freed allocation mapped. With the option off, the emulator unmaps a freed allocation when no other allocation of its block is live, and keeps it mapped while one is. The layout then leaves out each freed allocation.",
+          "title": "Freed"
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the region data: the images of the modules that load from a file, such as the input, the allocations and heaps of the guest (``api.*`` tags), the regions with no tag that API handlers allocate for the guest, and the static TLS data (``emu.tls.*`` tags). Absent when ``memory.final_contents`` is off, for the stacks, for the memory of the emulator (the stub images of system modules and the other ``emu.*`` tags), and when the emulator cannot read the region.",
+          "title": "Data Ref"
+        }
+      },
+      "required": [
+        "base",
+        "size",
+        "permissions"
+      ],
+      "title": "MemoryRegion",
+      "type": "object"
+    },
+    "ModuleLoadEvent": {
+      "description": "A module that the guest loads at run time.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "module_load",
+          "default": "module_load",
+          "description": "Event type of a module load.",
+          "title": "Event",
+          "type": "string"
+        },
+        "name": {
+          "description": "File name of the module, such as ``urlmon.dll``, the same as ``memory.modules[].name``.",
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "description": "Emulated path of the module.",
+          "title": "Path",
+          "type": "string"
+        },
+        "base": {
+          "description": "Base address of the module.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Base",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size of the module image in bytes.",
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pos",
+        "name",
+        "path",
+        "base",
+        "size"
+      ],
+      "title": "ModuleLoadEvent",
+      "type": "object"
+    },
+    "NetDnsEvent": {
+      "description": "A host name that the guest looks up.\n\nThe profiler adds one event for each query and response in a run.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "net_dns",
+          "default": "net_dns",
+          "description": "Event type of a DNS lookup.",
+          "title": "Event",
+          "type": "string"
+        },
+        "query": {
+          "description": "Host name of the lookup.",
+          "title": "Query",
+          "type": "string"
+        },
+        "response": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "IP address from ``network.dns.names`` in the config. Absent when the config has no address.",
+          "title": "Response"
+        }
+      },
+      "required": [
+        "pos",
+        "query"
+      ],
+      "title": "NetDnsEvent",
+      "type": "object"
+    },
+    "NetHttpEvent": {
+      "description": "An HTTP request that the guest sends with WinINet or WinHTTP.\n\nThe profiler adds one event for each server, port, protocol and headers in a run.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "net_http",
+          "default": "net_http",
+          "description": "Event type of an HTTP request.",
+          "title": "Event",
+          "type": "string"
+        },
+        "server": {
+          "description": "Host name or address of the server.",
+          "title": "Server",
+          "type": "string"
+        },
+        "port": {
+          "description": "Port of the server.",
+          "title": "Port",
+          "type": "integer"
+        },
+        "proto": {
+          "$ref": "#/$defs/NetHttpProtocol",
+          "description": "``http``, or ``https`` for a secure request."
+        },
+        "headers": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Headers of the request, as text.",
+          "title": "Headers"
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the first bytes of the request body. Absent when there are no bytes.",
+          "title": "Data Ref"
+        }
+      },
+      "required": [
+        "pos",
+        "server",
+        "port",
+        "proto"
+      ],
+      "title": "NetHttpEvent",
+      "type": "object"
+    },
+    "NetHttpProtocol": {
+      "description": "Protocol of a ``net_http`` event.",
+      "enum": [
+        "http",
+        "https"
+      ],
+      "title": "NetHttpProtocol",
+      "type": "string"
+    },
+    "NetTrafficEvent": {
+      "description": "A socket operation of the guest: connect, bind, accept, send or receive.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "net_traffic",
+          "default": "net_traffic",
+          "description": "Event type of a socket operation.",
+          "title": "Event",
+          "type": "string"
+        },
+        "server": {
+          "description": "Host name or IP address of the socket peer.",
+          "title": "Server",
+          "type": "string"
+        },
+        "port": {
+          "description": "Port of the socket peer.",
+          "title": "Port",
+          "type": "integer"
+        },
+        "proto": {
+          "$ref": "#/$defs/NetTrafficProtocol",
+          "description": "Protocol of the socket type: ``tcp``, ``udp``, ``raw``, or ``unknown`` for another socket type."
+        },
+        "type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetTrafficType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Socket operation of the event."
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the first bytes that the guest sent or received. Absent when there are no bytes.",
+          "title": "Data Ref"
+        },
+        "method": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the operation, such as ``winsock.connect``.",
+          "title": "Method"
+        }
+      },
+      "required": [
+        "pos",
+        "server",
+        "port",
+        "proto"
+      ],
+      "title": "NetTrafficEvent",
+      "type": "object"
+    },
+    "NetTrafficProtocol": {
+      "description": "Protocol of the socket type of a ``net_traffic`` event.",
+      "enum": [
+        "tcp",
+        "udp",
+        "raw",
+        "unknown"
+      ],
+      "title": "NetTrafficProtocol",
+      "type": "string"
+    },
+    "NetTrafficType": {
+      "description": "Socket operation of a ``net_traffic`` event.",
+      "enum": [
+        "connect",
+        "bind",
+        "accept",
+        "data_in",
+        "data_out"
+      ],
+      "title": "NetTrafficType",
+      "type": "string"
+    },
+    "ProcessCreateEvent": {
+      "description": "A process that the guest creates, such as with ``CreateProcess`` or ``ShellExecute``.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "process_create",
+          "default": "process_create",
+          "description": "Event type of a process creation.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Emulated path of the image of the new process.",
+          "title": "Path",
+          "type": "string"
+        },
+        "command_line": {
+          "description": "Command line of the new process.",
+          "title": "Command Line",
+          "type": "string"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the new process.",
+          "title": "Pid"
+        }
+      },
+      "required": [
+        "pos",
+        "path",
+        "command_line"
+      ],
+      "title": "ProcessCreateEvent",
+      "type": "object"
+    },
+    "ProcessInfo": {
+      "description": "One process that the report refers to.\n\nThe report has an entry for the process of each run, for each process that the guest created,\nand for each process that is the target of an event, such as a process that existed before the\nemulation.",
+      "properties": {
+        "pid": {
+          "description": "Process ID, the same as the ``pid`` of runs and events.",
+          "title": "Pid",
+          "type": "integer"
+        },
+        "parent_pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the process that created this process, the ``pos.pid`` of its ``process_create`` event. Absent for the process of the input (``Report.pid``) and for a process that existed before the emulation.",
+          "title": "Parent Pid"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Emulated path of the process image, such as ``C:\\Windows\\explorer.exe``. Absent when the process has no image path.",
+          "title": "Path"
+        },
+        "command_line": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Command line of the process. Absent for a process from the config with no ``command_line``, except the container process.",
+          "title": "Command Line"
+        },
+        "runs": {
+          "description": "Indexes in ``runs`` of the runs of the process. Empty when no run executed in the process.",
+          "items": {
+            "type": "integer"
+          },
+          "title": "Runs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "pid"
+      ],
+      "title": "ProcessInfo",
+      "type": "object"
+    },
+    "RegCreateKeyEvent": {
+      "description": "A registry key that the guest creates or opens with a create API, such as ``RegCreateKeyEx``.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "reg_create_key",
+          "default": "reg_create_key",
+          "description": "Event type of a registry key creation.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path of the key.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key handle that the API returns.",
+          "title": "Handle"
+        },
+        "open_flags": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Disposition of the call, ``REG_CREATED_NEW_KEY`` or ``REG_OPENED_EXISTING_KEY``. Absent when the create fails.",
+          "title": "Open Flags"
+        },
+        "access_flags": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Names of the access rights that the caller asks for, such as ``KEY_READ``.",
+          "title": "Access Flags"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "RegCreateKeyEvent",
+      "type": "object"
+    },
+    "RegDeleteKeyEvent": {
+      "description": "A registry key that the guest deletes.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "reg_delete_key",
+          "default": "reg_delete_key",
+          "description": "Event type of a registry key deletion.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path of the key.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key handle of the call.",
+          "title": "Handle"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "RegDeleteKeyEvent",
+      "type": "object"
+    },
+    "RegDeleteValueEvent": {
+      "description": "A registry value that the guest deletes.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "reg_delete_value",
+          "default": "reg_delete_value",
+          "description": "Event type of a registry value deletion.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path of the key that had the value.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key handle of the call.",
+          "title": "Handle"
+        },
+        "value_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the value.",
+          "title": "Value Name"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "RegDeleteValueEvent",
+      "type": "object"
+    },
+    "RegListSubkeysEvent": {
+      "description": "A registry key whose subkeys the guest lists.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "reg_list_subkeys",
+          "default": "reg_list_subkeys",
+          "description": "Event type of a subkey list.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path of the key.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key handle of the call.",
+          "title": "Handle"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "RegListSubkeysEvent",
+      "type": "object"
+    },
+    "RegOpenKeyEvent": {
+      "description": "A registry key that the guest opens.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "reg_open_key",
+          "default": "reg_open_key",
+          "description": "Event type of a registry key open.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path of the key.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key handle that the API returns.",
+          "title": "Handle"
+        },
+        "access_flags": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Names of the access rights that the caller asks for, such as ``KEY_READ``.",
+          "title": "Access Flags"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "RegOpenKeyEvent",
+      "type": "object"
+    },
+    "RegReadValueEvent": {
+      "description": "A registry value that the guest reads.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "reg_read_value",
+          "default": "reg_read_value",
+          "description": "Event type of a registry value read.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path of the key that has the value.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key handle of the call.",
+          "title": "Handle"
+        },
+        "value_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the value.",
+          "title": "Value Name"
+        },
+        "size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Size of the value data in bytes.",
+          "title": "Size"
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the first bytes of the value data. Absent when there are no bytes.",
+          "title": "Data Ref"
+        },
+        "buffer": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Address of the output buffer.",
+          "title": "Buffer"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "RegReadValueEvent",
+      "type": "object"
+    },
+    "RegWriteValueEvent": {
+      "description": "A registry value that the guest writes.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "reg_write_value",
+          "default": "reg_write_value",
+          "description": "Event type of a registry value write.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path of the key that has the value.",
+          "title": "Path",
+          "type": "string"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key handle of the call.",
+          "title": "Handle"
+        },
+        "value_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the value.",
+          "title": "Value Name"
+        },
+        "size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Size of the value data in bytes.",
+          "title": "Size"
+        },
+        "data_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Key in the top-level ``data`` of the first bytes of the value data. Absent when there are no bytes.",
+          "title": "Data Ref"
+        },
+        "buffer": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Address of the input buffer.",
+          "title": "Buffer"
+        }
+      },
+      "required": [
+        "pos",
+        "path"
+      ],
+      "title": "RegWriteValueEvent",
+      "type": "object"
+    },
+    "RegionAccesses": {
+      "description": "Read, write and execute counts of one memory region in one run.",
+      "properties": {
+        "region": {
+          "description": "Base of the region, as in ``memory.layout``: for a module image, the base of its headers or section. An access in a module image outside the headers and the sections counts for the headers.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Region",
+          "type": "string"
+        },
+        "reads": {
+          "description": "Number of reads in the region.",
+          "title": "Reads",
+          "type": "integer"
+        },
+        "writes": {
+          "description": "Number of writes in the region.",
+          "title": "Writes",
+          "type": "integer"
+        },
+        "execs": {
+          "description": "Number of instructions that ran in the region.",
+          "title": "Execs",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "region",
+        "reads",
+        "writes",
+        "execs"
+      ],
+      "title": "RegionAccesses",
+      "type": "object"
+    },
+    "RegionInfo": {
+      "description": "One memory region: an allocation of the memory manager, or one part of a module image.\n\nThe emulator splits the image of a module into one region for the headers and one region\nfor each section. Each part has the tag ``emu.module``, and ``module`` and ``section`` give\nthe image and the part.",
+      "properties": {
+        "base": {
+          "description": "Base address of the region.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Base",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size of the region in bytes.",
+          "title": "Size",
+          "type": "integer"
+        },
+        "permissions": {
+          "description": "Permissions, such as ``r-x`` or ``rw-``. For a part of a module image, the permissions from the section header, and ``r--`` for the headers.",
+          "title": "Permissions",
+          "type": "string"
+        },
+        "tag": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Tag of the memory manager, such as ``api.VirtualAlloc``, ``api.heap.HeapAlloc`` or ``emu.stack``. ``emu.module`` for a part of a module image. Absent when the region has no tag.",
+          "title": "Tag"
+        },
+        "module": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "File name of the module, such as ``sample.exe`` or ``kernel32.dll``, the same as ``memory.modules[].name``. Only for a part of a module image.",
+          "title": "Module"
+        },
+        "section": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the section, such as ``.text``, or ``headers`` for the PE headers. Absent for a region that is not part of a module image, for a module image with no sections, and for an address in a module image that is outside the headers and the sections. In the last two cases, the region is the full image.",
+          "title": "Section"
+        }
+      },
+      "required": [
+        "base",
+        "size",
+        "permissions"
+      ],
+      "title": "RegionInfo",
+      "type": "object"
+    },
+    "RunReport": {
+      "description": "One run, and the events and data that the run collected.\n\nA run starts at one address, such as the module entry point, an export, a TLS callback or a\nthread.",
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/RunType",
+          "description": "Kind of code that the run executes, such as ``module_entry``, ``export`` or ``thread``."
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Detail for ``type``, such as the export name (``#<ordinal>`` for an export without a name), the TLS callback index, the dependency module or the IRP major function. Absent when the type has no detail.",
+          "title": "Name"
+        },
+        "start_address": {
+          "description": "Address where the run started.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Start Address",
+          "type": "string"
+        },
+        "args": {
+          "description": "Arguments that the emulator gives to the code at ``start_address``.",
+          "items": {
+            "pattern": "^0x[0-9a-f]+$",
+            "type": "string"
+          },
+          "title": "Args",
+          "type": "array"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the process of the run.",
+          "title": "Pid"
+        },
+        "tid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the thread of the run.",
+          "title": "Tid"
+        },
+        "instruction_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Number of instructions that the run executed. The emulator counts them only with ``memory.accesses``, ``memory.dynamic_code_contents`` or a ``limits.instructions`` above 0. Absent when no option counts them.",
+          "title": "Instruction Count"
+        },
+        "api_call_count": {
+          "default": 0,
+          "description": "Number of API calls that the run made, also the calls that ``events`` leaves out as repeats. ``limits.api_calls`` limits this count.",
+          "title": "Api Call Count",
+          "type": "integer"
+        },
+        "return_value": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Value of the return register when the run completed.",
+          "title": "Return Value"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Error that ended the run. Absent when the run completed."
+        },
+        "events": {
+          "description": "Events of the run, in order.",
+          "items": {
+            "oneOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "api": "#/$defs/ApiEvent",
+                    "directory_create": "#/$defs/DirectoryCreateEvent",
+                    "directory_delete": "#/$defs/DirectoryDeleteEvent",
+                    "exception": "#/$defs/ExceptionEvent",
+                    "file_create": "#/$defs/FileCreateEvent",
+                    "file_delete": "#/$defs/FileDeleteEvent",
+                    "file_open": "#/$defs/FileOpenEvent",
+                    "file_read": "#/$defs/FileReadEvent",
+                    "file_write": "#/$defs/FileWriteEvent",
+                    "mem_alloc": "#/$defs/MemAllocEvent",
+                    "mem_free": "#/$defs/MemFreeEvent",
+                    "mem_protect": "#/$defs/MemProtectEvent",
+                    "mem_read": "#/$defs/MemReadEvent",
+                    "mem_write": "#/$defs/MemWriteEvent",
+                    "module_load": "#/$defs/ModuleLoadEvent",
+                    "net_dns": "#/$defs/NetDnsEvent",
+                    "net_http": "#/$defs/NetHttpEvent",
+                    "net_traffic": "#/$defs/NetTrafficEvent",
+                    "process_create": "#/$defs/ProcessCreateEvent",
+                    "reg_create_key": "#/$defs/RegCreateKeyEvent",
+                    "reg_delete_key": "#/$defs/RegDeleteKeyEvent",
+                    "reg_delete_value": "#/$defs/RegDeleteValueEvent",
+                    "reg_list_subkeys": "#/$defs/RegListSubkeysEvent",
+                    "reg_open_key": "#/$defs/RegOpenKeyEvent",
+                    "reg_read_value": "#/$defs/RegReadValueEvent",
+                    "reg_write_value": "#/$defs/RegWriteValueEvent",
+                    "thread_create": "#/$defs/ThreadCreateEvent",
+                    "thread_inject": "#/$defs/ThreadInjectEvent"
+                  },
+                  "propertyName": "event"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/ApiEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/ProcessCreateEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/MemAllocEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/MemWriteEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/MemReadEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/MemProtectEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/MemFreeEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/ModuleLoadEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/ThreadCreateEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/ThreadInjectEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/FileCreateEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/FileOpenEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/FileReadEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/FileWriteEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/FileDeleteEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/DirectoryCreateEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/DirectoryDeleteEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/RegOpenKeyEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/RegCreateKeyEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/RegReadValueEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/RegWriteValueEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/RegListSubkeysEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/RegDeleteKeyEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/RegDeleteValueEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/NetDnsEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/NetTrafficEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/NetHttpEvent"
+                  },
+                  {
+                    "$ref": "#/$defs/ExceptionEvent"
+                  }
+                ]
+              },
+              {
+                "$ref": "#/$defs/UnknownEvent"
+              }
+            ]
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "accesses": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryAccesses"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Read, write and execute counts of the regions and the symbols. Only with ``memory.accesses``."
+        },
+        "dynamic_code": {
+          "description": "Dynamic code regions where code ran in the run, one entry for each region, in the order of the first time that code ran in the region.",
+          "items": {
+            "$ref": "#/$defs/DynamicCodeRegion"
+          },
+          "title": "Dynamic Code",
+          "type": "array"
+        },
+        "coverage": {
+          "anyOf": [
+            {
+              "items": {
+                "pattern": "^0x[0-9a-f]+$",
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Sorted addresses of the instructions that ran. Only with ``code.coverage``.",
+          "title": "Coverage"
+        },
+        "dropped_files": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/DroppedFile"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Files that the guest wrote completely, up to the end of the run. User mode only.",
+          "title": "Dropped Files"
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryLayout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Memory regions and modules at the end of the run. User mode only."
+        }
+      },
+      "required": [
+        "type",
+        "start_address"
+      ],
+      "title": "RunReport",
+      "type": "object"
+    },
+    "RunType": {
+      "description": "Kind of code that a run executes.",
+      "enum": [
+        "module_entry",
+        "dll_entry",
+        "tls_callback",
+        "export",
+        "shellcode",
+        "thread",
+        "service_main",
+        "dependency_dll_entry",
+        "dependency_tls_callback",
+        "call",
+        "driver_entry",
+        "driver_unload",
+        "driver_reinit",
+        "irp"
+      ],
+      "title": "RunType",
+      "type": "string"
+    },
+    "StackEntry": {
+      "description": "One pointer-size slot of the stack at the time of an error or an exception.",
+      "properties": {
+        "offset": {
+          "description": "Offset of the slot from the stack pointer, in bytes.",
+          "title": "Offset",
+          "type": "integer"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Value in the slot. Absent when the slot is not mapped.",
+          "title": "Value"
+        },
+        "region": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Base of the memory region that contains ``value``, as in ``memory.layout``: for a module image, the base of its headers or section. Absent when ``value`` is not in mapped memory.",
+          "title": "Region"
+        }
+      },
+      "required": [
+        "offset"
+      ],
+      "title": "StackEntry",
+      "type": "object"
+    },
+    "StringCollection": {
+      "description": "ANSI and UTF-16 strings from one source.",
+      "properties": {
+        "ansi": {
+          "description": "ASCII strings.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Ansi",
+          "type": "array"
+        },
+        "unicode": {
+          "description": "UTF-16LE strings.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Unicode",
+          "type": "array"
+        }
+      },
+      "title": "StringCollection",
+      "type": "object"
+    },
+    "StringsReport": {
+      "description": "Strings of the input file, and strings that the guest made in memory.",
+      "properties": {
+        "static": {
+          "$ref": "#/$defs/StringCollection",
+          "description": "Strings in the data of the input file."
+        },
+        "in_memory": {
+          "$ref": "#/$defs/StringCollection",
+          "description": "Strings at the end of the emulation that are not in ``static``. Speakeasy reads the stack, the memory that API handlers allocate, and the images of the guest modules. In an image, it reads only the strings that the guest changed after the load. These strings often are decoded data."
+        }
+      },
+      "title": "StringsReport",
+      "type": "object"
+    },
+    "SymbolAccesses": {
+      "description": "Read, write and execute counts of one symbol address in one run.",
+      "properties": {
+        "symbol": {
+          "description": "Symbol name in ``module.symbol`` form.",
+          "title": "Symbol",
+          "type": "string"
+        },
+        "reads": {
+          "description": "Number of reads that start at the symbol address.",
+          "title": "Reads",
+          "type": "integer"
+        },
+        "writes": {
+          "description": "Number of writes that start at the symbol address.",
+          "title": "Writes",
+          "type": "integer"
+        },
+        "execs": {
+          "description": "Number of instructions that ran at the symbol address.",
+          "title": "Execs",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "symbol",
+        "reads",
+        "writes",
+        "execs"
+      ],
+      "title": "SymbolAccesses",
+      "type": "object"
+    },
+    "ThreadCreateEvent": {
+      "description": "A thread that the guest creates in its own process.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "thread_create",
+          "default": "thread_create",
+          "description": "Event type of a thread creation.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Image path of the target process.",
+          "title": "Path",
+          "type": "string"
+        },
+        "start_address": {
+          "description": "Start address of the thread.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Start Address",
+          "type": "string"
+        },
+        "param": {
+          "description": "Parameter that the thread routine gets.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Param",
+          "type": "string"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the target process. Absent when the target is the process in ``pos``.",
+          "title": "Pid"
+        },
+        "tid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the new thread.",
+          "title": "Tid"
+        }
+      },
+      "required": [
+        "pos",
+        "path",
+        "start_address",
+        "param"
+      ],
+      "title": "ThreadCreateEvent",
+      "type": "object"
+    },
+    "ThreadInjectEvent": {
+      "description": "A thread that the guest creates in another process, such as with ``CreateRemoteThread``.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "const": "thread_inject",
+          "default": "thread_inject",
+          "description": "Event type of a thread injection.",
+          "title": "Event",
+          "type": "string"
+        },
+        "path": {
+          "description": "Image path of the target process.",
+          "title": "Path",
+          "type": "string"
+        },
+        "start_address": {
+          "description": "Start address of the thread.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Start Address",
+          "type": "string"
+        },
+        "param": {
+          "description": "Parameter that the thread routine gets.",
+          "pattern": "^0x[0-9a-f]+$",
+          "title": "Param",
+          "type": "string"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the target process. Absent when the target is the process in ``pos``.",
+          "title": "Pid"
+        },
+        "tid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ID of the new thread.",
+          "title": "Tid"
+        }
+      },
+      "required": [
+        "pos",
+        "path",
+        "start_address",
+        "param"
+      ],
+      "title": "ThreadInjectEvent",
+      "type": "object"
+    },
+    "TracePosition": {
+      "description": "Position of an event: the instruction count, the thread, the process and the pc.",
+      "properties": {
+        "tick": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Instruction count of the run at the time of the event, as in ``instruction_count`` of the run. The events of a run are in tick order. Absent when no option counts the instructions.",
+          "title": "Tick"
+        },
+        "tid": {
+          "description": "ID of the thread that did the operation.",
+          "title": "Tid",
+          "type": "integer"
+        },
+        "pid": {
+          "description": "ID of the process that did the operation.",
+          "title": "Pid",
+          "type": "integer"
+        },
+        "pc": {
+          "anyOf": [
+            {
+              "pattern": "^0x[0-9a-f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Address of the instruction that did the operation. For an API event, the address of the instruction that goes to the API, such as a ``call``, or the ``jmp`` of an import thunk. For an event that the code of an API makes, such as a file, registry, memory, process, thread or network event, also the address of the call: the same ``pc`` as the ``api`` event of the call. Such an event comes just before the ``api`` event of its call, with the same ``tick``. An exception that the code of an API raises also has the ``pos`` of the ``api`` event of the call.",
+          "title": "Pc"
+        }
+      },
+      "required": [
+        "tid",
+        "pid"
+      ],
+      "title": "TracePosition",
+      "type": "object"
+    },
+    "UnknownEvent": {
+      "additionalProperties": true,
+      "description": "An event of a type that these models do not know, from a report of a newer minor version.\n\n``model_extra`` has the other keys of the event.",
+      "properties": {
+        "pos": {
+          "$ref": "#/$defs/TracePosition",
+          "description": "Position of the thread that did the operation."
+        },
+        "event": {
+          "description": "Type of the event. Not one of the known types.",
+          "not": {
+            "enum": [
+              "api",
+              "process_create",
+              "mem_alloc",
+              "mem_write",
+              "mem_read",
+              "mem_protect",
+              "mem_free",
+              "module_load",
+              "thread_create",
+              "thread_inject",
+              "file_create",
+              "file_open",
+              "file_read",
+              "file_write",
+              "file_delete",
+              "directory_create",
+              "directory_delete",
+              "reg_open_key",
+              "reg_create_key",
+              "reg_read_value",
+              "reg_write_value",
+              "reg_list_subkeys",
+              "reg_delete_key",
+              "reg_delete_value",
+              "net_dns",
+              "net_traffic",
+              "net_http",
+              "exception"
+            ]
+          },
+          "title": "Event",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pos",
+        "event"
+      ],
+      "title": "UnknownEvent",
+      "type": "object"
+    }
+  },
+  "description": "Report of one emulation: the input metadata, the runs and the payloads.\n\nMachine words are ``0x``-prefixed hex strings: addresses, pointers,\nhandles, raw argument values, return values, register values and exception\ncodes. A 64-bit word can be above 2**53 or 2**63, and JavaScript, Go\n``interface{}``, jq and int64 stores such as SQLite lose such a value as a\nJSON number with no error. Quantities, such as sizes, counts, offsets,\nticks and IDs, are JSON numbers.\n\nA key is absent when Speakeasy did not collect its data: its option is off,\nor the data does not apply, such as the memory layout in kernel mode. An\nempty list or object means that Speakeasy collected the data and found\nnothing. A counter or a boolean is always present when Speakeasy collects\nit, also when it is 0 or false.",
+  "properties": {
+    "report_version": {
+      "default": "7.1.0",
+      "description": "Version of the report format. The models read each report of the same major version, also of a newer minor version.",
+      "pattern": "^7\\.",
+      "title": "Report Version",
+      "type": "string"
+    },
+    "emulation_total_runtime": {
+      "description": "Wall-clock time in seconds, rounded to milliseconds, from the first start of the run queue to the end of the emulation.",
+      "title": "Emulation Total Runtime",
+      "type": "number"
+    },
+    "timestamp": {
+      "description": "Unix time in seconds of the first start of the run queue.",
+      "title": "Timestamp",
+      "type": "integer"
+    },
+    "arch": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Arch"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Architecture of the input."
+    },
+    "path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Host path of the input file. Absent when the input came from bytes.",
+      "title": "Path"
+    },
+    "sha256": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "SHA-256 of the input.",
+      "title": "Sha256"
+    },
+    "size": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Size of the input in bytes.",
+      "title": "Size"
+    },
+    "file_type": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FileType"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Kind of input file."
+    },
+    "image_base": {
+      "anyOf": [
+        {
+          "pattern": "^0x[0-9a-f]+$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Base address of the input image in the emulator. Rebase a disassembler database to this address to match the addresses of the report.",
+      "title": "Image Base"
+    },
+    "pid": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "ID of the process that runs the input: the process of the input EXE, or the container process of a DLL or shellcode. Absent in kernel mode.",
+      "title": "Pid"
+    },
+    "errors": {
+      "description": "Errors that do not belong to one run, such as an ``invalid_image`` defect of the input PE.",
+      "items": {
+        "$ref": "#/$defs/ErrorInfo"
+      },
+      "title": "Errors",
+      "type": "array"
+    },
+    "strings": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StringsReport"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Strings of the input and of memory. Only with ``memory.strings``."
+    },
+    "data": {
+      "additionalProperties": {
+        "$ref": "#/$defs/DataArtifact"
+      },
+      "description": "Payloads of the report, keyed by SHA-256. Each ``data_ref`` field holds a key of this mapping.",
+      "title": "Data",
+      "type": "object"
+    },
+    "processes": {
+      "description": "Processes of the runs and of the events, in the order of ``pid``. A kernel-mode run has no process, so in kernel mode the list has only the targets of memory events.",
+      "items": {
+        "$ref": "#/$defs/ProcessInfo"
+      },
+      "title": "Processes",
+      "type": "array"
+    },
+    "runs": {
+      "description": "Runs of the emulation, in the order that the runs started.",
+      "items": {
+        "$ref": "#/$defs/RunReport"
+      },
+      "title": "Runs",
+      "type": "array"
+    }
+  },
+  "required": [
+    "emulation_total_runtime",
+    "timestamp"
+  ],
+  "title": "Report",
+  "type": "object"
+}

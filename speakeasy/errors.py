@@ -2,92 +2,65 @@
 
 
 class SpeakeasyError(Exception):
-    """
-    Base class for Speakeasy errors
-    """
-
-    pass
-
-
-class NotSupportedError(SpeakeasyError):
-    """
-    Sample is not currently supported
-    """
-
-    pass
-
-
-class ApiEmuError(SpeakeasyError):
-    """
-    Base class for API errors
-    """
-
-    pass
-
-
-class EmuException(SpeakeasyError):
-    """
-    Base class for emulation errors
-    """
-
-    pass
-
-
-class EmuEngineError(SpeakeasyError):
-    pass
-
-
-class WindowsEmuError(SpeakeasyError):
-    """
-    Base class for Windows emulation errors
-    """
-
-    pass
-
-
-class KernelEmuError(SpeakeasyError):
-    """
-    Base class for Windows kernel mode emulation errors
-    """
-
-    pass
-
-
-class Win32EmuError(SpeakeasyError):
-    """
-    Base class for Windows user mode emulation errors
-    """
-
-    pass
-
-
-class FileSystemEmuError(SpeakeasyError):
-    """
-    Base class for Windows user mode emulation errors
-    """
-
-    pass
-
-
-class NetworkEmuError(SpeakeasyError):
-    """
-    Raised during network emulation errors
-    """
-
-    pass
-
-
-class RegistryEmuError(SpeakeasyError):
-    """
-    Raised during registry emulation errors
-    """
-
-    pass
+    """Base class for Speakeasy errors."""
 
 
 class ConfigError(SpeakeasyError):
-    """
-    Raised during validating configuration
-    """
+    """Raised when the configuration is not valid."""
 
-    pass
+
+class InputError(SpeakeasyError):
+    """Raised when the input file or its architecture is not supported."""
+
+
+class EmulationError(SpeakeasyError):
+    """Base class for errors at run time."""
+
+
+class NotSupportedError(EmulationError):
+    """Raised when the emulator does not support the input, for example a .NET assembly."""
+
+
+class ApiEmuError(EmulationError):
+    """Base class for API errors."""
+
+
+class CpuError(EmulationError):
+    """Raised for CPU state errors, for example an unknown register or an instruction that does not decode."""
+
+
+class OutOfMemoryError(EmulationError):
+    """Raised when no free range of the address space can hold an allocation."""
+
+
+class WindowsEmuError(EmulationError):
+    """Base class for Windows emulation errors."""
+
+
+class KernelEmuError(EmulationError):
+    """Base class for Windows kernel mode emulation errors."""
+
+
+class Win32EmuError(EmulationError):
+    """Base class for Windows user mode emulation errors."""
+
+
+class FileSystemEmuError(WindowsEmuError):
+    """Base class for Windows file system emulation errors."""
+
+
+class NetworkEmuError(WindowsEmuError):
+    """Raised for network emulation errors."""
+
+
+class RegistryEmuError(WindowsEmuError):
+    """Raised for registry emulation errors."""
+
+
+class EngineError(SpeakeasyError):
+    """Raised when the CPU engine rejects a request, for example an unknown register or hook type."""
+
+
+# Deprecated aliases.
+EmuException = CpuError
+EmuEngineError = EngineError

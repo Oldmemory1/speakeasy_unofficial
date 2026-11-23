@@ -1,0 +1,299 @@
+"""
+x86 exception dispatch, modeled on RtlDispatchException and RtlUnwind of ntdll.
+
+The emulator gets the handlers from the chain of EXCEPTION_REGISTRATION_RECORDs at fs:[0].
+
+dispatch_fault dispatches CPU exceptions. The API handlers, such as raise_exception, rtl_unwind
+and the MSVC language handlers, are generator handlers (see guest_callbacks.py). seh.py has the
+code that x86 and x64 share.
+
+MSVC frames (_except_handler3, and the SEH4 frames of _except_handler4_common) add a scope table
+and a try level to the registration record. The saved esp and the exception pointers of the frame
+are just below the record. Filters and __finally blocks run with the ebp of the frame. An __except
+block runs with the ebp and esp of the frame.
+
+See http://www.openrce.org/articles/full_view/21
+"""
+
+from __future__ import annotations
+
+import struct
+from collections.abc import Generator, Iterator
+from typing import TYPE_CHECKING
+
+import unicorn as uc
+
+import speakeasy.winenv.arch as _arch
+import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy.windows import guest_callbacks, seh
+from speakeasy.windows.cpu_exceptions import CpuException
+from speakeasy.windows.guest_callbacks import GeneratorHandler, GuestCall
+from speakeasy.windows.seh import STATUS_UNWIND, UNWINDING, as_long, read_context, resume_at
+
+if TYPE_CHECKING:
+    from speakeasy.windows.winemu import WindowsEmulator
+
+END_OF_CHAIN = 0xFFFFFFFF
+
+# An MSVC frame. The offsets are from the registration record, which is at ebp - 0x10.
+#
+#   struct CPPEH_RECORD {
+#       DWORD SavedEsp;                         // -0x08
+#       PEXCEPTION_POINTERS ExceptionPointers;  // -0x04
+#       PVOID Next;                             // 0x00
+#       PVOID ExceptionHandler;                 // 0x04
+#       PVOID ScopeTable;                       // 0x08
+#       DWORD TryLevel;                         // 0x0c
+#   };
+SAVED_ESP = -0x08
+EXCEPTION_POINTERS = -0x04
+SCOPE_TABLE = 0x08
+TRY_LEVEL = 0x0C
+FRAME_POINTER = 0x10
+
+# Try levels outside of all scopes
+TRYLEVEL_NONE_SEH3 = 0xFFFFFFFF  # -1
+TRYLEVEL_NONE_SEH4 = 0xFFFFFFFE  # -2
+# SEH4 scope tables start with GS and EH cookie offsets
+SEH4_SCOPE_TABLE_HEADER = 0x10
+
+# The registration that the local unwind adds while a __finally block runs, as _local_unwind2 of the CRT.
+#
+#   struct {
+#       PVOID Next;              // 0x00
+#       PVOID ExceptionHandler;  // 0x04, _unwind_handler
+#       DWORD TryLevel;          // 0x08, the enclosing level of the scope
+#       PVOID Registration;      // 0x0c, the registration of the frame
+#   };
+UNWIND_HANDLER = "_unwind_handler"
+UNWIND_LEVEL = 0x08
+UNWIND_REGISTRATION = 0x0C
+
+
+def _u32(emu, address: int) -> int:
+    value: int = struct.unpack("<I", emu.mem_read(address, 4))[0]
+    return value
+
+
+def _write_u32(emu, address: int, value: int) -> None:
+    emu.mem_write(address, struct.pack("<I", value & 0xFFFFFFFF))
+
+
+def exception_list(emu) -> int:
+    """The head of the thread's registration chain, at fs:[0]."""
+    thread = emu.get_current_thread()
+    return thread.get_teb().read_back().object.NtTib.ExceptionList if thread else 0
+
+
+def registrations(emu) -> Iterator[tuple[int, int, int]]:
+    """
+    Yield the registration, next registration and handler of each record on the chain at fs:[0].
+
+    The walk ends at a record that the emulator cannot read, as Windows ends it at a record outside the stack.
+    """
+    registration = exception_list(emu)
+    for _ in range(seh.MAX_FRAMES):
+        if registration in (0, END_OF_CHAIN):
+            return
+        try:
+            next_registration, handler = struct.unpack("<II", emu.mem_read(registration, 8))
+        except uc.UcError:
+            return
+        yield registration, next_registration, handler
+        registration = next_registration
+
+
+def set_exception_list(emu, registration: int) -> None:
+    teb = emu.get_current_thread().get_teb()
+    teb.object.NtTib.ExceptionList = registration
+    teb.write_back()
+
+
+def dispatch_fault(emu, exception: CpuException, error: guest_callbacks.CallbackError | None = None) -> bool:
+    return seh.dispatch_fault(emu, exception, dispatch_exception, error)
+
+
+def raise_exception(emu, code: int, flags: int = 0, params=()) -> GeneratorHandler:
+    """RaiseException."""
+    return seh.raise_exception(emu, code, flags, params, dispatch_exception)
+
+
+def rtl_raise_exception(emu, record: int) -> GeneratorHandler:
+    """RtlRaiseException."""
+    return seh.rtl_raise_exception(emu, record, dispatch_exception)
+
+
+def call_handler(emu, handler: int, record: int, registration: int, context: int, dispatcher_context: int) -> GuestCall:
+    """
+    Build a call of an exception handler, with EBP at a frame like the one that ExecuteHandler2 leaves.
+
+    The frame has the saved EBP, a return address, then the arguments. Some handlers, such as the
+    Borland C++ handlers, read the arguments through EBP.
+    """
+    args = (record, registration, context, dispatcher_context)
+    frame = guest_callbacks.alloca(emu, struct.pack("<6I", emu.reg_read(_arch.X86_REG_EBP), 0, *args))
+    return GuestCall(handler, args, registers=((_arch.X86_REG_EBP, frame),))
+
+
+def dispatch_exception(emu, record: int, context: int) -> GeneratorHandler:
+    """RtlDispatchException: offer the exception to vectored handlers, then along the registration chain."""
+    exception = seh.Dispatch(emu, record, context)
+    if (yield from exception.vectored()):
+        return exception.resume()
+
+    dispatcher_context = guest_callbacks.alloca(emu, bytes(4))
+    for registration, _, handler in registrations(emu):
+        exception.offer(handler)
+        disposition = yield call_handler(emu, handler, record, registration, context, dispatcher_context)
+        if disposition == windefs.ExceptionContinueExecution:
+            return exception.resume()
+    return (yield from exception.unhandled())
+
+
+def unwind_registrations(emu, target_frame: int, record: int = 0) -> Generator[GuestCall, int, None]:
+    """
+    Call the handlers of the registrations above target_frame to unwind, and unlink them.
+
+    A target_frame of 0 unwinds them all.
+    """
+    fields = seh.read_record(emu, record) if record else seh.exception_record(emu, STATUS_UNWIND, 0, 0)
+    fields.ExceptionFlags |= seh.EXCEPTION_UNWINDING if target_frame else UNWINDING
+    record = guest_callbacks.alloca(emu, fields.get_bytes())
+    context = guest_callbacks.alloca(emu, emu.get_thread_context().get_bytes())
+    dispatcher_context = guest_callbacks.alloca(emu, bytes(4))
+
+    for registration, next_registration, handler in registrations(emu):
+        # Registrations are in stack order, so a registration above the target shows that the target is not on the chain
+        if registration == target_frame or target_frame and registration > target_frame:
+            break
+        yield call_handler(emu, handler, record, registration, context, dispatcher_context)
+        set_exception_list(emu, next_registration)
+
+
+def rtl_unwind(emu, target_frame: int, target_ip: int, record: int, return_value: int) -> GeneratorHandler:
+    """
+    Unwind the registrations above target_frame, then return to the caller.
+
+    The caller is a handler that takes the exception and continues in its frame.
+    """
+    caller = guest_callbacks.caller_context(emu)  # read before the first guest call
+    yield from unwind_registrations(emu, target_frame, record)
+    caller.Eax = return_value
+    return resume_at(emu, caller)
+
+
+class MsvcFrame:
+    """The scopes of an MSVC frame, from its registration record."""
+
+    def __init__(self, emu: WindowsEmulator, registration: int, scope_table: int, header: int, none: int):
+        self.emu: WindowsEmulator = emu
+        self.registration: int = registration
+        self.ebp: int = registration + FRAME_POINTER
+        self.scope_table: int = scope_table + header
+        self.none: int = none
+
+    @property
+    def try_level(self) -> int:
+        return _u32(self.emu, self.registration + TRY_LEVEL)
+
+    @try_level.setter
+    def try_level(self, level: int) -> None:
+        _write_u32(self.emu, self.registration + TRY_LEVEL, level)
+
+    def scope(self, level: int) -> tuple[int, int, int]:
+        """The enclosing level, filter (0 for a __finally) and handler of a scope."""
+        return struct.unpack("<III", self.emu.mem_read(self.scope_table + 12 * level, 12))
+
+    def call(self, function: int) -> GuestCall:
+        """A call of a filter or __finally block, which runs with the frame's ebp."""
+        return GuestCall(function, registers=((_arch.X86_REG_EBP, self.ebp),))
+
+    def local_unwind(self, stop: int) -> Generator[GuestCall, int, None]:
+        """Leave the scopes inside the stop level, running their __finally blocks."""
+        node = 0
+        for _ in range(seh.MAX_FRAMES):  # a scope table may be corrupt
+            if self.try_level in (self.none, stop):
+                break
+            enclosing, filter_function, handler = self.scope(self.try_level)
+            self.try_level = enclosing
+            if not filter_function:
+                if not node:
+                    unwind_handler = self.emu.add_callback("msvcrt", UNWIND_HANDLER)
+                    node = guest_callbacks.alloca(
+                        self.emu, struct.pack("<IIII", exception_list(self.emu), unwind_handler, 0, self.registration)
+                    )
+                    set_exception_list(self.emu, node)
+                _write_u32(self.emu, node + UNWIND_LEVEL, enclosing)
+                yield self.call(handler)
+        if node:
+            set_exception_list(self.emu, _u32(self.emu, node))
+
+
+def is_abnormal_termination(emu) -> bool:
+    """
+    Get the result of _abnormal_termination: whether the caller is a __finally block that local_unwind runs.
+
+    As in the CRT, the newest registration at fs:[0] must be the one that local_unwind adds, and the try
+    level of the frame must be the level in that registration. A function that the block calls adds a
+    registration, and a __try in the block changes the try level.
+    """
+    newest = next(registrations(emu), None)
+    if newest is None:
+        return False
+    node, _, handler = newest
+    entry = emu.api_registry.entries.get(handler)
+    if entry is None or entry.name != UNWIND_HANDLER:
+        return False
+    registration = _u32(emu, node + UNWIND_REGISTRATION)
+    return _u32(emu, registration + TRY_LEVEL) == _u32(emu, node + UNWIND_LEVEL)
+
+
+def msvc_handler(emu, frame: MsvcFrame, record: int, context: int) -> GeneratorHandler:
+    """The language handler of MSVC frames: run filters, or __finally blocks when unwinding."""
+    flags = _u32(emu, record + 4)
+    if flags & UNWINDING:
+        yield from frame.local_unwind(frame.none)
+        return windefs.ExceptionContinueSearch
+
+    pointers = guest_callbacks.alloca(emu, struct.pack("<II", record, context))
+    _write_u32(emu, frame.registration + EXCEPTION_POINTERS, pointers)
+    level = frame.try_level
+    for _ in range(seh.MAX_FRAMES):  # a scope table may be corrupt
+        if level == frame.none:
+            break
+        enclosing, filter_function, handler = frame.scope(level)
+        if filter_function:
+            verdict = as_long((yield frame.call(filter_function)))
+            if verdict < 0:
+                return windefs.ExceptionContinueExecution
+            if verdict > 0:
+                yield from unwind_registrations(emu, frame.registration, record)
+                yield from frame.local_unwind(level)
+                frame.try_level = enclosing
+                ctx = read_context(emu, context)
+                ctx.Ebp = frame.ebp
+                ctx.Esp = _u32(emu, frame.registration + SAVED_ESP)
+                ctx.Eip = handler
+                return resume_at(emu, ctx)
+        level = enclosing
+    return windefs.ExceptionContinueSearch
+
+
+def except_handler3(emu, record: int, registration: int, context: int, dispatcher: int) -> GeneratorHandler:
+    """_except_handler3."""
+    scope_table = _u32(emu, registration + SCOPE_TABLE)
+    frame = MsvcFrame(emu, registration, scope_table, 0, TRYLEVEL_NONE_SEH3)
+    return (yield from msvc_handler(emu, frame, record, context))
+
+
+def except_handler4_common(
+    emu, cookie: int, check_cookie: int, record: int, registration: int, context: int, dispatcher: int
+) -> GeneratorHandler:
+    """
+    _except_handler4_common: SEH4 XORs the scope table pointer with the security cookie.
+
+    The emulator does not check the cookies.
+    """
+    scope_table = _u32(emu, registration + SCOPE_TABLE) ^ _u32(emu, cookie)
+    frame = MsvcFrame(emu, registration, scope_table, SEH4_SCOPE_TABLE_HEADER, TRYLEVEL_NONE_SEH4)
+    return (yield from msvc_handler(emu, frame, record, context))

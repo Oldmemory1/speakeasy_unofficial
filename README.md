@@ -1,8 +1,8 @@
 # Speakeasy
 
-Speakeasy is a Windows malware emulation framework that executes binaries, drivers, and shellcode in a modeled Windows runtime instead of a full VM. It emulates APIs, process/thread behavior, filesystem, registry, and network activity so samples can keep moving through realistic execution paths. You can run it from the `speakeasy` CLI for fast triage or embed it as a Python library and consume structured JSON reports.
+Speakeasy is a Windows malware emulation framework that executes binaries, drivers and shellcode in a modeled Windows runtime instead of a full VM. It emulates the Windows APIs, processes, threads, file system, registry and network that a sample uses, so the sample runs further than in a bare CPU emulator. The `speakeasy` CLI writes the report as JSON for triage, and the Python library returns the same report to your code.
 
-Background context: [Mandiant's overview post](https://cloud.google.com/blog/topics/threat-intelligence/emulation-of-malicious-shellcode-with-speakeasy/).
+For background, see Mandiant's [introduction to Speakeasy](https://cloud.google.com/blog/topics/threat-intelligence/emulation-of-malicious-shellcode-with-speakeasy/).
 
 ## Quick start
 
@@ -12,59 +12,28 @@ Install from PyPI:
 python3 -m pip install speakeasy-emulator
 ```
 
-Run a sample and inspect high-level report fields (replace `sample.dll` with your target):
+Emulate a sample and print some fields of the report. Replace `sample.dll` with your file:
 
 ```console
 speakeasy -t sample.dll --no-mp -o report.json 2>/dev/null
-jq '{sha256, arch, filetype, entry_points: (.entry_points | length)}' report.json
+jq '{sha256, arch, file_type, runs: (.runs | length)}' report.json
 ```
+
+The values depend on the sample:
 
 ```json
 {
-  "sha256": "30ec092d122a90441a2560f6778ef8233c98079cd34b7633f7bbc2874c8d7a45",
+  "sha256": "…",
   "arch": "x86",
-  "filetype": "dll",
-  "entry_points": 3
+  "file_type": "dll",
+  "runs": 3
 }
 ```
 
-Executable proof for this snippet: [doc/readme-quickstart-showboat.md](doc/readme-quickstart-showboat.md).
+By default, Speakeasy turns on all its features: it runs the exports and the child processes, and the report has coverage, memory access counts and the final memory contents. Each feature has a `--no-` flag that turns it off, for example `--no-code-coverage`. A run with fewer features is faster and gives a smaller report. The [CLI reference](https://github.com/mandiant/speakeasy/blob/master/doc/cli-reference.md#config-flags) lists the flags.
 
-## Documentation map
+## Documentation
 
-### Start here
+Start with [installation](https://github.com/mandiant/speakeasy/blob/master/doc/install.md), [Python library usage](https://github.com/mandiant/speakeasy/blob/master/doc/library.md) and the [CLI reference](https://github.com/mandiant/speakeasy/blob/master/doc/cli-reference.md). The [documentation index](https://github.com/mandiant/speakeasy/blob/master/doc/index.md) lists all pages.
 
-- [Installation and Docker usage](doc/install.md)
-- [Python library usage](doc/library.md)
-- [Help and troubleshooting](doc/help.md)
-- [Documentation index](doc/index.md)
-
-### CLI usage
-
-- [CLI reference](doc/cli-reference.md)
-- [CLI analysis recipes](doc/cli-analysis-recipes.md)
-- [CLI environment overrides](doc/cli-environment-overrides.md)
-- [CLI execution controls](doc/cli-execution-controls.md)
-- [CLI help snapshot (showboat)](doc/cli-help-showboat.md)
-
-### Reports, configuration, and runtime behavior
-
-- [Configuration walkthrough](doc/configuration.md)
-- [Report walkthrough](doc/reporting.md)
-- [Memory management](doc/memory.md)
-- [Limitations](doc/limitations.md)
-
-### Debugging and extension
-
-- [GDB debugging reference](doc/gdb.md)
-- [GDB sessions (showboat)](doc/gdb-examples.md)
-- [Mounting host files with `--volume`](doc/volumes.md)
-- [Adding API handlers](doc/api-handlers.md)
-- [Examples directory](examples/)
-- [Speakeasy 2 walkthrough outline](doc/speakeasy2-walkthrough.md)
-
-## Questions and help
-
-Start with [doc/help.md](doc/help.md).
-
-If you still need help, open an issue at [github.com/mandiant/speakeasy/issues](https://github.com/mandiant/speakeasy/issues).
+For help, see [doc/help.md](https://github.com/mandiant/speakeasy/blob/master/doc/help.md) or open an issue at [github.com/mandiant/speakeasy/issues](https://github.com/mandiant/speakeasy/issues).

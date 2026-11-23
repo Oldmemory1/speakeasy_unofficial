@@ -2,13 +2,75 @@
 
 import ntpath
 import os
-from typing import Any
+from typing import TYPE_CHECKING
+from urllib.parse import urljoin
 
 import speakeasy.winenv.arch as e_arch
+import speakeasy.winenv.defs.windows.com as comdefs
+import speakeasy.winenv.defs.windows.kernel32 as k32defs
+import speakeasy.winenv.defs.windows.windows as windefs
 
 from .. import api
+from .shell32 import write_dll_version
 
-MAX_PATH = 260
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
+
+
+OS_NT = 1
+OS_NT4ORGREATER = 3
+OS_WIN2000ORGREATER_ALT = 4
+OS_WIN2000ORGREATER = 7
+OS_XPORGREATER = 18
+OS_PROFESSIONAL = 20
+OS_FASTUSERSWITCHING = 26
+OS_WELCOMELOGONUI = 27
+
+
+def get_path_without_file_spec(s: str) -> str | None:
+    """
+    Remove the last element of a path the way PathRemoveFileSpec does.
+    Return None when nothing is removed.
+    """
+    i = cut = len(s[:2]) - len(s[:2].lstrip("\\"))
+    while i < len(s):
+        if s[i] == "\\":
+            cut = i
+        elif s[i] == ":":
+            i += 1
+            cut = i + 1 if s[i : i + 1] == "\\" else i
+        i += 1
+    if cut >= len(s):
+        return None
+    return s[:cut]
+
+
+def get_path_root(path: str) -> str:
+    """
+    Get the root of a path the way PathStripToRoot does: a drive, a UNC
+    share, a single backslash, or an empty string for a relative path.
+    """
+    if path[1:2] == ":":
+        return path[:3] if path[2:3] == "\\" else path[:2]
+    if path.startswith("\\\\"):
+        return "\\".join(path.split("\\")[:4])
+    return "\\" if path.startswith("\\") else ""
+
+
+def get_canonical_path(path: str) -> str:
+    """
+    Remove the "." and ".." elements of a path the way PathCanonicalize does.
+    A ".." element at the root is dropped.
+    """
+    root = path[:3] if path[1:3] == ":\\" else path[: len(path[:2]) - len(path[:2].lstrip("\\"))]
+    parts: list[str] = []
+    for part in path[len(root) :].split("\\"):
+        if part == "..":
+            if parts:
+                parts.pop()
+        elif part != ".":
+            parts.append(part)
+    return root + "\\".join(parts)
 
 
 class Shlwapi(api.ApiHandler):
@@ -23,178 +85,280 @@ class Shlwapi(api.ApiHandler):
     def __init__(self, emu):
         super().__init__(emu)
 
-        self.funcs: dict[str, Any] = {}
-        self.data: dict[str, Any] = {}
+        self.funcs = {}
+        self.data = {}
         self.window_hooks: dict[int, tuple] = {}
         self.handle: int = 0
-        self.win: Any | None = None
 
         super().__get_hook_attrs__(self)
 
     def join_windows_path(self, *args, **kwargs):
-        args = list(map(lambda x: x.replace("\\", "/"), args))
-        return os.path.join(*args, **kwargs).replace("/", "\\")
+        parts = [x.replace("\\", "/") for x in args]
+        return os.path.join(*parts, **kwargs).replace("/", "\\")
 
     @apihook("PathIsRelative", argc=1)
-    def PathIsRelative(self, emu, argv, ctx: api.ApiContext = None):
+    def PathIsRelative(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL PathIsRelativeA(
-            LPCSTR pszPath
+        BOOL PathIsRelative(
+            LPCTSTR pszPath
         );
         """
-        ctx = ctx or {}
-
         (pszPath,) = argv
 
         cw = self.get_char_width(ctx)
         pn = ""
-        rv = False
+        rv = True
         if pszPath:
             pn = self.read_mem_string(pszPath, cw)
-            if ".." in pn:
-                rv = True
+            if pn.startswith("\\") or pn[1:2] == ":":
+                rv = False
 
-            argv[0] = pn
+            ctx.args["pszPath"].display = pn
 
         return rv
 
-    @apihook("StrStr", argc=2)
-    def StrStr(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("PathFileExists", argc=1)
+    def PathFileExists(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        PCSTR StrStr(
-            PCSTR pszFirst,
-            PCSTR pszSrch
+        BOOL PathFileExists(
+            LPCTSTR pszPath
         );
         """
-        ctx = ctx or {}
+        (pszPath,) = argv
 
-        hay, needle = argv
+        path = ""
+        if pszPath:
+            path = self.read_mem_string(pszPath, self.get_char_width(ctx))
+            ctx.args["pszPath"].display = path
+        if path and (emu.get_file_manager().is_directory(path) or self.does_file_exist(path)):
+            return 1
+        emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
+        return 0
+
+    @apihook("StrStr", argc=2)
+    def StrStr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        PCTSTR StrStr(
+            PCTSTR pszFirst,
+            PCTSTR pszSrch
+        );
+        """
+        pszFirst, pszSrch = argv
 
         cw = self.get_char_width(ctx)
 
-        if hay:
-            _hay = self.read_mem_string(hay, cw)
-            argv[0] = _hay
+        if pszFirst:
+            _hay = self.read_mem_string(pszFirst, cw)
+            ctx.args["pszFirst"].display = _hay
 
-        if needle:
-            needle = self.read_mem_string(needle, cw)
-            argv[1] = needle
+        if pszSrch:
+            _needle = self.read_mem_string(pszSrch, cw)
+            ctx.args["pszSrch"].display = _needle
 
-        ret = _hay.find(needle)
+        if not pszFirst or not pszSrch or not _needle:
+            return 0
+
+        ret = _hay.find(_needle)
         if ret != -1:
-            ret = hay + ret
+            ret = pszFirst + ret * cw
         else:
             ret = 0
 
         return ret
 
     @apihook("StrStrI", argc=2)
-    def StrStrI(self, emu, argv, ctx: api.ApiContext = None):
+    def StrStrI(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        PCSTR StrStrI(
-            PCSTR pszFirst,
-            PCSTR pszSrch
+        PCTSTR StrStrI(
+            PCTSTR pszFirst,
+            PCTSTR pszSrch
         );
         """
-        ctx = ctx or {}
-
-        hay, needle = argv
+        pszFirst, pszSrch = argv
 
         cw = self.get_char_width(ctx)
 
-        if hay:
-            _hay = self.read_mem_string(hay, cw)
-            argv[0] = _hay
+        if pszFirst:
+            _hay = self.read_mem_string(pszFirst, cw)
+            ctx.args["pszFirst"].display = _hay
             _hay = _hay.lower()
 
-        if needle:
-            needle = self.read_mem_string(needle, cw)
-            argv[1] = needle
-            needle = needle.lower()
+        if pszSrch:
+            _needle = self.read_mem_string(pszSrch, cw)
+            ctx.args["pszSrch"].display = _needle
+            _needle = _needle.lower()
 
-        ret = _hay.find(needle)
+        if not pszFirst or not pszSrch or not _needle:
+            return 0
+
+        ret = _hay.find(_needle)
         if ret != -1:
-            ret = hay + ret
+            ret = pszFirst + ret * cw
         else:
             ret = 0
 
         return ret
 
-    @apihook("PathFindExtension", argc=1)
-    def PathFindExtension(self, emu, argv, ctx: api.ApiContext = None):
-        """LPCSTR PathFindExtensionA(
-          LPCSTR pszPath
+    def find_char(self, start, end, match, cw, ignore_case, last):
+        """Return the address of the first or last ``match`` in [start, end), or 0."""
+        if not start:
+            return 0
+        match = chr(match & (0xFFFF if cw == 2 else 0xFF))
+        if ignore_case:
+            match = match.lower()
+        found = 0
+        addr = start
+        while not end or addr < end:
+            unit = int.from_bytes(self.mem_read(addr, cw), "little")
+            if not unit:
+                break
+            char = chr(unit).lower() if ignore_case else chr(unit)
+            if char == match:
+                found = addr
+                if not last:
+                    break
+            addr += cw
+        return found
+
+    @apihook("StrChr", argc=2)
+    def StrChr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        PTSTR StrChr(
+            PCTSTR pszStart,
+            TCHAR wMatch
         );
         """
-        ctx = ctx or {}
+        pszStart, wMatch = argv
+        return self.find_char(pszStart, 0, wMatch, self.get_char_width(ctx), False, False)
+
+    @apihook("StrChrI", argc=2)
+    def StrChrI(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        PTSTR StrChrI(
+            PCTSTR pszStart,
+            TCHAR wMatch
+        );
+        """
+        pszStart, wMatch = argv
+        return self.find_char(pszStart, 0, wMatch, self.get_char_width(ctx), True, False)
+
+    @apihook("StrRChr", argc=3)
+    def StrRChr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        PTSTR StrRChr(
+            PCTSTR pszStart,
+            PCTSTR pszEnd,
+            TCHAR wMatch
+        );
+        """
+        pszStart, pszEnd, wMatch = argv
+        return self.find_char(pszStart, pszEnd, wMatch, self.get_char_width(ctx), False, True)
+
+    @apihook("StrRChrI", argc=3)
+    def StrRChrI(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        PTSTR StrRChrI(
+            PCTSTR pszStart,
+            PCTSTR pszEnd,
+            TCHAR wMatch
+        );
+        """
+        pszStart, pszEnd, wMatch = argv
+        return self.find_char(pszStart, pszEnd, wMatch, self.get_char_width(ctx), True, True)
+
+    @apihook("PathFindExtension", argc=1)
+    def PathFindExtension(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        LPCTSTR PathFindExtension(
+            LPCTSTR pszPath
+        );
+        """
         (pszPath,) = argv
         cw = self.get_char_width(ctx)
         s = self.read_mem_string(pszPath, cw)
-        argv[0] = s
+        ctx.args["pszPath"].display = s
         idx1 = s.rfind("\\")
         t = s[idx1 + 1 :]
         idx2 = t.rfind(".")
         if idx2 == -1:
-            return pszPath + len(s)
+            return pszPath + len(s) * cw
 
-        argv[0] = t[idx2:]
-        return pszPath + idx1 + 1 + idx2
+        ctx.args["pszPath"].display = t[idx2:]
+        return pszPath + (idx1 + 1 + idx2) * cw
 
     @apihook("StrCmpI", argc=2)
-    def StrCmpI(self, emu, argv, ctx: api.ApiContext = None):
+    def StrCmpI(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int StrCmpI(
-        PCWSTR psz1,
-        PCWSTR psz2
+            PCTSTR psz1,
+            PCTSTR psz2
         );
         """
-        ctx = ctx or {}
+        return self.compare_strings(argv, ctx, ignore_case=True)
+
+    @apihook("StrCmpIC", argc=2)
+    def StrCmpIC(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int StrCmpIC(
+            LPCTSTR pszStr1,
+            LPCTSTR pszStr2
+        );
+        """
+        return self.compare_strings(argv, ctx, ignore_case=True)
+
+    @apihook("StrCmpC", argc=2)
+    def StrCmpC(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int StrCmpC(
+            LPCTSTR pszStr1,
+            LPCTSTR pszStr2
+        );
+        """
+        return self.compare_strings(argv, ctx, ignore_case=False)
+
+    def compare_strings(self, argv, ctx, ignore_case):
         psz1, psz2 = argv
 
         cw = self.get_char_width(ctx)
         s1 = self.read_mem_string(psz1, cw)
         s2 = self.read_mem_string(psz2, cw)
-        rv = 1
 
-        argv[0] = s1
-        argv[1] = s2
+        ctx.args[0].display = s1
+        ctx.args[1].display = s2
 
-        if s1.lower() == s2.lower():
-            rv = 0
-
-        return rv
+        if ignore_case:
+            s1, s2 = s1.lower(), s2.lower()
+        return (s1 > s2) - (s1 < s2)
 
     @apihook("PathFindFileName", argc=1)
-    def PathFindFileName(self, emu, argv, ctx: api.ApiContext = None):
+    def PathFindFileName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LPCSTR PathFindFileNameA(
-          LPCSTR pszPath
+        LPCTSTR PathFindFileName(
+            LPCTSTR pszPath
         );
         """
-        ctx = ctx or {}
         (pszPath,) = argv
         cw = self.get_char_width(ctx)
         s = self.read_mem_string(pszPath, cw)
-        argv[0] = s
+        ctx.args["pszPath"].display = s
         idx = s.rfind("\\")
         if idx == -1:
-            return pszPath + len(s)
+            return pszPath
 
-        argv[0] = s[idx + 1 :]
-        return pszPath + idx + 1
+        ctx.args["pszPath"].display = s[idx + 1 :]
+        return pszPath + (idx + 1) * cw
 
     @apihook("PathRemoveExtension", argc=1)
-    def PathRemoveExtension(self, emu, argv, ctx: api.ApiContext = None):
+    def PathRemoveExtension(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void PathRemoveExtensionA(
-          LPSTR pszPath
+        void PathRemoveExtension(
+            LPTSTR pszPath
         );
         """
-        ctx = ctx or {}
         (pszPath,) = argv
         cw = self.get_char_width(ctx)
         s = self.read_mem_string(pszPath, cw)
-        argv[0] = s
+        ctx.args["pszPath"].display = s
         idx1 = s.rfind("\\")
         t = s[idx1 + 1 :]
         idx2 = t.rfind(".")
@@ -202,166 +366,218 @@ class Shlwapi(api.ApiHandler):
             return pszPath
 
         s = s[: idx1 + 1 + idx2]
-        argv[0] = s
+        ctx.args["pszPath"].display = s
         self.write_mem_string(s, pszPath, cw)
         return pszPath
 
     @apihook("PathStripPath", argc=1)
-    def PathStripPath(self, emu, argv, ctx: api.ApiContext = None):
+    def PathStripPath(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void PathStripPath(
-        LPSTR pszPath
+            LPTSTR pszPath
         );
         """
-        ctx = ctx or {}
         (pszPath,) = argv
         cw = self.get_char_width(ctx)
         s = self.read_mem_string(pszPath, cw)
-        argv[0] = s
+        ctx.args["pszPath"].display = s
         mod_name = ntpath.basename(s) + "\x00"
 
-        enc = self.get_encoding(cw)
-        mod_name = mod_name.encode(enc)
-        self.mem_write(pszPath, mod_name)
+        self.mem_write(pszPath, self.encode_string(mod_name, cw))
 
     @apihook("wvnsprintfA", argc=4)
-    def wvnsprintfA(self, emu, argv, ctx: api.ApiContext = None):
+    def wvnsprintfA(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int wvnsprintfA(
-            PSTR    pszDest,
-            int     cchDest,
-            PCSTR   pszFmt,
+            PSTR pszDest,
+            int cchDest,
+            PCSTR pszFmt,
             va_list arglist
         );
         """
-        buffer, count, _format, argptr = argv
-        rv = 0
+        pszDest, cchDest, pszFmt, arglist = argv
 
-        fmt_str = self.read_mem_string(_format, 1)
+        fmt_str = self.read_mem_string(pszFmt, 1)
         fmt_cnt = self.get_va_arg_count(fmt_str)
 
-        vargs = self.va_args(argptr, fmt_cnt)
+        vargs = self.va_args(arglist, fmt_cnt)
 
         fin = self.do_str_format(fmt_str, vargs)
-        fin = fin[:count] + "\x00"
+        out = fin[: max(cchDest - 1, 0)]
+        if cchDest > 0:
+            self.write_mem_string(out, pszDest, 1)
+        ctx.args["pszDest"].display = out
+        ctx.args["pszFmt"].display = fmt_str
 
-        rv = len(fin)
-        self.mem_write(buffer, fin.encode("utf-8"))
-        argv[0] = fin.replace("\x00", "")
-        argv[1] = fmt_str
-
-        return rv
+        return len(fin) if len(fin) < cchDest else -1
 
     @apihook("wnsprintf", argc=e_arch.VAR_ARGS, conv=e_arch.CALL_CONV_CDECL)
-    def wnsprintf(self, emu, argv, ctx: api.ApiContext = None):
+    def wnsprintf(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int wnsprintfA(
-          PSTR  pszDest,
-          int   cchDest,
-          PCSTR pszFmt,
-          ...
+        int wnsprintf(
+            PTSTR pszDest,
+            int cchDest,
+            PCTSTR pszFmt,
+            ...
         );
         """
-        ctx = ctx or {}
         argv = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 3)
-        buf, max_buf_size, fmt = argv
+        pszDest, cchDest, pszFmt = argv
 
         cw = self.get_char_width(ctx)
 
-        fmt_str = self.read_mem_string(fmt, cw)
+        fmt_str = self.read_mem_string(pszFmt, cw)
         fmt_cnt = self.get_va_arg_count(fmt_str)
-        if not fmt_cnt:
-            self.write_mem_string(fmt_str, buf, cw)
-            return len(fmt_str)
-
         _argv = emu.get_func_argv(e_arch.CALL_CONV_CDECL, 3 + fmt_cnt)[3:]
-        fin = self.do_str_format(fmt_str, _argv)
-        rv = len(fin)
+        fin = self.do_str_format(fmt_str, _argv, wide=cw == 2)
 
-        if rv <= max_buf_size:
-            self.write_mem_string(fin, buf, cw)
-            argv[0] = fin
-            argv[2] = fmt_str
-            return rv
-        else:
-            return -1
+        out = fin[: max(cchDest - 1, 0)]
+        if cchDest > 0:
+            self.write_mem_string(out, pszDest, cw)
+        ctx.args.clear()
+        ctx.args.append(out)
+
+        return len(fin) if len(fin) < cchDest else -1
 
     @apihook("PathAppend", argc=2)
-    def PathAppend(self, emu, argv, ctx: api.ApiContext = None):
+    def PathAppend(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL PathAppendA(
-          LPSTR  pszPath,
-          LPCSTR pszMore
+        BOOL PathAppend(
+            LPTSTR pszPath,
+            LPCTSTR pszMore
         );
         """
-        ctx = ctx or {}
         pszPath, pszMore = argv
         cw = self.get_char_width(ctx)
         path = self.read_mem_string(pszPath, cw)
         more = self.read_mem_string(pszMore, cw)
-        argv[0] = path
-        argv[1] = more
+        ctx.args["pszPath"].display = path
+        ctx.args["pszMore"].display = more
+        if not more.startswith("\\\\"):
+            more = more.lstrip("\\")
         out = self.join_windows_path(path, more)
         out += "\0"
         self.write_mem_string(out, pszPath, cw)
         return 1
 
-    @apihook("PathCanonicalize", argc=2)
-    def PathCanonicalize(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("PathCombine", argc=3)
+    def PathCombine(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL PathCanonicalizeW(
-            [out] LPWSTR  pszBuf,
-            [in]  LPCWSTR pszPath
+        LPTSTR PathCombine(
+            LPTSTR pszDest,
+            LPCTSTR pszDir,
+            LPCTSTR pszFile
+        );
+        """
+        pszDest, pszDir, pszFile = argv
+        if not pszDest:
+            return 0
+        cw = self.get_char_width(ctx)
+        directory = self.read_mem_string(pszDir, cw) if pszDir else ""
+        file = self.read_mem_string(pszFile, cw) if pszFile else ""
+        if not pszDir and not pszFile:
+            path = None
+        elif not file:
+            path = directory
+        elif not directory or file[1:2] == ":" or file.startswith("\\\\"):
+            path = file
+        else:
+            if file.startswith("\\"):
+                directory = get_path_root(directory)
+                file = file[1:]
+            if directory and not directory.endswith("\\"):
+                directory += "\\"
+            path = directory + file
+        if path is None or len(path) >= k32defs.MAX_PATH:
+            self.write_mem_string("\0", pszDest, cw)
+            return 0
+        self.write_mem_string(get_canonical_path(path) + "\0", pszDest, cw)
+        return pszDest
+
+    @apihook("PathCanonicalize", argc=2)
+    def PathCanonicalize(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL PathCanonicalize(
+            LPTSTR pszBuf,
+            LPCTSTR pszPath
         );
         """
         pszBuf, pszPath = argv
-        path = self.read_wide_string(pszPath)
-        self.write_wide_string(path, pszBuf)
+        cw = self.get_char_width(ctx)
+        path = self.read_mem_string(pszPath, cw)
+        self.write_mem_string(path, pszBuf, cw)
         return 1
 
     @apihook("PathRemoveFileSpec", argc=1)
-    def PathRemoveFileSpec(self, emu, argv, ctx: api.ApiContext = None):
+    def PathRemoveFileSpec(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL PathRemoveFileSpec(LPTSTR pszPath);
+        BOOL PathRemoveFileSpec(
+            LPTSTR pszPath
+        );
         """
-        ctx = ctx or {}
         (pszPath,) = argv
         cw = self.get_char_width(ctx)
-        s = self.read_mem_string(pszPath, cw)
-        idx = s.rfind("\\")
-        if idx == -1:
+        s = get_path_without_file_spec(self.read_mem_string(pszPath, cw))
+        if s is None:
             return 0
 
-        s = s[:idx]
         self.write_mem_string(s, pszPath, cw)
         return 1
 
+    @apihook("UrlCombine", argc=5)
+    def UrlCombine(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HRESULT UrlCombine(
+            PCTSTR pszBase,
+            PCTSTR pszRelative,
+            PTSTR pszCombined,
+            DWORD *pcchCombined,
+            DWORD dwFlags
+        );
+        """
+        pszBase, pszRelative, pszCombined, pcchCombined, dwFlags = argv
+        if not pszBase or not pszRelative or not pcchCombined:
+            return windefs.E_INVALIDARG
+        cw = self.get_char_width(ctx)
+        base = self.read_mem_string(pszBase, cw)
+        relative = self.read_mem_string(pszRelative, cw)
+        ctx.args[0].display = base
+        ctx.args[1].display = relative
+        combined = urljoin(base, relative)
+        size = self.read_dword(pcchCombined)
+        if not pszCombined or size <= len(combined):
+            self.write_dword(pcchCombined, len(combined) + 1)
+            return comdefs.E_POINTER
+        self.write_mem_string(combined + "\0", pszCombined, cw)
+        self.write_dword(pcchCombined, len(combined))
+        return 0
+
     @apihook("PathAddBackslash", argc=1)
-    def PathAddBackslash(self, emu, argv, ctx: api.ApiContext = None):
+    def PathAddBackslash(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LPTSTR PathAddBackslash(LPTSTR pszPath);
+        LPTSTR PathAddBackslash(
+            LPTSTR pszPath
+        );
         """
-        ctx = ctx or {}
         (pszPath,) = argv
         cw = self.get_char_width(ctx)
         s = self.read_mem_string(pszPath, cw)
         if not s.endswith("\\"):
             s += "\\"
-            if len(s) > MAX_PATH:
+            if len(s) > k32defs.MAX_PATH:
                 return 0
 
         self.write_mem_string(s, pszPath, cw)
-        return pszPath
+        return pszPath + len(s) * cw
 
     @apihook("PathRenameExtension", argc=2)
-    def PathRenameExtension(self, emu, argv, ctx: api.ApiContext = None):
+    def PathRenameExtension(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL PathRenameExtension(
-          [in, out] LPSTR  pszPath,
-          [in]      LPCSTR pszExt
+            LPTSTR pszPath,
+            LPCTSTR pszExt
         );
         """
-        ctx = ctx or {}
         pszPath, pszExt = argv
 
         cw = self.get_char_width(ctx)
@@ -372,13 +588,49 @@ class Shlwapi(api.ApiHandler):
             return 0
 
         i = path.rfind(".")
-        if i == -1:
+        if i == -1 or i < path.rfind("\\"):
             path += ext
         else:
             path = path[:i] + ext
 
-        if len(path) > MAX_PATH:
+        if len(path) > k32defs.MAX_PATH:
             return 0
 
         self.write_mem_string(path, pszPath, cw)
         return 1
+
+    @apihook("DllGetVersion", argc=1)
+    def DllGetVersion(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HRESULT DllGetVersion(
+            DLLVERSIONINFO *pdvi
+        );
+        """
+        (pdvi,) = argv
+        ver = emu.config.system.os_ver
+        return write_dll_version(self, pdvi, ver.major or 0, ver.minor or 0, ver.build or 0)
+
+    @apihook("IsOS", argc=1)
+    def IsOS(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL IsOS(
+            DWORD dwOS
+        );
+
+        The emulated system is a native NT workstation of the configured version,
+        not a server and not a WOW64 process.
+        """
+        (dwOS,) = argv
+        ver = emu.config.system.os_ver
+        version = (ver.major or 0, ver.minor or 0)
+        minimum = {
+            OS_NT: (0, 0),
+            OS_NT4ORGREATER: (4, 0),
+            OS_WIN2000ORGREATER_ALT: (5, 0),
+            OS_WIN2000ORGREATER: (5, 0),
+            OS_XPORGREATER: (5, 1),
+            OS_PROFESSIONAL: (0, 0),
+            OS_FASTUSERSWITCHING: (5, 1),
+            OS_WELCOMELOGONUI: (5, 1),
+        }.get(dwOS)
+        return int(minimum is not None and version >= minimum)

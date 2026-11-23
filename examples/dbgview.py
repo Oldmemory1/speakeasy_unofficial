@@ -4,9 +4,7 @@ import speakeasy
 
 
 class DbgView(speakeasy.Speakeasy):
-    """
-    Print debug port prints to the console
-    """
+    """Print debug port prints to the console."""
 
     def __init__(self, debug=False):
         super().__init__(debug=debug)
@@ -15,7 +13,7 @@ class DbgView(speakeasy.Speakeasy):
         # Call the DbgPrint* function and print the formatted string to the console
         rv = func(params)
 
-        formatted_str = params[0]
+        formatted_str = emu.get_api_args()[-1].display
         print(formatted_str)
 
         return rv
@@ -24,7 +22,7 @@ class DbgView(speakeasy.Speakeasy):
         # Call the DbgPrintEx function and print the formatted string to the console
         rv = func(params)
 
-        formatted_str = params[2]
+        formatted_str = emu.get_api_args()[-1].display
         print(formatted_str)
 
         return rv
@@ -39,7 +37,7 @@ def main(args):
     dbg.add_api_hook(dbg.debug_printex_hook, "ntoskrnl", "DbgPrintEx")
 
     # Emulate the module
-    dbg.run_module(module, all_entrypoints=True)
+    dbg.run_module(module)
 
 
 if __name__ == "__main__":

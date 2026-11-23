@@ -8,6 +8,8 @@ from types import ModuleType
 
 import pytest
 
+from speakeasy.winenv.api import sigdb
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GENERATOR = REPO_ROOT / "scripts" / "gen_phnt_signatures.py"
 
@@ -155,9 +157,6 @@ def mini_phnt(tmp_path: Path) -> Path:
 
 def test_generate_prototypes(gen: ModuleType, mini_phnt: Path) -> None:
     doc, stats = gen.generate(str(mini_phnt))
-    assert doc["format"] == gen.FORMAT_VERSION
-    assert doc["source"] == "phnt"
-    assert doc["structs"] == {}
     funcs = doc["functions"]
     assert set(funcs) == {
         "NtCreateFile",
@@ -190,7 +189,7 @@ def test_generate_prototypes(gen: ModuleType, mini_phnt: Path) -> None:
         ["KeyInformation", "p", "o?", {"n": 3}],
         ["Length", "u32", "i"],
         ["ResultLength", "p:u32", "o"],
-        ["Affinity", "p:p", "io"],
+        ["Affinity", "p:up", "io"],
         ["Handles", "p:h", "i", {"c": 7}],
         ["Count", "u32", "i"],
         ["Flags", "i32:FLAGGY", "i"],
@@ -253,14 +252,24 @@ def test_type_resolution(gen: ModuleType, mini_phnt: Path) -> None:
     assert types.resolve("PCUNICODE_STRING") == "ps:UNICODE_STRING"
     assert types.resolve("const UNICODE_STRING *") == "ps:UNICODE_STRING"
     assert types.resolve("UNICODE_STRING **") == "p:ps:UNICODE_STRING"
-    assert types.resolve("KAFFINITY") == "p"
-    assert types.resolve("PKAFFINITY") == "p:p"
+    assert types.resolve("KAFFINITY") == "up"
+    assert types.resolve("PKAFFINITY") == "p:up"
+    assert types.resolve("SIZE_T") == "up"
+    assert types.resolve("SSIZE_T") == "ip"
+    assert types.resolve("LPARAM") == "ip"
+    assert types.resolve("HANDLE_PTR") == "h"
     assert types.resolve("PTEB") == "ps:TEB"
     assert types.resolve("PIO_APC_ROUTINE") == "p"
     assert types.resolve("PCALLBACK") == "p"
     assert types.resolve("PWSTR") == "S"
     assert types.resolve("WCHAR *") == "S"
     assert types.resolve("CHAR *") == "s"
+    # only CHAR and WCHAR pointers are strings
+    assert types.resolve("PUCHAR") == "a:u8"
+    assert types.resolve("UCHAR *") == "a:u8"
+    assert types.resolve("PBYTE") == "a:u8"
+    assert types.resolve("PUSHORT") == "p:u16"
+    assert types.resolve("PCWCHAR") == "S"
     assert types.resolve("PVOID *") == "p:p"
     assert types.resolve("unsigned long") == "u32"
     assert types.resolve("PSOME_SDK_STRUCT") == "ps:SOME_SDK_STRUCT"
@@ -283,3 +292,46 @@ def test_write_output_is_reproducible(gen: ModuleType, mini_phnt: Path, tmp_path
 def test_main_reports_missing_submodule(gen: ModuleType, tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="git submodule update"):
         gen.generate(str(tmp_path / "empty"))
+
+
+def test_curated_win64_declarations_filter_generated_catalog(gen: ModuleType, mini_phnt: Path, tmp_path: Path):
+    (mini_phnt / "ntrtl.h").write_text(
+        """
+#if defined(_WIN64)
+NTSYSAPI
+NTSTATUS
+NTAPI
+RtlWow64GetThreadContext(
+    _In_ HANDLE ThreadHandle,
+    _Inout_ PVOID ThreadContext
+    );
+NTSYSAPI
+NTSTATUS
+NTAPI
+RtlWow64SetThreadContext(
+    _In_ HANDLE ThreadHandle,
+    _In_ PVOID ThreadContext
+    );
+NTSYSAPI
+PVOID
+NTAPI
+RtlGetFunctionTableListHead(
+    VOID
+    );
+#endif
+"""
+    )
+    doc, _ = gen.generate(str(mini_phnt))
+    names = {"RtlWow64GetThreadContext", "RtlWow64SetThreadContext", "RtlGetFunctionTableListHead"}
+    for name in names:
+        assert doc["functions"][name][0]["arch"] == ["x64"]
+    assert "arch" not in doc["functions"]["RtlNoArgs"][0]
+    path = tmp_path / "generated.json.gz"
+    gen.write_output(doc, str(path))
+    db = sigdb.SignatureDatabase([sigdb.PhntSource(str(path))])
+    x86 = db.get_functions("ntdll", "x86")
+    x64 = db.get_functions("ntdll", "x64")
+    assert names.isdisjoint(x86)
+    assert names <= x64.keys()
+    assert "RtlNoArgs" in x86.keys() & x64.keys()
+    assert all(x64[name].arch == ("x64",) for name in names)

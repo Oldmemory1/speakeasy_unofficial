@@ -1,64 +1,275 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
-import logging
-from collections.abc import Callable
-from typing import Any
+from __future__ import annotations
 
-import speakeasy.windows.common as winemu
+import logging
+import re
+import struct
+from collections.abc import Callable, Generator
+from typing import TYPE_CHECKING, Any, TypeVar
+
 import speakeasy.winenv.arch as _arch
 import speakeasy.winenv.defs.nt.ntoskrnl as ntos
+from speakeasy import common
 from speakeasy.errors import ApiEmuError
-from speakeasy.profiler import ApiCallbackFrame, Run
-from speakeasy.profiler_events import TracePosition
+from speakeasy.profiler import Run
+from speakeasy.profiler_events import ApiArg, ApiArgType, EventType
+from speakeasy.report import RunType
 from speakeasy.struct import EmuStruct
-from speakeasy.windows import api_name_resolution_diagnostics
+from speakeasy.windows import api_name_resolution_diagnostics, guest_callbacks
+from speakeasy.windows.guest_callbacks import GuestCall
+from speakeasy.winenv.api import sigdb, sigfmt
+from speakeasy.winenv.codepage import decode_ansi, encode_ansi
+from speakeasy.winenv.defs.enums import PAGE_PROTECTION_FLAGS, REG_CREATE_KEY_DISPOSITION, REG_SAM_FLAGS
+from speakeasy.winenv.defs.lookup import decode_flags
+
+if TYPE_CHECKING:
+    from speakeasy.windows.fileman import File
+    from speakeasy.windows.regman import RegKey
+    from speakeasy.windows.winemu import WindowsEmulator
 
 logger = logging.getLogger(__name__)
 
-ApiContext = dict[str, Any] | None
+F = TypeVar("F", bound=Callable[..., Any])
+
+FORMAT_SPEC = re.compile(
+    r"%(?P<flags>[-+ #0]*)(?P<width>\*|\d+)?(?:\.(?P<precision>\*|\d*))?"
+    r"(?P<length>hh|h|ll|l|L|I64|I32|I|q|z|j|t|w)?(?P<conv>[diouxXeEfFgGaAcCsSpPnZ%])"
+)
+MAX_FORMAT_FIELD = 0x10000
+INT_BITS = {"hh": 8, "h": 16, "ll": 64, "I64": 64, "q": 64, "j": 64}
+
+
+def get_format_slot_sizes(spec: re.Match, ptr_size: int) -> list[int]:
+    """
+    Get the size in bytes of each argument that one printf conversion reads.
+
+    The order is the width, the precision, then the value.
+    """
+    sizes = [ptr_size] * [spec["width"], spec["precision"]].count("*")
+    conv, length = spec["conv"], spec["length"]
+    if conv in "diouxX":
+        bits = INT_BITS.get(length, ptr_size * 8 if length in ("I", "z", "t") else 32)
+        sizes.append(max(ptr_size, bits // 8))
+    elif conv in "eEfFgGaA":
+        sizes.append(8)
+    elif conv != "%":
+        sizes.append(ptr_size)
+    return sizes
+
+
+class HandlerArg:
+    """
+    One argument of an API call, as the report shows it.
+
+    A handler sets ``display`` to show a value that it decoded, such as the path of a handle.
+    """
+
+    def __init__(self, arg: ApiArg, param: sigdb.ParamSig | None = None) -> None:
+        self._arg: ApiArg = arg
+        self._param: sigdb.ParamSig | None = param
+
+    @property
+    def name(self) -> str | None:
+        return self._arg.name
+
+    @property
+    def value(self) -> int | None:
+        return self._arg.value
+
+    @property
+    def type(self) -> ApiArgType:
+        return self._arg.type
+
+    @property
+    def display(self) -> str:
+        return self._arg.display
+
+    @display.setter
+    def display(self, text: object) -> None:
+        """
+        Show ``text`` for this argument.
+
+        The type changes to ``str`` for a parameter that the signature declares as a
+        string, else to ``text``. A parameter that the signature shows as an enum or
+        flags keeps that display, so that all these values have one format. If ``text``
+        is not a string, for example ``None`` from a failed lookup or a NULL pointer
+        that the handler did not decode, the display does not change.
+        """
+        if not isinstance(text, str) or (
+            self._param is not None and self._arg.type in (ApiArgType.ENUM, ApiArgType.FLAGS)
+        ):
+            return
+        self._arg.display = text
+        self._arg.type = (
+            ApiArgType.STR if self._param is not None and self._param.kind in sigdb.STRING_KINDS else ApiArgType.TEXT
+        )
+
+
+def _detached_arg() -> HandlerArg:
+    return HandlerArg(ApiArg(type=ApiArgType.INT, display=""))
+
+
+class HandlerArgs:
+    """
+    The arguments of an API call.
+
+    If the emulator can use the signature of the API, there is one entry for each
+    parameter, and a handler gets an entry by parameter name or index. Else there is
+    one entry for each argument slot, and a handler gets an entry by slot index. A
+    name or index without an entry gives a detached argument. The report does not
+    record changes to a detached argument, so a missing signature does not stop emulation.
+    """
+
+    def __init__(self, args: list[ApiArg], params: list[sigdb.ParamSig] | None = None, discard: bool = False) -> None:
+        self._args: list[ApiArg] = args
+        self._params: list[sigdb.ParamSig] | None = params
+        self._discard: bool = discard
+
+    @classmethod
+    def from_signature(
+        cls, sig: sigdb.FuncSig, ptr_size: int, rendered: list[sigfmt.RenderedArg], slots: list[int]
+    ) -> HandlerArgs:
+        """
+        Make the arguments from the rendered values of the signature parameters.
+
+        Raises:
+            ValueError: if the slots do not match the slots that the signature uses.
+        """
+        return cls(sigfmt.get_call_args(sig, ptr_size, rendered, slots), list(sig.params))
+
+    @classmethod
+    def from_slots(cls, slots: list[int]) -> HandlerArgs:
+        return cls(sigfmt.get_slot_args(slots))
+
+    def __len__(self) -> int:
+        return len(self._args)
+
+    def __getitem__(self, key: int | str) -> HandlerArg:
+        if isinstance(key, str):
+            for index, param in enumerate(self._params or []):
+                if param.name == key:
+                    return HandlerArg(self._args[index], param)
+            logger.debug("no argument named %s", key)
+            return _detached_arg()
+        if not 0 <= key < len(self._args):
+            logger.debug("no argument at index %d", key)
+            return _detached_arg()
+        params = self._params or []
+        return HandlerArg(self._args[key], params[key] if key < len(params) else None)
+
+    def append(self, display: str, type: ApiArgType = ApiArgType.TEXT) -> HandlerArg:
+        """Add an argument without a raw value, such as the output of a printf call."""
+        arg = ApiArg(type=type, display=display)
+        if not self._discard:
+            self._args.append(arg)
+        return HandlerArg(arg)
+
+    def clear(self) -> None:
+        self._args.clear()
+        self._params = None
+
+    def get_report_args(self) -> list[ApiArg]:
+        return list(self._args)
+
+
+class ApiContext(dict):
+    """Call context that the emulator passes to an API handler.
+
+    The v2.1.0 interface exposes the API name and the report arguments as the
+    ``func_name`` and ``args`` attributes. The context is also a mapping with
+    those values under the same names, because the local FX-003/004/005
+    diagnostic modules store read-only evidence in ``ctx["_api_observation"]``,
+    and the handler contract tests pass a plain ``{"func_name": ...}`` dict. One
+    channel serves both, so a diagnostic attached to a dispatch context reaches
+    ``ApiEvent.observation`` and ``ErrorInfo.diagnostics["api_observation"]``.
+    """
+
+    def __init__(self, func_name: str = "", args: HandlerArgs | None = None) -> None:
+        super().__init__()
+        self["func_name"] = func_name
+        self["args"] = HandlerArgs([]) if args is None else args
+
+    @property
+    def func_name(self) -> str:
+        return self["func_name"]
+
+    @func_name.setter
+    def func_name(self, value: str) -> None:
+        self["func_name"] = value
+
+    @property
+    def args(self) -> HandlerArgs:
+        return self["args"]
+
+    @args.setter
+    def args(self, value: HandlerArgs) -> None:
+        self["args"] = value
+
+    @property
+    def _api_observation(self) -> dict[str, Any] | None:
+        """The diagnostic observation of the call, which the local FX modules attach."""
+        observation = self.get("_api_observation")
+        return observation if isinstance(observation, dict) else None
+
+    @_api_observation.setter
+    def _api_observation(self, observation: dict[str, Any] | None) -> None:
+        if observation is None:
+            self.pop("_api_observation", None)
+        else:
+            self["_api_observation"] = observation
+
+    def __repr__(self) -> str:
+        return f"ApiContext(func_name={self.func_name!r}, args={self.args!r})"
+
+
+NO_CONTEXT = ApiContext(args=HandlerArgs([], discard=True))
+
+
+def _context_func_name(ctx: Any) -> str:
+    """Get the API name of a handler context, an ApiContext or the dict of a direct call."""
+    name = ctx.get("func_name", "") if isinstance(ctx, dict) else getattr(ctx, "func_name", "")
+    return name if isinstance(name, str) else ""
 
 
 class ApiHandler:
-    """
-    Base class for handling exported functions
-    """
+    """Base class of the API handlers of one emulated DLL."""
 
     name = ""
 
     @staticmethod
-    def apihook(impname=None, argc=0, conv=_arch.CALL_CONV_STDCALL, ordinal=None):
-        def apitemp(f):
+    def apihook(
+        impname: str | None = None, argc: int = 0, conv: int = _arch.CALL_CONV_STDCALL, ordinal: int | None = None
+    ) -> Callable[[F], F]:
+        def apitemp(f: F) -> F:
             if not callable(f):
                 raise ApiEmuError(f"Invalid function type supplied: {str(f)}")
-            f.__apihook__ = (impname or f.__name__, f, argc, conv, ordinal)
+            if hasattr(f, "__apihook__"):
+                raise ApiEmuError(f"{f.__name__} has more than one apihook decorator")
+            f.__apihook__ = (impname or f.__name__, f, argc, conv, ordinal)  # type: ignore[attr-defined]
             return f
 
         return apitemp
 
     @staticmethod
-    def impdata(impname):
-        def datatmp(f):
+    def impdata(impname: str) -> Callable[[F], F]:
+        def datatmp(f: F) -> F:
             if not callable(f):
                 raise ApiEmuError(f"Invalid function type supplied: {str(f)}")
-            f.__datahook__ = (impname, f)
+            f.__datahook__ = (impname, f)  # type: ignore[attr-defined]
             return f
 
         return datatmp
 
-    @staticmethod
-    def get_api_name(func):
-        return func.__apihook__[0]
-
     def __init__(self, emu):
         super().__init__()
-        self.funcs = {}
-        self.data = {}
-        self.mod_name = ""
-        self.emu = emu
+        self.funcs: dict[str | int, tuple[str, Callable[..., Any], int, int, int | None]] = {}
+        self.data: dict[str, Callable[..., Any]] = {}
+        self.emu: WindowsEmulator = emu
         arch = self.emu.get_arch()
 
         if arch == _arch.ARCH_X86:
-            self.ptr_size = 4
+            self.ptr_size: int = 4
         elif arch == _arch.ARCH_AMD64:
             self.ptr_size = 8
         else:
@@ -112,27 +323,23 @@ class ApiHandler:
                     return handler
         return self.funcs.get(exp_name)
 
-    def get_ptr_size(self):
+    def get_ptr_size(self) -> int:
         return self.ptr_size
 
     def sizeof(self, obj):
         if isinstance(obj, EmuStruct):
             return obj.sizeof()
-        else:
-            raise ApiEmuError("Invalid object")
+        raise ApiEmuError("Invalid object")
 
     def get_bytes(self, obj):
         if isinstance(obj, EmuStruct):
             return obj.get_bytes()
-        else:
-            raise ApiEmuError("Invalid object")
+        raise ApiEmuError("Invalid object")
 
     def cast(self, obj, bytez):
         if isinstance(obj, EmuStruct):
             return obj.cast(bytez)
-        else:
-            raise ApiEmuError("Invalid object")
-        return obj
+        raise ApiEmuError("Invalid object")
 
     def write_back(self, addr, obj):
         bytez = self.get_bytes(obj)
@@ -141,14 +348,83 @@ class ApiHandler:
     def pool_alloc(self, pool_type, size, tag):
         return self.emu.pool_alloc(pool_type, size, tag)
 
+    def create_heap(self, emu):
+        """Map the header of a new heap and return its address, which is the heap handle."""
+        return self.mem_alloc(20, tag="emu.process_heap")
+
     def heap_alloc(self, size, heap):
         return self.emu.heap_alloc(size, heap)
 
-    def mem_alloc(self, size, base=None, tag=None, flags=0, perms=0, shared=False, process=None):
+    def heap_size(self, addr):
+        """Get the requested size of a block that ``heap_alloc`` returned, or None for any other address."""
+        mm = self.emu.get_address_map(addr)
+        if not mm or mm.free or mm.base != addr or not (mm.tag or "").startswith("api.heap"):
+            return None
+        return next((n for a, n, _ in reversed(self.emu.get_heap_allocs()) if a == addr), mm.size)
+
+    def heap_free(self, addr):
+        """Free a block that ``heap_alloc`` returned. Return False, and free nothing, for any other address."""
+        if self.heap_size(addr) is None:
+            return False
+        self.emu.mem_free(addr)
+        return True
+
+    def mem_alloc(self, size, base=None, tag=None, flags=0, perms=common.PERM_MEM_RWX, shared=False, process=None):
         return self.emu.mem_map(size, base=base, tag=tag, flags=flags, perms=perms, shared=shared, process=process)
 
     def mem_free(self, addr):
         return self.emu.mem_free(addr)
+
+    def win_perms_to_emu_perms(self, win_perms):
+        """Get the emulator permissions for a Windows page protection."""
+        new = 0
+        if win_perms & (PAGE_PROTECTION_FLAGS.PAGE_EXECUTE_READWRITE | PAGE_PROTECTION_FLAGS.PAGE_EXECUTE_WRITECOPY):
+            new = common.PERM_MEM_RWX
+        elif win_perms & PAGE_PROTECTION_FLAGS.PAGE_NOACCESS:
+            new = common.PERM_MEM_NONE
+        else:
+            if win_perms & PAGE_PROTECTION_FLAGS.PAGE_EXECUTE or win_perms & PAGE_PROTECTION_FLAGS.PAGE_EXECUTE_READ:
+                new |= common.PERM_MEM_EXEC
+            if (
+                win_perms & PAGE_PROTECTION_FLAGS.PAGE_EXECUTE_READ
+                or win_perms & PAGE_PROTECTION_FLAGS.PAGE_READONLY
+                or win_perms & PAGE_PROTECTION_FLAGS.PAGE_READWRITE
+                or win_perms & PAGE_PROTECTION_FLAGS.PAGE_WRITECOPY
+            ):
+                new |= common.PERM_MEM_READ
+            if win_perms & (PAGE_PROTECTION_FLAGS.PAGE_READWRITE | PAGE_PROTECTION_FLAGS.PAGE_WRITECOPY):
+                new |= common.PERM_MEM_WRITE
+        return new
+
+    def emu_perms_to_win_perms(self, emu_perms):
+        """Get the Windows page protection for emulator permissions."""
+        if emu_perms & common.PERM_MEM_WRITE:
+            if emu_perms & common.PERM_MEM_EXEC:
+                new = PAGE_PROTECTION_FLAGS.PAGE_EXECUTE_READWRITE
+            else:
+                new = PAGE_PROTECTION_FLAGS.PAGE_READWRITE
+        elif emu_perms & common.PERM_MEM_EXEC:
+            if emu_perms & common.PERM_MEM_READ:
+                new = PAGE_PROTECTION_FLAGS.PAGE_EXECUTE_READ
+            else:
+                new = PAGE_PROTECTION_FLAGS.PAGE_EXECUTE
+        elif emu_perms & common.PERM_MEM_READ:
+            new = PAGE_PROTECTION_FLAGS.PAGE_READONLY
+        else:
+            new = PAGE_PROTECTION_FLAGS.PAGE_NOACCESS
+        return new
+
+    def get_page_protection(self, address):
+        """Get the Windows page protection of the page at ``address``, with ``PAGE_GUARD`` for a guard page."""
+        emu = self.emu
+        page = address & ~(emu.page_size - 1)
+        # A guard page has no access in Unicorn until the first access restores its perms.
+        if page in emu.guard_pages:
+            return self.emu_perms_to_win_perms(emu.guard_pages[page]) | PAGE_PROTECTION_FLAGS.PAGE_GUARD
+        uc_to_perms = {native: perms for perms, native in emu.emu_eng.perms.items()}
+        regions = emu.get_mem_regions()
+        perms = next((uc_to_perms[p] for start, end, p in regions if start <= address <= end), common.PERM_MEM_NONE)
+        return self.emu_perms_to_win_perms(perms)
 
     def mem_reserve(self, size, base=None, tag=None):
         return self.emu.mem_reserve(size, base=base, tag=tag)
@@ -160,9 +436,28 @@ class ApiHandler:
     def mem_copy(self, dst, src, n):
         return self.emu.mem_copy(dst, src, n)
 
-    def read_mem_string(self, addr, width, max_chars=0):
+    def read_mem_string(self, addr, width, max_chars=0) -> str:
         string = self.emu.read_mem_string(addr, width=width, max_chars=max_chars)
         return string
+
+    def normalize_res_identifier(self, emu, cw, val):
+        if val >> 16:  # not an INTRESOURCE
+            name = emu.read_mem_string(val, cw)
+            if name.startswith("#"):
+                try:
+                    name = int(name[1:])
+                except ValueError:
+                    pass
+        else:
+            name = val
+
+        return name
+
+    def read_res_identifier(self, emu, ctx, arg, cw, val):
+        """Read a resource name or integer ID (MAKEINTRESOURCE) and show it as the display of ``arg``."""
+        name = self.normalize_res_identifier(emu, cw, val)
+        ctx.args[arg].display = name if isinstance(name, str) else hex(name)
+        return name
 
     def mem_string_len(self, addr, width):
         return self.emu.mem_string_len(addr, width)
@@ -198,9 +493,11 @@ class ApiHandler:
     def write_string(self, string, addr):
         return self.write_mem_string(string, addr, width=1)
 
-    def queue_run(self, run_type, ep, run_args=[]):
+    def queue_run(self, run_type, ep, run_args=None, name=None):
+        if run_args is None:
+            run_args = []
         run = Run()
-        if not isinstance(run_type, str):
+        if not isinstance(run_type, RunType):
             raise ApiEmuError("Invalid run type")
         if not isinstance(ep, int):
             raise ApiEmuError("Invalid run entry point")
@@ -208,89 +505,27 @@ class ApiHandler:
             raise ApiEmuError("Invalid run args")
 
         run.type = run_type
+        run.name = name
         run.start_addr = ep
         run.args = run_args
         self.emu.add_run(run)
 
-    def _get_current_trace_position(self) -> TracePosition:
-        run = self.emu.get_current_run()
-        thread = self.emu.get_current_thread()
-        proc = self.emu.get_current_process()
-        tick = run.instr_cnt if run else 0
-        tid = thread.tid if thread else 0
-        pid = proc.id if proc else 0
-        pc = None
-        try:
-            pc = self.emu.get_pc()
-        except Exception:
-            pc = None
-        return TracePosition(tick=tick, tid=tid, pid=pid, pc=pc)
-
-    def record_file_access_event(
-        self, path, event_type, data=None, handle=0, disposition=[], access=[], buffer=0, size=None
-    ):
-        logger.debug("file_%s: %s", event_type, path)
+    def record_process_event(self, proc, event_type: EventType, **kwargs):
+        logger.debug("%s: pid=%d", event_type.value, proc.id)
         profiler = self.emu.get_profiler()
         if profiler:
             run = self.emu.get_current_run()
-            pos = self._get_current_trace_position()
-            profiler.record_file_access_event(
-                run, pos, path, event_type, data, handle, disposition, access, buffer, size
-            )
-
-    def record_process_event(self, proc, event_type, **kwargs):
-        logger.debug("process_%s: pid=%d", event_type, proc.id)
-        profiler = self.emu.get_profiler()
-        if profiler:
-            run = self.emu.get_current_run()
-            pos = self._get_current_trace_position()
+            pos = self.emu.get_trace_position()
             profiler.record_process_event(run, pos, proc, event_type, kwargs)
 
-    def record_registry_access_event(
-        self, path, event_type, value_name=None, data=None, handle=0, disposition=[], access=[], buffer=0, size=None
-    ):
-        logger.debug("reg_%s: %s", event_type, path)
-        profiler = self.emu.get_profiler()
-        if profiler:
-            run = self.emu.get_current_run()
-            pos = self._get_current_trace_position()
-            profiler.record_registry_access_event(
-                run, pos, path, event_type, value_name, data, handle, disposition, access, buffer, size
-            )
-
-    def record_dns_event(self, domain, ip=""):
-        logger.debug("dns: %s -> %s", domain, ip)
-        profiler = self.emu.get_profiler()
-        if profiler:
-            run = self.emu.get_current_run()
-            pos = self._get_current_trace_position()
-            profiler.record_dns_event(run, pos, domain, ip)
-
-    def record_network_event(self, server, port, typ="unknown", proto="unknown", data=b"", method=""):
-        logger.debug("net: %s:%d %s", server, port, proto)
-        profiler = self.emu.get_profiler()
-        if profiler:
-            run = self.emu.get_current_run()
-            pos = self._get_current_trace_position()
-            profiler.record_network_event(run, pos, server, port, typ=typ, proto=proto, data=data, method=method)
-
-    def record_http_event(self, server, port, headers="", body=b"", secure=False):
-        logger.debug("http: %s:%d", server, port)
-        profiler = self.emu.get_profiler()
-        if profiler:
-            run = self.emu.get_current_run()
-            pos = self._get_current_trace_position()
-            profiler.record_http_event(run, pos, server, port, headers=headers, body=body, secure=secure)
-
     def get_max_int(self):
-        # Byte order is irrelevant here
         return int.from_bytes(b"\xff" * self.get_ptr_size(), "little")
 
     def mem_read(self, addr, size):
         return self.emu.mem_read(addr, size)
 
-    def file_open(self, path, create=False, truncate=False):
-        return self.emu.file_open(path, create, truncate=truncate)
+    def file_open(self, path, create=False, truncate=False, disposition=None, access=None):
+        return self.emu.file_open(path, create=create, truncate=truncate, disposition=disposition, access=access)
 
     def file_create_mapping(self, hfile, name, size, prot):
         return self.emu.file_create_mapping(hfile, name, size, prot)
@@ -298,46 +533,99 @@ class ApiHandler:
     def file_get(self, handle):
         return self.emu.file_get(handle)
 
+    def get_file(self, handle) -> File | None:
+        """Get the file of an open handle, or None if the handle is not open or does not refer to a file."""
+        return self.emu.fileman.get_file(handle)
+
     def does_file_exist(self, path):
         return self.emu.does_file_exist(path)
 
-    def reg_open_key(self, path, create=False):
-        return self.emu.reg_open_key(path, create)
+    def reg_open_key(self, path, create=False, disposition=None, access=None):
+        """
+        Open or optionally create a registry key, and return a new handle or None.
 
-    def reg_get_key(self, handle):
-        return self.emu.reg_get_key(handle)
+        ``disposition`` is a REG_CREATE_KEY_DISPOSITION value and ``access`` a REGSAM or ACCESS_MASK value
+        of the call. The event gets their names.
+        """
+        disposition_names = decode_flags(REG_CREATE_KEY_DISPOSITION, disposition) if disposition else None
+        access_names = decode_flags(REG_SAM_FLAGS, access) if access else None
+        return self.emu.reg_open_key(path, create=create, disposition=disposition_names, access=access_names)
+
+    def get_reg_key(self, handle) -> RegKey | None:
+        """Get the key of a predefined key or an open key handle, or None if the handle refers to no key."""
+        return self.emu.regman.get_key(handle)
 
     def reg_get_subkeys(self, hkey):
         return self.emu.reg_get_subkeys(hkey)
 
-    def get_encoding(self, char_width):
-        if char_width == 2:
-            enc = "utf-16le"
-        elif char_width == 1:
-            enc = "utf-8"
-        else:
-            raise ApiEmuError(f"No encoding found for char width: {char_width}")
-        return enc
+    def encode_string(self, string: str, width: int) -> bytes:
+        """
+        Encode ``string`` as guest characters of ``width`` bytes: ANSI for 1, UTF-16LE for 2.
+
+        Raises:
+            ApiEmuError: if ``width`` is not 1 or 2.
+        """
+        if width == 1:
+            return encode_ansi(string)
+        if width == 2:
+            return string.encode("utf-16le")
+        raise ApiEmuError(f"No encoding found for char width: {width}")
+
+    def decode_string(self, data: bytes, width: int) -> str:
+        """
+        Decode guest characters of ``width`` bytes: ANSI for 1, UTF-16LE for 2.
+
+        Raises:
+            ApiEmuError: if ``width`` is not 1 or 2.
+        """
+        if width == 1:
+            return decode_ansi(data)
+        if width == 2:
+            return data.decode("utf-16le", "replace")
+        raise ApiEmuError(f"No encoding found for char width: {width}")
 
     def mem_write(self, addr, data):
-        # If the data being written to a shared memory mapping, update all mappings
-        # This will likely have to be made more robust to handle more complicated
-        # scenarios with varying file offsets
+        # A write to a view of a shared file mapping also goes to each other shared view that shows the same
+        # bytes of the section. Only the part of the write that a view covers goes to it.
         mm = self.emu.get_address_map(addr)
         if mm and mm.shared:
             fm = self.emu.get_file_manager()
             fmap = fm.get_mapping_from_addr(mm.base)
             if fmap:
-                for base, view in fmap.views.items():
-                    if base == mm.base:
+                src = fmap.views[mm.base]
+                start = src.offset + (addr - src.base)
+                end = start + len(data)
+                for view in fmap.views.values():
+                    if view is src:
                         continue
-                    tgt_offset = addr - mm.base
-                    self.emu.mem_write(base + tgt_offset, data)
+                    tgt = self.emu.get_address_map(view.base)
+                    if not tgt or not tgt.shared:
+                        continue
+                    lo = max(start, view.offset)
+                    hi = min(end, view.offset + view.size)
+                    if lo < hi:
+                        self.emu.mem_write(view.base + (lo - view.offset), data[lo - start : hi - start])
 
         return self.emu.mem_write(addr, data)
 
-    def create_thread(self, addr, ctx, hproc, thread_type="thread", is_suspended=False):
-        return self.emu.create_thread(addr, ctx, hproc, thread_type=thread_type, is_suspended=is_suspended)
+    def read_dword(self, addr: int) -> int:
+        return int.from_bytes(self.mem_read(addr, 4), "little")
+
+    def read_ptr(self, addr: int) -> int:
+        return int.from_bytes(self.mem_read(addr, self.ptr_size), "little")
+
+    def write_dword(self, addr: int, value: int) -> None:
+        """Write the low 32 bits of ``value``. A negative value becomes its two's complement."""
+        self.mem_write(addr, (value & 0xFFFFFFFF).to_bytes(4, "little"))
+
+    def write_qword(self, addr: int, value: int) -> None:
+        self.mem_write(addr, value.to_bytes(8, "little"))
+
+    def write_ptr(self, addr: int, value: int) -> None:
+        self.mem_write(addr, value.to_bytes(self.ptr_size, "little"))
+
+    def create_thread(self, addr, ctx, hproc, name=None, is_suspended=False):
+        return self.emu.create_thread(addr, ctx, hproc, name=name, is_suspended=is_suspended)
 
     def get_object_from_id(self, id):
         return self.emu.get_object_from_id(id)
@@ -348,9 +636,6 @@ class ApiHandler:
     def get_object_handle(self, obj):
         return self.emu.get_object_handle(obj)
 
-    def get_object_from_handle(self, hnd):
-        return self.emu.get_object_from_handle(hnd)
-
     def get_object_from_name(self, name):
         return self.emu.get_object_from_name(name)
 
@@ -360,46 +645,46 @@ class ApiHandler:
     def get_char_width(self, ctx):
         """
         Based on the API name, determine the character width
-        being used by the function
+        being used by the function.
+
+        The width comes from the requested spelling: ``A`` is ANSI and ``W`` is
+        wide. An undecorated name is not a valid character-width request, so it
+        keeps the local behavior and raises ``ApiEmuError``. FX-005 records
+        read-only evidence of the lookup before the width is returned or the
+        error is raised; the observation never changes either.
         """
-        name = ctx.get("func_name", "")
+        name = _context_func_name(ctx)
         if name.endswith("A"):
             # FX-005 diagnostics: evidence only; the width itself is unchanged.
-            api_name_resolution_diagnostics.observe_char_width(self, ctx, name, char_width=1)
+            if ctx is not NO_CONTEXT:
+                api_name_resolution_diagnostics.observe_char_width(self, ctx, name, char_width=1)
             return 1
-        elif name.endswith("W"):
-            api_name_resolution_diagnostics.observe_char_width(self, ctx, name, char_width=2)
+        if name.endswith("W"):
+            if ctx is not NO_CONTEXT:
+                api_name_resolution_diagnostics.observe_char_width(self, ctx, name, char_width=2)
             return 2
         # Undecorated name: record which lookup matched it to a handler before
         # preserving the existing ApiEmuError and its message.
-        api_name_resolution_diagnostics.observe_char_width(
-            self, ctx, name, failure="undecorated_api_name"
-        )
+        if ctx is not NO_CONTEXT:
+            api_name_resolution_diagnostics.observe_char_width(
+                self, ctx, name, failure="undecorated_api_name"
+            )
         raise ApiEmuError(f"Failed to get character width from function: {name}")
 
     def get_va_arg_count(self, fmt):
-        """
-        Get the number of arguments in the variable argument list
-        """
-
-        # Ignore escapes
-        i = fmt.count("%%")
-        c = fmt.count("%")
-
-        if self.get_ptr_size() != 8:
-            c += fmt.count("%ll")
-        return c - i
+        """Get the number of pointer-sized argument slots that a printf format reads."""
+        ptr_size = self.get_ptr_size()
+        sizes = (size for spec in FORMAT_SPEC.finditer(fmt) for size in get_format_slot_sizes(spec, ptr_size))
+        return sum(size // ptr_size for size in sizes)
 
     def va_args(self, va_list, num_args):
-        """
-        Get the variable argument list
-        """
+        """Read ``num_args`` pointer-sized values from ``va_list``."""
         args = []
         ptr = va_list
         ptrsize = self.get_ptr_size()
 
-        for n in range(num_args):
-            arg = int.from_bytes(self.emu.mem_read(ptr, ptrsize), "little")
+        for _ in range(num_args):
+            arg = self.read_ptr(ptr)
             args.append(arg)
             ptr += ptrsize
         return args
@@ -414,120 +699,128 @@ class ApiHandler:
         complete: Callable[[int | None], int | None] | None = None,
     ):
         """
-        For APIs that call functions, we will setup the stack to make this flow
-        naturally.
+        Call the guest function ``func`` with ``args`` from the current API handler.
+
+        The call uses the v2.1.0 guest-call dispatch: a one-call generator handler
+        (``GuestCall``) runs on the API frame, the guest function returns to the
+        ``GUEST_CALLBACK_RETURN_ADDR`` sentinel, and the emulator completes the
+        intercepted API call with the generator result.
+
+        Args:
+            func: Entry point of the guest function.
+            args: Arguments of the guest call.
+            caller_argv: Accepted for the local handler contract, which passes
+                the arguments of the intercepted API call. The emulator takes the
+                argument count and the calling convention of the API call from
+                the API frame.
+            return_value: Return value of the intercepted API call when
+                ``complete`` is None.
+            complete: Map the return value of the guest function to the return
+                value of the intercepted API call.
+
+        Raises:
+            ApiEmuError: if no API call is active.
         """
+        frame = self.emu.active_api_frame
+        if frame is None:
+            raise ApiEmuError("No API call is active")
+        if frame.handler is not None:
+            # The API already runs guest code. Queue this call after the active
+            # one, as the v2.1.0 dispatch does.
+            frame.pending.append((func, tuple(args)))
+            return
 
-        run = self.emu.get_current_run()
-        callback_argv = tuple(caller_argv or ())
-        ret = self.emu.get_ret_address()
-        sp = self.emu.get_stack_ptr()
+        def call_guest() -> Generator[GuestCall, int | None, int | None]:
+            result = yield GuestCall(func, tuple(args))
+            while frame.pending:
+                function, pending_args = frame.pending.pop(0)
+                result = yield GuestCall(function, pending_args)
+            if complete is not None:
+                return complete(result)
+            if return_value is not None:
+                return return_value
+            # The emulator sets the handler result on the API frame after the
+            # handler returns, so the API call gets that result back.
+            return frame.result
 
-        self.emu.set_func_args(
-            sp,
-            winemu.API_CALLBACK_HANDLER_ADDR,
-            *args,
-            conv=_arch.CALL_CONV_STDCALL,
-        )
-        self.emu.set_pc(func)
-        run.api_callbacks.append(
-            ApiCallbackFrame(
-                ret_addr=ret,
-                function=func,
-                cleanup_argc=len(callback_argv),
-                caller_argv=callback_argv,
-                return_value=return_value,
-                complete=complete,
-            )
-        )
+        guest_callbacks.start_api_handler(self.emu, frame, call_guest())
 
-    def do_str_format(self, string, argv):
+    def do_str_format(self, string, argv, wide=False):
         """
-        Format a string similar to msvcrt.printf
+        Format a string as msvcrt printf does.
+
+        With ``wide``, %s and %S follow the wide-character functions: %s is a wide
+        string and %S is an ANSI string, unless an h or l prefix gives the width.
+        Missing arguments read as 0.
         """
+        ptr_size = self.get_ptr_size()
+        slots = list(argv)
 
-        # Skip over the format string
-        args = list(argv)
-        new = list(string)
-        curr_fmt = ""
-        new_fmts = []
+        def next_value(size):
+            value = 0
+            for i in range(size // ptr_size):
+                value |= (slots.pop(0) if slots else 0) << (i * ptr_size * 8)
+            return value
 
-        # Very brittle format string parser, should improve later
-        inside_fmt = False
-        # Characters spliced out of new so far; every positional edit below must subtract it
-        removed = 0
-        for i, c in enumerate(string):
-            if c == "%":
-                if inside_fmt:
-                    inside_fmt = False
+        def to_signed(value, bits):
+            value &= (1 << bits) - 1
+            return value - (1 << bits) if value >> (bits - 1) else value
+
+        out = []
+        pos = 0
+        for spec in FORMAT_SPEC.finditer(string):
+            out.append(string[pos : spec.start()])
+            pos = spec.end()
+            conv, length = spec["conv"], spec["length"]
+            if conv == "%":
+                out.append("%")
+                continue
+
+            flags, width, precision = spec["flags"], spec["width"] or "", spec["precision"]
+            sizes = get_format_slot_sizes(spec, ptr_size)
+            if width == "*":
+                value = to_signed(next_value(sizes.pop(0)), 32)
+                flags += "-" if value < 0 else ""
+                width = str(abs(value))
+            if precision == "*":
+                value = to_signed(next_value(sizes.pop(0)), 32)
+                precision = str(value) if value >= 0 else None
+            if width:
+                width = str(min(int(width), MAX_FORMAT_FIELD))
+            if precision:
+                precision = str(min(int(precision), MAX_FORMAT_FIELD))
+            fmt = f"%{flags}{width}" + (f".{precision}" if precision is not None else "")
+            size = sizes.pop(0)
+            value = next_value(size)
+            bits = INT_BITS.get(length, size * 8 if length in ("I", "z", "t") else 32)
+
+            if conv in "di":
+                out.append((fmt + "d") % to_signed(value, bits))
+            elif conv in "ouxX":
+                out.append((fmt + conv.replace("u", "d")) % (value & ((1 << bits) - 1)))
+            elif conv in "eEfFgG":
+                out.append((fmt + conv) % struct.unpack("<d", struct.pack("<Q", value))[0])
+            elif conv in "aA":
+                text = struct.unpack("<d", struct.pack("<Q", value))[0].hex()
+                out.append(text.upper() if conv == "A" else text)
+            elif conv in "pP":
+                # The CRT prints every hex digit of a pointer in uppercase and ignores the 0 flag
+                fmt = f"%{flags.replace('0', '')}{width}.{2 * ptr_size}X"
+                out.append(fmt % (value & ((1 << (8 * ptr_size)) - 1)))
+            elif conv in "cCsSZ":
+                is_wide = length in ("l", "w") or (length != "h" and (conv in "CS") != wide)
+                if conv in "cC":
+                    char = chr(value & 0xFFFF) if is_wide else decode_ansi(bytes([value & 0xFF]))
+                    out.append((fmt + "c") % char)
+                elif not value:
+                    out.append((fmt + "s") % "(null)")
+                elif conv == "Z":
+                    count = int.from_bytes(self.mem_read(value, 2), "little")
+                    buf = self.read_ptr(value + ptr_size)
+                    text = self.decode_string(self.mem_read(buf, count), 2 if is_wide else 1)
+                    out.append((fmt + "s") % text)
                 else:
-                    inside_fmt = True
-
-            if inside_fmt:
-                if c == "S":
-                    s = self.read_wide_string(args.pop(0))
-                    new_fmts.append(s)
-                    new[i - removed] = "s"
-                    inside_fmt = False
-
-                elif c == "s":
-                    if curr_fmt.startswith("w"):
-                        s = self.read_wide_string(args.pop(0))
-                        new[i - 1 - removed] = "\xff"
-                        curr_fmt = ""
-                        new_fmts.append(s)
-                    else:
-                        string_arg = args.pop(0)
-                        # Rendering a NULL %s argument as empty avoids
-                        # dereferencing address zero and aborting emulation.
-                        s = self.read_string(string_arg) if string_arg else ""
-                        new_fmts.append(s)
-                elif c in ("x", "X", "d", "u", "i"):
-                    if curr_fmt.startswith("ll"):
-                        if self.get_ptr_size() == 8:
-                            new_fmts.append(args.pop(0))
-                        else:
-                            low = args.pop(0)
-                            high = args.pop(0)
-                            new_fmts.append(high << 32 | low)
-                        start = i - removed
-                        new = new[: start - 2] + new[start:]
-                        removed += 2
-                        curr_fmt = ""
-                    elif curr_fmt.startswith(("z", "j", "t")):
-                        if self.get_ptr_size() == 8:
-                            new_fmts.append(args.pop(0))
-                        else:
-                            new_fmts.append(0xFFFFFFFF & args.pop(0))
-                        start = i - removed
-                        new = new[: start - 1] + new[start:]
-                        removed += 1
-                        curr_fmt = ""
-                    else:
-                        new_fmts.append(0xFFFFFFFF & args.pop(0))
-                elif c == "c":
-                    new_fmts.append(0xFF & args.pop(0))
-                elif c == "P":
-                    new[i - removed] = "X"
-                    new_fmts.append(args.pop(0))
-                elif c == "p":
-                    new[i - removed] = "x"
-                    new_fmts.append(args.pop(0))
-                elif c == "l":
-                    curr_fmt += c
-                elif c in ("z", "j", "t"):
-                    curr_fmt += c
-                elif c == "w":
-                    curr_fmt += c
-
-            if inside_fmt and c in "diuoxXfFeEgGaAcspn":
-                inside_fmt = False
-
-            if not args:
-                break
-
-        new = "".join(new)  # type: ignore[assignment]  # intentional list-to-str reuse
-        new = new.replace("\xff", "")  # type: ignore[attr-defined]  # new is str after join above
-        new = new % tuple(new_fmts)
-
-        return new
+                    text = self.read_wide_string(value) if is_wide else self.read_string(value)
+                    out.append((fmt + "s") % text)
+        out.append(string[pos:])
+        return "".join(out)

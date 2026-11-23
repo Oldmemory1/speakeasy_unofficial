@@ -1,6 +1,9 @@
-import os
+from typing import TYPE_CHECKING
 
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
 
 
 class Bcryptprimitives(api.ApiHandler):
@@ -19,11 +22,13 @@ class Bcryptprimitives(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("ProcessPrng", argc=2)
-    def ProcessPrng(self, emu, argv, ctx={}):
+    def ProcessPrng(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL ProcessPrng(PBYTE pbData, SIZE_T cbData);
+        BOOL ProcessPrng(
+            PBYTE pbData,
+            SIZE_T cbData
+        );
         """
         pbData, cbData = argv
-        rand_bytes = os.urandom(cbData)
-        self.mem_write(pbData, rand_bytes)
+        self.mem_write(pbData, emu.rng.randbytes(cbData))
         return 1

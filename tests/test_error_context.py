@@ -1,6 +1,7 @@
 """Tests for enriched exception context in ErrorInfo and error dict parsing."""
 
 import copy
+import struct
 
 import pytest
 
@@ -59,7 +60,7 @@ def _read_error(base_config):
         addr = se.load_shellcode(data=_SC_INVALID_READ, arch="x86")
         se.run_shellcode(addr)
         report = se.get_report()
-        ep = report.entry_points[0]
+        ep = report.runs[0]
         assert ep.error is not None, "shellcode should trigger invalid_read"
         return ep.error
     finally:
@@ -74,7 +75,7 @@ def _write_error(base_config):
         addr = se.load_shellcode(data=_SC_INVALID_WRITE, arch="x86")
         se.run_shellcode(addr)
         report = se.get_report()
-        ep = report.entry_points[0]
+        ep = report.runs[0]
         assert ep.error is not None, "shellcode should trigger invalid_write"
         return ep.error
     finally:
@@ -87,31 +88,33 @@ def test_invalid_read_error_fields(_read_error):
     assert e.access_type == "read"
     assert e.address == 0xDEADBEEF
     assert e.pc is not None
-    assert e.instr is not None
-    assert "mov" in e.instr.lower()
+    assert e.instruction is not None
+    assert "mov" in e.instruction.lower()
     assert e.pc_module is not None
-    assert e.thread_id is not None
-    assert e.process_id is not None
+    assert e.pc_offset is not None
+    assert e.tid is not None
+    assert e.pid is not None
 
 
 def test_invalid_read_has_register_state(_read_error):
     e = _read_error
-    assert e.regs is not None
-    assert "eax" in e.regs
-    assert e.regs["eax"] == "0xdeadbeef"
+    assert e.registers is not None
+    assert "eax" in e.registers
+    assert e.registers["eax"] == 0xDEADBEEF
     for reg in ("esp", "ebp", "eip"):
-        assert reg in e.regs
+        assert reg in e.registers
 
 
 def test_invalid_read_has_stack_trace(_read_error):
     e = _read_error
     assert e.stack is not None
-    assert len(e.stack) > 0
-    assert "sp+" in e.stack[0]
+    assert [entry.offset for entry in e.stack[:2]] == [0, 4]
+    assert e.stack[0].value is not None
 
 
 def test_invalid_read_context_summary(_read_error):
-    """Verify the one-line triage summary is present and structured.
+    """
+    Verify the one-line triage summary is present and structured.
 
     Expected format:
         read of 0xdeadbeef; from <module>+0x5; in unknown [0xdeadb000-0xdeadbfff]
@@ -130,7 +133,8 @@ def test_invalid_write_error_fields(_write_error):
 
 
 def test_invalid_write_context_summary(_write_error):
-    """Verify the write summary reports the correct access type.
+    """
+    Verify the write summary reports the correct access type.
 
     Expected format:
         write of 0xdeadbeef; from <module>+0x5; in unknown [0xdeadb000-0xdeadbfff]
@@ -155,6 +159,8 @@ def test_error_info_round_trips_through_json(_read_error):
     assert restored.address == e.address
     assert restored.access_type == e.access_type
     assert restored.context_summary == e.context_summary
+    assert restored.registers == e.registers
+    # The local ``regs`` property stays an alias of ``registers`` (SC-05).
     assert restored.regs == e.regs
 
 
@@ -177,3 +183,45 @@ def test_non_map_errors_do_not_infer_a_memory_operand() -> None:
         "unsupported API",
         0x2C710,
     ) == (None, None)
+
+
+def test_python_exception_in_speakeasy_is_internal_error(base_config):
+    def hook(emu, api, original, argv):
+        raise ValueError("bad handler state")
+
+    with Speakeasy(config=copy.deepcopy(base_config)) as se:
+        code = se.load_shellcode(data=b"\xcc" * 0x100, arch="x86")
+        proc = se.emu.get_proc("kernel32", "GetTickCount")
+        se.mem_write(code, b"\xb8" + proc.to_bytes(4, "little") + b"\xff\xd0\xc3")
+        se.add_api_hook(hook, "kernel32", "GetTickCount", argc=0)
+
+        se.run_shellcode(code)
+
+        e = se.get_report().runs[0].error
+        assert e is not None
+        assert (e.type, e.message) == ("internal_error", "bad handler state")
+        assert e.traceback is not None and e.traceback.endswith("ValueError: bad handler state\n")
+        assert e.context_summary is not None and "bad handler state" in e.context_summary
+
+
+def test_fault_after_the_end_of_a_module_is_not_in_the_module(base_config):
+    with Speakeasy(config=copy.deepcopy(base_config)) as se:
+        code = se.load_shellcode(data=b"\xcc" * 0x10, arch="x86")
+        kernel32 = se.emu.get_mod_by_name("kernel32")
+        end = kernel32.base + kernel32.image_size
+        se.mem_write(code, b"\xb8" + struct.pack("<I", end) + b"\xff\xe0")  # mov eax, end; jmp eax
+        se.run_shellcode(code)
+
+        e = se.get_report().runs[0].error
+        assert e is not None
+        assert (e.type, e.pc, e.pc_module) == ("invalid_fetch", end, None)
+
+
+def test_fault_with_no_disassembly_has_no_instruction(base_config):
+    with Speakeasy(config=copy.deepcopy(base_config)) as se:
+        code = se.load_shellcode(data=b"\x31\xc0\xff\xe0", arch="amd64")  # xor eax, eax; jmp rax
+        se.run_shellcode(code)
+
+        e = se.get_report().runs[0].error
+        assert e is not None
+        assert (e.type, e.pc, e.instruction) == ("invalid_fetch", 0, None)

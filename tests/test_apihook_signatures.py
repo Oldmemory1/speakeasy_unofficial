@@ -1,15 +1,19 @@
 """
-Cross-check every hand-written ``@apihook`` declaration against the Win32 API
-signature database. A mismatch in ``argc`` corrupts the emulated stack on x86,
-so hooks and metadata must agree wherever both exist.
+Cross-check every hand-written ``@apihook`` declaration against the Win32 API signature database.
+
+A mismatch in ``argc`` corrupts the emulated stack on x86, so hooks and metadata must agree wherever
+both exist.
 """
 
+import re
 from collections.abc import Iterator
 
 import pytest
 
 import speakeasy.winenv.arch as _arch
+from speakeasy.errors import ApiEmuError
 from speakeasy.winenv.api import sigdb, winapi
+from speakeasy.winenv.api.api import ApiHandler
 
 # Hooks whose argc intentionally differs from the documented prototype.
 # Add an entry with a justification if a deviation is deliberate.
@@ -59,3 +63,40 @@ def test_apihook_argc_matches_metadata() -> None:
 
     assert compared > 500, "expected the metadata to cover most hooks"
     assert not mismatches, "\n".join(mismatches)
+
+
+def test_apihook_params_have_names() -> None:
+    db = sigdb.get_default_database()
+    if not db.available:
+        pytest.skip("bundled signature database not generated (run scripts/gen_win32_signatures.py)")
+
+    unnamed = set()
+    for mod_name, name, argc, _ in _hooked_functions():
+        for candidate in (name, name + "W", name + "A"):
+            sig = db.lookup(mod_name, candidate, sigdb.ARCH_X86)
+            if sig is None or sig.variadic or sig.slot_count(4) != argc:
+                continue
+            if any(re.fullmatch(r"param\d+", p.name) for p in sig.params):
+                unnamed.add(f"{mod_name}.{candidate}")
+
+    assert not unnamed, "add param_names to scripts/win32_overrides.json for: " + ", ".join(sorted(unnamed))
+
+
+def test_crt_hooks_are_cdecl() -> None:
+    # _CxxThrowException is declared __stdcall in the CRT headers.
+    stdcall = {"_CxxThrowException"}
+    wrong = [
+        f"{mod_name}.{name}"
+        for mod_name, name, argc, conv in _hooked_functions()
+        if mod_name == "msvcrt" and argc and name not in stdcall and conv == _arch.CALL_CONV_STDCALL
+    ]
+    assert not wrong, "CRT functions are cdecl: " + ", ".join(sorted(wrong))
+
+
+def test_apihook_rejects_a_second_decorator() -> None:
+    with pytest.raises(ApiEmuError):
+
+        @ApiHandler.apihook("ExampleA", argc=1)
+        @ApiHandler.apihook("ExampleW", argc=1)
+        def Example(self, emu, argv, ctx):
+            return 0

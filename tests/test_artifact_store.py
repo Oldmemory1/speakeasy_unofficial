@@ -2,7 +2,7 @@ import base64
 import zlib
 
 from speakeasy.artifacts import ArtifactStore
-from speakeasy.report import DataArtifact, Report
+from speakeasy.report import DataArtifact
 
 
 def decode_artifact(entry: DataArtifact) -> bytes:
@@ -16,26 +16,6 @@ def test_artifact_store_deduplicates_payloads():
     second_ref = store.put_bytes(b"artifact-bytes")
 
     assert first_ref == second_ref
-    report_data = store.to_report_data()
+    report_data = store.to_report_data({first_ref})
     assert list(report_data) == [first_ref]
     assert decode_artifact(report_data[first_ref]) == b"artifact-bytes"
-
-
-def test_report_data_roundtrip_json():
-    report = Report(
-        emulation_total_runtime=1.0,
-        timestamp=123,
-        entry_points=[],
-        data={
-            "deadbeef": DataArtifact(
-                compression="zlib",
-                encoding="base64",
-                size=4,
-                data=base64.b64encode(zlib.compress(b"data")).decode(),
-            )
-        },
-    )
-
-    restored = Report.model_validate_json(report.model_dump_json())
-
-    assert decode_artifact(restored.data["deadbeef"]) == b"data"

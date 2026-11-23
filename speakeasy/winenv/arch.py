@@ -8,8 +8,9 @@ BITS_64 = 64
 
 LSTAR = 0xC0000082
 
-X86_REG_CS = 1001
-X86_REG_DS = 1002
+# The number of bytes to read to disassemble one instruction. It is larger than the longest instruction.
+DISASM_SIZE = 0x20
+
 X86_REG_EAX = 1003
 X86_REG_EBP = 1004
 X86_REG_EBX = 1005
@@ -87,6 +88,12 @@ X86_REG_XMM2 = 1065
 X86_REG_XMM3 = 1066
 X86_REG_XMM4 = 1067
 
+X86_REG_FPSW = 1068
+X86_REG_FPTAG = 1069
+X86_REG_FP0 = 1070
+X86_REG_FPCW = 1078
+X86_REG_MXCSR = 1079
+
 # Calling conventions
 CALL_CONV_CDECL = 0
 CALL_CONV_STDCALL = 1
@@ -94,7 +101,7 @@ CALL_CONV_FASTCALL = 2
 CALL_CONV_FLOAT = 3
 VAR_ARGS = -1
 
-# Register string constants
+# Register names to register IDs
 REG_LOOKUP = {
     # x86 registers
     "eax": X86_REG_EAX,

@@ -1,260 +1,260 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import ctypes as ct
+from enum import IntEnum
+from typing import Annotated
 
 from speakeasy.struct import EmuStruct, Ptr
-
-WSADESCRIPTION_LEN = 256
-WSASYS_STATUS_LEN = 128
 
 MAX_PATH = 260
 MAX_MODULE_NAME32 = 255
 
-FILE_ATTRIBUTE_DIRECTORY = 0x10
-FILE_ATTRIBUTE_NORMAL = 0x80
 
-TH32CS_INHERIT = 0x80000000
-TH32CS_SNAPHEAPLIST = 0x00000001
-TH32CS_SNAPMODULE = 0x00000008
-TH32CS_SNAPMODULE32 = 0x00000010
-TH32CS_SNAPPROCESS = 0x00000002
-TH32CS_SNAPTHREAD = 0x00000004
+GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x00000004
+
+FORMAT_MESSAGE_MAX_WIDTH_MASK = 0x000000FF
+FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100
+FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200
+FORMAT_MESSAGE_FROM_STRING = 0x00000400
+FORMAT_MESSAGE_FROM_HMODULE = 0x00000800
+FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000
+FORMAT_MESSAGE_ARGUMENT_ARRAY = 0x00002000
+
+SYSTEM_MESSAGES = {
+    0: "The operation completed successfully.\r\n",
+    1: "Incorrect function.\r\n",
+    2: "The system cannot find the file specified.\r\n",
+    3: "The system cannot find the path specified.\r\n",
+    4: "The system cannot open the file.\r\n",
+    5: "Access is denied.\r\n",
+    6: "The handle is invalid.\r\n",
+    8: "Not enough memory resources are available to process this command.\r\n",
+    32: "The process cannot access the file because it is being used by another process.\r\n",
+    87: "The parameter is incorrect.\r\n",
+    122: "The data area passed to a system call is too small.\r\n",
+    126: "The specified module could not be found.\r\n",
+    127: "The specified procedure could not be found.\r\n",
+    183: "Cannot create a file when that file already exists.\r\n",
+    1450: "Insufficient system resources exist to complete the requested service.\r\n",
+    0x80004005: "Unspecified error\r\n",
+    0x80040154: "Class not registered\r\n",
+}
+
+INIT_ONCE_CHECK_ONLY = 0x00000001
+INIT_ONCE_ASYNC = 0x00000002
+INIT_ONCE_INIT_FAILED = 0x00000004
 
 PROCESSOR_ARCHITECTURE_AMD64 = 9
 PROCESSOR_ARCHITECTURE_INTEL = 0
 
-LOCALE_INVARIANT = 0x7F
-LOCALE_USER_DEFAULT = 0x400
-LOCALE_SYSTEM_DEFAULT = 0x800
-LOCALE_CUSTOM_DEFAULT = 0xC00
-LOCALE_CUSTOM_UNSPECIFIED = 0x1000
-LOCALE_CUSTOM_UI_DEFAULT = 0x1400
+PROCESSOR_INTEL_PENTIUM = 586
+PROCESSOR_AMD_X8664 = 8664
 
-LOCALE_SENGLISHLANGUAGENAME = 0x1001
-LOCALE_SENGLISHCOUNTRYNAME = 0x1002
 
-DRIVE_UNKNOWN = 0
-DRIVE_NO_ROOT_DIR = 1
-DRIVE_REMOVABLE = 2
-DRIVE_FIXED = 3
-DRIVE_REMOTE = 4
-DRIVE_CDROM = 5
-DRIVE_RAMDISK = 6
+class LCID(IntEnum):
+    """
+    The predefined locale identifiers.
 
-ComputerNameNetBIOS = 0
-ComputerNameDnsHostname = 1
-ComputerNameDnsDomain = 2
-ComputerNameDnsFullyQualified = 3
-ComputerNamePhysicalNetBIOS = 4
-ComputerNamePhysicalDnsHostname = 5
-ComputerNamePhysicalDnsDomain = 6
-ComputerNamePhysicalDnsFullyQualified = 7
-ComputerNameMax = 8
+    The SDK defines them with the MAKELCID macro, so win32json has no constants for them.
+    """
 
-GetFileExInfoStandard = 0
+    LOCALE_INVARIANT = 0x7F
+    LOCALE_USER_DEFAULT = 0x400
+    LOCALE_SYSTEM_DEFAULT = 0x800
+    LOCALE_CUSTOM_DEFAULT = 0xC00
+    LOCALE_CUSTOM_UNSPECIFIED = 0x1000
+    LOCALE_CUSTOM_UI_DEFAULT = 0x1400
 
-EXCEPTION_CONTINUE_SEARCH = 0
-EXCEPTION_EXECUTE_HANDLER = 1
 
 THREAD_PRIORITY_NORMAL = 0
 
 
 class PROCESSENTRY32(EmuStruct):
+    dwSize: Annotated[int, ct.c_uint32]
+    cntUsage: Annotated[int, ct.c_uint32]
+    th32ProcessID: Annotated[int, ct.c_uint32]
+    th32DefaultHeapID: Annotated[int, Ptr]
+    th32ModuleID: Annotated[int, ct.c_uint32]
+    cntThreads: Annotated[int, ct.c_uint32]
+    th32ParentProcessID: Annotated[int, ct.c_uint32]
+    pcPriClassBase: Annotated[int, ct.c_uint32]
+    dwFlags: Annotated[int, ct.c_uint32]
+    szExeFile: bytes
+
     def __init__(self, ptr_size, width):
         super().__init__(ptr_size)
-        self.dwSize = ct.c_uint32
-        self.cntUsage = ct.c_uint32
-        self.th32ProcessID = ct.c_uint32
-        self.th32DefaultHeapID = Ptr
-        self.th32ModuleID = ct.c_uint32
-        self.cntThreads = ct.c_uint32
-        self.th32ParentProcessID = ct.c_uint32
-        self.pcPriClassBase = ct.c_uint32
-        self.dwFlags = ct.c_uint32
-        self.szExeFile = ct.c_uint8 * (MAX_PATH * width)
+        self.add_fields(szExeFile=ct.c_uint8 * (MAX_PATH * width))
 
 
 class THREADENTRY32(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.dwSize = ct.c_uint32
-        self.cntUsage = ct.c_uint32
-        self.th32ThreadID = ct.c_uint32
-        self.th32OwnerProcessID = ct.c_uint32
-        self.tpBasePri = ct.c_uint32
-        self.tpDeltaPri = ct.c_uint32
-        self.dwFlags = ct.c_uint32
+    dwSize: Annotated[int, ct.c_uint32]
+    cntUsage: Annotated[int, ct.c_uint32]
+    th32ThreadID: Annotated[int, ct.c_uint32]
+    th32OwnerProcessID: Annotated[int, ct.c_uint32]
+    tpBasePri: Annotated[int, ct.c_uint32]
+    tpDeltaPri: Annotated[int, ct.c_uint32]
+    dwFlags: Annotated[int, ct.c_uint32]
 
 
 class MODULEENTRY32(EmuStruct):
+    dwSize: Annotated[int, ct.c_uint32]
+    th32ModuleID: Annotated[int, ct.c_uint32]
+    th32ProcessID: Annotated[int, ct.c_uint32]
+    GlblcntUsage: Annotated[int, ct.c_uint32]
+    ProccntUsage: Annotated[int, ct.c_uint32]
+    modBaseAddr: Annotated[int, Ptr]
+    modBaseSize: Annotated[int, ct.c_uint32]
+    hModule: Annotated[int, Ptr]
+    szModule: bytes
+    szExePath: bytes
+
     def __init__(self, ptr_size, width):
         super().__init__(ptr_size)
-        self.dwSize = ct.c_uint32
-        self.th32ModuleID = ct.c_uint32
-        self.th32ProcessID = ct.c_uint32
-        self.GlblcntUsage = ct.c_uint32
-        self.ProccntUsage = ct.c_uint32
-        self.modBaseAddr = Ptr
-        self.modBaseSize = ct.c_uint32
-        self.hModule = ct.c_uint32
-        self.szModule = ct.c_uint8 * ((MAX_MODULE_NAME32 + 1) * width)
-        self.szExePath = ct.c_uint8 * (MAX_PATH * width)
+        self.add_fields(
+            szModule=ct.c_uint8 * ((MAX_MODULE_NAME32 + 1) * width),
+            szExePath=ct.c_uint8 * (MAX_PATH * width),
+        )
 
 
 class PROCESS_INFORMATION(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.hProcess = Ptr
-        self.hThread = Ptr
-        self.dwProcessId = ct.c_uint32
-        self.dwThreadId = ct.c_uint32
+    hProcess: Annotated[int, Ptr]
+    hThread: Annotated[int, Ptr]
+    dwProcessId: Annotated[int, ct.c_uint32]
+    dwThreadId: Annotated[int, ct.c_uint32]
 
 
 class MEMORY_BASIC_INFORMATION(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.BaseAddress = Ptr
-        self.AllocationBase = Ptr
-        self.AllocationProtect = ct.c_uint32
-        self.RegionSize = Ptr
-        self.State = ct.c_uint32
-        self.Protect = ct.c_uint32
-        self.Type = ct.c_uint32
+    BaseAddress: Annotated[int, Ptr]
+    AllocationBase: Annotated[int, Ptr]
+    AllocationProtect: Annotated[int, ct.c_uint32]
+    RegionSize: Annotated[int, Ptr]
+    State: Annotated[int, ct.c_uint32]
+    Protect: Annotated[int, ct.c_uint32]
+    Type: Annotated[int, ct.c_uint32]
 
 
 class FILETIME(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.dwLowDateTime = ct.c_uint32
-        self.dwHighDateTime = ct.c_uint32
+    dwLowDateTime: Annotated[int, ct.c_uint32]
+    dwHighDateTime: Annotated[int, ct.c_uint32]
 
 
 class WIN32_FIND_DATA(EmuStruct):
+    dwFileAttributes: Annotated[int, ct.c_uint32]
+    ftCreationTime: FILETIME
+    ftLastAccessTime: FILETIME
+    ftLastWriteTime: FILETIME
+    nFileSizeHigh: Annotated[int, ct.c_uint32]
+    nFileSizeLow: Annotated[int, ct.c_uint32]
+    dwReserved0: Annotated[int, ct.c_uint32]
+    dwReserved1: Annotated[int, ct.c_uint32]
+    cFileName: bytes
+    cAlternateFileName: bytes
+
     def __init__(self, ptr_size, width):
         super().__init__(ptr_size)
-        self.dwFileAttributes = ct.c_uint32
-        self.ftCreationTime = FILETIME
-        self.ftLastAccessTime = FILETIME
-        self.ftLastWriteTime = FILETIME
-        self.nFileSizeHigh = ct.c_uint32
-        self.nFileSizeLow = ct.c_uint32
-        self.dwReserved0 = ct.c_uint32
-        self.dwReserved1 = ct.c_uint32
-        self.cFileName = ct.c_uint8 * (260 * width)
-        self.cAlternateFileName = ct.c_uint8 * (14 * width)
+        self.add_fields(cFileName=ct.c_uint8 * (260 * width), cAlternateFileName=ct.c_uint8 * (14 * width))
+
+
+class BY_HANDLE_FILE_INFORMATION(EmuStruct):
+    dwFileAttributes: Annotated[int, ct.c_uint32]
+    ftCreationTime: FILETIME
+    ftLastAccessTime: FILETIME
+    ftLastWriteTime: FILETIME
+    dwVolumeSerialNumber: Annotated[int, ct.c_uint32]
+    nFileSizeHigh: Annotated[int, ct.c_uint32]
+    nFileSizeLow: Annotated[int, ct.c_uint32]
+    nNumberOfLinks: Annotated[int, ct.c_uint32]
+    nFileIndexHigh: Annotated[int, ct.c_uint32]
+    nFileIndexLow: Annotated[int, ct.c_uint32]
 
 
 class WIN32_FILE_ATTRIBUTE_DATA(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.dwFileAttributes = ct.c_uint32
-        self.ftCreationTime = FILETIME
-        self.ftLastAccessTime = FILETIME
-        self.ftLastWriteTime = FILETIME
-        self.nFileSizeHigh = ct.c_uint32
-        self.nFileSizeLow = ct.c_uint32
+    dwFileAttributes: Annotated[int, ct.c_uint32]
+    ftCreationTime: FILETIME
+    ftLastAccessTime: FILETIME
+    ftLastWriteTime: FILETIME
+    nFileSizeHigh: Annotated[int, ct.c_uint32]
+    nFileSizeLow: Annotated[int, ct.c_uint32]
 
 
 class SYSTEM_INFO(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.wProcessorArchitecture = ct.c_uint16
-        self.dwPageSize = ct.c_uint32
-        self.lpMinimumApplicationAddress = Ptr
-        self.lpMaximumApplicationAddress = Ptr
-        self.dwActiveProcessorMask = Ptr
-        self.dwNumberOfProcessors = ct.c_uint32
-        self.dwProcessorType = ct.c_uint32
-        self.dwAllocationGranularity = ct.c_uint32
-        self.wProcessorLevel = ct.c_uint16
-        self.wProcessorRevision = ct.c_uint16
+    wProcessorArchitecture: Annotated[int, ct.c_uint16]
+    dwPageSize: Annotated[int, ct.c_uint32]
+    lpMinimumApplicationAddress: Annotated[int, Ptr]
+    lpMaximumApplicationAddress: Annotated[int, Ptr]
+    dwActiveProcessorMask: Annotated[int, Ptr]
+    dwNumberOfProcessors: Annotated[int, ct.c_uint32]
+    dwProcessorType: Annotated[int, ct.c_uint32]
+    dwAllocationGranularity: Annotated[int, ct.c_uint32]
+    wProcessorLevel: Annotated[int, ct.c_uint16]
+    wProcessorRevision: Annotated[int, ct.c_uint16]
 
 
 class SYSTEMTIME(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.wYear = ct.c_uint16
-        self.wMonth = ct.c_uint16
-        self.wDayOfWeek = ct.c_uint16
-        self.wDay = ct.c_uint16
-        self.wHour = ct.c_uint16
-        self.wMinute = ct.c_uint16
-        self.wSecond = ct.c_uint16
-        self.wMilliseconds = ct.c_uint16
+    wYear: Annotated[int, ct.c_uint16]
+    wMonth: Annotated[int, ct.c_uint16]
+    wDayOfWeek: Annotated[int, ct.c_uint16]
+    wDay: Annotated[int, ct.c_uint16]
+    wHour: Annotated[int, ct.c_uint16]
+    wMinute: Annotated[int, ct.c_uint16]
+    wSecond: Annotated[int, ct.c_uint16]
+    wMilliseconds: Annotated[int, ct.c_uint16]
 
 
 class STARTUPINFO(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.cb = ct.c_uint32
-        self.lpReserved = Ptr
-        self.lpDesktop = Ptr
-        self.lpTitle = Ptr
-        self.dwX = ct.c_uint32
-        self.dwY = ct.c_uint32
-        self.dwXSize = ct.c_uint32
-        self.dwYSize = ct.c_uint32
-        self.dwXCountChars = ct.c_uint32
-        self.dwYCountChars = ct.c_uint32
-        self.dwFillAttribute = ct.c_uint32
-        self.dwFlags = ct.c_uint32
-        self.wShowWindow = ct.c_uint16
-        self.cbReserved2 = ct.c_uint16
-        self.lpReserved2 = Ptr
-        self.hStdInput = Ptr
-        self.hStdOutput = Ptr
-        self.hStdError = Ptr
+    cb: Annotated[int, ct.c_uint32]
+    lpReserved: Annotated[int, Ptr]
+    lpDesktop: Annotated[int, Ptr]
+    lpTitle: Annotated[int, Ptr]
+    dwX: Annotated[int, ct.c_uint32]
+    dwY: Annotated[int, ct.c_uint32]
+    dwXSize: Annotated[int, ct.c_uint32]
+    dwYSize: Annotated[int, ct.c_uint32]
+    dwXCountChars: Annotated[int, ct.c_uint32]
+    dwYCountChars: Annotated[int, ct.c_uint32]
+    dwFillAttribute: Annotated[int, ct.c_uint32]
+    dwFlags: Annotated[int, ct.c_uint32]
+    wShowWindow: Annotated[int, ct.c_uint16]
+    cbReserved2: Annotated[int, ct.c_uint16]
+    lpReserved2: Annotated[int, Ptr]
+    hStdInput: Annotated[int, Ptr]
+    hStdOutput: Annotated[int, Ptr]
+    hStdError: Annotated[int, Ptr]
 
 
 class OSVERSIONINFO(EmuStruct):
-    def __init__(self, ptr_size):
+    dwOSVersionInfoSize: Annotated[int, ct.c_uint32]
+    dwMajorVersion: Annotated[int, ct.c_uint32]
+    dwMinorVersion: Annotated[int, ct.c_uint32]
+    dwBuildNumber: Annotated[int, ct.c_uint32]
+    dwPlatformId: Annotated[int, ct.c_uint32]
+    szCSDVersion: bytes
+
+    def __init__(self, ptr_size, width):
         super().__init__(ptr_size)
-        self.dwOSVersionInfoSize = ct.c_uint32
-        self.dwMajorVersion = ct.c_uint32
-        self.dwMinorVersion = ct.c_uint32
-        self.dwBuildNumber = ct.c_uint32
-        self.dwPlatformId = ct.c_uint32
-        self.szCSDVersion = ct.c_uint8 * 128
+        self.add_fields(szCSDVersion=ct.c_uint8 * (128 * width))
 
 
 class OSVERSIONINFOEX(EmuStruct):
-    def __init__(self, ptr_size):
+    dwOSVersionInfoSize: Annotated[int, ct.c_uint32]
+    dwMajorVersion: Annotated[int, ct.c_uint32]
+    dwMinorVersion: Annotated[int, ct.c_uint32]
+    dwBuildNumber: Annotated[int, ct.c_uint32]
+    dwPlatformId: Annotated[int, ct.c_uint32]
+    szCSDVersion: bytes
+    wServicePackMajor: int
+    wServicePackMinor: int
+    wSuiteMask: int
+    wProductType: int
+    wReserved: int
+
+    def __init__(self, ptr_size, width):
         super().__init__(ptr_size)
-        self.dwOSVersion = OSVERSIONINFO
-        self.dwPlatformId = ct.c_uint16
-        self.dwPlatformId = ct.c_uint16
-        self.wProductType = ct.c_uint8
-        self.wReserved = ct.c_uint8
-
-
-def get_define(define, prefix=""):
-    for k, v in globals().items():
-        if not isinstance(v, int) or v != define:
-            continue
-        if prefix:
-            if k.startswith(prefix):
-                return k
-        else:
-            return k
-
-
-def get_define_value(define, prefix=""):
-    for k, v in globals().items():
-        if not isinstance(v, int) or k != define:
-            continue
-        if prefix:
-            if k.startswith(prefix):
-                return v
-        else:
-            return v
-
-
-def get_flag_defines(flags, prefix=""):
-    defs = []
-    for k, v in globals().items():
-        if not isinstance(v, int):
-            continue
-        if v & flags:
-            if prefix and k.startswith(prefix):
-                defs.append(k)
-    return defs
+        self.add_fields(
+            szCSDVersion=ct.c_uint8 * (128 * width),
+            wServicePackMajor=ct.c_uint16,
+            wServicePackMinor=ct.c_uint16,
+            wSuiteMask=ct.c_uint16,
+            wProductType=ct.c_uint8,
+            wReserved=ct.c_uint8,
+        )

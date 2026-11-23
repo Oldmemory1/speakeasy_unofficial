@@ -1,36 +1,26 @@
 # Memory management
 
-Speakeasy layers a memory manager on top of the emulator engine and tracks each mapped region with tags and metadata that can be exported in reports.
+The Speakeasy memory manager wraps the memory functions of the CPU engine. It gives each mapped region a tag, and the report can include the regions with their tags.
 
-## Memory tagging
+## Memory tags
 
-Each allocation is tagged with this namespace format:
+A tag starts with the origin and then names the object, for example `api.VirtualAlloc` or `emu.stack`. The origin `emu` marks memory that the emulator maps, such as images, stacks and system structures. The origin `api` marks memory that an API handler allocates for the guest, for example for `VirtualAlloc`. Some small allocations of API handlers have no tag. In the memory manager, the tag of a map ends with its base address, for example `api.VirtualAlloc.0x450000`. The report leaves out the address: the region has `tag` `api.VirtualAlloc` and `base` `0x450000`.
 
-`<origin>.<object_type>.<object_name>.<base_address>`
+The memory manager gives a module image one map. The report splits it into one region for the PE headers and one region for each section. Each of these regions has the tag `emu.module`, the file name of the module in `module`, and the section name or `headers` in `section`. [Reporting](reporting.md#memory-regions) gives the fields.
 
-Typical origins:
+## Keeping freed memory
 
-- `emu`: memory mapped by emulator internals (images, stacks, core runtime structures)
-- `api`: memory allocated via API handlers (for example `VirtualAlloc` paths)
+By default, `memory.freed_regions` keeps a region mapped after the sample frees it, so you can examine a buffer that the sample frees soon after it writes the buffer. Each region in the report then has `freed`, which is true for a freed region. The guest can also read and write the region after the free without a fault, which is different from Windows. `--no-memory-freed-regions` unmaps a freed region, as Windows does, when no other allocation of its page block is live. The report then has no `freed` and leaves out each freed allocation. This option changes what the guest sees, so it can change the result of the run.
 
-## Memory freezing
+## Memory contents
 
-Set `keep_memory_on_free` (or `--keep-memory-on-free`) to keep mappings after free operations. This is useful when samples allocate, populate, and free buffers quickly but you still need to inspect resulting artifacts.
+By default, `memory.final_contents` adds the content of each memory region at the end of each run to the report, and `--no-memory-final-contents` turns this off. Only user mode has these contents. Each region of guest memory has a `data_ref`, which is a SHA-256 key in the top-level `data` section. [Memory regions](reporting.md#memory-regions) lists the regions of guest memory. The `data` section keeps the bytes as `base64(zlib(raw_bytes))`. The report keeps one copy of bytes that repeat across regions or runs, and it does not need other files.
 
-## Memory acquisition mode
+An unpacker can run code in a buffer and then overwrite the buffer with the next stage, so the snapshot at the end of the run does not have the first stage. By default, `memory.dynamic_code_contents` adds the contents of each dynamic code region, at the first time that code runs in it, to the report. `--no-memory-dynamic-code-contents` turns this off. When `memory.accesses` is off and `limits.instructions` is 0, this option adds a hook that counts each instruction, so that each snapshot has its position. Each entry of `dynamic_code[].contents` then has a `data_ref`, and its `pos` gives the position of the snapshot in the timeline of events. If the guest then writes a new stage into the region and runs it, `contents` has one more entry for each stage, up to `memory.dynamic_code_contents.limit` entries for each region. [Reporting](reporting.md) gives the rules.
 
-In-report snapshots:
+## Memory access counts
 
-- `--snapshot-memory-regions` stores region payload refs in the report
-- resolve those refs through the top-level `data` section, which stores `base64(zlib(raw_bytes))` keyed by SHA-256
-
-This keeps memory snapshots self-contained while deduplicating repeated regions across runs.
-
-## Memory tracing
-
-Set `analysis.memory_tracing` (or `--analysis-memory-tracing`) to track per-region read/write/execute counters and symbol access summaries.
-
-This adds overhead, especially on memory-heavy samples.
+By default, `memory.accesses` counts the reads, writes and executes of each region and of each symbol address, in `runs[].accesses`. It also counts the instructions for `instruction_count` and `pos.tick`. The counts make the run slower, mostly for samples that access much memory. `--no-memory-accesses` turns them off.
 
 ## Related docs
 

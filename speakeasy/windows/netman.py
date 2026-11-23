@@ -1,18 +1,38 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+from __future__ import annotations
+
 import io
 import os
 from io import BytesIO
-from typing import Any
-from urllib.parse import urlparse
+from socket import inet_aton
+from typing import TYPE_CHECKING, TypeVar
+from urllib.parse import ParseResult, urlparse
 
 from speakeasy.errors import NetworkEmuError
+from speakeasy.profiler_events import NetTrafficProtocol, NetTrafficType
+from speakeasy.windows.handles import HandleTable
+from speakeasy.winenv.defs.enums import INTERNET_FLAGS, SOCKET_TYPE
+
+if TYPE_CHECKING:
+    from speakeasy.config import DnsConfig, NetworkConfig
+    from speakeasy.windows.winemu import WindowsEmulator
+
+SOCKET_PROTOCOLS: dict[int, NetTrafficProtocol] = {
+    SOCKET_TYPE.SOCK_STREAM: NetTrafficProtocol.TCP,
+    SOCKET_TYPE.SOCK_DGRAM: NetTrafficProtocol.UDP,
+    SOCKET_TYPE.SOCK_RAW: NetTrafficProtocol.RAW,
+}
+
+T = TypeVar("T", bound="WininetComponent")
 
 
-def is_empty(bio):
-    if len(bio.getbuffer()) == bio.tell():
+def is_ip_address(ip):
+    try:
+        inet_aton(ip)
         return True
-    return False
+    except Exception:
+        return False
 
 
 def normalize_response_path(path):
@@ -29,12 +49,10 @@ def normalize_response_path(path):
 
 
 class Socket:
-    """
-    Represents a Windows network socket
-    """
+    """Represents a Windows network socket."""
 
-    def __init__(self, fd, family, stype, protocol, flags):
-        self.fd: int = fd
+    def __init__(self, family, stype, protocol, flags):
+        self.fd: int = 0
         self.family: int = family
         self.type: int = stype
         self.protocol: int = protocol
@@ -42,7 +60,6 @@ class Socket:
         self.connected_host: str = ""
         self.connected_port: int = 0
         self.curr_packet: BytesIO = BytesIO(b"")
-        self.packet_queue: list[bytes] = []
 
     def set_connection_info(self, host, port):
         self.connected_host = host
@@ -50,6 +67,10 @@ class Socket:
 
     def get_connection_info(self):
         return (self.connected_host, self.connected_port)
+
+    def get_protocol(self) -> NetTrafficProtocol:
+        """Get the protocol of the socket type, for example ``tcp``."""
+        return SOCKET_PROTOCOLS.get(self.type, NetTrafficProtocol.UNKNOWN)
 
     def fill_recv_queue(self, responses):
         for resp in responses:
@@ -63,66 +84,48 @@ class Socket:
 
     def get_recv_data(self, size, peek=False):
         data = self.curr_packet.read(size)
-        if not peek:
-            return data
-        elif peek:
-            self.curr_packet.seek(-size, os.SEEK_CUR)
+        if peek:
+            self.curr_packet.seek(-len(data), os.SEEK_CUR)
         return data
 
 
-class WSKSocket(Socket):
-    """
-    Represents a WSK socket used in kernel mode applications
-    """
-
-    def __init__(self, fd, family, stype, protocol, flags):
-        super().__init__(fd, family, stype, protocol, flags)
-
-
 class WininetComponent:
-    """
-    Base class used for WinInet connections
-    """
+    """Base class for the WinInet handle objects: instance, session and request."""
 
-    config: Any | None = None
-
-    def __init__(self, allocator):
+    def __init__(self, handles):
         super().__init__()
-        self.allocator = allocator
-        self.handle = self.allocator.allocate_wininet_handle()
+        self.handles: HandleTable = handles
+        self.handle: int = self.handles.new_handle(self)
+        self.children: list[WininetComponent] = []
 
     def get_handle(self):
         return self.handle
 
 
 class WininetRequest(WininetComponent):
-    """
-    WinInet request object
-    """
+    """Represents a WinInet request."""
 
-    def __init__(self, allocator, session, verb, objname, ver, ref, accepts, flags, ctx):
-        super().__init__(allocator)
+    def __init__(self, handles, session, verb, objname, ver, ref, accepts, flags, ctx):
+        super().__init__(handles)
 
-        # The WiniNet APIs default to a HTTP "GET" if no verb is specified
+        # WinInet uses GET when the caller gives no verb.
+        self.verb: str
         if not verb:
             self.verb = "get"
         else:
             self.verb = verb.lower()
 
-        self.objname = objname
-        if not self.objname:
-            self.objname = ""
-        self.objname = urlparse(self.objname)
+        self.objname: ParseResult = urlparse(objname or "")
 
-        self.session = session
+        self.session: WininetSession = session
 
         if not ver:
             ver = "HTTP/1.1"
         self.ver: str = ver
-        self.referrer = ref
-        self.accept_types = accepts
-        self.flags = flags
-        self.ctx = ctx
+        self.referrer: str | int | None = ref
+        self.accept_types: int | None = accepts
+        self.flags: int = flags
+        self.ctx: int = ctx
         self.response: BytesIO | None = None
 
     def get_server(self):
@@ -135,9 +138,8 @@ class WininetRequest(WininetComponent):
         return self.session.instance
 
     def is_secure(self):
-        if "INTERNET_FLAG_SECURE" in self.flags:
-            return True
-        return False
+        # WINHTTP_FLAG_SECURE has the same value, so this test is also correct for WinHTTP requests
+        return bool(self.flags & INTERNET_FLAGS.INTERNET_FLAG_SECURE)
 
     def format_http_request(self, headers=None):
         request_string = ""
@@ -156,15 +158,19 @@ class WininetRequest(WininetComponent):
         if ua:
             request_string += f"User-Agent: {ua}\n"
 
-        if "INTERNET_FLAG_KEEP_CONNECTION" in self.flags:
+        if self.flags & INTERNET_FLAGS.INTERNET_FLAG_KEEP_CONNECTION:
             request_string += "Connection: Keep-Alive\n"
         else:
             request_string += "Connection: Close\n"
 
-        if "INTERNET_FLAG_DONT_CACHE" in self.flags:
+        if self.flags & INTERNET_FLAGS.INTERNET_FLAG_DONT_CACHE:
             request_string += "Cache-Control: no-cache\n"
 
         return request_string
+
+    def get_response_headers(self):
+        """Get the status line and the header lines of the response."""
+        return ["HTTP/1.1 200 OK", f"Content-Length: {len(self.get_response().getvalue())}"]
 
     def get_response_size(self):
         resp = self.get_response()
@@ -175,19 +181,20 @@ class WininetRequest(WininetComponent):
 
     def get_response(self):
         """
-        Check the configuration file so see if there is a
-        handler for the current WinInet request
-        """
+        Get the response data from the HTTP config.
 
-        cfg = WininetComponent.config
+        A ``by_ext`` entry for the verb that matches the URL extension gives the data, else the
+        ``default`` entry. With no entry, the response has no data.
+
+        Raises:
+            NetworkEmuError: if the config has no HTTP responses.
+        """
+        cfg = self.get_instance().config
 
         if self.response:
             return self.response
 
-        http = cfg.http if cfg else None
-        if not http:
-            raise NetworkEmuError("No HTTP configuration supplied")
-        resps = http.responses
+        resps = cfg.http.responses
         if not resps:
             raise NetworkEmuError("No HTTP responses supplied")
 
@@ -199,8 +206,8 @@ class WininetRequest(WininetComponent):
                 resp_files = res.files
                 if resp_files:
                     for file in resp_files:
-                        mode = file.mode or ""
-                        if mode.lower() == "by_ext":
+                        mode = file.mode
+                        if mode == "by_ext":
                             ext = getattr(file, "ext", "") or ""
                             fn, obj_ext = os.path.splitext(self.objname.path)
 
@@ -210,7 +217,7 @@ class WininetRequest(WininetComponent):
                                     path = normalize_response_path(path)
                                     with open(path, "rb") as f:
                                         self.response = BytesIO(f.read())
-                        elif mode.lower() == "default":
+                        elif mode == "default":
                             default_resp_path = getattr(file, "path", None)
                             if default_resp_path:
                                 default_resp_path = normalize_response_path(default_resp_path)
@@ -219,103 +226,94 @@ class WininetRequest(WininetComponent):
                         with open(default_resp_path, "rb") as f:
                             self.response = BytesIO(f.read())
 
+        if self.response is None:
+            self.response = BytesIO(b"")
+
         return self.response
 
 
 class WininetSession(WininetComponent):
-    def __init__(self, allocator, instance, server, port, user, password, service, flags, ctx):
-        super().__init__(allocator)
-        self.server = server
-        self.port = port
-        self.user = user
-        self.password = password
-        self.service = service
-        self.flags = flags
-        self.ctx = ctx
-        self.requests: dict[int, WininetRequest] = {}
+    def __init__(self, handles, instance, server, port, user, password, service, flags, ctx):
+        super().__init__(handles)
+        self.server: str | int = server
+        self.port: int = port
+        self.user: str | int = user
+        self.password: str | int = password
+        self.service: int | str = service
+        self.flags: int = flags
+        self.ctx: int = ctx
 
-        self.instance = instance
+        self.instance: WininetInstance = instance
 
     def new_request(self, verb, objname, ver, ref, accepts, flags, ctx):
-        req = WininetRequest(self.allocator, self, verb, objname, ver, ref, accepts, flags, ctx)
-        hdl = req.get_handle()
-        self.requests.update({hdl: req})
+        req = WininetRequest(self.handles, self, verb, objname, ver, ref, accepts, flags, ctx)
+        self.children.append(req)
         return req
 
 
 class WininetInstance(WininetComponent):
-    def __init__(self, allocator, user_agent, access, proxy, bypass, flags):
-        super().__init__(allocator)
-        self.user_agent = user_agent
-        self.access = access
-        self.proxy = proxy
-        self.bypass = bypass
-        self.flags = flags
-        self.sessions: dict[int, WininetSession] = {}
-
-    def get_session(self, sess_handle):
-        self.sessions.get(sess_handle)
-
-    def add_session(self, handle, session):
-        self.sessions.update({handle: session})
+    def __init__(self, handles, config, user_agent, access, proxy, bypass, flags):
+        super().__init__(handles)
+        self.config: NetworkConfig = config
+        self.user_agent: str | int = user_agent
+        self.access: int = access
+        self.proxy: str | int = proxy
+        self.bypass: str | int = bypass
+        self.flags: int = flags
 
     def new_session(self, server, port, user, password, service, flags, ctx):
-        sess = WininetSession(self.allocator, self, server, port, user, password, service, flags, ctx)
-        hdl = sess.get_handle()
-        self.sessions.update({hdl: sess})
+        sess = WininetSession(self.handles, self, server, port, user, password, service, flags, ctx)
+        self.children.append(sess)
         return sess
 
 
 class NetworkManager:
     """
-    Class that manages network connections during emulation
+    Keep the sockets and WinInet objects, and record the network events.
+
+    Sockets and WinInet objects are not kernel objects, so their handles are in tables of the
+    manager and not in the process handle table. Each WinInet level (instance, session and
+    request) has its own handle.
+
+    With an ``emu``, the name lookup, socket and HTTP methods record their events in the report.
     """
 
-    def __init__(self, allocator, config):
+    def __init__(self, allocator, config, emu=None):
         super().__init__()
-        self.sockets: dict[int, Socket] = {}
-        self.wininets: dict[int, WininetInstance] = {}
-        self.curr_fd: int = 4
-        self.curr_handle: int = 0x20
-        self.allocator = allocator
-        self.config: Any = config
-        self.dns: Any | None = None
-
-        WininetComponent.config = config
-        if config:
-            self.dns = config.dns
+        self.sockets: HandleTable = HandleTable(allocator, release=lambda obj: None)
+        self.wininets: HandleTable = HandleTable(allocator, release=lambda obj: None)
+        self.config: NetworkConfig = config
+        self.dns: DnsConfig = config.dns
+        self.emu: WindowsEmulator | None = emu
 
     def new_socket(self, family, stype, protocol, flags):
-        fd = self.curr_fd
+        sock = Socket(family, stype, protocol, flags)
 
-        sock = Socket(fd, family, stype, protocol, flags)
-        self.curr_fd += 4
+        responses = self.config.winsock.responses
+        if responses:
+            sock.fill_recv_queue(responses)
 
-        if self.config and self.config.winsock:
-            responses = self.config.winsock.responses
-            if responses:
-                sock.fill_recv_queue(responses)
-
-        self.sockets.update({fd: sock})
+        sock.fd = self.sockets.new_handle(sock)
         return sock
 
     def name_lookup(self, domain):
-        if not self.dns:
-            return None
+        """Get the IP address of a domain name, or None when the config has no address, and record the lookup."""
+        ip = self.get_address(domain)
+        if self.emu:
+            self.emu.record_dns_event(domain, ip or "")
+        return ip
 
+    def get_address(self, domain):
+        """Get the IP address of a domain name, or the default address of the config, or None."""
         names = self.dns.names
 
-        # Do we have an IP for this name?
         if domain.lower() not in names.keys():
-            # use the default IP (if any)
             return names.get("default")
 
-        return names.get(domain)
+        return names.get(domain.lower())
 
     def get_dns_txt(self, domain):
-        """
-        Return a configured DNS TXT record (if any)
-        """
+        """Get the data of the configured TXT record of a domain, or of the default record, or None."""
 
         def _read_txt_data(txt):
             path = txt.path
@@ -324,10 +322,7 @@ class NetworkManager:
                 with open(path, "rb") as f:
                     return f.read()
 
-        if not self.dns:
-            return None
-
-        txts = self.dns.txt or []
+        txts = self.dns.txt
         txt = [t for t in txts if (t.name or "") == domain]
         if txt:
             return _read_txt_data(txt[0])
@@ -335,35 +330,89 @@ class NetworkManager:
         if txt:
             return _read_txt_data(txt[0])
 
-    def ip_lookup(self, ip):
-        for item in self.dns:  # type: ignore[union-attr]  # dns may be None but callers check
-            if item["response"] == ip:
-                return item["query"]
-        return None
-
     def new_wininet_inst(self, user_agent, access, proxy, bypass, flags):
-        wini = WininetInstance(self.allocator, user_agent, access, proxy, bypass, flags)
+        return WininetInstance(self.wininets, self.config, user_agent, access, proxy, bypass, flags)
 
-        self.wininets.update({wini.get_handle(): wini})
-        return wini
+    def get_wininet(self, handle, cls: type[T]) -> T | None:
+        """Get the WinInet object of an open handle, or None if the handle refers to no ``cls`` object."""
+        return self.wininets.get(handle, cls)
 
-    def get_wininet_object(self, handle):
-        for hinst, inst in self.wininets.items():
-            if hinst == handle:
-                return inst
-            for hsess, sess in inst.sessions.items():
-                if hsess == handle:
-                    return sess
-                for hreq, req in sess.requests.items():
-                    if hreq == handle:
-                        return req
+    def close_wininet_object(self, handle) -> bool:
+        """
+        Close a WinInet handle and the open handles of the objects under it.
 
-    def close_wininet_object(self, handle):
-        if self.wininets.get(handle):
-            self.wininets.pop(handle)
+        Return False if the handle is not an open WinInet handle.
+        """
+        obj = self.get_wininet(handle, WininetComponent)
+        if obj is None:
+            return False
+        for child in obj.children:
+            if child.handle in self.wininets:
+                self.close_wininet_object(child.handle)
+        return self.wininets.close(handle)
 
-    def get_socket(self, fd):
-        return self.sockets.get(fd)
+    def get_socket(self, fd) -> Socket | None:
+        """Get the socket of an open socket handle, else None."""
+        return self.sockets.get(fd, Socket)
 
-    def close_socket(self, fd):
-        self.sockets.pop(fd)
+    def record_traffic(self, sock, typ: NetTrafficType, method, data=b""):
+        if self.emu:
+            host, port = sock.get_connection_info()
+            self.emu.record_network_event(host, port, typ=typ, proto=sock.get_protocol(), data=data, method=method)
+
+    def connect(self, sock, host, port):
+        """Connect a socket to a remote address."""
+        sock.set_connection_info(host, port)
+        self.record_traffic(sock, NetTrafficType.CONNECT, "winsock.connect")
+
+    def bind(self, sock, host, port):
+        """Bind a socket to a local address."""
+        sock.set_connection_info(host, port)
+        self.record_traffic(sock, NetTrafficType.BIND, "winsock.bind")
+
+    def accept(self, sock):
+        """
+        Accept a connection on a listening socket, and return the new socket.
+
+        The peer has the default address of the config, or 127.0.0.1.
+        """
+        new_sock = self.new_socket(sock.family, sock.type, sock.protocol, 0)
+        new_sock.set_connection_info(self.get_address("default") or "127.0.0.1", sock.connected_port)
+        self.record_traffic(new_sock, NetTrafficType.ACCEPT, "winsock.accept")
+        return new_sock
+
+    def recv(self, sock, size, peek=False):
+        """Get the next data that a socket receives."""
+        data = sock.get_recv_data(size, peek)
+        self.record_traffic(sock, NetTrafficType.DATA_IN, "winsock.recv", data=data)
+        return data
+
+    def send(self, sock, data):
+        """Send data on a socket."""
+        self.record_traffic(sock, NetTrafficType.DATA_OUT, "winsock.send", data=data)
+
+    def record_http_request(self, server, port, headers="", body=b"", secure=False):
+        if self.emu:
+            self.emu.record_http_event(server, port, headers=headers, body=body, secure=secure)
+
+    def send_request(self, req, headers=None, body=b""):
+        """
+        Send an HTTP request.
+
+        A server name gets a name lookup first.
+        """
+        srv = req.get_server()
+        if not is_ip_address(srv):
+            self.name_lookup(srv)
+        req_str = req.format_http_request(headers=headers)
+        self.record_http_request(srv, req.get_port(), headers=req_str, body=body, secure=req.is_secure())
+
+    def open_url(self, inst, url, server, port, headers, flags, ctx, secure=False):
+        """Open a session and a GET request for a URL, and return the request."""
+        self.record_http_request(server, port, headers=headers, secure=secure)
+        sess = inst.new_session(server, port, "", "", "", flags, ctx)
+        return sess.new_request("GET", url, None, None, None, flags, ctx)
+
+    def close_socket(self, fd) -> bool:
+        """Close a socket handle. Return False if the socket handle is not open."""
+        return self.sockets.close(fd)

@@ -11,20 +11,18 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 from pydantic import BaseModel
 from pydantic.fields import PydanticUndefined
 
-from speakeasy.config import SpeakeasyConfig
-from speakeasy.config import get_default_config_dict as get_model_default_config_dict
+from speakeasy.config import SpeakeasyConfig, get_default_config_dict
+from speakeasy.volumes import apply_volumes
 
 EXCLUDED_CLI_PATHS = {
     "config_version",
-    "description",
     "emu_engine",
-    "system",
-    "os_ver.name",
+    "system.os_ver.name",
 }
 
 EXCLUDED_CLI_PREFIXES = (
-    "symlinks",
-    "drives",
+    "system.symlinks",
+    "system.drives",
     "filesystem.files",
     "registry.keys",
     "network.dns.txt",
@@ -32,15 +30,35 @@ EXCLUDED_CLI_PREFIXES = (
     "network.winsock.responses",
     "network.adapters",
     "processes",
-    "modules.user_modules",
-    "modules.system_modules",
+    "modules.user",
+    "modules.system",
 )
+
+CLI_SHORT_OPTIONS = {
+    "runs.children": "-k",
+}
+
+CLI_METAVARS = {
+    "limits.per_run_time": "SECONDS",
+    "limits.total_time": "SECONDS",
+    "limits.api_calls": "COUNT",
+    "limits.api_loop_calls": "COUNT",
+    "limits.instructions": "COUNT",
+    "runs.stack_size": "SIZE",
+    "memory.dynamic_code_contents.limit": "COUNT",
+    "modules.directory_x86": "DIR",
+    "modules.directory_x64": "DIR",
+    "system.start_time": "TIME",
+    "system.random_seed": "SEED",
+    "process.current_dir": "DIR",
+}
 
 
 @dataclass(frozen=True)
 class ConfigCliFieldSpec:
     path: str
     option: str
+    short_option: str | None
     dest: str
     kind: Literal["bool", "int", "float", "str", "list_str", "dict_str_str"]
     description: str
@@ -55,27 +73,36 @@ class _LeafField:
     model_default: Any
 
 
-def get_default_config_dict() -> dict[str, Any]:
-    return get_model_default_config_dict()
+def get_active_config(
+    data: dict[str, Any],
+    volumes: list[str],
+    args: argparse.Namespace,
+    specs: list[ConfigCliFieldSpec],
+) -> SpeakeasyConfig:
+    """
+    Build the config of a CLI run from the config file data, the volumes and the config flags.
 
+    The file data gets the same validation as ``Speakeasy(config=data)``: a key that the file
+    leaves out gets its default. The volumes and the flags then change this config.
 
-def merge_config_dicts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
-    merged = copy.deepcopy(base)
-    for key, value in overlay.items():
-        current = merged.get(key)
-        if isinstance(current, dict) and isinstance(value, dict):
-            merged[key] = merge_config_dicts(current, value)
-            continue
-        merged[key] = copy.deepcopy(value)
-    return merged
+    Raises:
+        pydantic.ValidationError: if the data or a flag value is not valid.
+        ValueError: if a volume specification is not valid.
+        FileNotFoundError: if the host path of a volume does not exist.
+    """
+    config = SpeakeasyConfig.model_validate(data).model_dump()
+    apply_volumes(config, volumes)
+    config = apply_config_cli_overrides(config, args, specs)
+    return SpeakeasyConfig.model_validate(config)
 
 
 def add_config_cli_arguments(parser: argparse.ArgumentParser, specs: list[ConfigCliFieldSpec]) -> None:
     for spec in specs:
-        help_text = f"{spec.description} (default: {render_cli_default(spec.default)})"
+        help_text = render_cli_help(spec)
         if spec.kind == "bool":
+            option_strings = [spec.short_option, spec.option] if spec.short_option else [spec.option]
             parser.add_argument(
-                spec.option,
+                *option_strings,
                 dest=spec.dest,
                 action=argparse.BooleanOptionalAction,
                 default=argparse.SUPPRESS,
@@ -86,7 +113,7 @@ def add_config_cli_arguments(parser: argparse.ArgumentParser, specs: list[Config
             parser.add_argument(
                 spec.option,
                 dest=spec.dest,
-                type=int,
+                type=parse_cli_int,
                 metavar=get_cli_metavar(spec),
                 default=argparse.SUPPRESS,
                 help=help_text,
@@ -171,6 +198,7 @@ def get_config_cli_field_specs(default_config: dict[str, Any] | None = None) -> 
             ConfigCliFieldSpec(
                 path=leaf.path,
                 option=get_option_name_for_path(leaf.path),
+                short_option=CLI_SHORT_OPTIONS.get(leaf.path),
                 dest=get_dest_name_for_path(leaf.path),
                 kind=kind,
                 description=leaf.description,
@@ -201,7 +229,16 @@ def output_active_config(model: SpeakeasyConfig, logger) -> None:
 
 
 def get_option_name_for_path(path: str) -> str:
-    return "--" + path.replace(".", "-").replace("_", "-")
+    """
+    Get the flag of a config path, such as --code-coverage for code.coverage.
+
+    The enabled key of a group gives the flag of the group, so that memory.dynamic_code_contents.enabled
+    gives --memory-dynamic-code-contents.
+    """
+    parts = path.split(".")
+    if len(parts) > 1 and parts[-1] == "enabled":
+        parts = parts[:-1]
+    return "--" + "-".join(parts).replace("_", "-")
 
 
 def get_dest_name_for_path(path: str) -> str:
@@ -213,7 +250,7 @@ def get_cli_metavar(spec: ConfigCliFieldSpec) -> str:
         return "KEY=VALUE"
     if spec.kind == "list_str":
         return "VALUE"
-    return spec.path.split(".")[-1].upper()
+    return CLI_METAVARS.get(spec.path, spec.path.split(".")[-1].upper())
 
 
 def get_path_value(data: dict[str, Any], path: tuple[str, ...]) -> tuple[Any, bool]:
@@ -247,7 +284,22 @@ def update_config_mapping_keys(data: dict[str, Any], path: tuple[str, ...], upda
         target = {}
         cursor[path[-1]] = target
     for key, value in updates:
+        # Move the key to the end, so that it wins over a config file key that differs only in case.
+        target.pop(key, None)
         target[key] = value
+
+
+def parse_cli_int(raw: str) -> int:
+    """
+    Parse a decimal int, or a hex int that starts with 0x.
+
+    Raises:
+        argparse.ArgumentTypeError: if the text is not an int.
+    """
+    try:
+        return int(raw, 16) if raw.lower().startswith("0x") else int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {raw!r}") from None
 
 
 def parse_cli_mapping_entry(raw: str) -> tuple[str, str]:
@@ -259,12 +311,22 @@ def parse_cli_mapping_entry(raw: str) -> tuple[str, str]:
     return key, value
 
 
+def render_cli_help(spec: ConfigCliFieldSpec) -> str:
+    if spec.default is None:
+        return spec.description
+    # argparse formats the help text with %.
+    default = render_cli_default(spec.default).replace("%", "%%")
+    return f"{spec.description} (default: {default})"
+
+
 def render_cli_default(value: Any) -> str:
+    if isinstance(value, bool):
+        return "on" if value else "off"
     if isinstance(value, dict):
         return f"{len(value)} entries"
     if isinstance(value, list):
         return f"{len(value)} items"
-    return repr(value)
+    return str(value)
 
 
 def render_config_value(value: Any) -> str:
@@ -279,7 +341,8 @@ def render_config_value(value: Any) -> str:
 
 def normalize_config_value(value: Any) -> Any:
     if isinstance(value, BaseModel):
-        return value.model_dump(mode="python")
+        # JSON mode writes addresses as 0x strings, as --dump-default-config does.
+        return value.model_dump(mode="json")
     if isinstance(value, list):
         return [normalize_config_value(item) for item in value]
     if isinstance(value, tuple):
@@ -330,7 +393,7 @@ def unwrap_annotated(annotation: Any) -> Any:
 
 
 def is_model_type(annotation: Any) -> bool:
-    return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+    return isinstance(annotation, type) and get_origin(annotation) is None and issubclass(annotation, BaseModel)
 
 
 def get_cli_kind(annotation: Any) -> Literal["bool", "int", "float", "str", "list_str", "dict_str_str"] | None:

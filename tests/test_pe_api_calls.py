@@ -1,0 +1,526 @@
+"""PE32/PE32+ images, built or real samples, that call APIs through their IAT."""
+
+import logging
+import struct
+import time
+
+import pefile
+import pytest
+import unicorn
+
+from speakeasy import Speakeasy
+from speakeasy.config import get_default_config_dict
+from tests.pe_builder import build_pe
+
+STAGER = "0d0988a3401fe356ba73e1ae63d007eb4c69a021ddeb05d03bd3d6c2a52eb255.exe.xz"
+HHCTRL = "08ddd39118289af1fbbd641e587b69dd9f819342f0061a38030536d1909353b1.dll.xz"
+TICK = {"kernel32.dll": ["GetTickCount"]}
+
+
+def configured(**overrides):
+    config = get_default_config_dict()
+    config["limits"].update(per_run_time=3, instructions=1000, api_calls=10)
+    for key, value in overrides.items():
+        node = config
+        *parents, leaf = key.split(".")
+        for parent in parents:
+            node = node[parent]
+        node[leaf] = value
+    return config
+
+
+def calls(architecture, imports, *, prefix=b"", suffix=b""):
+    def text(base, iat):
+        code = b"\x48\x83\xec\x28" if architecture == 64 else b""
+        code += prefix
+        for dll, name in imports:
+            target = iat[dll, name]
+            operand = (
+                struct.pack("<i", target - (0x1000 + len(code) + 6))
+                if architecture == 64
+                else struct.pack("<I", base + target)
+            )
+            code += b"\xff\x15" + operand
+        code += suffix
+        if architecture == 64:
+            code += b"\x48\x83\xc4\x28"
+        return code + b"\xc3"
+
+    return text
+
+
+def api_names(entry):
+    return [event.api_name for event in entry.events if event.event == "api"]
+
+
+def test_timeout_budget_public_pe_iat_calls_are_independent():
+    marker = b"\xb8\x37\x13\0\0"
+    data, _ = build_pe(32, text=calls(32, [("kernel32.dll", "GetTickCount")], suffix=marker), imports=TICK)
+    with Speakeasy(config=configured(**{"limits.per_run_time": 0.5})) as se:
+
+        def tick(emu, name, original, args):
+            time.sleep(0.3)
+            return 7
+
+        se.add_api_hook(tick, "kernel32", "GetTickCount", argc=0)
+        module = se.load_module(data=data)
+        se.run_module(module)
+        se.call(module.base + 0x1000)
+        assert se.reg_read("eax") == 0x1337
+        entries = se.get_report().runs
+        assert len(entries) == 2
+        assert all(entry.error is None and api_names(entry) == ["kernel32.GetTickCount"] for entry in entries)
+
+
+def test_public_guest_data_execution_and_nx_policy():
+    def text(base, iat):
+        load = b"\xb8" + struct.pack("<I", base + 0x2000)
+        return calls(32, [("kernel32.dll", "GetTickCount")], prefix=load + b"\xff\xd0")(base, iat)
+
+    data, _ = build_pe(32, text=text, data=b"\xb8\x2a\0\0\0\xc3", imports=TICK, nxcompat=True)
+    hits = []
+    with Speakeasy(config=configured()) as se:
+
+        def tick(emu, name, original, args):
+            hits.append(name)
+            assert emu.reg_read("eax") == 42
+            return 77
+
+        se.add_api_hook(tick, "kernel32", "GetTickCount", argc=0)
+        module = se.load_module(data=data)
+
+        def permissions(address):
+            return next(p for start, end, p in se.emu.get_mem_regions() if start <= address <= end)
+
+        data_address = module.base + 0x2000
+        previous = permissions(data_address)
+        adjacent = permissions(module.base + 0x3000)
+        assert previous == unicorn.UC_PROT_READ | unicorn.UC_PROT_WRITE
+        se.run_module(module)
+        entry = se.get_report().runs[0]
+        assert entry.error is None and entry.return_value == 77
+        assert hits == ["kernel32.GetTickCount"]
+        assert api_names(entry) == hits
+        assert permissions(data_address) == previous | unicorn.UC_PROT_EXEC
+        assert permissions(module.base + 0x3000) == adjacent
+
+
+@pytest.mark.parametrize("malformation", ["delay-outside", "export-outside"])
+def test_public_malformed_optional_pe_inventory_still_executes(malformation, caplog):
+    if malformation == "delay-outside":
+        section = bytearray()
+        dirs = {13: (0x7FFF0000, 64)}
+    else:
+        section = bytearray(0x80)
+        struct.pack_into("<IIHHIIIIIII", section, 0, 0, 0, 0, 0, 0x2060, 1, 1, 0, 0x2040, 0, 0)
+        struct.pack_into("<I", section, 0x40, 0x00FF0000)
+        section[0x60:0x66] = b"x.dll\0"
+        dirs = {0: (0x2000, 0x80)}
+    data, _ = build_pe(
+        32, text=calls(32, [("kernel32.dll", "GetTickCount")]), data=section, imports=TICK, extra_dirs=dirs
+    )
+    with Speakeasy(config=configured()) as se:
+        module = se.load_module(data=data)
+        se.run_module(module)
+        entry = se.get_report().runs[0]
+        assert entry.error is None and api_names(entry) == ["kernel32.GetTickCount"]
+        assert caplog.records
+
+
+@pytest.mark.parametrize("oft_zero", [False, True])
+def test_public_filtered_import_does_not_shift_valid_iat_call(oft_zero):
+    imports = {"kernel32.dll": ["BadFunction", "GetTickCount"]}
+    data, slots = build_pe(32, text=calls(32, [("kernel32.dll", "GetTickCount")]), imports=imports)
+    pe = pefile.PE(data=data)
+    first = pe.DIRECTORY_ENTRY_IMPORT[0].imports[0]
+    if oft_zero:
+        pe.DIRECTORY_ENTRY_IMPORT[0].struct.OriginalFirstThunk = 0
+    raw = bytearray(pe.write())
+    raw[first.name_offset] = 0xE9
+    bad_slot = slots["kernel32.dll", "BadFunction"]
+    original = pe.get_data(bad_slot, 4)
+    with Speakeasy(config=configured()) as se:
+        module = se.load_module(data=bytes(raw))
+        assert se.mem_read(module.base + bad_slot, 4) == original
+        bound = int.from_bytes(se.mem_read(module.base + slots["kernel32.dll", "GetTickCount"], 4), "little")
+        assert bound == se.emu.get_proc("kernel32", "GetTickCount")
+        se.run_module(module)
+        entry = se.get_report().runs[0]
+        assert entry.error is None and api_names(entry) == ["kernel32.GetTickCount"]
+
+
+@pytest.mark.parametrize("architecture", [32, 64])
+@pytest.mark.parametrize("always_exist", [False, True])
+def test_public_unknown_iat_call_uses_four_argument_stub(architecture, always_exist):
+    unknown = "SpeakeasyNoSuchExport"
+    imports = {"kernel32.dll": [unknown, "GetTickCount"]}
+    # The x86 stub is stdcall and pops four arguments.
+    prefix = b"\x6a\x00" * 4 if architecture == 32 else b""
+    data, _ = build_pe(
+        architecture,
+        text=calls(architecture, [("kernel32.dll", unknown), ("kernel32.dll", "GetTickCount")], prefix=prefix),
+        imports=imports,
+    )
+    with Speakeasy(config=configured(**{"apis.stubs": always_exist})) as se:
+        module = se.load_module(data=data)
+        se.run_module(module)
+        entry = se.get_report().runs[0]
+        if always_exist:
+            assert entry.error is None
+            assert api_names(entry) == [f"kernel32.{unknown}", "kernel32.GetTickCount"]
+            event = next(event for event in entry.events if event.event == "api")
+            assert event.return_value == 1 and len(event.args) == 4
+        else:
+            assert entry.error.type == "unsupported_api"
+            assert entry.error.api_name == f"kernel32.{unknown}"
+            assert api_names(entry) == [f"kernel32.{unknown}"]
+
+
+def test_shfolder_iat_call_runs_the_shell32_handler():
+    def text(base, iat):
+        buf = struct.pack("<I", base + 0x2000)
+        # SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, buf)
+        prefix = b"\x68" + buf + b"\x6a\x00\x6a\x00\x6a\x1a\x6a\x00"
+        return calls(32, [("SHFolder.dll", "SHGetFolderPathA")], prefix=prefix)(base, iat)
+
+    data, _ = build_pe(32, text=text, data=b"\0" * 0x104, imports={"SHFolder.dll": ["SHGetFolderPathA"]})
+    with Speakeasy(config=configured()) as se:
+        module = se.load_module(data=data)
+        se.run_module(module)
+        entry = se.get_report().runs[0]
+        path = se.read_mem_string(module.base + 0x2000, 1)
+    assert entry.error is None
+    assert api_names(entry) == ["shell32.SHGetFolderPathA"]
+    assert path.endswith("\\AppData\\Roaming")
+
+
+def test_icmp_iat_call_runs_from_the_iphlpapi_prototype():
+    imports = {"ICMP.dll": ["IcmpCreateFile"]}
+    data, _ = build_pe(32, text=calls(32, [("ICMP.dll", "IcmpCreateFile")]), imports=imports)
+    with Speakeasy(config=configured()) as se:
+        module = se.load_module(data=data)
+        se.run_module(module)
+        entry = se.get_report().runs[0]
+    assert entry.error is None
+    assert api_names(entry) == ["iphlpapi.IcmpCreateFile"]
+
+
+def test_appmodel_api_set_iat_call_runs_from_the_kernel32_prototype():
+    appmodel = "api-ms-win-appmodel-runtime-l1-1-2.dll"
+
+    def text(base, iat):
+        # AppPolicyGetProcessTerminationMethod(GetCurrentThreadEffectiveToken(), &policy)
+        prefix = b"\x68" + struct.pack("<I", base + 0x2000) + b"\x6a\xfa"
+        return calls(32, [(appmodel, "AppPolicyGetProcessTerminationMethod")], prefix=prefix)(base, iat)
+
+    data, _ = build_pe(32, text=text, data=b"\xcc" * 4, imports={appmodel: ["AppPolicyGetProcessTerminationMethod"]})
+    with Speakeasy(config=configured()) as se:
+        module = se.load_module(data=data)
+        se.run_module(module)
+        entry = se.get_report().runs[0]
+        policy = se.mem_read(module.base + 0x2000, 4)
+    assert entry.error is None
+    assert api_names(entry) == ["kernel32.AppPolicyGetProcessTerminationMethod"]
+    # 0 is ERROR_SUCCESS, and the policy 0 is AppPolicyProcessTerminationMethod_ExitProcess.
+    assert entry.return_value == 0
+    assert policy == b"\0" * 4
+
+
+def test_unsupported_api_error_names_the_api_and_its_caller(caplog, load_test_bin):
+    unknown = "SpeakeasyNoSuchExport"
+    with Speakeasy(config=configured(**{"apis.stubs": False})) as se:
+        module = se.load_module(data=load_test_bin("unknown_import_x86.exe.xz"))
+        se.run_module(module)
+        error = se.get_report().runs[0].error
+        name = module.get_base_name()
+    assert error.type == "unsupported_api"
+    assert (error.pc_module, error.pc_offset, error.address) == (name, 0x1000, module.base + 0x1006)
+    assert error.instruction.startswith("call")
+    assert error.context_summary == f"unsupported_api kernel32.{unknown} called from {name}+0x1006"
+    assert error.nearby_regions is None
+    assert "Invalid memory read" not in caplog.text
+
+
+def test_public_catalogued_unsafe_iat_call_cannot_use_unknown_fallback():
+    name = "GetLargestConsoleWindowSize"
+    data, _ = build_pe(
+        64,
+        text=calls(64, [("kernel32.dll", name), ("kernel32.dll", "GetTickCount")]),
+        imports={"kernel32.dll": [name, "GetTickCount"]},
+    )
+    with Speakeasy(config=configured(**{"apis.stubs": True})) as se:
+        module = se.load_module(data=data)
+        se.run_module(module)
+        entry = se.get_report().runs[0]
+        assert entry.error.type == "unsupported_api"
+        assert entry.error.api_name == f"kernel32.{name}"
+        assert api_names(entry) == [f"kernel32.{name}"]
+
+
+def test_non_ascii_imported_modules_keep_distinct_callable_identity():
+    dlls = ("k\xe9rnel", "f\xfcnk")
+    imports = {dll + ".dll": ["Foo"] for dll in dlls}
+    imports.update(TICK)
+    sequence = [(dll + ".dll", "Foo") for dll in dlls] + [("kernel32.dll", "GetTickCount")]
+    data, _ = build_pe(32, text=calls(32, sequence), imports=imports)
+    hits = []
+    with Speakeasy(config=configured()) as se:
+
+        def hook(emu, name, original, args):
+            assert original is None and args == []
+            hits.append(name)
+            return 11
+
+        for dll in dlls:
+            se.add_api_hook(hook, dll, "Foo", argc=0)
+        module = se.load_module(data=data)
+        targets = set()
+        for dll in dlls:
+            dependency = se.emu.get_mod_by_name(dll)
+            assert dependency.name == dll
+            assert dependency.emu_path.endswith(dll + ".dll")
+            assert dependency in se.emu.get_peb_modules()
+            target = se.emu.get_proc(dll, "Foo")
+            assert se.get_symbols()[target] == (dll, "Foo")
+            targets.add(target)
+        assert len(targets) == 2
+        se.run_module(module)
+        entry = se.get_report().runs[0]
+        assert entry.error is None
+        assert hits == [dll + ".Foo" for dll in dlls]
+        assert api_names(entry) == hits + ["kernel32.GetTickCount"]
+
+
+def test_public_sp_changing_hook_stops_once_without_redispatch():
+    data, _ = build_pe(32, text=calls(32, [("kernel32.dll", "GetTickCount")]), imports=TICK)
+    hits = []
+    with Speakeasy(config=configured()) as se:
+
+        def hook(emu, api, original, args):
+            hits.append(api)
+            emu.push_stack(0x41414141)
+            return 7
+
+        se.add_api_hook(hook, "kernel32", "GetTickCount", argc=0)
+        module = se.load_module(data=data)
+        se.run_module(module)
+        entry = se.get_report().runs[0]
+        assert hits == ["kernel32.GetTickCount"]
+        assert entry.error.type == "api_handler_did_not_return"
+        assert entry.error.api_name == "kernel32.GetTickCount"
+        events = [event for event in entry.events if event.event == "api"]
+        assert len(events) == 1 and events[0].return_value == 7
+
+
+@pytest.mark.parametrize("architecture", [32, 64])
+@pytest.mark.parametrize("accesses", [False, True])
+def test_api_event_pc_is_the_call_site(architecture, accesses):
+    data, _ = build_pe(architecture, text=calls(architecture, [("kernel32.dll", "GetTickCount")]), imports=TICK)
+    with Speakeasy(config=configured(**{"memory.accesses": accesses})) as se:
+        module = se.load_module(data=data)
+        se.run_module(module)
+        (event,) = [event for event in se.get_report().runs[0].events if event.event == "api"]
+    call = module.base + 0x1000 + (4 if architecture == 64 else 0)
+    assert event.pos.pc == call
+
+
+def test_nt_create_thread_ex_runs_the_thread(config, load_test_bin):
+    """
+    0d0988a3 (x64) maps an RWX section view, decodes its shellcode into it and starts it.
+
+    It starts the shellcode with ``NtCreateThreadEx(&handle, THREAD_ALL_ACCESS, NULL, NtCurrentProcess(),
+    view, ...)``, then waits on the handle. The thread loads wininet to fetch the next stage.
+    """
+    with Speakeasy(config=config) as se:
+        se.run_module(se.load_module(data=load_test_bin(STAGER)))
+        main, *threads = se.get_report().runs
+
+    assert main.error is None
+    assert api_names(main)[-3:] == ["ntdll.NtCreateThreadEx", "ntdll.NtWaitForSingleObject", "ntdll.NtTerminateProcess"]
+    create = next(e for e in main.events if e.event == "api" and e.api_name == "ntdll.NtCreateThreadEx")
+    start_routine = create.args[4].value
+    assert [(thread.type, thread.start_address) for thread in threads] == [("thread", start_routine)]
+    assert api_names(threads[0])[:2] == ["kernel32.LoadLibraryA", "wininet.InternetOpenA"]
+
+
+def test_nt_terminate_process_ends_the_run(config, load_test_bin):
+    """0d0988a3 ends at RVA 0x1000 with NtTerminateProcess(NtCurrentProcess(), 0), followed by ud2."""
+    with Speakeasy(config=config) as se:
+        se.run_module(se.load_module(data=load_test_bin(STAGER)), entry_point=0x1000)
+        entry = se.get_report().runs[0]
+
+    assert entry.error is None
+    assert api_names(entry) == ["ntdll.NtTerminateProcess"]
+
+
+def test_enum_resource_names_calls_the_callback_for_each_name(config, load_test_bin):
+    """
+    08ddd391 is a Wine build of hhctrl.ocx.
+
+    Its DllRegisterServer (RVA 0xC200) calls EnumResourceNamesW(module, "WINE_REGISTRY", callback,
+    &params), and the callback (RVA 0xCB30) loads each named registry script with FindResourceW. The
+    module has one WINE_REGISTRY resource, with a string name.
+    """
+    config["runs"] = {"exports": False}
+    callbacks = []
+    with Speakeasy(config=config) as se:
+        module = se.load_module(data=load_test_bin(HHCTRL))
+
+        def callback(emu, address, size):
+            module_base, kind, name, param = struct.unpack("<4I", se.mem_read(se.reg_read("esp") + 4, 16))
+            callbacks.append((module_base, se.read_mem_string(kind, width=2), se.read_mem_string(name, width=2), param))
+
+        se.add_code_hook(callback, begin=module.base + 0xCB30, end=module.base + 0xCB30)
+        se.run_module(module, entry_point=0xC200)
+        entry = se.get_report().runs[0]
+
+    enum, find = [event for event in entry.events if event.event == "api"][:2]
+    assert enum.api_name == "kernel32.EnumResourceNamesW"
+    name = "DLLS/HHCTRL.OCX/I386-WINDOWS/HHCTRL_TLB_T.RES"
+    assert callbacks == [(module.base, "WINE_REGISTRY", name, enum.args[3].value)]
+    assert find.api_name == "kernel32.FindResourceW"
+    assert [arg.display for arg in find.args[1:]] == [name, "WINE_REGISTRY"]
+    assert find.return_value
+
+
+@pytest.mark.parametrize(("architecture", "return_value"), [(32, 0xFFFFFFFF), (64, 0xFFFFFFFFFFFFFFFF)])
+def test_api_log_and_event_show_a_negative_return_as_the_register_value(
+    caplog: pytest.LogCaptureFixture, architecture: int, return_value: int
+) -> None:
+    # LZSeek is stdcall and pops three arguments on x86.
+    pushes = b"\x6a\x00" * 3 if architecture == 32 else b""
+    imports = {"lz32.dll": ["LZSeek"]}
+    data, _ = build_pe(architecture, text=calls(architecture, [("lz32.dll", "LZSeek")], prefix=pushes), imports=imports)
+    with caplog.at_level(logging.INFO, logger="speakeasy.windows.winemu"), Speakeasy(config=configured()) as se:
+        se.run_module(se.load_module(data=data))
+        entry = se.get_report().runs[0]
+    events = [event for event in entry.events if event.event == "api"]
+    assert [(event.api_name, event.return_value) for event in events] == [("lz32.LZSeek", return_value)]
+    assert f"-> {hex(return_value)}" in caplog.text
+
+
+def test_api_log_and_event_keep_the_64_bits_of_an_x86_double_return(caplog: pytest.LogCaptureFixture) -> None:
+    # floor(-2.5) is cdecl and returns -3.0 in ST(0).
+    pushes = b"\x68" + struct.pack("<I", 0xC0040000) + b"\x6a\x00"
+    text = calls(32, [("msvcrt.dll", "floor")], prefix=pushes, suffix=b"\x83\xc4\x08")
+    data, _ = build_pe(32, text=text, imports={"msvcrt.dll": ["floor"]})
+    with caplog.at_level(logging.INFO, logger="speakeasy.windows.winemu"), Speakeasy(config=configured()) as se:
+        se.run_module(se.load_module(data=data))
+        entry = se.get_report().runs[0]
+    events = [event for event in entry.events if event.event == "api"]
+    assert [(event.api_name, event.return_value) for event in events] == [("msvcrt.floor", 0xC008000000000000)]
+    assert "-> 0xc008000000000000" in caplog.text
+
+
+def test_report_clock_covers_every_start_of_the_run_queue():
+    data, _ = build_pe(32, text=calls(32, [("kernel32.dll", "GetTickCount")]), imports=TICK)
+    with Speakeasy(config=configured()) as se:
+
+        def tick(emu, name, original, args):
+            time.sleep(0.3)
+            return 7
+
+        se.add_api_hook(tick, "kernel32", "GetTickCount", argc=0)
+        module = se.load_module(data=data)
+        before = time.time()
+        se.run_module(module)
+        se.call(module.base + 0x1000)
+        report = se.get_report()
+
+    assert int(before) <= report.timestamp <= int(before) + 1
+    assert report.emulation_total_runtime >= 0.6
+
+
+def test_api_events_of_one_thunk_keep_each_caller():
+    def text(base, iat):
+        jump = b"\xff\x25" + struct.pack("<I", base + iat["kernel32.dll", "GetCurrentProcessId"])
+        return b"\xe8\x06\0\0\0" + b"\xe8\x01\0\0\0" + b"\xc3" + jump
+
+    data, _ = build_pe(32, text=text, imports={"kernel32.dll": ["GetCurrentProcessId"]})
+    with Speakeasy(config=configured()) as se:
+        module = se.load_module(data=data)
+        se.run_module(module)
+        events = [event for event in se.get_report().runs[0].events if event.event == "api"]
+    assert [event.pos.pc for event in events] == [module.base + 0x100B] * 2
+    assert [event.return_address for event in events] == [module.base + 0x1005, module.base + 0x100A]
+
+
+def test_api_call_count_includes_repeated_calls():
+    def text(base, iat):
+        code = b"\xbe\x03\0\0\0"  # mov esi, 3
+        code += b"\xff\x15" + struct.pack("<I", base + iat["kernel32.dll", "GetCurrentProcessId"])
+        code += b"\x4e"  # dec esi
+        code += b"\x75\xf7"  # jnz call
+        return code + b"\xc3"
+
+    data, _ = build_pe(32, text=text, imports={"kernel32.dll": ["GetCurrentProcessId"]})
+    with Speakeasy(config=configured()) as se:
+        module = se.load_module(data=data)
+        se.run_module(module)
+        run = se.get_report().runs[0]
+
+    (event,) = [event for event in run.events if event.event == "api"]
+    assert event.pos.pc == module.base + 0x1005
+    assert event.return_address == module.base + 0x100B
+    assert run.api_call_count == 3
+
+
+def test_handler_events_have_the_pc_of_their_api_call():
+    path, subkey = b"C:\\out.bin\0", b"Software\\Microsoft\0"
+    imports = {"kernel32.dll": ["VirtualAlloc", "CreateFileA"], "advapi32.dll": ["RegOpenKeyExA"]}
+    sites = []
+
+    def text(base, iat):
+        def push(value):
+            return b"\x68" + struct.pack("<I", value)
+
+        def call(dll, name):
+            sites.append(base + 0x1000 + len(code))
+            return b"\xff\x15" + struct.pack("<I", base + iat[dll, name])
+
+        code = push(4) + push(0x3000) + push(0x1000) + push(0)
+        code += call("kernel32.dll", "VirtualAlloc")
+        code += push(0) + push(0) + push(2) + push(0) + push(0) + push(0x40000000) + push(base + 0x2000)
+        code += call("kernel32.dll", "CreateFileA")
+        code += push(base + 0x2100) + push(0x20019) + push(0) + push(base + 0x2000 + len(path)) + push(0x80000002)
+        code += call("advapi32.dll", "RegOpenKeyExA")
+        return code + b"\xc3"
+
+    data, _ = build_pe(32, text=text, data=path + subkey, imports=imports)
+    with Speakeasy(config=configured()) as se:
+        se.run_module(se.load_module(data=data))
+        events = se.get_report().runs[0].events
+
+    pairs = [(event, after) for event, after in zip(events, events[1:]) if event.event != "api"]
+    assert [event.event for event, _ in pairs] == ["mem_alloc", "file_create", "reg_open_key"]
+    assert [after.api_name for _, after in pairs] == [
+        "kernel32.VirtualAlloc",
+        "kernel32.CreateFileA",
+        "advapi32.RegOpenKeyExA",
+    ]
+    assert [event.pos.pc for event, _ in pairs] == sites
+    assert all(event.pos == after.pos for event, after in pairs)
+
+
+def test_handler_events_have_the_pos_of_their_api_call_in_a_thread_that_starts_at_the_api():
+    imports = {"kernel32.dll": ["CreateThread", "LoadLibraryA"]}
+
+    def text(base, iat):
+        def push(value):
+            return b"\x68" + struct.pack("<I", value)
+
+        code = push(0) + push(0) + push(base + 0x2000)
+        code += b"\xff\x35" + struct.pack("<I", base + iat["kernel32.dll", "LoadLibraryA"])
+        code += push(0) + push(0)
+        code += b"\xff\x15" + struct.pack("<I", base + iat["kernel32.dll", "CreateThread"])
+        return code + b"\xc3"
+
+    data, _ = build_pe(32, text=text, data=b"C:\\foo.dll\0", imports=imports)
+    with Speakeasy(config=configured()) as se:
+        se.run_module(se.load_module(data=data))
+        run = se.get_report().runs[1]
+
+    assert run.type == "thread"
+    event, after = run.events[:2]
+    assert (event.event, event.name, after.api_name) == ("module_load", "foo.dll", "kernel32.LoadLibraryA")
+    assert event.pos == after.pos

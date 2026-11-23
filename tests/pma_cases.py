@@ -17,6 +17,7 @@ from tests.pma_profiles import (
     profile_pma_1402,
     profile_pma_1603,
     profile_pma_1702,
+    profile_pma_1803_ocl,
 )
 
 PMA_CASES: tuple[PmaCase, ...] = (
@@ -24,7 +25,7 @@ PMA_CASES: tuple[PmaCase, ...] = (
         name="pma-01-01-dll",
         sample="Practical Malware Analysis Lab 01-01.dll_",
         expected_apis=("KERNEL32.OpenMutexA", "WS2_32.WSAStartup"),
-        allowed_entrypoint_errors=("max_api_count",),
+        allowed_entrypoint_errors=("api_call_limit",),
     ),
     PmaCase(
         name="pma-01-01-exe",
@@ -35,7 +36,7 @@ PMA_CASES: tuple[PmaCase, ...] = (
         name="pma-01-01-exe-staged",
         sample="Practical Malware Analysis Lab 01-01.exe_",
         expected_apis=("KERNEL32.CreateFileMappingA", "KERNEL32.MapViewOfFile"),
-        allowed_entrypoint_errors=("max_api_count", "invalid_read"),
+        allowed_entrypoint_errors=("api_call_limit", "invalid_read"),
         profile=profile_pma_0101_staged,
     ),
     PmaCase(
@@ -46,13 +47,14 @@ PMA_CASES: tuple[PmaCase, ...] = (
             domains=("www.malwareanalysisbook.com",),
             urls=("http://www.malwareanalysisbook.com",),
         ),
-        allowed_entrypoint_errors=("max_api_count",),
+        allowed_entrypoint_errors=("api_call_limit",),
         profile=profile_pma_0102,
     ),
     PmaCase(
         name="pma-01-04-exe",
         sample="Practical Malware Analysis Lab 01-04.exe_",
         expected_apis=("KERNEL32.LoadLibraryA", "KERNEL32.GetProcAddress"),
+        allowed_errors=("child_process_skipped",),
         profile=profile_pma_0104,
     ),
     PmaCase(
@@ -63,17 +65,19 @@ PMA_CASES: tuple[PmaCase, ...] = (
             registry_keys=("HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Svchost",),
             domains=("practicalmalwareanalysis.com",),
         ),
-        allowed_entrypoint_errors=("max_api_count",),
+        allowed_entrypoint_errors=("api_call_limit", "unhandled_exception"),
     ),
     PmaCase(
         name="pma-03-03-exe",
         sample="Practical Malware Analysis Lab 03-03.exe_",
         expected_apis=("KERNEL32.HeapCreate", "KERNEL32.Sleep"),
+        argv=("myarg1", "myarg2"),
     ),
     PmaCase(
         name="pma-03-04-exe",
         sample="Practical Malware Analysis Lab 03-04.exe_",
         expected_apis=("KERNEL32.GetVersionExA", "KERNEL32.SetHandleCount"),
+        allowed_errors=("child_process_skipped",),
     ),
     PmaCase(
         name="pma-03-04-probe",
@@ -105,9 +109,9 @@ PMA_CASES: tuple[PmaCase, ...] = (
         expected_apis=("KERNEL32.CreateThread", "ADVAPI32.RegSetValueExA"),
         indicators=IndicatorExpectations(
             files=("C:\\Windows\\system32\\Practical Malware Analysis Lab 05-01.dll_",),
-            registry_keys=("HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\Irmon",),
+            registry_keys=("HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Irmon",),
         ),
-        allowed_entrypoint_errors=("max_api_count", "invalid_read"),
+        allowed_entrypoint_errors=("api_call_limit", "unhandled_exception"),
     ),
     PmaCase(
         name="pma-06-03-exe",
@@ -138,7 +142,7 @@ PMA_CASES: tuple[PmaCase, ...] = (
         sample="Practical Malware Analysis Lab 11-01.exe_",
         expected_apis=("KERNEL32.FindResourceA", "ADVAPI32.RegSetValueExA"),
         indicators=IndicatorExpectations(
-            files=("msgina32.dll",),
+            files=("C:\\Windows\\system32\\msgina32.dll",),
             registry_keys=("HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",),
         ),
     ),
@@ -157,7 +161,7 @@ PMA_CASES: tuple[PmaCase, ...] = (
         sample="Practical Malware Analysis Lab 11-03.dll_",
         expected_apis=("KERNEL32.CreateThread", "USER32.GetAsyncKeyState", "KERNEL32.Sleep"),
         indicators=IndicatorExpectations(files=("C:\\WINDOWS\\System32\\kernel64x.dll",)),
-        allowed_entrypoint_errors=("max_api_count",),
+        allowed_entrypoint_errors=("api_call_limit",),
         profile=profile_pma_1103_dll,
     ),
     PmaCase(
@@ -170,7 +174,7 @@ PMA_CASES: tuple[PmaCase, ...] = (
         name="pma-12-01-dll",
         sample="Practical Malware Analysis Lab 12-01.dll_",
         expected_apis=("KERNEL32.TlsAlloc", "KERNEL32.InitializeCriticalSection"),
-        allowed_entrypoint_errors=("max_api_count",),
+        allowed_entrypoint_errors=("api_call_limit",),
     ),
     PmaCase(
         name="pma-12-01-exe",
@@ -189,13 +193,14 @@ PMA_CASES: tuple[PmaCase, ...] = (
         name="pma-12-03-exe",
         sample="Practical Malware Analysis Lab 12-03.exe_",
         expected_apis=("USER32.SetWindowsHookExA", "USER32.CallNextHookEx", "USER32.UnhookWindowsHookEx"),
-        indicators=IndicatorExpectations(files=("practicalmalwareanalysis.log",)),
+        indicators=IndicatorExpectations(files=("C:\\Windows\\system32\\practicalmalwareanalysis.log",)),
         profile=profile_pma_1203_deep,
     ),
     PmaCase(
         name="pma-12-04-exe",
         sample="Practical Malware Analysis Lab 12-04.exe_",
         expected_apis=("KERNEL32.CreateRemoteThread", "KERNEL32.WinExec", "sfc_os.SfcTerminateWatcherThread"),
+        allowed_errors=("child_process_skipped",),
         profile=profile_pma_1204_deep,
     ),
     PmaCase(
@@ -206,12 +211,14 @@ PMA_CASES: tuple[PmaCase, ...] = (
             files=("C:\\Windows\\Temp\\a.png",),
             domains=("www.practicalmalwareanalysis.com",),
         ),
+        allowed_errors=("child_process_skipped",),
     ),
     PmaCase(
         name="pma-14-02-exe",
         sample="Practical Malware Analysis Lab 14-02.exe_",
         expected_apis=("KERNEL32.CreatePipe", "SHELL32.ShellExecuteExA", "SHELL32.SHChangeNotify"),
-        allowed_entrypoint_errors=("max_api_count",),
+        allowed_entrypoint_errors=("api_call_limit",),
+        allowed_errors=("child_process_skipped",),
         profile=profile_pma_1402,
     ),
     PmaCase(
@@ -223,6 +230,7 @@ PMA_CASES: tuple[PmaCase, ...] = (
         name="pma-16-02-exe",
         sample="Practical Malware Analysis Lab 16-02.exe_",
         expected_apis=("USER32.FindWindowA", "KERNEL32.CreateThread"),
+        argv=("myarg1", "myarg2"),
     ),
     PmaCase(
         name="pma-16-03-exe",
@@ -236,9 +244,9 @@ PMA_CASES: tuple[PmaCase, ...] = (
         expected_apis=("KERNEL32.CreateThread", "MSVCRT._strtime"),
         indicators=IndicatorExpectations(
             files=("C:\\Windows\\system32\\Practical Malware Analysis Lab 17-02.dll_",),
-            registry_keys=("HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\Irmon",),
+            registry_keys=("HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Irmon",),
         ),
-        allowed_entrypoint_errors=("max_api_count", "invalid_read"),
+        allowed_entrypoint_errors=("api_call_limit", "unhandled_exception"),
         profile=profile_pma_1702,
     ),
     PmaCase(
@@ -248,11 +256,13 @@ PMA_CASES: tuple[PmaCase, ...] = (
         indicators=IndicatorExpectations(
             registry_keys=("HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\DeviceClasses",),
         ),
+        argv=("myarg1", "myarg2"),
     ),
     PmaCase(
         name="pma-18-01-exe",
         sample="Practical Malware Analysis Lab 18-01.exe_",
         expected_apis=("KERNEL32.LoadLibraryA", "KERNEL32.GetProcAddress"),
+        allowed_errors=("child_process_skipped",),
     ),
     PmaCase(
         name="pma-18-03-exe",
@@ -276,5 +286,14 @@ PMA_CASES: tuple[PmaCase, ...] = (
         name="pma-21-01-exe",
         sample="Practical Malware Analysis Lab 21-01.exe_",
         expected_apis=("KERNEL32.GetTickCount", "KERNEL32.EncodePointer"),
+    ),
+    PmaCase(
+        name="pma-18-03-ocl",
+        sample="Practical Malware Analysis Lab 18-03.exe_",
+        expected_apis=("WS2_32.WSAStartup", "WS2_32.gethostbyname", "WS2_32.connect", "KERNEL32.CreateProcessA"),
+        indicators=IndicatorExpectations(domains=("www.practicalmalwareanalysis.com",)),
+        allowed_entrypoint_errors=("api_call_limit",),
+        allowed_errors=("child_process_skipped",),
+        profile=profile_pma_1803_ocl,
     ),
 )

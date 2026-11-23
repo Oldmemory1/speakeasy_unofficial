@@ -1,10 +1,16 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import base64
+from typing import TYPE_CHECKING
 
+import speakeasy.winenv.defs.windows.advapi32 as adv32defs
 import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy.windows.cryptman import CryptContext, CryptKey
 
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
 
 
 class Ncrypt(api.ApiHandler):
@@ -25,52 +31,55 @@ class Ncrypt(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("NCryptOpenStorageProvider", argc=3)
-    def NCryptOpenStorageProvider(self, emu, argv, ctx: api.ApiContext = None):
+    def NCryptOpenStorageProvider(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SECURITY_STATUS NCryptOpenStorageProvider(
             NCRYPT_PROV_HANDLE *phProvider,
-            LPCWSTR            pszProviderName,
-            DWORD              dwFlags
+            LPCWSTR pszProviderName,
+            DWORD dwFlags
         );
         """
         phProvider, pszProviderName, dwFlags = argv
+        prov_str = ""
         if pszProviderName:
             prov_str = self.read_wide_string(pszProviderName)
-            argv[1] = prov_str
+            ctx.args["pszProviderName"].display = prov_str
 
-            cm = emu.get_crypt_manager()
-            hnd = cm.crypt_open(pname=prov_str, flags=dwFlags)
-            if hnd:
-                self.mem_write(phProvider, hnd.to_bytes(emu.get_ptr_size(), "little"))
+        cm = emu.get_crypt_manager()
+        hnd = cm.crypt_open(pname=prov_str, flags=dwFlags)
+        if hnd:
+            self.write_ptr(phProvider, hnd)
 
         return windefs.ERROR_SUCCESS
 
     @apihook("NCryptImportKey", argc=8)
-    def NCryptImportKey(self, emu, argv, ctx: api.ApiContext = None):
+    def NCryptImportKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SECURITY_STATUS NCryptImportKey(
             NCRYPT_PROV_HANDLE hProvider,
-            NCRYPT_KEY_HANDLE  hImportKey,
-            LPCWSTR            pszBlobType,
-            NCryptBufferDesc   *pParameterList,
-            NCRYPT_KEY_HANDLE  *phKey,
-            PBYTE              pbData,
-            DWORD              cbData,
-            DWORD              dwFlags
+            NCRYPT_KEY_HANDLE hImportKey,
+            LPCWSTR pszBlobType,
+            NCryptBufferDesc *pParameterList,
+            NCRYPT_KEY_HANDLE *phKey,
+            PBYTE pbData,
+            DWORD cbData,
+            DWORD dwFlags
         );
         """
-        ctx = ctx or {}
         hProvider, hImportKey, pszBlobType, pParameterList, phKey, pbData, cbData, dwFlags = argv
         blob_type = self.read_wide_string(pszBlobType)
-        argv[2] = blob_type
+        ctx.args["pszBlobType"].display = blob_type
 
+        cbData = cbData & 0xFFFFFFFF
         blob = self.mem_read(pbData, cbData)
-        argv[5] = base64.b64encode(blob).decode("utf-8")
+        ctx.args["pbData"].display = base64.b64encode(blob).decode("utf-8")
 
         cm = emu.get_crypt_manager()
         if hProvider and phKey:
-            ctx = cm.crypt_get(hProvider)
-            hnd = ctx.import_key(
+            prov_ctx = cm.get_context(hProvider)
+            if not prov_ctx:
+                return adv32defs.NTE_INVALID_HANDLE
+            hnd = prov_ctx.import_key(
                 blob_type=blob_type,
                 blob=blob,
                 blob_len=cbData,
@@ -79,47 +88,40 @@ class Ncrypt(api.ApiHandler):
                 flags=dwFlags,
             )
             if hnd:
-                self.mem_write(phKey, hnd.to_bytes(emu.get_ptr_size(), "little"))
+                self.write_ptr(phKey, hnd)
 
         return windefs.ERROR_SUCCESS
 
     @apihook("NCryptDeleteKey", argc=2)
-    def NCryptDeleteKey(self, emu, argv, ctx: api.ApiContext = None):
+    def NCryptDeleteKey(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SECURITY_STATUS NCryptDeleteKey(
             NCRYPT_KEY_HANDLE hKey,
-            DWORD             dwFlags
+            DWORD dwFlags
         );
         """
-        ctx = ctx or {}
         hKey, dwFlags = argv
-        cm = emu.get_crypt_manager()
-        for hnd, ctx in cm.ctx_handles.items():
-            hnd_key = ctx.get_key(hKey)
-            if hnd_key:
-                ctx.delete_key(hKey)
-                break
+        if not emu.get_crypt_manager().delete_key(hKey):
+            return adv32defs.NTE_INVALID_HANDLE
 
         return windefs.ERROR_SUCCESS
 
     @apihook("NCryptFreeObject", argc=1)
-    def NCryptFreeObject(self, emu, argv, ctx: api.ApiContext = None):
+    def NCryptFreeObject(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SECURITY_STATUS NCryptFreeObject(
             NCRYPT_HANDLE hObject
         );
         """
-        ctx = ctx or {}
-        hObject = argv[0]
+        (hObject,) = argv
         cm = emu.get_crypt_manager()
 
         # hObject can be a handle to a provider or key
-        for hnd, ctx in cm.ctx_handles.items():
-            if hnd == hObject:
-                cm.crypt_close(hObject)
-                break
-            elif ctx.get_key(hObject):
-                ctx.delete_key(hObject)
-                break
+        if isinstance(cm.handles.get(hObject, CryptContext, CryptKey), CryptContext):
+            closed = cm.crypt_close(hObject)
+        else:
+            closed = cm.delete_key(hObject)
+        if not closed:
+            return adv32defs.NTE_INVALID_HANDLE
 
         return windefs.ERROR_SUCCESS

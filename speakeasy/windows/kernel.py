@@ -4,105 +4,92 @@ import hashlib
 import ntpath
 import os
 
-import speakeasy.windows.objman as objman
 import speakeasy.winenv.arch as _arch
-import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.nt.ntoskrnl as ntos
-import speakeasy.winenv.defs.registry.reg as regdefs
+from speakeasy import common
+from speakeasy.binemu import BinaryEmulator
 from speakeasy.errors import KernelEmuError
 from speakeasy.profiler import Run
-from speakeasy.windows.ioman import IoManager
-from speakeasy.windows.winemu import BootstrapPhase, WindowsEmulator
+from speakeasy.report import RunType
+from speakeasy.windows import objman
+from speakeasy.windows.handles import HandleTable
+from speakeasy.windows.loaders import PeLoader, RuntimeModule
+from speakeasy.windows.winemu import MAX_EXPORTS_TO_EMULATE, WindowsEmulator
+from speakeasy.winenv.defs.enums import REG_VALUE_TYPE
+from speakeasy.winenv.defs.nt import ddk
 
-EP_DRIVER_ENTRY = ddk.IRP_MJ_MAXIMUM_FUNCTION
-EP_DRIVER_UNLOAD = ddk.IRP_MJ_MAXIMUM_FUNCTION + 1
+# The IOCTL code of the IRP_MJ_DEVICE_CONTROL IRP that the emulator sends to a driver. It is not a real IOCTL code.
+DISPATCH_IOCTL = 0x5D5D5D5D
 
-MAX_EXPORTS_TO_EMULATE = 10
+# The IRPs that the emulator sends to the first device of a driver, in this order.
+DISPATCH_IRPS = (
+    (ddk.IRP_MJ_CREATE, "IRP_MJ_CREATE"),
+    (ddk.IRP_MJ_DEVICE_CONTROL, "IRP_MJ_DEVICE_CONTROL"),
+    (ddk.IRP_MJ_READ, "IRP_MJ_READ"),
+    (ddk.IRP_MJ_WRITE, "IRP_MJ_WRITE"),
+    (ddk.IRP_MJ_CLOSE, "IRP_MJ_CLOSE"),
+    (ddk.IRP_MJ_CLEANUP, "IRP_MJ_CLEANUP"),
+)
 
-SYSTEM_TIME_START = 131911108955110000
+
+def is_nt_success(status: int) -> bool:
+    """Get whether an NTSTATUS is a success or an informational status, as the NT_SUCCESS macro does."""
+    return not status & 0x80000000
 
 
-class WinKernelEmulator(WindowsEmulator, IoManager):
-    """
-    Class used to emulate Windows drivers
-    """
+class WinKernelEmulator(WindowsEmulator):
+    """Emulate a Windows driver in kernel mode."""
 
-    def __init__(self, config, debug=False, exit_event=None, gdb_port=None, gdb_host=None):
+    ssdt_ptr: int
+
+    def __init__(self, config, *, debug=False, exit_event=None, gdb_port=None, gdb_host=None):
         super().__init__(config, debug=debug, exit_event=exit_event, gdb_port=gdb_port, gdb_host=gdb_host)
 
-        self.disasm_eng: object | None = None
-        self.curr_mod: object | None = None
-        self.debug: bool = debug
         self.drivers: list[objman.Driver] = []
         self.pool_allocs: list[tuple[int, int, int, str]] = []
-        self.all_entrypoints: bool = False
-        self.kernel_mode: bool = True
+        self.is_kernel_mode: bool = True
         self.irql: int = ddk.PASSIVE_LEVEL
-        self.delayed_runs: list[Run] = []
-        self.system_time: int = SYSTEM_TIME_START
         self.ktypes = ntos
 
-    def get_system_time(self):
-        return self.system_time
-
     def get_system_process(self):
-        """
-        Get the process object for the system process (PID 4)
-        """
+        """Get the process object for the system process (PID 4)."""
         for proc in self.processes:
             if proc.pid == 4:
                 return proc
 
     def get_current_irql(self):
-        """
-        Get the current interrupt request level
-        """
+        """Get the current interrupt request level."""
         return self.irql
 
     def set_current_irql(self, irql):
-        """
-        Set the current interrupt request level
-        """
+        """Set the current interrupt request level."""
         self.irql = irql
 
-    def create_driver_object(self, name=None, pe=None):
-        """
-        Create a driver object for the driver that is going to be emulated
-        """
-        from speakeasy.windows.common import _PeParser
+    def _prepare_run_context(self, run):
+        """Set the registers, the stack and the IRQL for run. Each run starts at ``PASSIVE_LEVEL``."""
+        # A run that ended while it held a spin lock does not change the IRQL of the next run.
+        self.irql = ddk.PASSIVE_LEVEL
+        return super()._prepare_run_context(run)
 
+    def create_driver_object(self, pe, name=None):
+        """Create a driver object for a loaded driver image."""
         drv = objman.Driver(emu=self)
-
-        if not pe:
-            default_path = self.get_native_module_path("default_sys")
-            pe = _PeParser(path=default_path)
-
-        drv.init_driver_object(name, pe, is_decoy=False)
+        drv.init_driver_object(name, pe)
 
         self.add_object(drv)
 
         self.drivers.append(drv)
         return drv
 
-    def bootstrap_object_services(self):
-        if self.om is None:
-            self.om = objman.ObjectManager(emu=self)
-
-        if not self.processes:
-            self.init_processes(self.config.processes)
-
-        self.advance_bootstrap_phase(BootstrapPhase.OBJECT_MANAGER_READY)
-
-    def setup(self):
-        self.bootstrap_object_services()
+    def init_machine_structures(self):
+        self.om = objman.ObjectManager(emu=self)
+        self.init_processes(self.config.processes)
         self._setup_gdt(self.get_arch())
-        self.init_sys_modules(self.config.modules.system_modules)
+        self.init_sys_modules(self.config.modules.system)
         self.setup_kernel_mode()
         self.setup_user_shared_data()
 
-    def load_module(self, path=None, data=None, filename=None):
-        from speakeasy.windows.loaders import PeLoader
-
+    def load_module(self, path=None, data=None, filename=None) -> RuntimeModule:
         if filename:
             file_name = ntpath.basename(filename)
             mod_name = os.path.splitext(file_name)[0]
@@ -117,28 +104,26 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
             with open(path, "rb") as f:
                 data = f.read()
         else:
-            drv_hash = hashlib.sha256()
-            drv_hash.update(data)
-            drv_hash = drv_hash.hexdigest()  # type: ignore[assignment]
-            mod_name = drv_hash
+            mod_name = hashlib.sha256(data).hexdigest()
             file_name = f"{mod_name}.sys"
 
-        emu_path = f"{self.get_system_root()}drivers\\{file_name}"
+        self._set_input_metadata(path, data)
 
-        loader = PeLoader(path=path, data=data)
-        image = loader.make_image()
+        emu_path = f"{self.get_system_root()}system32\\drivers\\{file_name}"
+
+        image = PeLoader(path=path, data=data).make_image()
         image.name = mod_name
         image.emu_path = emu_path
 
-        rtmod = self.load_image(image)
+        rtmod = self.load_image(image, is_input=True)
+
+        if self.input is not None:
+            self.input["image_base"] = rtmod.base
 
         return rtmod
 
     def pool_alloc(self, pooltype, size, tag="None"):
-        """
-        Allocate memory in the emulated "pool"
-        """
-
+        """Map a pool allocation in the System process, and tag it with the pool type and ``tag``."""
         if pooltype == ddk.POOL_TYPE.NonPagedPool:
             pt = "NonPagedPool"
         elif pooltype == ddk.POOL_TYPE.PagedPool:
@@ -170,53 +155,31 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
 
         return sysmods
 
-    def get_processes(self):
-        """
-        Get processes that exist in the emulation space
-        """
-        if not self.processes:
-            self.init_processes(self.config.processes)
-        return self.processes
-
     def init_processes(self, processes):
         for proc in processes:
-            p = objman.Process(self)
+            path = "System" if proc.name.lower() == "system" else proc.path
+            p = objman.Process(self, name=proc.name, path=path, base=proc.base_addr, cmdline=proc.command_line or "")
             self.add_object(p)
-            p.name = proc.name
-            p.pid = proc.pid
+            if proc.pid is not None:
+                p.pid = proc.pid
 
             if p.name.lower() == "system":
                 p.pid = 4
-                p.path = "System"
 
-            if not p.pid:
-                p.pid = self.om.new_id()  # type: ignore[union-attr]
-            base = proc.base_addr
-
-            if isinstance(base, str):
-                base = int(base, 16)
-            p.base = base
-            if not p.path:
-                p.path = proc.path
-            p.image = ntpath.basename(p.path)
-
-            # Create an initial thread for each process
             t = objman.Thread(self)
             self.add_object(t)
             t.process = p
             p.threads.append(t)
             self.processes.append(p)
 
-        # The SYSTEM process should be the starting context
+        # The System process is the current process at start.
         sp = [p for p in self.processes if p.name.lower() == "system"]
         if sp:
             sp = sp[0]
             self.set_current_process(sp)
 
     def alloc_peb(self, proc):
-        """
-        Allocate PEB and related substructures for a given process
-        """
+        """Map the loader data of the PEB of a process if it is not mapped, and return the PEB."""
         ldr = proc.peb_ldr_data
         if not ldr.address:
             size = ldr.sizeof()
@@ -226,89 +189,64 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         return proc.peb
 
     def get_process_peb(self, process):
-        """
-        Retrieve the PEB for the supplied process
-        """
+        """Get the PEB of a process, with the loaded modules in its loader lists."""
         self.alloc_peb(process)
         process.init_peb(self.get_peb_modules())
         return process.peb
 
     def set_current_process(self, process):
-        """
-        Set the current process context
-        """
+        """Set the current process."""
         self.curr_process = process
 
     def get_current_process(self):
-        """
-        Get the current process context
-        """
-        self.validate_bootstrap_phase(BootstrapPhase.OBJECT_MANAGER_READY, "kernel current-process resolution")
-
-        if not self.processes:
-            self.processes = self.get_processes()
-
+        """Get the current process."""
+        self.get_object_manager("kernel current-process resolution")
         return self.curr_process
 
-    def run_module(self, module, all_entrypoints=False, entry_point=None):
-        """
-        Begin emulation fo a previously loaded kernel module
-        """
+    def get_handle_table(self) -> HandleTable:
+        """Get the handle table of the emulator. The kernel emulator keeps all handles in one table."""
+        return self.handles
 
-        self.all_entrypoints = all_entrypoints
+    def _get_process_state(self) -> WindowsEmulator:
+        """
+        Get the emulator for the state that each process has.
 
+        A driver runs in the context of any process, and KeStackAttachProcess changes the current process. The
+        function tables, heap blocks, current directory and environment of the kernel do not change with it.
+        """
+        return self
+
+    def run_module(self, module, *, entry_point=None) -> None:
+        """
+        Add a DriverEntry run for a loaded driver, and run the queue.
+
+        If ``runs.exports`` is true, the emulator also runs the exports, the IRP handlers and the unload
+        routine of the driver after DriverEntry. See ``_queue_driver_routines``.
+        """
         # Create the service key for the driver
         drv = self.create_driver_object(pe=module)
         svc_key = self.regman.create_key(drv.reg_path)
-        # Create the values for the service key
-        svc_key.create_value("ImagePath", regdefs.REG_EXPAND_SZ, module.emu_path)
-        svc_key.create_value("Type", regdefs.REG_DWORD, 0x1)  # SERVICE_KERNEL_DRIVER
-        svc_key.create_value("Start", regdefs.REG_DWORD, 0x3)  # SERVICE_DEMAND_START
-        svc_key.create_value("ErrorControl", regdefs.REG_DWORD, 0x1)  # SERVICE_ERROR_NORMAL
+        svc_key.create_value("ImagePath", REG_VALUE_TYPE.REG_EXPAND_SZ, module.emu_path)
+        svc_key.create_value("Type", REG_VALUE_TYPE.REG_DWORD, 0x1)  # SERVICE_KERNEL_DRIVER
+        svc_key.create_value("Start", REG_VALUE_TYPE.REG_DWORD, 0x3)  # SERVICE_DEMAND_START
+        svc_key.create_value("ErrorControl", REG_VALUE_TYPE.REG_DWORD, 0x1)  # SERVICE_ERROR_NORMAL
 
-        # Create the parameters subkey
         self.regman.create_key(drv.reg_path + "\\Parameters")
 
         if entry_point is not None:
             ep = module.base + entry_point
         else:
-            ep = module.base + module.ep
+            ep = module.get_ep()
 
         if entry_point is not None or module.ep > 0:
-            run = Run()
-            run.type = EP_DRIVER_ENTRY
-            run.start_addr = ep
-            run.instr_cnt = 0
-            run.args = [drv.address, drv.reg_path_ptr]
-            self.add_run(run)
-
-        if self.all_entrypoints:
-            # Only emulate a subset of all the exported functions
-            # There are some modules (such as the windows kernel) with thousands of exports
-            exports = [k for k in module.get_exports()[:MAX_EXPORTS_TO_EMULATE]]
-
-            if exports:
-                args = [self.mem_map(8, tag=f"emu.export_arg_{i}") for i in range(4)]
-                for exp in exports:
-                    run = Run()
-                    if exp.name:
-                        fn = exp.name
-                    else:
-                        fn = "no_name"
-                    run.type = f"export.{fn}"
-                    run.start_addr = exp.address
-                    # Here we set dummy args to pass into the export function
-                    run.args = args
-                    # Store these runs and only queue them before the unload routine
-                    # this is because some exports may not be ready to be called yet
-                    self.delayed_runs.append(run)
+            self._add_driver_run(RunType.DRIVER_ENTRY, None, ep, (drv.address, drv.reg_path_ptr))
+        else:
+            self._queue_driver_routines(drv, None)
 
         self.start()
 
     def create_device_object(self, name="", drv=0, ext_size=0, devtype=0, chars=0, tag=""):
-        """
-        Create a device object to use for kernel emulation
-        """
+        """Create a device object and add it to the device list of ``drv``."""
         dev = objman.Device(self)
 
         alloc_size = ext_size + dev.sizeof()
@@ -329,14 +267,14 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
 
         # Create a FILE_OBJECT for the device
         fobj = objman.FileObject(self)
-        dev.object.DeviceObject = dev.address  # type: ignore[attr-defined]
+        dev.object.DeviceObject = dev.address
         dev.file_object = fobj
 
         self.add_object(dev)
 
         if drv:
             drv.read_back()
-            dev.object.DriverObject = drv.address  # type: ignore[attr-defined]
+            dev.object.DriverObject = drv.address
             dev.driver = drv
 
             if not drv.object.DeviceObject:
@@ -346,241 +284,157 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
                 next_dev = self.get_object_from_addr(drv.object.DeviceObject)
                 while next_dev:
                     if next_dev.object.NextDevice:
-                        next_dev = self.get_object_from_addr(drv.object.NextDevice)
+                        next_dev = self.get_object_from_addr(next_dev.object.NextDevice)
                     else:
-                        # This is the last in the list, add our new device
                         next_dev.object.NextDevice = dev.address
                         next_dev.write_back()
                         break
 
-        drv.devices.append(dev)
+            drv.devices.append(dev)
 
-        dev.object.Characteristics = chars  # type: ignore[attr-defined]
-        dev.object.DeviceType = devtype  # type: ignore[attr-defined]
+        dev.object.Characteristics = chars
+        dev.object.DeviceType = devtype
         if ext_size > 0:
-            dev.object.DeviceExtension = dev.address + dev.sizeof()  # type: ignore[attr-defined]
+            dev.object.DeviceExtension = dev.address + dev.sizeof()
 
         dev.write_back()
 
         return dev
 
     def add_symlink(self, symlink, devname):
-        """
-        Add a symlink for a device
-        """
-        self.om.add_symlink(symlink, devname)  # type: ignore[union-attr]
-
-    def _call_driver_dispatch(self, func, dev_addr, irp_addr):
-        """
-        Call a WDM driver dispatch function with a supplied IRP
-        """
-        stk_ptr = self.get_stack_ptr()
-        self.set_func_args(stk_ptr, self.return_hook, dev_addr, irp_addr, conv=_arch.CALL_CONV_STDCALL)
-        self.set_pc(func)
+        """Add a symlink for a device."""
+        self.get_object_manager("symlink creation").add_symlink(symlink, devname)
 
     def new_irp(self):
-        """
-        Create a new IRP
-        """
+        """Create a new IRP."""
         return objman.Irp(emu=self)
 
-    def irp_mj_create(self, func, dev):
-        # Generate an IRP for the create request
-        irp = self.new_irp()
-
-        self._call_driver_dispatch(func, dev.address, irp.address)
-        return irp
-
-    def irp_mj_close(self, func, dev):
-        irp = self.new_irp()
-        self._call_driver_dispatch(func, dev.address, irp.address)
-        return irp
-
-    def irp_mj_dev_io(self, func, dev):
-        irp = self.new_irp()
-
-        ios = irp.get_curr_stack_loc()
-        ios.object.MajorFunction = ddk.IRP_MJ_DEVICE_CONTROL
-        ios.object.Parameters.DeviceIoControl.IoControlCode = 0x5D5D5D5D
-
-        ios.write_back()
-        irp.write_back()
-
-        self._call_driver_dispatch(func, dev.address, irp.address)
-        return irp
-
-    def irp_mj_read(self, func, dev):
-        irp = self.new_irp()
-
-        self._call_driver_dispatch(func, dev.address, irp.address)
-        return irp
-
-    def irp_mj_write(self, func, dev):
-        irp = self.new_irp()
-
-        self._call_driver_dispatch(func, dev.address, irp.address)
-        return irp
-
-    def irp_mj_cleanup(self, func, dev):
-        irp = self.new_irp()
-
-        self._call_driver_dispatch(func, dev.address, irp.address)
-        return irp
-
-    def driver_unload(self, drv):
+    def new_dispatch_irp(self, major: int, dev) -> objman.Irp:
         """
-        Call the unload routine for a driver
+        Create the IRP that the emulator sends to the dispatch routine of ``major`` for ``dev``.
+
+        An ``IRP_MJ_DEVICE_CONTROL`` IRP has the IOCTL code ``DISPATCH_IOCTL``.
         """
+        irp: objman.Irp = self.new_irp()
+        ios = irp.get_next_stack_loc()
+        ios.object.MajorFunction = major
+        if major == ddk.IRP_MJ_DEVICE_CONTROL:
+            ios.object.Parameters.DeviceIoControl.IoControlCode = DISPATCH_IOCTL
+        irp.dispatch_to(dev.address)
+        return irp
 
-        if not drv.on_unload or drv.unload_called:
-            self.on_emu_complete()
+    def _queue_driver_routines(self, drv: objman.Driver, entry: Run | None) -> None:
+        """
+        Add the runs that follow DriverEntry: the exports, the IRP handlers, then the unload routine.
+
+        ``entry`` is the DriverEntry run, or None if the driver has no entry point. The IRP handlers are the ones that
+        DriverEntry registered.
+
+        The exports run after DriverEntry, because an export can depend on the state that DriverEntry sets up.
+
+        Windows unloads a driver whose DriverEntry returns a status that fails ``NT_SUCCESS``, and does not call its
+        unload routine. Then the emulator adds no runs. If DriverEntry ended with an emulator error, such as an
+        unsupported API, the return value is not the result of DriverEntry, so the emulator adds the runs: they show
+        more of the driver.
+
+        The IRP handlers get one IRP each, for the first device of the driver.
+        """
+        if not self.config.runs.exports:
+            return
+        if entry is not None and entry.error is None and not is_nt_success(entry.return_value or 0):
             return
 
-        stk_ptr = self.get_stack_ptr()
-        self.set_func_args(stk_ptr, self.exit_hook, drv.address, conv=_arch.CALL_CONV_STDCALL)
-        self.set_pc(drv.on_unload)
+        # Limit the number of export runs, because some modules, such as the Windows kernel, have thousands of
+        # exports.
+        exports = drv.pe.get_exports()[:MAX_EXPORTS_TO_EMULATE] if drv.pe else []
+        if exports:
+            # Each export gets the same placeholder arguments.
+            args = [self.mem_map(8, tag=f"emu.export_arg_{i}") for i in range(4)]
+            for exp in exports:
+                self._add_driver_run(RunType.EXPORT, exp.name or None, exp.address, args)
 
-        run = Run()
-        run.type = EP_DRIVER_UNLOAD
-        run.start_addr = drv.on_unload
-        run.instr_cnt = 0
-        run.args = (drv.address,)
-        run.ret_val = None
-        self.add_run(run)
-        drv.unload_called = True
-
-    def next_driver_func(self, drv):
-        func_addr = None
-        func_handler = None
-
-        if self.curr_run.type is not None:  # type: ignore[union-attr]
-            self.curr_run.ret_val = self.get_return_val()  # type: ignore[union-attr]
-
-        # Check if theres anything in the run queue
-        if len(self.run_queue):
-            return
-
-        if not self.all_entrypoints:
-            return
-
-        # TODO right now just use the first device object that was created
-        dev = None
-        if len(drv.devices):
+        # TODO: send the IRPs to each device, not only the first device.
+        if drv.devices:
             dev = drv.devices[0]
+            for major, irp_name in DISPATCH_IRPS:
+                func = drv.mj_funcs[major]
+                if func:
+                    irp = self.new_dispatch_irp(major, dev)
+                    self._add_driver_run(RunType.IRP, irp_name, int(func), (dev.address, irp.address))
 
-        # Run any remaining IRP handlers
-        for hdlr, i in (
-            (self.irp_mj_create, ddk.IRP_MJ_CREATE),
-            (self.irp_mj_dev_io, ddk.IRP_MJ_DEVICE_CONTROL),
-            (self.irp_mj_read, ddk.IRP_MJ_READ),
-            (self.irp_mj_write, ddk.IRP_MJ_WRITE),
-            (self.irp_mj_close, ddk.IRP_MJ_CLOSE),
-            (self.irp_mj_cleanup, ddk.IRP_MJ_CLEANUP),
-        ):
-            # Did we run this mj func yet?
-            if i not in [r.type for r in self.runs]:
-                func_handler = hdlr
-                func_addr = int(drv.mj_funcs[i])
+        if drv.on_unload:
+            self._add_driver_run(RunType.DRIVER_UNLOAD, None, drv.on_unload, (drv.address,))
 
-                if not func_addr:
-                    continue
-                break
-
-        if len(self.delayed_runs):
-            [self.add_run(r) for r in self.delayed_runs]
-            self.delayed_runs = []
-
-        if not func_addr or not dev or func_handler is None:
-            # We are done here, call the unload routine
-            self.driver_unload(drv)
-            return
-
-        irp = func_handler(func_addr, dev)
-
+    def _add_driver_run(self, kind: RunType, name: str | None, address: int, args: list | tuple) -> None:
+        """Add a run of a driver routine to the queue."""
         run = Run()
-        run.type = i
-        run.start_addr = func_addr
-        run.instr_cnt = 0
-        run.args = (dev.address, irp.address)
+        run.type = kind
+        run.name = name
+        run.start_addr = address
+        run.args = args
         self.add_run(run)
 
     def on_run_complete(self):
-        self.curr_run.ret_val = self.get_return_val()  # type: ignore[union-attr]
+        """Record the return value of the run. After DriverEntry, add the runs of the other driver routines."""
+        run = self.curr_run
+        if run is None:
+            return
+        run.return_value = self.get_return_val()
 
         for drv in self.drivers:
             drv.read_back()
-            if drv.pe == self.curr_mod:
-                self.next_driver_func(drv)
-
-        # Dispatch the next run
-        return self._exec_next_run()
+        if run.type == RunType.DRIVER_ENTRY:
+            # The first argument of DriverEntry is the driver object.
+            driver = next((d for d in self.drivers if run.args and d.address == run.args[0]), None)
+            if driver is not None:
+                self._queue_driver_routines(driver, run)
 
     def on_emu_complete(self):
-        if not self.emu_complete:
-            self.emu_complete = True
+        if not self.is_emu_complete:
+            self.is_emu_complete = True
 
-            if self.config.analysis.strings and self.profiler:
+            if self.config.memory.strings and self.profiler:
                 dec_ansi, dec_unicode = self.get_mem_strings()
-                dec_ansi = [a[1] for a in dec_ansi if a not in self.profiler.strings["ansi"]]
-                dec_unicode = [u[1] for u in dec_unicode if u not in self.profiler.strings["unicode"]]
+                static_ansi = set(self.profiler.strings["ansi"])
+                static_unicode = set(self.profiler.strings["unicode"])
+                dec_ansi = list(dict.fromkeys(s for _, s in dec_ansi if s not in static_ansi))
+                dec_unicode = list(dict.fromkeys(s for _, s in dec_unicode if s not in static_unicode))
                 self.profiler.decoded_strings["ansi"] = dec_ansi
                 self.profiler.decoded_strings["unicode"] = dec_unicode
-        self.stop()
+        # Stop the engine and the run clock. WindowsEmulator.stop also ends the run.
+        BinaryEmulator.stop(self)
 
     def set_hooks(self):
-        """Set the emulator callbacks"""
-
+        """Add the hooks of the kernel emulator, then the tracing, coverage and debug hooks."""
         super().set_hooks()
 
-        if not self.builtin_hooks_set:
+        if not self.has_builtin_hooks:
             self.add_mem_invalid_hook(cb=self._hook_mem_unmapped)
             self.add_interrupt_hook(cb=self._hook_interrupt)
-            self.builtin_hooks_set = True
+            self.add_invalid_instruction_hook(cb=self._hook_invalid_instruction)
+            self.has_builtin_hooks = True
 
+        self.set_call_site_hook()
         self.set_mem_tracing_hooks()
         self.set_coverage_hooks()
         self.set_debug_hooks()
 
     def get_kernel_base(self):
-        """
-        Get the base address of the kernel image (ntoskrnl.exe)
-        """
-        # Get kernel base address
+        """Get the base address of the kernel image (ntoskrnl.exe)."""
         kern = self.get_kernel_mod()
         return kern.base
 
     def get_kernel_mod(self):
         """
-        Get the kernel image module
+        Get the module of the kernel image.
+
+        Raises:
+            KernelEmuError: if ``ntoskrnl`` is not loaded.
         """
         mod = self.get_mod_by_name("ntoskrnl")
         if mod:
             return mod
         raise KernelEmuError("Failed to get kernel base")
-
-    def _set_entry_point_names(self):
-        run_types = {
-            ddk.IRP_MJ_CREATE: "irp_mj_create",
-            ddk.IRP_MJ_DEVICE_CONTROL: "irp_mj_device_control",
-            ddk.IRP_MJ_READ: "irp_mj_read",
-            ddk.IRP_MJ_WRITE: "irp_mj_write",
-            ddk.IRP_MJ_CLOSE: "irp_mj_close",
-            ddk.IRP_MJ_CLEANUP: "irp_mj_cleanup",
-            EP_DRIVER_ENTRY: "entry_point",
-            EP_DRIVER_UNLOAD: "driver_unload",
-        }
-        for r in self.runs:
-            if not r.type or run_types.get(r.type):
-                r.type = run_types.get(r.type, "unk")
-
-    def get_report(self):
-        """Retrieve the execution profile for the emulator"""
-        self._set_entry_point_names()
-        return super().get_report()
-
-    def get_json_report(self):
-        self._set_entry_point_names()
-        return super().get_json_report()
 
     def get_ssdt_ptr(self):
         return self.ssdt_ptr
@@ -589,56 +443,51 @@ class WinKernelEmulator(WindowsEmulator, IoManager):
         idt = objman.IDT(self)
         idt.init_descriptors()
 
-        # selector, base, limit, flags
-        self.reg_write(_arch.X86_REG_IDTR, (0, idt.object.Descriptors, idt.object.Limit, 0))  # type: ignore[attr-defined]
+        # Unicorn takes the IDTR as (selector, base, limit, flags).
+        self.reg_write(_arch.X86_REG_IDTR, (0, idt.object.Descriptors, idt.object.Limit, 0))
 
-        # Setup the SSDT
+        # Set up the SSDT.
         ssdt = self.ktypes.SSDT(self.get_ptr_size())
         size = self.get_ptr_size() * 256
 
-        self.ssdt_ptr = self.mem_map(size, base=None, tag="api.struct.SSDT")
+        self.ssdt_ptr = self.get_proc("ntoskrnl", "KeServiceDescriptorTable")
         ssdt.NumberOfServices = 256
-        ssdt.pServiceTable = self.ssdt_ptr + self.sizeof(ssdt)
+        ssdt.pServiceTable = self.mem_map(size, base=None, tag="api.struct.SSDT.services")
         self.mem_write(self.ssdt_ptr, self.get_bytes(ssdt))
 
         self.setup_msrs()
 
-        for sl in self.config.symlinks:
-            self.om.add_symlink(sl.name, sl.target)  # type: ignore[union-attr]
+        for sl in self.config.system.symlinks:
+            self.get_object_manager("symlink creation").add_symlink(sl.name, sl.target)
 
     def setup_msrs(self):
-        """
-        Setup machine specific registers for kernel emulation
-        """
+        """On x64, map a ``KiSystemCall64`` stub next to the kernel and point the LSTAR MSR to it."""
         km = self.get_kernel_mod()
 
         if self.get_arch() == _arch.ARCH_AMD64 and km.image_size > 0:
-            kbase = km.base
-            km_data = bytes(self.mem_read(kbase, km.image_size))
-            ksc64_off = km_data.find(b"\x00" * 100)
-            if ksc64_off != -1:
-                sdt_entry = km.get_export_by_name("KeServiceDescriptorTable")
-                sdt_addr = sdt_entry.address if sdt_entry else None
-                if sdt_addr:
-                    for i in range(0x20):
-                        self.symbols.update({sdt_addr + i: (km.get_base_name(), "KeServiceDescriptorTable")})
-                    self.symbols.update({sdt_addr: (km.get_base_name(), "KeServiceDescriptorTable.pServiceTable")})
-                    self.symbols.update(
-                        {sdt_addr + 0x10: (km.get_base_name(), "KeServiceDescriptorTable.NumberOfServices")}
-                    )
-                    ksc64_off += 5
+            sdt_entry = km.get_export_by_name("KeServiceDescriptorTable")
+            sdt_addr = sdt_entry.address if sdt_entry else None
+            if sdt_addr:
+                for i in range(0x20):
+                    self.symbols.update({sdt_addr + i: (km.get_base_name(), "KeServiceDescriptorTable")})
+                self.symbols.update({sdt_addr: (km.get_base_name(), "KeServiceDescriptorTable.pServiceTable")})
+                self.symbols.update(
+                    {sdt_addr + 0x10: (km.get_base_name(), "KeServiceDescriptorTable.NumberOfServices")}
+                )
 
-                    ksc64_addr = kbase + ksc64_off
-                    self.symbols.update({ksc64_addr: (km.get_base_name(), "KiSystemCall64")})
-
-                    self.reg_write(_arch.X86_REG_MSR, (_arch.LSTAR, ksc64_addr))
-                    sdt_offset = (sdt_addr - ksc64_addr) - 7
-                    data = b"\x90\x90\xc3" + sdt_offset.to_bytes(4, "little")
-                    self.mem_write(kbase + ksc64_off, data)
-                    ksc64_off += 7
-                    sdt_offset = sdt_addr - (kbase + ksc64_off)
-                    data = b"\x90\x90\xc3" + sdt_offset.to_bytes(4, "little")
-                    self.mem_write(kbase + ksc64_off, data)
-                    ksc64_off += 7
-                    data = b"\x90\x90\x90\x90\x90\x90\xc3"
-                    self.mem_write(kbase + ksc64_off, data)
+                # Map the compatibility stub next to the kernel image so that its
+                # 32-bit relative offsets reach the SSDT.
+                ksc64_addr = self.mem_map(
+                    self.page_size,
+                    base=km.base + km.image_size,
+                    perms=common.PERM_MEM_RX,
+                    tag="emu.KiSystemCall64",
+                )
+                self.symbols.update({ksc64_addr: (km.get_base_name(), "KiSystemCall64")})
+                self.reg_write(_arch.X86_REG_MSR, (_arch.LSTAR, ksc64_addr))
+                sdt_offset = sdt_addr - ksc64_addr - 7
+                data = b"\x90\x90\xc3" + sdt_offset.to_bytes(4, "little", signed=True)
+                second_offset = sdt_addr - ksc64_addr - 14
+                data += b"\x90\x90\xc3" + second_offset.to_bytes(4, "little", signed=True)
+                data += b"\x90\x90\x90\x90\x90\x90\xc3"
+                self.mem_write(ksc64_addr, data)

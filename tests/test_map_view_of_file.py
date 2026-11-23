@@ -1,8 +1,12 @@
 import copy
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
+
 from speakeasy import Speakeasy
+from tests.handler_harness import alloc, call, load_emu, start_process
 
 
 def test_map_view_of_file_uses_readable_protections(base_config, tmp_path):
@@ -20,19 +24,62 @@ def test_map_view_of_file_uses_readable_protections(base_config, tmp_path):
     se = Speakeasy(config=cfg, argv=["WARNING_THIS_WILL_DESTROY_YOUR_MACHINE"])
     try:
         module = se.load_module(path=str(exe_path))
-        se.run_module(module, all_entrypoints=True)
+        se.run_module(module)
         report = se.get_report()
     finally:
         se.shutdown()
 
-    ep = report.entry_points[0]
+    ep = report.runs[0]
     assert ep.memory is not None
 
-    map_views = [region for region in ep.memory.layout if region.tag.startswith("api.MapViewOfFile.")]
+    map_views = [region for region in ep.memory.layout if (region.tag or "").startswith("api.MapViewOfFile")]
     assert len(map_views) >= 2
 
     for region in map_views:
-        assert region.prot in {"r--", "rw-", "r-x", "rwx"}
+        assert region.permissions in {"r--", "rw-", "r-x", "rwx"}
 
     if ep.error is not None:
-        assert ep.error.type != "Read from non-readable memory (UC_ERR_READ_PROT)"
+        assert ep.error.type != "internal_error"
+
+
+FILE_MAP_READ = 0x04
+GENERIC_READ = 0x80000000
+OPEN_EXISTING = 3
+PAGE_READONLY = 0x02
+
+
+@pytest.fixture
+def split_file_emu(config, load_test_bin, tmp_path) -> Iterator[Speakeasy]:
+    host = tmp_path / "data.bin"
+    host.write_bytes(b"A" * 0x10000 + b"B" * 0x10000)
+    config["filesystem"]["files"].insert(0, {"mode": "full_path", "emu_path": "c:\\data.bin", "path": str(host)})
+    yield from load_emu(config, load_test_bin("dll_test_x86.dll.xz"))
+
+
+@pytest.mark.parametrize("part_first", [False, True], ids=["whole_first", "part_first"])
+def test_views_at_different_file_offsets_keep_their_own_bytes(split_file_emu: Speakeasy, part_first: bool) -> None:
+    se = split_file_emu
+    start_process(se)
+    name = alloc(se, b"c:\\data.bin\x00")
+    hfile, _ = call(se, "kernel32", "CreateFileA", [name, GENERIC_READ, 0, 0, OPEN_EXISTING, 0, 0])
+    hmap, _ = call(se, "kernel32", "CreateFileMappingA", [hfile, 0, PAGE_READONLY, 0, 0, 0])
+
+    def map_whole() -> int:
+        view, _ = call(se, "kernel32", "MapViewOfFile", [hmap, FILE_MAP_READ, 0, 0, 0])
+        return view
+
+    def map_part() -> int:
+        view, _ = call(se, "kernel32", "MapViewOfFile", [hmap, FILE_MAP_READ, 0, 0x10000, 0x1000])
+        return view
+
+    if part_first:
+        part = map_part()
+        whole = map_whole()
+    else:
+        whole = map_whole()
+        part = map_part()
+    assert whole and part
+
+    assert se.mem_read(whole, 0x1000) == b"A" * 0x1000
+    assert se.mem_read(whole + 0x10000, 0x1000) == b"B" * 0x1000
+    assert se.mem_read(part, 0x1000) == b"B" * 0x1000

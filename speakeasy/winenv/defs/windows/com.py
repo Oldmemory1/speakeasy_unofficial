@@ -1,18 +1,28 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import uuid
+from typing import Annotated
 
 from speakeasy.struct import EmuStruct, Ptr
 
 S_OK = 0
-
+S_FALSE = 1
 # Standard COM HRESULT failure codes (winerror.h). COM callers use
 # SUCCEEDED()/FAILED() on the full 32-bit value, so these must be returned
 # unchanged rather than collapsed into a generic nonzero value.
-REGDB_E_CLASSNOTREG = 0x80040154
 E_NOINTERFACE = 0x80004002
 E_POINTER = 0x80004003
+CLASS_E_CLASSNOTAVAILABLE = 0x80040111
+REGDB_E_CLASSNOTREG = 0x80040154
+MK_E_SYNTAX = 0x800401E4
+CO_E_CLASSSTRING = 0x800401F3
+RPC_E_CHANGED_MODE = 0x80010106
+WBEM_E_NOT_FOUND = 0x80041002
 
+COINIT_APARTMENTTHREADED = 0x2
+
+# COM authentication and impersonation levels (objidl.h). The local
+# CoInitializeSecurity handler and its display helpers read these values.
 RPC_C_AUTHN_LEVEL_DEFAULT = 0
 RPC_C_AUTHN_LEVEL_NONE = 1
 RPC_C_AUTHN_LEVEL_CONNECT = 2
@@ -27,9 +37,25 @@ RPC_C_IMP_LEVEL_IDENTIFY = 2
 RPC_C_IMP_LEVEL_IMPERSONATE = 3
 RPC_C_IMP_LEVEL_DELEGATE = 4
 
+
 CLSID_WbemLocator = "{4590F811-1D3A-11D0-891F-00AA004B2E24}"
 CLSID_IWbemContext = "{674B6698-EE92-11D0-AD71-00C04FD8FDFF}"
 
+PROGID_CLSIDS = {
+    "adodb.stream": "{00000566-0000-0010-8000-00AA006D2EA4}",
+    "microsoft.xmlhttp": "{ED8C108E-4349-11D2-91A4-00C04F7969E8}",
+    "msxml2.xmlhttp": "{F6D90F16-9C73-11D3-B32E-00C04F990BB4}",
+    "msxml2.xmlhttp.3.0": "{F5078F35-C551-11D3-89B9-0000F81FE221}",
+    "msxml2.xmlhttp.6.0": "{88D96A0A-F192-11D4-A65F-0040963251E5}",
+    "schedule.service": "{0F87369F-A4E5-4CFC-BD3E-73E6154572DD}",
+    "scripting.filesystemobject": "{0D43FE01-F093-11CF-8940-00A0C9054228}",
+    "shell.application": "{13709620-C279-11CE-A49E-444553540000}",
+    "wbemscripting.swbemlocator": "{76A64158-CB41-11D1-8B02-00600806D9B6}",
+    "winhttp.winhttprequest.5.1": "{2087C2F4-2CEF-4953-A8AB-66779B670495}",
+    "wscript.shell": "{72C24DD5-D70A-438B-8A42-98424B88AFB8}",
+}
+
+IID_IUnknown = "{00000000-0000-0000-C000-000000000046}"
 IID_IWbemLocator = "{DC12A687-737F-11CF-884D-00AA004B2E24}"
 IID_IWbemContext = "{44ACA674-E8FC-11D0-A07C-00C04FB68820}"
 
@@ -42,74 +68,64 @@ class ComInterface:
 
 
 class IUnknown(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.QueryInterface = Ptr
-        self.AddRef = Ptr
-        self.Release = Ptr
+    QueryInterface: Annotated[int, Ptr]
+    AddRef: Annotated[int, Ptr]
+    Release: Annotated[int, Ptr]
 
 
 class IMalloc(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.IUnknown = IUnknown
-        self.Alloc = Ptr
-        self.Realloc = Ptr
-        self.Free = Ptr
-        self.GetSize = Ptr
-        self.DidAlloc = Ptr
-        self.HeapMinimize = Ptr
+    IUnknown: IUnknown
+    Alloc: Annotated[int, Ptr]
+    Realloc: Annotated[int, Ptr]
+    Free: Annotated[int, Ptr]
+    GetSize: Annotated[int, Ptr]
+    DidAlloc: Annotated[int, Ptr]
+    HeapMinimize: Annotated[int, Ptr]
 
 
 class IWbemLocator(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.IUnknown = IUnknown
-        self.ConnectServer = Ptr
+    IUnknown: IUnknown
+    ConnectServer: Annotated[int, Ptr]
 
 
 class IWbemServices(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.IUnknown = IUnknown
-        self.OpenNamespace = Ptr
-        self.CancelAsyncCall = Ptr
-        self.QueryObjectSink = Ptr
-        self.GetObject = Ptr
-        self.GetObjectAsync = Ptr
-        self.PutClass = Ptr
-        self.PutClassAsync = Ptr
-        self.DeleteClass = Ptr
-        self.DeleteClassAsync = Ptr
-        self.CreateClassEnum = Ptr
-        self.CreateClassEnumAsync = Ptr
-        self.PutInstance = Ptr
-        self.PutInstanceAsync = Ptr
-        self.DeleteInstance = Ptr
-        self.DeleteInstanceAsync = Ptr
-        self.CreateInstanceEnum = Ptr
-        self.CreateInstanceEnumAsync = Ptr
-        self.ExecQuery = Ptr
-        self.ExecQueryAsync = Ptr
-        self.ExecNotificationQuery = Ptr
-        self.ExecNotificationQueryAsync = Ptr
-        self.ExecMethod = Ptr
-        self.ExecMethodAsync = Ptr
+    IUnknown: IUnknown
+    OpenNamespace: Annotated[int, Ptr]
+    CancelAsyncCall: Annotated[int, Ptr]
+    QueryObjectSink: Annotated[int, Ptr]
+    GetObject: Annotated[int, Ptr]
+    GetObjectAsync: Annotated[int, Ptr]
+    PutClass: Annotated[int, Ptr]
+    PutClassAsync: Annotated[int, Ptr]
+    DeleteClass: Annotated[int, Ptr]
+    DeleteClassAsync: Annotated[int, Ptr]
+    CreateClassEnum: Annotated[int, Ptr]
+    CreateClassEnumAsync: Annotated[int, Ptr]
+    PutInstance: Annotated[int, Ptr]
+    PutInstanceAsync: Annotated[int, Ptr]
+    DeleteInstance: Annotated[int, Ptr]
+    DeleteInstanceAsync: Annotated[int, Ptr]
+    CreateInstanceEnum: Annotated[int, Ptr]
+    CreateInstanceEnumAsync: Annotated[int, Ptr]
+    ExecQuery: Annotated[int, Ptr]
+    ExecQueryAsync: Annotated[int, Ptr]
+    ExecNotificationQuery: Annotated[int, Ptr]
+    ExecNotificationQueryAsync: Annotated[int, Ptr]
+    ExecMethod: Annotated[int, Ptr]
+    ExecMethodAsync: Annotated[int, Ptr]
 
 
 class IWbemContext(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.IUnknown = IUnknown
-        self.Clone = Ptr
-        self.GetNames = Ptr
-        self.BeginEnumeration = Ptr
-        self.Next = Ptr
-        self.EndEnumeration = Ptr
-        self.SetValue = Ptr
-        self.GetValue = Ptr
-        self.DeleteValue = Ptr
-        self.DeleteAll = Ptr
+    IUnknown: IUnknown
+    Clone: Annotated[int, Ptr]
+    GetNames: Annotated[int, Ptr]
+    BeginEnumeration: Annotated[int, Ptr]
+    Next: Annotated[int, Ptr]
+    EndEnumeration: Annotated[int, Ptr]
+    SetValue: Annotated[int, Ptr]
+    GetValue: Annotated[int, Ptr]
+    DeleteValue: Annotated[int, Ptr]
+    DeleteAll: Annotated[int, Ptr]
 
 
 IFACE_TYPES = {

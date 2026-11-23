@@ -1,19 +1,17 @@
 import argparse
 
 import speakeasy
-import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.nt.ntoskrnl as ntos
-import speakeasy.winenv.defs.registry.reg as reg
 import speakeasy.winenv.defs.usb as usbdefs
-import speakeasy.winenv.defs.wdf as wdf
+from speakeasy.winenv.defs import wdf
+from speakeasy.winenv.defs.enums import REG_VALUE_TYPE
+from speakeasy.winenv.defs.nt import ddk
 
 IOCTL_IS_SUPER_SPEED_SUPPORTED = 0x49104B
 
 
 class UsbEmu(speakeasy.Speakeasy):
-    """
-    WDF USB Emulator
-    """
+    """WDF USB Emulator."""
 
     def __init__(self, debug=False):
         super().__init__(debug=debug)
@@ -29,7 +27,7 @@ class UsbEmu(speakeasy.Speakeasy):
         self.pEvtIoWrite = 0
 
     def init_usb_descriptors(self):
-        for i, ep in enumerate(self.endpoints):
+        for ep in self.endpoints:
             ep.bLength = 7
             ep.bDescriptorType = 5
 
@@ -84,9 +82,7 @@ class UsbEmu(speakeasy.Speakeasy):
         config = self.mem_cast(wdf.WDF_DRIVER_CONFIG(emu.get_ptr_size()), DriverConfig)
         self.device_add_func = config.EvtDriverDeviceAdd
 
-        rv = func(params)
-
-        return rv
+        return func(params)
 
     def wdf_device_set_pnp_hooks(self, emu, api_name, func, params):
         DriverGlobals, DeviceInit, PnpPowerEventCallbacks = params
@@ -103,8 +99,7 @@ class UsbEmu(speakeasy.Speakeasy):
         DriverGlobals, UsbDevice, ConfigDescriptor, ConfigDescriptorLength = params
 
         rv = ddk.STATUS_BUFFER_TOO_SMALL
-        buf_len = self.mem_read(ConfigDescriptorLength, 2)
-        buf_len = int.from_bytes(buf_len, "little")
+        buf_len = int.from_bytes(self.mem_read(ConfigDescriptorLength, 2), "little")
 
         cfg = self.emit_config_descriptor()
         if buf_len < len(cfg):
@@ -115,15 +110,12 @@ class UsbEmu(speakeasy.Speakeasy):
             self.mem_write(ConfigDescriptor, cfg)
             self.mem_write(ConfigDescriptorLength, (len(cfg)).to_bytes(2, "little"))
 
-        rv = func(params)
-
-        return rv
+        return func(params)
 
     def wdf_get_usb_device_descriptor(self, emu, api_name, func, params):
         DriverGlobals, UsbDevice, UsbDeviceDescriptor = params
 
         self.mem_write(UsbDeviceDescriptor, self.ddesc.get_bytes())
-        return
 
     def wdf_get_usb_info(self, emu, api_name, func, params):
         DriverGlobals, UsbDevice, Information = params
@@ -135,8 +127,7 @@ class UsbEmu(speakeasy.Speakeasy):
         info.Traits |= wdf.WDF_USB_DEVICE_TRAIT_AT_HIGH_SPEED
         self.mem_write(Information, info.get_bytes())
 
-        rv = func(params)
-        return rv
+        return func(params)
 
     def wdf_queue_create_hook(self, emu, api_name, func, params):
         DriverGlobals, Device, Config, QueueAttributes, Queue = params
@@ -166,7 +157,7 @@ class UsbEmu(speakeasy.Speakeasy):
         csl = ntos.IO_STACK_LOCATION(emu.get_ptr_size())
         csl = self.mem_cast(csl, stack - csl.sizeof())
 
-        if IOCTL_IS_SUPER_SPEED_SUPPORTED == csl.Parameters.DeviceIoControl.IoControlCode:
+        if csl.Parameters.DeviceIoControl.IoControlCode == IOCTL_IS_SUPER_SPEED_SUPPORTED:
             rv = ddk.STATUS_NOT_SUPPORTED
             _irp.IoStatus.Status = rv
             self.mem_write(pIrp, _irp.get_bytes())
@@ -205,8 +196,8 @@ def main(args):
     # Emulate the module
     usb.run_module(module)
 
-    param_key = usb.get_registry_key(path="HKLM\\System\\CurrentControlSet\\Services\\*\\Parameters")  # noqa
-    param_key.create_value("MaximumTransferSize", reg.REG_DWORD, 65536)
+    param_key = usb.get_registry_key(path="HKLM\\System\\CurrentControlSet\\Services\\*\\Parameters")
+    param_key.create_value("MaximumTransferSize", REG_VALUE_TYPE.REG_DWORD, 65536)
 
     # Call the AddDevice function to get us setup
 

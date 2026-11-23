@@ -1,202 +1,264 @@
-from base64 import b64encode
-from typing import Annotated, Any, Literal
+from enum import Enum
+from typing import Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer
+from pydantic import BaseModel, ConfigDict, Field
 
-from speakeasy.profiler_events import AnyEvent
+from speakeasy.profiler_events import AnyEvent, StackEntry, TracePosition
+from speakeasy.report_types import HexInt, HexIntOptional
 
-
-def hex_serializer(v: int | None) -> str | None:
-    """Serialize integer values as ``0x``-prefixed hexadecimal strings.
-
-    Args:
-        v: Integer value to serialize.
-
-    Returns:
-        Hexadecimal string, or ``None`` when the input is ``None``.
-    """
-
-    if v is None:
-        return None
-    return hex(v)
-
-
-def bytes_serializer(v: bytes | None) -> str | None:
-    """Serialize byte sequences as base64 ASCII strings.
-
-    Args:
-        v: Byte payload to serialize.
-
-    Returns:
-        Base64-encoded ASCII string, or ``None`` when the input is ``None``.
-    """
-
-    if v is None:
-        return None
-    return b64encode(v).decode("ascii")
-
-
-def _parse_hex_int(v: Any) -> Any:
-    """Parse integer-like strings accepted by report models.
-
-    Args:
-        v: Raw input value.
-
-    Returns:
-        Parsed integer when ``v`` is a numeric string, otherwise ``v`` unchanged.
-    """
-
-    if isinstance(v, str):
-        return int(v, 0)
-    return v
-
-
-HexInt = Annotated[int, BeforeValidator(_parse_hex_int), PlainSerializer(hex_serializer, return_type=str)]
-HexIntOptional = Annotated[
-    int | None,
-    BeforeValidator(_parse_hex_int),
-    PlainSerializer(hex_serializer, return_type=str | None),
-]
-Base64Bytes = Annotated[bytes | None, PlainSerializer(bytes_serializer, return_type=str | None)]
+REPORT_VERSION = "7.1.0"
 
 
 class StringCollection(BaseModel):
-    """Represents one categorized bucket of extracted strings.
-
-    String extraction runs both on static image bytes and post-emulation memory
-    snapshots. This model keeps ANSI and UTF-16 findings separated.
-
-    Compare these lists to identify runtime-decoded strings that were not present
-    in the original file bytes.
-    """
-
-    model_config = ConfigDict(extra="forbid")
+    """ANSI and UTF-16 strings from one source."""
 
     ansi: list[str] = Field(
         default_factory=list,
-        description=(
-            "ASCII/ANSI strings extracted for this bucket.\n\n"
-            "These are populated by static string scans or memory string extraction "
-            "depending on the parent field."
-        ),
+        description="ASCII strings.",
     )
     unicode: list[str] = Field(
         default_factory=list,
-        description=(
-            "UTF-16 style strings extracted for this bucket.\n\n"
-            "Use these to spot wide-character configuration values and command "
-            "artifacts."
-        ),
+        description="UTF-16LE strings.",
     )
 
 
 class StringsReport(BaseModel):
-    """Groups static and in-memory string extraction results.
-
-    Static strings come from the original loaded image, while in-memory strings
-    are collected after execution and often include decoded/decrypted content.
-
-    Use this section to quickly triage embedded versus runtime materialized
-    indicators.
-    """
-
-    model_config = ConfigDict(extra="forbid")
+    """Strings of the input file, and strings that the guest made in memory."""
 
     static: StringCollection = Field(
         default_factory=StringCollection,
-        description=(
-            "Strings extracted from the initial file image bytes.\n\n"
-            "Primarily influenced by the module loader and static string scanner."
-        ),
+        description="Strings in the data of the input file.",
     )
     in_memory: StringCollection = Field(
         default_factory=StringCollection,
         description=(
-            "Strings extracted from memory after emulation executes.\n\n"
-            "Populated when string analysis is enabled and runtime decoding created "
-            "new string material."
+            "Strings at the end of the emulation that are not in ``static``. Speakeasy reads the stack, the "
+            "memory that API handlers allocate, and the images of the guest modules. In an image, it reads only "
+            "the strings that the guest changed after the load. These strings often are decoded data."
         ),
     )
 
 
 class RegionInfo(BaseModel):
-    """Describes a memory region for exception context."""
+    """
+    One memory region: an allocation of the memory manager, or one part of a module image.
 
-    model_config = ConfigDict(extra="forbid")
+    The emulator splits the image of a module into one region for the headers and one region
+    for each section. Each part has the tag ``emu.module``, and ``module`` and ``section`` give
+    the image and the part.
+    """
 
-    tag: str = Field(description="Memory-map tag identifying the region.")
     base: HexInt = Field(description="Base address of the region.")
-    size: HexInt = Field(description="Region size in bytes.")
-    prot: str | None = Field(default=None, description="Protection string (e.g. ``r-x``).")
+    size: int = Field(description="Size of the region in bytes.")
+    permissions: str = Field(
+        description=(
+            "Permissions, such as ``r-x`` or ``rw-``. For a part of a module image, the permissions from the "
+            "section header, and ``r--`` for the headers."
+        )
+    )
+    tag: str | None = Field(
+        default=None,
+        description=(
+            "Tag of the memory manager, such as ``api.VirtualAlloc``, ``api.heap.HeapAlloc`` or ``emu.stack``. "
+            "``emu.module`` for a part of a module image. Absent when the region has no tag."
+        ),
+    )
+    module: str | None = Field(
+        default=None,
+        description=(
+            "File name of the module, such as ``sample.exe`` or ``kernel32.dll``, the same as "
+            "``memory.modules[].name``. Only for a part of a module image."
+        ),
+    )
+    section: str | None = Field(
+        default=None,
+        description=(
+            "Name of the section, such as ``.text``, or ``headers`` for the PE headers. Absent for a region that is "
+            "not part of a module image, for a module image with no sections, and for an address in a module image "
+            "that is outside the headers and the sections. In the last two cases, the region is the full image."
+        ),
+    )
+
+
+class ErrorType(str, Enum):
+    """Reason why a run or the emulation ended with an error."""
+
+    PER_RUN_TIME_LIMIT = "per_run_time_limit"
+    TOTAL_TIME_LIMIT = "total_time_limit"
+    INSTRUCTION_LIMIT = "instruction_limit"
+    API_CALL_LIMIT = "api_call_limit"
+    API_LOOP_LIMIT = "api_loop_limit"
+    UNSUPPORTED_API = "unsupported_api"
+    INTERNAL_ERROR = "internal_error"
+    ENGINE_STOPPED = "engine_stopped"
+    INVALID_IMAGE = "invalid_image"
+    CHILD_PROCESS_SKIPPED = "child_process_skipped"
+    DLL_INITIALIZATION_FAILED = "dll_initialization_failed"
+    API_HANDLER_DID_NOT_RETURN = "api_handler_did_not_return"
+    INVALID_READ = "invalid_read"
+    INVALID_WRITE = "invalid_write"
+    INVALID_FETCH = "invalid_fetch"
+    INVALID_PROTECT_READ = "invalid_protect_read"
+    INVALID_PROTECT_WRITE = "invalid_protect_write"
+    INVALID_PROTECT_FETCH = "invalid_protect_fetch"
+    GUARD_PAGE_VIOLATION = "guard_page_violation"
+    PRIVILEGED_INSTRUCTION = "privileged_instruction"
+    INVALID_INSTRUCTION = "invalid_instruction"
+    UNSUPPORTED_CPU_FEATURE = "unsupported_cpu_feature"
+    UNHANDLED_INTERRUPT = "unhandled_interrupt"
+    UNHANDLED_EXCEPTION = "unhandled_exception"
+    HARDWARE_BREAKPOINT = "hardware_breakpoint"
+    BUG_CHECK = "bug_check"
+
+    def __str__(self) -> str:
+        """Return the serialized value, so string comparisons on error types are stable."""
+        return self.value
+
+
+class AccessType(str, Enum):
+    """Kind of memory access that faulted."""
+
+    READ = "read"
+    WRITE = "write"
+    FETCH = "fetch"
+
+    def __str__(self) -> str:
+        """Return the serialized value, so string comparisons on access types are stable."""
+        return self.value
+
+
+class ApiLoopSite(BaseModel):
+    """One call site of an API loop."""
+
+    api_name: str = Field(description="Name of the API in ``module.function`` form.")
+    return_address: HexIntOptional = Field(default=None, description="Return address of the calls from this site.")
+    calls: int = Field(description="Number of calls from this site in the loop.")
+
+
+class ApiLoop(BaseModel):
+    """
+    The API calls of a run after its last call from a new call site.
+
+    A call site is an API and a return address.
+    """
+
+    start: TracePosition = Field(description="Position of the first API call of the loop.")
+    calls: int = Field(description="Number of API calls in the loop.")
+    sites: list[ApiLoopSite] = Field(
+        description="Call sites of the loop, the site with the most calls first. At most 16 sites."
+    )
 
 
 class ErrorInfo(BaseModel):
-    """Captures failure context for top-level or per-entry-point errors.
+    """
+    Why a run, or the emulation, ended with an error.
 
-    Error records can represent unsupported API termination, instruction faults,
-    explicit runtime limits, or unhandled exceptions.
-
-    Inspect this structure first when a run exits unexpectedly.
+    The emulator fills only the fields that apply to the error ``type``.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
-    type: str = Field(
+    type: ErrorType | str = Field(
+        union_mode="left_to_right",
         description=(
-            "Error category identifier describing the failure mode.\n\n"
-            "Examples include unsupported API paths, max API limits, and fault "
-            "conditions raised by emulator hooks."
-        )
+            "Kind of error, such as ``unsupported_api``, ``api_call_limit``, ``api_loop_limit`` or ``invalid_read``. "
+            "A Python exception in Speakeasy itself, such as a bug in an API handler, is ``internal_error``. "
+            "A string that is not an ``ErrorType`` comes from a report of a newer minor version."
+        ),
     )
     pc: HexIntOptional = Field(
         default=None,
         description=(
-            "Program counter associated with the error, when available.\n\n"
-            "Use this address to align failures with disassembly and event traces."
+            "Address of the instruction where the run stopped. For an error of an API call, such as"
+            " ``unsupported_api`` or ``api_loop_limit``, the address of the call, the same as ``pos.pc`` of its"
+            " ``api`` event."
         ),
     )
-    instr: str | None = Field(
+    instruction: str | None = Field(
         default=None,
         description=(
-            "Faulting instruction text, when known.\n\n"
-            "Useful for quickly identifying invalid memory operations or bad control "
-            "flow transitions."
+            "Disassembly of the instruction at ``pc``. Absent when Speakeasy cannot disassemble it, for example when"
+            " ``pc`` is not mapped."
         ),
     )
     address: HexIntOptional = Field(
         default=None,
-        description="Faulting memory address that triggered the error.",
+        description=(
+            "Memory address that the faulting access used. For ``unsupported_api``, the return address of the API call."
+        ),
     )
-    access_type: str | None = Field(
+    access_type: AccessType | None = Field(
         default=None,
-        description="Memory access type that faulted: read, write, or fetch.",
+        description="Kind of the faulting access: read, write or fetch.",
     )
-    regs: dict[str, str] | None = Field(
+    registers: dict[str, HexInt] | None = Field(
         default=None,
-        description="Register state snapshot at the time of the error.",
+        description="Register values at the time of the error.",
     )
-    stack: list[str] | None = Field(
+    stack: list[StackEntry] | None = Field(
         default=None,
-        description="Stack trace entries captured at the time of the error.",
+        description="Stack slots at the time of the error, from the stack pointer up.",
     )
     pc_module: str | None = Field(
         default=None,
-        description="Module name + offset containing the faulting PC (e.g. ``sample.exe+0x1234``).",
+        description=(
+            "File name of the module that contains the faulting PC, for example ``sample.exe``. The same as "
+            "``memory.modules[].name``."
+        ),
+    )
+    pc_offset: int | None = Field(
+        default=None,
+        description="Offset of the faulting PC from the base of ``pc_module``.",
     )
     address_region: RegionInfo | None = Field(
         default=None,
-        description="Memory region containing the faulting address, if mapped.",
+        description="Memory region that contains ``address``. Absent when ``address`` is not mapped.",
     )
     nearby_regions: list[RegionInfo] | None = Field(
         default=None,
-        description="Up to 2 nearest memory regions when the faulting address is unmapped.",
+        description="The memory regions nearest to ``address`` when ``address`` is not mapped.",
     )
-    thread_id: int | None = Field(default=None, description="Thread ID at the time of the error.")
-    process_id: int | None = Field(default=None, description="Process ID at the time of the error.")
+    tid: int | None = Field(default=None, description="Thread ID at the time of the error.")
+    pid: int | None = Field(
+        default=None,
+        description="Process ID at the time of the error. For ``child_process_skipped``, the ID of the child process.",
+    )
     context_summary: str | None = Field(
         default=None,
-        description="Human-readable one-line triage summary of the error.",
+        description="One line of text that tells what went wrong.",
     )
+    traceback: str | None = Field(
+        default=None,
+        description="Python traceback of an ``internal_error``.",
+    )
+    message: str | None = Field(
+        default=None,
+        description="Text of the Python exception of an ``internal_error``.",
+    )
+    api_name: str | None = Field(
+        default=None,
+        description="Name of the API that has no handler, for ``unsupported_api``.",
+    )
+    limit: int | None = Field(
+        default=None,
+        description=(
+            "Limit that ended the run: ``limits.api_calls`` of the config for ``api_call_limit``, "
+            "``limits.api_loop_calls`` for ``api_loop_limit``, or ``limits.instructions`` for ``instruction_limit``."
+        ),
+    )
+    last_api: str | None = Field(
+        default=None,
+        description=(
+            "Name of the API of the last call before the run ended, for ``api_call_limit`` and ``api_loop_limit``."
+        ),
+    )
+    loop: ApiLoop | None = Field(
+        default=None,
+        description="The API loop that ended the run, for ``api_loop_limit``.",
+    )
+    interrupt_num: int | None = Field(
+        default=None,
+        description="Interrupt number, for ``unhandled_interrupt``.",
+    )
+    # Local additive fields (FX-003/FX-015/FX-016) kept on top of the 7.1.0 model.
     diagnostics: dict[str, Any] | None = Field(
         default=None,
         description=(
@@ -205,26 +267,6 @@ class ErrorInfo(BaseModel):
             "with its call-site/return address, a bounded API tail, and the "
             "fault-time register/stack snapshot. Purely observational."
         ),
-    )
-    traceback: str | None = Field(
-        default=None,
-        description="Python traceback when the error originated from an internal exception.",
-    )
-    api_name: str | None = Field(
-        default=None,
-        description="API function name for unsupported-API errors.",
-    )
-    count: int | None = Field(
-        default=None,
-        description="API call count that triggered a max-API-count limit.",
-    )
-    last_api: str | None = Field(
-        default=None,
-        description="Last API name invoked before max-API-count termination.",
-    )
-    interrupt_num: int | None = Field(
-        default=None,
-        description="Software interrupt vector associated with the error or termination.",
     )
     termination_kind: Literal["process_terminated"] | None = Field(
         default=None,
@@ -243,305 +285,233 @@ class ErrorInfo(BaseModel):
         description="Optional Windows __fastfail payload captured from EDX/RDX.",
     )
 
+    @property
+    def thread_id(self) -> int | None:
+        """Alias of ``tid`` kept for local report consumers."""
+        return self.tid
 
-class SymAccessReport(BaseModel):
-    """Summarizes memory accesses to symbol-resolved addresses.
+    @thread_id.setter
+    def thread_id(self, value: int | None) -> None:
+        self.tid = value
 
-    Symbol access accounting is mainly populated when memory tracing is active
-    and the emulator can resolve touched addresses back to known symbols.
+    @property
+    def process_id(self) -> int | None:
+        """Alias of ``pid`` kept for local report consumers."""
+        return self.pid
 
-    Use these counters to identify import-table walking and export resolution
-    behavior.
-    """
+    @process_id.setter
+    def process_id(self, value: int | None) -> None:
+        self.pid = value
 
-    model_config = ConfigDict(extra="forbid")
+    @property
+    def regs(self) -> dict[str, HexInt] | None:
+        """Alias of ``registers`` kept for local report consumers."""
+        return self.registers
 
-    symbol: str = Field(
+    @regs.setter
+    def regs(self, value: dict[str, HexInt] | None) -> None:
+        self.registers = value
+
+    @property
+    def instr(self) -> str | None:
+        """Alias of ``instruction`` kept for local report consumers."""
+        return self.instruction
+
+    @instr.setter
+    def instr(self, value: str | None) -> None:
+        self.instruction = value
+
+    @property
+    def count(self) -> int | None:
+        """Alias of ``limit`` kept for local report consumers."""
+        return self.limit
+
+    @count.setter
+    def count(self, value: int | None) -> None:
+        self.limit = value
+
+
+class RegionAccesses(BaseModel):
+    """Read, write and execute counts of one memory region in one run."""
+
+    region: HexInt = Field(
         description=(
-            "Resolved symbol name in ``module.symbol`` form.\n\n"
-            "This identifies the logical target accessed by code during tracing."
+            "Base of the region, as in ``memory.layout``: for a module image, the base of its headers or section. "
+            "An access in a module image outside the headers and the sections counts for the headers."
         )
     )
-    reads: int = Field(
-        description=(
-            "Number of read accesses observed for this symbol.\n\n"
-            "High values often indicate lookup loops or pointer chasing."
-        )
-    )
-    writes: int = Field(
-        description=(
-            "Number of write accesses observed for this symbol.\n\n"
-            "Non-zero writes can indicate tampering or patching behavior."
-        )
-    )
-    execs: int = Field(
-        description=(
-            "Number of execution accesses observed for this symbol.\n\n"
-            "Execution hits often represent direct calls/jumps through symbol-backed "
-            "addresses."
-        )
-    )
+    reads: int = Field(description="Number of reads in the region.")
+    writes: int = Field(description="Number of writes in the region.")
+    execs: int = Field(description="Number of instructions that ran in the region.")
 
 
-class DynamicCodeSegment(BaseModel):
-    """Describes one dynamically generated code region that executed.
+class SymbolAccesses(BaseModel):
+    """Read, write and execute counts of one symbol address in one run."""
 
-    Dynamic code segments are added when execution reaches memory previously
-    registered as dynamic code (for example after VirtualAlloc/WriteProcessMemory
-    style paths).
-
-    This section is useful for unpacking and staged payload detection.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    tag: str = Field(
-        description=(
-            "Memory-map tag assigned to the dynamic region.\n\n"
-            "Tags help correlate the segment with allocation provenance in traces."
-        )
-    )
-    base: HexInt = Field(
-        description=(
-            "Base address of the dynamic code region.\n\n"
-            "Use this with memory layout data to inspect surrounding mapped content."
-        )
-    )
-    size: HexInt = Field(
-        description=(
-            "Region size of the dynamic code segment.\n\n"
-            "Large regions may indicate unpacked module images or staged blobs."
-        )
-    )
-
-
-class DataArtifact(BaseModel):
-    """Stores one deduplicated binary payload referenced elsewhere in a report.
-
-    Payloads are keyed by SHA-256 in the top-level ``Report.data`` mapping.
-    Other models store the SHA-256 key as a reference instead of embedding bytes
-    inline repeatedly.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    compression: str = Field(description="Compression algorithm applied to the stored payload.")
-    encoding: str = Field(description="Text encoding used for serialized payload bytes.")
-    size: int = Field(description="Uncompressed payload size in bytes.")
-    data: str = Field(description="Encoded payload bytes after compression and serialization.")
-
-
-class DroppedFile(BaseModel):
-    """Represents one file artifact written by emulated execution.
-
-    Dropped-file entries are created from filesystem manager state when a run
-    completes and fully written files are detected.
-
-    Use these records to recover secondary payloads and configuration artifacts.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    path: str = Field(
-        description=(
-            "Emulated destination path of the written file.\n\n"
-            "Interpret this as the malware-intended filesystem location."
-        )
-    )
-    size: int = Field(description="Dropped file size in bytes.")
-    sha256: str = Field(
-        description=(
-            "SHA-256 hash of the dropped file bytes.\n\nUse this for sample correlation and deduplication workflows."
-        )
-    )
-    data_ref: str | None = Field(
-        default=None,
-        description=(
-            "Optional reference into the top-level report ``data`` store.\n\n"
-            "When present, resolve this SHA-256 key in ``Report.data`` to recover the compressed file bytes."
-        ),
-    )
+    symbol: str = Field(description="Symbol name in ``module.symbol`` form.")
+    reads: int = Field(description="Number of reads that start at the symbol address.")
+    writes: int = Field(description="Number of writes that start at the symbol address.")
+    execs: int = Field(description="Number of instructions that ran at the symbol address.")
 
 
 class MemoryAccesses(BaseModel):
-    """Aggregates read/write/execute counters for one memory region.
+    """Read, write and execute counts of the memory regions and the symbols that a run used."""
 
-    These counters are produced by runtime memory tracing hooks when enabled.
-
-    Use them to prioritize regions with meaningful behavioral activity.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    reads: int = Field(
-        description=(
-            "Total read operations observed for the region.\n\n"
-            "High read density often indicates lookup tables or parsed structures."
-        )
+    regions: list[RegionAccesses] = Field(
+        default_factory=list,
+        description="Counts of each region that the run read, wrote or ran code in, in the order of ``region``.",
     )
-    writes: int = Field(
+    symbols: list[SymbolAccesses] = Field(
+        default_factory=list,
         description=(
-            "Total write operations observed for the region.\n\n"
-            "High write density often indicates decoded payload construction."
-        )
-    )
-    execs: int = Field(
-        description=(
-            "Total execute operations observed for the region.\n\n"
-            "Non-zero execution marks code-bearing pages and trampoline regions."
-        )
-    )
-
-
-class MemoryRegion(BaseModel):
-    """Represents one memory layout entry captured for an entry point.
-
-    Memory layout capture runs at run completion and may include section-split
-    module regions plus generic heap/stack mappings.
-
-    Use this data to correlate execution artifacts with mapped memory topology.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    tag: str = Field(
-        description=(
-            "Region tag assigned by the memory manager.\n\n"
-            "Tags encode provenance such as module sections, heaps, or emulator "
-            "internal structures."
-        )
-    )
-    address: HexInt = Field(
-        description=(
-            "Base address of the memory region.\n\n"
-            "Treat this as the start of the region for disassembly and dump slicing."
-        )
-    )
-    size: HexInt = Field(
-        description=("Region size in bytes.\n\nCombine with ``address`` to derive half-open address ranges.")
-    )
-    prot: str = Field(
-        description=(
-            "Protection string (for example ``r-x`` or ``rw-``).\n\n"
-            "Interpret this as the final effective page protection at capture time."
-        )
-    )
-    is_free: bool = Field(
-        default=False,
-        description=(
-            "Whether the region had been freed at capture time.\n\n"
-            "Freed regions can remain visible when memory retention settings keep old "
-            "maps for analysis."
+            "Counts of each symbol address that the run read, wrote or ran code at, in the order of the address. "
+            "Only an access at the exact address of the symbol counts."
         ),
     )
-    accesses: MemoryAccesses | None = Field(
+
+
+class DynamicCodeContents(BaseModel):
+    """The position and the data of a dynamic code region when code ran in it."""
+
+    pos: TracePosition = Field(
+        description=(
+            "Position when the emulator found code that ran in the region: the first time, or for a later"
+            " snapshot, the first block in the region after the change. ``pc`` is in the region."
+        )
+    )
+    data_ref: str | None = Field(
         default=None,
         description=(
-            "Optional read/write/execute counters for the region.\n\n"
-            "Populated primarily when memory tracing was enabled for the run."
+            "Key in the top-level ``data`` of the region data at ``pos``. Each snapshot of a region has different"
+            " data from the snapshot before it. Absent when ``memory.dynamic_code_contents`` is off."
+        ),
+    )
+
+
+class DynamicCodeRegion(BaseModel):
+    """
+    A dynamic code region where code ran.
+
+    The emulator watches the memory that the guest allocates, for example with ``VirtualAlloc``, and
+    adds a region when the guest runs code in the region. With ``memory.dynamic_code_contents``, the
+    emulator adds one more snapshot to ``contents`` each time that code runs in the region after the
+    region changed, and control came from outside the region.
+    """
+
+    region: HexInt = Field(description="Base address of the region, as in ``memory.layout``.")
+    size: int = Field(description="Size of the region in bytes.")
+    tag: str | None = Field(
+        default=None,
+        description=("Tag of the memory manager, such as ``api.VirtualAlloc``. Absent when the region has no tag."),
+    )
+    contents: list[DynamicCodeContents] = Field(
+        description=(
+            "With ``memory.dynamic_code_contents``, one snapshot for each time that code ran in the region with"
+            " new data, in the order of ``pos.tick``. With the option off, one entry with the ``pos`` of the first"
+            " time that code ran in the region."
+        )
+    )
+    limit_reached: bool | None = Field(
+        default=None,
+        description=(
+            "True if the region changed and code ran in it again after the last snapshot that"
+            " ``memory.dynamic_code_contents.limit`` allows. Absent when ``memory.dynamic_code_contents`` is off."
+        ),
+    )
+
+
+class ArtifactCompression(str, Enum):
+    """Compression of a stored payload."""
+
+    ZLIB = "zlib"
+
+
+class ArtifactEncoding(str, Enum):
+    """Text encoding of a stored payload."""
+
+    BASE64 = "base64"
+
+
+class DataArtifact(BaseModel):
+    """
+    One payload of the report.
+
+    The top-level ``data`` of the report keys each payload by the SHA-256 of its bytes. A ``data_ref``
+    field elsewhere in the report holds such a key.
+    """
+
+    compression: ArtifactCompression = Field(description="Compression of the payload.")
+    encoding: ArtifactEncoding = Field(description="Text encoding of the compressed payload.")
+    size: int = Field(description="Size of the payload before compression, in bytes.")
+    data: str = Field(description="Payload, compressed and then encoded.")
+
+
+class DroppedFile(BaseModel):
+    """A file that the guest wrote completely, up to the end of the run."""
+
+    path: str = Field(description="Emulated path of the file.")
+    size: int = Field(description="Size of the file in bytes.")
+    sha256: str = Field(description="SHA-256 of the file data.")
+    data_ref: str | None = Field(
+        default=None,
+        description=(
+            "Key in the top-level ``data`` of the file data. It is equal to ``sha256``. Absent for an empty file"
+            " and for a file above ``MAX_EMBEDDED_FILE_SIZE`` (10 MiB)."
+        ),
+    )
+
+
+class MemoryRegion(RegionInfo):
+    """
+    One memory region at the end of a run.
+
+    The emulator splits the image of a module into one region for the headers and one region
+    for each section. Each part has the tag ``emu.module``, and ``module`` and ``section`` give
+    the image and the part.
+    """
+
+    freed: bool | None = Field(
+        default=None,
+        description=(
+            "True if the guest freed the allocation of the region. Only with ``memory.freed_regions``, which keeps "
+            "a freed allocation mapped. With the option off, the emulator unmaps a freed allocation when no other "
+            "allocation of its block is live, and keeps it mapped while one is. The layout then leaves out each "
+            "freed allocation."
         ),
     )
     data_ref: str | None = Field(
         default=None,
         description=(
-            "Optional reference into the top-level report ``data`` store.\n\n"
-            "When present, resolve this SHA-256 key in ``Report.data`` to recover the compressed region bytes."
+            "Key in the top-level ``data`` of the region data: the images of the modules that load from a file, "
+            "such as the input, the allocations and heaps of the guest (``api.*`` tags), the regions with no tag "
+            "that API handlers allocate for the guest, and the static TLS data (``emu.tls.*`` tags). Absent when "
+            "``memory.final_contents`` is off, for the stacks, for the memory of the emulator (the stub images of "
+            "system modules and the other ``emu.*`` tags), and when the emulator cannot read the region."
         ),
-    )
-
-
-class ModuleSegment(BaseModel):
-    """Describes one section-like segment within a loaded module.
-
-    Segment data is collected from module metadata during memory layout capture.
-
-    Use this to align addresses with section boundaries and permissions.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(
-        description=(
-            "Segment or section name within the module image.\n\n"
-            "Useful for mapping behavior to familiar PE sections such as ``.text``."
-        )
-    )
-    address: HexInt = Field(
-        description=(
-            "Absolute virtual address of the segment start.\n\nUse with ``size`` to identify covered address ranges."
-        )
-    )
-    size: HexInt = Field(
-        description=("Segment size in bytes.\n\nLarge executable segments usually contain primary code paths.")
-    )
-    prot: str = Field(
-        description=(
-            "Effective memory protection for the segment.\n\n"
-            "Use this to identify writable-executable anomalies or data-only regions."
-        )
     )
 
 
 class LoadedModule(BaseModel):
-    """Captures one module visible in the run's loaded-module inventory.
-
-    Module entries are assembled from runtime module objects at run completion.
-
-    This section provides a concise map of what binaries were present and where.
-    """
-
-    model_config = ConfigDict(extra="forbid")
+    """A module that is loaded at the end of a run."""
 
     name: str = Field(
-        description=(
-            "Module file name or canonical module identifier.\n\n"
-            "Use this to correlate module events and API import usage."
-        )
+        description="File name of the module, such as ``sample.exe``. The ``module`` of the regions of its image."
     )
-    path: str = Field(
-        description=("Emulated module path.\n\nUseful for distinguishing system modules from payload modules.")
-    )
-    base: HexInt = Field(
-        description=(
-            "Module base address in virtual memory.\n\n"
-            "Use this as the relocation anchor for offsets and symbol lookups."
-        )
-    )
-    size: HexInt = Field(
-        description=("Total mapped module size in bytes.\n\nHelps identify unusually large or tiny mapped images.")
-    )
-    segments: list[ModuleSegment] = Field(
-        default_factory=list,
-        description=(
-            "Section/segment breakdown for the module mapping.\n\n"
-            "Use these entries for section-aware interpretation of memory behavior."
-        ),
-    )
+    path: str = Field(description="Emulated path of the module.")
+    base: HexInt = Field(description="Base address of the module.")
+    size: int = Field(description="Size of the module image in bytes.")
 
 
 class MemoryLayout(BaseModel):
-    """Bundles memory-region and loaded-module snapshots for one run.
-
-    This object is populated when the emulator captures run-end memory state.
-
-    Use it to understand both raw mappings and higher-level module context.
-    """
-
-    model_config = ConfigDict(extra="forbid")
+    """Memory regions and loaded modules at the end of a run."""
 
     layout: list[MemoryRegion] = Field(
         default_factory=list,
-        description=(
-            "Flat list of captured memory regions for the run.\n\n"
-            "Entries may include module headers/sections and generic maps."
-        ),
+        description="Memory regions, with one region for the headers and one for each section of a module image.",
     )
     modules: list[LoadedModule] = Field(
         default_factory=list,
-        description=(
-            "Loaded modules present when the run completed.\n\n"
-            "Use alongside ``layout`` to interpret address ownership and segment roles."
-        ),
+        description="Modules that are loaded at the end of the run.",
     )
 
 
@@ -687,344 +657,271 @@ class ChildExecutionReport(BaseModel):
     )
 
 
-class EntryPoint(BaseModel):
-    """Represents one emulation execution primitive captured as a run.
+class RunType(str, Enum):
+    """Kind of code that a run executes."""
 
-    A run may be a module entry point, callback, exported function, injected
-    thread, or other execution start context.
+    MODULE_ENTRY = "module_entry"
+    DLL_ENTRY = "dll_entry"
+    TLS_CALLBACK = "tls_callback"
+    EXPORT = "export"
+    SHELLCODE = "shellcode"
+    THREAD = "thread"
+    SERVICE_MAIN = "service_main"
+    DEPENDENCY_DLL_ENTRY = "dependency_dll_entry"
+    DEPENDENCY_TLS_CALLBACK = "dependency_tls_callback"
+    CALL = "call"
+    DRIVER_ENTRY = "driver_entry"
+    DRIVER_UNLOAD = "driver_unload"
+    DRIVER_REINIT = "driver_reinit"
+    IRP = "irp"
+    # Local extension: child module entrypoint runs excluded by the outer pipeline.
+    CHILD_MODULE_ENTRY = "child.module_entry"
 
-    Most behavioral telemetry is attached at this level, so treat each entry as
-    a self-contained execution narrative.
+    def __str__(self) -> str:
+        """Return the serialized value, so string comparisons on run types are stable."""
+        return self.value
+
+
+class RunReport(BaseModel):
+    """
+    One run, and the events and data that the run collected.
+
+    A run starts at one address, such as the module entry point, an export, a TLS callback or a
+    thread.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
-    ep_type: str = Field(
-        description=(
-            "Execution primitive label for this run.\n\n"
-            "Examples include module entry, export callbacks, and thread contexts."
-        )
+    type: RunType = Field(
+        description="Kind of code that the run executes, such as ``module_entry``, ``export`` or ``thread``."
     )
-    start_addr: HexInt = Field(
+    name: str | None = Field(
+        default=None,
         description=(
-            "Address where this run began executing.\n\n"
-            "Use this as the anchor when following control flow in disassembly."
-        )
+            "Detail for ``type``, such as the export name (``#<ordinal>`` for an export without a name), the TLS "
+            "callback index, the dependency module or the IRP major function. Absent when the type has no detail."
+        ),
     )
-    ep_args: list[Any] = Field(
+    start_address: HexInt = Field(description="Address where the run started.")
+    args: list[HexInt] = Field(
+        default_factory=list,
+        description="Arguments that the emulator gives to the code at ``start_address``.",
+    )
+    pid: int | None = Field(
+        default=None,
+        description="ID of the process of the run.",
+    )
+    tid: int | None = Field(
+        default=None,
+        description="ID of the thread of the run.",
+    )
+    instruction_count: int | None = Field(
+        default=None,
+        description=(
+            "Number of instructions that the run executed. The emulator counts them only with ``memory.accesses``, "
+            "``memory.dynamic_code_contents`` or a ``limits.instructions`` above 0. Absent when no option counts them."
+        ),
+    )
+    api_call_count: int = Field(
+        default=0,
+        description=(
+            "Number of API calls that the run made, also the calls that ``events`` leaves out as repeats. "
+            "``limits.api_calls`` limits this count."
+        ),
+    )
+    return_value: HexIntOptional = Field(
+        default=None,
+        description="Value of the return register when the run completed.",
+    )
+    error: ErrorInfo | None = Field(
+        default=None,
+        description="Error that ended the run. Absent when the run completed.",
+    )
+    events: list[AnyEvent] = Field(
+        default_factory=list,
+        description="Events of the run, in order.",
+    )
+    accesses: MemoryAccesses | None = Field(
+        default=None,
+        description="Read, write and execute counts of the regions and the symbols. Only with ``memory.accesses``.",
+    )
+    dynamic_code: list[DynamicCodeRegion] = Field(
         default_factory=list,
         description=(
-            "Argument values supplied at run entry.\n\nInteger arguments are serialized as hex strings for readability."
+            "Dynamic code regions where code ran in the run, one entry for each region, in the order of the"
+            " first time that code ran in the region."
+        ),
+    )
+    coverage: list[HexInt] | None = Field(
+        default=None,
+        description="Sorted addresses of the instructions that ran. Only with ``code.coverage``.",
+    )
+    dropped_files: list[DroppedFile] | None = Field(
+        default=None,
+        description="Files that the guest wrote completely, up to the end of the run. User mode only.",
+    )
+    memory: MemoryLayout | None = Field(
+        default=None,
+        description="Memory regions and modules at the end of the run. User mode only.",
+    )
+
+
+class ProcessInfo(BaseModel):
+    """
+    One process that the report refers to.
+
+    The report has an entry for the process of each run, for each process that the guest created,
+    and for each process that is the target of an event, such as a process that existed before the
+    emulation.
+    """
+
+    pid: int = Field(description="Process ID, the same as the ``pid`` of runs and events.")
+    parent_pid: int | None = Field(
+        default=None,
+        description=(
+            "ID of the process that created this process, the ``pos.pid`` of its ``process_create`` event. "
+            "Absent for the process of the input (``Report.pid``) and for a process that existed before the emulation."
+        ),
+    )
+    path: str | None = Field(
+        default=None,
+        description=(
+            "Emulated path of the process image, such as ``C:\\Windows\\explorer.exe``. "
+            "Absent when the process has no image path."
+        ),
+    )
+    command_line: str | None = Field(
+        default=None,
+        description=(
+            "Command line of the process. Absent for a process from the config with no ``command_line``, "
+            "except the container process."
+        ),
+    )
+    runs: list[int] = Field(
+        default_factory=list,
+        description="Indexes in ``runs`` of the runs of the process. Empty when no run executed in the process.",
+    )
+
+
+class Arch(str, Enum):
+    """Architecture of the input."""
+
+    X86 = "x86"
+    X64 = "x64"
+
+
+class FileType(str, Enum):
+    """Kind of input file."""
+
+    EXE = "exe"
+    DLL = "dll"
+    DRIVER = "driver"
+    SHELLCODE = "shellcode"
+
+
+class Report(BaseModel):
+    """
+    Report of one emulation: the input metadata, the runs and the payloads.
+
+    Machine words are ``0x``-prefixed hex strings: addresses, pointers,
+    handles, raw argument values, return values, register values and exception
+    codes. A 64-bit word can be above 2**53 or 2**63, and JavaScript, Go
+    ``interface{}``, jq and int64 stores such as SQLite lose such a value as a
+    JSON number with no error. Quantities, such as sizes, counts, offsets,
+    ticks and IDs, are JSON numbers.
+
+    A key is absent when Speakeasy did not collect its data: its option is off,
+    or the data does not apply, such as the memory layout in kernel mode. An
+    empty list or object means that Speakeasy collected the data and found
+    nothing. A counter or a boolean is always present when Speakeasy collects
+    it, also when it is 0 or false.
+    """
+
+    report_version: str = Field(
+        default=REPORT_VERSION,
+        pattern=rf"^{REPORT_VERSION.split('.')[0]}\.",
+        description=(
+            "Version of the report format. The models read each report of the same major version, also of a newer"
+            " minor version."
+        ),
+    )
+    emulation_total_runtime: float = Field(
+        description=(
+            "Wall-clock time in seconds, rounded to milliseconds, from the first start of the run queue "
+            "to the end of the emulation."
+        )
+    )
+    timestamp: int = Field(description="Unix time in seconds of the first start of the run queue.")
+    arch: Arch | None = Field(
+        default=None,
+        description="Architecture of the input.",
+    )
+    path: str | None = Field(
+        default=None,
+        description="Host path of the input file. Absent when the input came from bytes.",
+    )
+    sha256: str | None = Field(
+        default=None,
+        description="SHA-256 of the input.",
+    )
+    size: int | None = Field(
+        default=None,
+        description="Size of the input in bytes.",
+    )
+    file_type: FileType | None = Field(
+        default=None,
+        description="Kind of input file.",
+    )
+    image_base: HexIntOptional = Field(
+        default=None,
+        description=(
+            "Base address of the input image in the emulator. Rebase a disassembler database to this "
+            "address to match the addresses of the report."
         ),
     )
     pid: int | None = Field(
         default=None,
         description=(
-            "Process identifier associated with the run context.\n\n"
-            "Populated when process context is known for this entry point."
+            "ID of the process that runs the input: the process of the input EXE, or the container process of a "
+            "DLL or shellcode. Absent in kernel mode."
         ),
     )
-    tid: int | None = Field(
-        default=None,
-        description=(
-            "Thread identifier associated with the run context.\n\n"
-            "Useful for correlating with per-event ``pos.tid`` values."
-        ),
-    )
-    instr_count: int | None = Field(
-        default=None,
-        description=(
-            "Instruction count executed for this run.\n\n"
-            "Can be limited by configuration caps or early termination conditions."
-        ),
-    )
-    apihash: str = Field(
-        default="",
-        description=(
-            "SHA-256 hash over unique API names invoked in first-seen order.\n\n"
-            "Use this for coarse behavioral clustering across samples and architectures."
-        ),
-    )
-    ret_val: HexIntOptional = Field(
-        default=None,
-        description=(
-            "Return value produced when the run ended normally.\n\n"
-            "Interpret this in the calling convention context of ``ep_type``."
-        ),
-    )
-    error: ErrorInfo | None = Field(
-        default=None,
-        description=(
-            "Run-local error details when execution did not complete cleanly.\n\n"
-            "Consult this with ``events`` to identify the exact failure transition."
-        ),
-    )
-    events: list[AnyEvent] | None = Field(
-        default=None,
-        description=(
-            "Chronological event stream emitted during this run.\n\n"
-            "Event contents are produced by API, process, file, registry, network, "
-            "and exception recorders."
-        ),
-    )
-    sym_accesses: list[SymAccessReport] | None = Field(
-        default=None,
-        description=(
-            "Symbol-level access counters observed during tracing.\n\n"
-            "Typically populated when memory tracing hooks are active."
-        ),
-    )
-    dynamic_code_segments: list[DynamicCodeSegment] | None = Field(
-        default=None,
-        description=(
-            "Dynamically generated code regions that executed in this run.\n\n"
-            "Indicates unpacking, JIT-like behavior, or in-memory staging activity."
-        ),
-    )
-    coverage: list[int] | None = Field(
-        default=None,
-        description=(
-            "Sorted list of executed instruction addresses for coverage analysis.\n\n"
-            "Populated only when coverage collection is enabled in config."
-        ),
-    )
-    dropped_files: list[DroppedFile] | None = Field(
-        default=None,
-        description=(
-            "File artifacts detected as fully written during the run.\n\n"
-            "Use this list to extract secondary payloads and logs."
-        ),
-    )
-    memory: MemoryLayout | None = Field(
-        default=None,
-        description=(
-            "Optional memory and module snapshot captured at run completion.\n\n"
-            "Populate this when memory-layout capture is active for the emulator mode."
-        ),
-    )
-    ownership: ChildExecutionOwnership | None = Field(
-        default=None,
-        description="Child execution lineage when this run belongs to a controlled child.",
-    )
-
-
-class Report(BaseModel):
-    """Top-level Speakeasy output report model.
-
-    This object combines run telemetry, metadata for the emulated input, and
-    optional analysis artifacts.
-
-    Treat this as the canonical machine-readable output for downstream tooling.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    report_version: str = Field(
-        default="3.0.0",
-        description=(
-            "Schema/report format version generated by the profiler.\n\n"
-            "Use this to route parsing logic when consuming multiple report versions."
-        ),
-    )
-    emulation_total_runtime: float = Field(
-        description=(
-            "Total wall-clock runtime in seconds for the emulation session.\n\n"
-            "Derived from profiler start/stop timing and rounded to milliseconds."
-        )
-    )
-    timestamp: int = Field(
-        description=(
-            "Epoch timestamp (seconds) captured at emulation start time.\n\n"
-            "Use this for timeline correlation with external logs."
-        )
-    )
-    arch: str | None = Field(
-        default=None,
-        description=(
-            "Architecture label for the input sample, when known.\n\n"
-            "Populated from loader metadata (for example ``x86`` or ``x64``)."
-        ),
-    )
-    filepath: str | None = Field(
-        default=None,
-        description=(
-            "Original local path of the emulated input file, when available.\n\n"
-            "Useful for provenance tracking in batch pipelines."
-        ),
-    )
-    sha256: str | None = Field(
-        default=None,
-        description=(
-            "SHA-256 hash of the emulated input bytes, when available.\n\n"
-            "Use this as the primary stable sample identifier."
-        ),
-    )
-    size: int | None = Field(
-        default=None,
-        description=(
-            "Input file size in bytes, when available.\n\n"
-            "Helps validate sample identity and triage packaging anomalies."
-        ),
-    )
-    filetype: str | None = Field(
-        default=None,
-        description=(
-            "Coarse file-type classification (for example exe, dll, driver).\n\n"
-            "Derived from loader inspection before emulation starts."
-        ),
-    )
-    image_base: HexIntOptional = Field(
-        default=None,
-        description=(
-            "Base address at which the primary module was loaded during emulation.\n\n"
-            "Use this to rebase analysis tools (e.g. IDA Pro) to match emulated addresses."
-        ),
-    )
-    errors: list[ErrorInfo] | None = Field(
-        default=None,
-        description=(
-            "Top-level emulator errors not tied to a specific run.\n\n"
-            "These usually reflect session-level failures rather than per-entry-point "
-            "termination."
-        ),
+    errors: list[ErrorInfo] = Field(
+        default_factory=list,
+        description="Errors that do not belong to one run, such as an ``invalid_image`` defect of the input PE.",
     )
     strings: StringsReport | None = Field(
         default=None,
-        description=(
-            "Optional static and in-memory string extraction output.\n\n"
-            "Present when string analysis is enabled and at least one string bucket is "
-            "non-empty."
-        ),
+        description="Strings of the input and of memory. Only with ``memory.strings``.",
     )
-    data: dict[str, DataArtifact] | None = Field(
-        default=None,
-        description=(
-            "Deduplicated binary payload store keyed by SHA-256.\n\n"
-            "Resolve ``*_ref`` fields in the report against this mapping to recover compressed payload bytes."
-        ),
+    data: dict[str, DataArtifact] = Field(
+        default_factory=dict,
+        description="Payloads of the report, keyed by SHA-256. Each ``data_ref`` field holds a key of this mapping.",
     )
     child_execution: ChildExecutionReport | None = Field(
         default=None,
         description="Model-only child launch requests and their resolution/admission state.",
     )
-    entry_points: list[EntryPoint] = Field(
+    processes: list[ProcessInfo] = Field(
         default_factory=list,
         description=(
-            "Ordered list of all runs executed during emulation.\n\n"
-            "This is the primary behavioral timeline for the report."
+            "Processes of the runs and of the events, in the order of ``pid``. A kernel-mode run has no process, "
+            "so in kernel mode the list has only the targets of memory events."
         ),
     )
+    runs: list[RunReport] = Field(
+        default_factory=list,
+        description="Runs of the emulation, in the order that the runs started.",
+    )
+
+    @property
+    def entry_points(self) -> list[RunReport]:
+        """Read-only alias of ``runs`` for local consumers that predate the 7.x schema."""
+        return self.runs
 
 
 class FileManifestEntry(BaseModel):
-    """Manifest entry used by dropped-file archive exports.
+    """One file in ``speakeasy_manifest.json`` of the dropped-files archive."""
 
-    These records are stored in ``speakeasy_manifest.json`` inside file archive
-    bundles created by the high-level API.
-
-    Use this manifest to map archive members back to emulated file paths.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    path: str = Field(
-        description=(
-            "Emulated file path associated with the archived artifact.\n\n"
-            "Represents where the sample wrote the file in emulated space."
-        )
-    )
-    file_name: str = Field(
-        description=(
-            "Archive member file name for the artifact bytes.\n\n"
-            "Use this to locate the corresponding entry inside the zip package."
-        )
-    )
-    size: int = Field(
-        description=(
-            "Artifact size in bytes.\n\nUseful for quick filtering of tiny markers versus payload-like binaries."
-        )
-    )
-    sha256: str = Field(
-        description=("SHA-256 hash of the archived file bytes.\n\nSupports integrity checks and IOC correlation.")
-    )
-
-
-class MemoryBlock(BaseModel):
-    """Manifest record for one dumped memory block.
-
-    Memory block manifests are emitted alongside memory dump archives to keep
-    hashable metadata separate from raw dump bytes.
-
-    Use this for deterministic indexing of memory dump artifacts.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    tag: str = Field(
-        description=(
-            "Memory-map tag identifying the dumped block's origin.\n\n"
-            "Tags help group blocks by module, heap, shellcode, or internal regions."
-        )
-    )
-    base: HexInt = Field(
-        description=(
-            "Base address of the dumped memory block.\n\n"
-            "Use this as the primary address key when loading dumps in analysis tools."
-        )
-    )
-    size: HexInt = Field(
-        description=("Dumped block size in bytes.\n\nCombine with ``base`` to reconstruct memory ranges.")
-    )
-    is_free: bool = Field(
-        description=(
-            "Whether the block was marked free at dump capture time.\n\n"
-            "Freed blocks can still contain useful residual payload material."
-        )
-    )
-    sha256: str = Field(
-        description=("SHA-256 hash of the dumped block bytes.\n\nUse for deduplication and reproducibility checks.")
-    )
-    file_name: str = Field(
-        description=(
-            "Archive file name storing this block's raw bytes.\n\n"
-            "Use this with the manifest to resolve metadata to zip members."
-        )
-    )
-
-
-class ProcessMemoryManifest(BaseModel):
-    """Groups dumped memory-block manifest records per process.
-
-    Memory dump archive generation emits one process manifest entry per process
-    that contributed dumpable blocks.
-
-    Use this to keep process context attached to raw dump artifacts.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    pid: int = Field(
-        description=(
-            "Process identifier associated with the dumped blocks.\n\n"
-            "Use this for correlation with run-level process and event metadata."
-        )
-    )
-    process_name: str = Field(
-        description=(
-            "Process path/name label associated with the dump set.\n\n"
-            "Helps distinguish blocks from parent and child process contexts."
-        )
-    )
-    arch: str = Field(
-        description=(
-            "Process architecture label for the dump set.\n\n"
-            "Useful when loading dumps into architecture-specific tooling."
-        )
-    )
-    memory_blocks: list[MemoryBlock] = Field(
-        default_factory=list,
-        description=(
-            "Dumped memory block descriptors belonging to this process.\n\n"
-            "Each entry maps one archived ``.mem`` file to address and hash metadata."
-        ),
-    )
+    path: str = Field(description="Emulated path of the file.")
+    file_name: str = Field(description="Name of the zip member that has the file data.")
+    size: int = Field(description="Size of the file in bytes.")
+    sha256: str = Field(description="SHA-256 of the file data.")

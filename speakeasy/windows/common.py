@@ -1,5 +1,6 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+import datetime
 import hashlib
 import os
 from collections import namedtuple
@@ -8,11 +9,10 @@ from enum import IntFlag
 import pefile
 
 import speakeasy.winenv.arch as _arch
-import speakeasy.winenv.defs.nt.ddk as ddk
 from speakeasy.struct import Enum
+from speakeasy.winenv.defs.nt import ddk
 
-# GDT Constants needed to set our emulator into protected mode
-# Access bits
+# Access bits and flags of the GDT descriptors that the emulator builds for protected mode.
 GDT_ACCESS_BITS = Enum()
 GDT_ACCESS_BITS.ProtMode32 = 0x4
 GDT_ACCESS_BITS.PresentBit = 0x80
@@ -28,13 +28,24 @@ GDT_FLAGS = Enum()
 GDT_FLAGS.Ring3 = 0x3
 GDT_FLAGS.Ring0 = 0
 
-IMPORT_HOOK_ADDR = 0xFEEDFACE
 DEFAULT_LOAD_ADDR = 0x40000
 
+# Local extension: page size used when the decoy PE builder grows SizeOfImage.
 PAGE_SIZE = 0x1000
+
+# The machine setup allocates memory from this base, so that the input image can use its preferred base.
+# On x86, the container image must fit between this base and TEB_ADDRESS.
+MACHINE_BASE = 0x7D000000
+# The user mode addresses of the first TEB and the first PEB in 32-bit Windows.
+# x64 uses them too, because the GS base comes from a 32-bit GDT descriptor.
+TEB_ADDRESS = 0x7FFDE000
+PEB_ADDRESS = 0x7FFDF000
 
 EMU_RESERVED = 0xFEEDF000
 EMU_RESERVE_SIZE = 0x4000
+
+# Local extension: reserved sub-ranges inside EMU_RESERVED, used by the
+# emulator for dynamic import, callback and syscall bookkeeping.
 DYM_IMP_RESERVE = EMU_RESERVED + 0x1000
 EMU_CALLBACK_RESERVE = DYM_IMP_RESERVE + 0x1000
 EMU_SYSCALL_RESERVE = EMU_CALLBACK_RESERVE + 0x1000
@@ -42,9 +53,24 @@ EMU_SYSCALL_RESERVE = EMU_CALLBACK_RESERVE + 0x1000
 EMU_RESERVED_END = EMU_RESERVED + EMU_RESERVE_SIZE
 EMU_RETURN_ADDR = EMU_RESERVED
 EXIT_RETURN_ADDR = EMU_RETURN_ADDR + 1
+
+# Local extension: sentinels for SEH unwinding, guest callbacks and import hooks.
+# ``API_CALLBACK_HANDLER_ADDR`` is the pre-merge local name of upstream's
+# ``GUEST_CALLBACK_RETURN_ADDR``; both names are kept because local-only
+# modules (guest_call, winenv/api/api, tests) still import the old one.
 SEH_RETURN_ADDR = EMU_RETURN_ADDR + 4
+GUEST_CALLBACK_RETURN_ADDR = EMU_RETURN_ADDR + 8
 API_CALLBACK_HANDLER_ADDR = EMU_RETURN_ADDR + 8
+# The pre-merge local file assigned this constant twice (0xFEEDFACE, then
+# EMU_RETURN_ADDR + 12); only the final value was ever observable. Define it
+# once, with the value the emulator actually used.
 IMPORT_HOOK_ADDR = EMU_RETURN_ADDR + 12
+
+# The emulated system booted one day before emulation starts.
+START_TICK_COUNT = 24 * 60 * 60 * 1000
+
+FILETIME_EPOCH = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
+FILETIME_UNIX_EPOCH = 116444736000000000
 
 # Common blank DOS header
 DOS_HEADER = (
@@ -155,86 +181,131 @@ class ImageSectionCharacteristics(IntFlag):
     IMAGE_SCN_MEM_WRITE = 0x80000000
 
 
-def normalize_dll_name(name):
-    ret = name
+def get_filetime(when: datetime.datetime) -> int:
+    """Return a time with a time zone as a FILETIME value, in 100 ns units since 1601."""
+    return (when - FILETIME_EPOCH) // datetime.timedelta(microseconds=1) * 10
 
-    # Funnel CRTs into a single handler
-    # fixI: crtdll 是 VC4/5 时代的 CRT（= 老 MSVCRT），原先不在折叠表里，
-    # 于是 crtdll._XcptFilter / _initterm / malloc / memset ... 全部落到
-    # "无 handler" 分支（fixH 之前是 argc=0 的空操作；fixH 之后因为签名库里
-    # 也没有 CRT 内部函数，仍然拿不到参数与返回值）。
-    # 语料实测：1204 个样本里 46 个的导入表里有 crtdll，共 705 个导入函数，
-    # 其中 17+ 个 msvcrt 已经实现（_XcptFilter / _exit / _initterm / malloc /
-    # memset / free / operator new / ...）。
-    if name.lower().startswith(
-        ("api-ms-win-crt", "vcruntime", "ucrtbased", "ucrtbase", "msvcr", "msvcp", "crtdll")
-    ):
-        ret = "msvcrt"
 
-    # Redirect windows sockets 1.0 to windows sockets 2.0
-    elif name.lower().startswith(("winsock", "wsock32")):
-        ret = "ws2_32"
+def get_datetime_from_filetime(filetime: int) -> datetime.datetime:
+    """Return a FILETIME value as a time in UTC."""
+    return FILETIME_EPOCH + datetime.timedelta(microseconds=filetime // 10)
 
-    elif name.lower().startswith("api-ms-win-core"):
-        ret = "kernel32"
 
-    # fixN：API set 前向 —— 语料里出现过的 8 个未折叠名字里，只有 security-*
-    # 在 advapi32 有对应实现（AllocateAndInitializeSid / GetTokenInformation /
-    # EqualSid / FreeSid / CheckTokenMembership）。其余（eventing / power-base /
-    # devices-config / shcore-taskpool）目标模块暂无 handler，折叠与否都不影响
-    # 解析结果，故不引入"看似映射、实则无实现"的噪声。
-    elif name.lower().startswith("api-ms-win-security"):
-        ret = "advapi32"
+# DLL and API set name prefixes, and the modules that have handlers for their functions.
+# ``get_dll_hosts`` uses the first prefix that matches. When the functions of a set are in
+# more than one module, the main module is first.
+#
+# Local behavior folded into the upstream table:
+# * ``crtdll`` is a VC4/VC5-era CRT (old MSVCRT); folding it into ``msvcrt``
+#   resolves its imports (_XcptFilter, _initterm, malloc, ...) to real handlers.
+# * ``api-ms-win-security`` resolves to ``advapi32``, which implements the
+#   security API-set functions used by the samples (AllocateAndInitializeSid,
+#   GetTokenInformation, EqualSid, FreeSid, CheckTokenMembership).
+DLL_HOSTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        ("api-ms-win-crt", "api-ms-win-core-crt", "vcruntime", "ucrtbased", "ucrtbase", "msvcr", "msvcp", "crtdll"),
+        ("msvcrt",),
+    ),
+    (("winsock", "wsock32"), ("ws2_32",)),
+    (("shfolder",), ("shell32",)),
+    (("icmp",), ("iphlpapi",)),
+    (
+        ("ext-ms-win-ntuser", "ext-ms-win-rtcore-ntuser", "api-ms-win-rtcore-ntuser", "api-ms-win-ntuser-"),
+        ("user32",),
+    ),
+    (("ext-ms-win-gdi", "ext-ms-win-rtcore-gdi"), ("gdi32",)),
+    (("api-ms-win-eventing", "api-ms-win-service", "api-ms-win-security"), ("advapi32",)),
+    (("api-ms-win-shell-", "api-ms-win-core-commandlinetoargv", "ext-ms-win-shell32-"), ("shell32",)),
+    (("api-ms-win-shcore-obsolete",), ("shell32", "shlwapi")),
+    (("api-ms-win-core-shlwapi",), ("shlwapi",)),
+    (("api-ms-win-core-com-l", "ext-ms-win-com-ole32", "ext-ms-win-ole32-"), ("ole32",)),
+    (("api-ms-win-core-winrt",), ("combase",)),
+    (("api-ms-win-core-string-l2",), ("user32",)),
+    (("api-ms-win-mm-",), ("winmm",)),
+    (("api-ms-win-core-version",), ("version",)),
+    (("api-ms-win-core-processthreads",), ("kernel32", "advapi32")),
+    (("api-ms-win-core-libraryloader", "api-ms-win-core-stringansi"), ("kernel32", "user32")),
+    (("api-ms-win-core", "api-ms-win-appmodel-"), ("kernel32",)),
+    (("ext-ms-win-session-wtsapi32",), ("wtsapi32",)),
+    (("ext-ms-win-setupapi-",), ("setupapi",)),
+    (("sspicli",), ("secur32",)),
+    (("kernelbase",), ("kernelbase", "kernel32")),
+    (("ntoskrnl",), ("ntoskrnl", "msvcrt")),
+)
 
-    return ret
+
+def get_dll_hosts(name: str) -> tuple[str, ...]:
+    """
+    Get the modules that have handlers for the functions of a DLL or API set.
+
+    A DLL that is not in ``DLL_HOSTS`` has its own handlers.
+    """
+    lower = name.lower()
+    for prefixes, hosts in DLL_HOSTS:
+        if lower.startswith(prefixes):
+            return hosts
+    return (name,)
+
+
+def normalize_dll_name(name: str) -> str:
+    """Get the main module that has handlers for a DLL or API set."""
+    return get_dll_hosts(name)[0]
 
 
 class PeParseException(Exception):
+    """Local extension: parse failure surfaced by the pre-merge PE loader.
+
+    Local-only callers (``winemu``) still catch this exception alongside
+    ``pefile.PEFormatError`` and ``ValueError``, so the name is kept.
+    """
+
     pass
 
 
 class _PeParser(pefile.PE):
-    """
-    Represents PE files loaded into the emulator
-    """
+    """A pefile PE with the mapped image and the imports that the loaders read."""
 
     def __init__(self, path=None, data=None, imp_id=IMPORT_HOOK_ADDR, imp_step=4, emu_path="", fast_load=False):
-        # An explicit byte buffer must take precedence over a path. pefile
-        # otherwise reads the on-disk file and silently discards normalized
-        # in-memory headers supplied by the loader.
+        # Local extension: an explicit byte buffer must take precedence over a
+        # path. pefile otherwise reads the on-disk file and silently discards
+        # normalized in-memory headers supplied by the loader.
         parse_path = None if data is not None else path
         super().__init__(name=parse_path, data=data, fast_load=fast_load)
 
-        if 0 == self.OPTIONAL_HEADER.ImageBase:
+        if self.OPTIONAL_HEADER.ImageBase == 0:
             self.relocate_image(DEFAULT_LOAD_ADDR)
             super().__init__(name=None, data=self.write())
 
+        # Local extension: import-sentinel allocation state (see _patch_imports).
         self.imp_id = imp_id
         self.imp_step = imp_step
-        self.file_size = 0
-        self.base = self.OPTIONAL_HEADER.ImageBase
-        self.hash = self._hash_pe(path=path, data=data)
-        self.imports = self._get_pe_imports()
-        self.exports = self._get_pe_exports()
-        self.mapped_image = self.get_memory_mapped_image(max_virtual_address=0xF0000000)
-        # self.mapped_image = None
-        self.image_size = self.OPTIONAL_HEADER.SizeOfImage
-        self.import_table = {}
-        self.is_mapped = True
-        self.pe_sections = self._get_pe_sections()
-        self.ep = self.OPTIONAL_HEADER.AddressOfEntryPoint
-        self.stack_commit = self.OPTIONAL_HEADER.SizeOfStackCommit
-        self.path = ""
-        self.name = ""
+
+        self.file_size: int = 0
+        self.base: int = self.OPTIONAL_HEADER.ImageBase
+        self.hash: str = self._hash_pe(path=path, data=data)
+        self.imports: dict[int, tuple[str, str]] = self._get_pe_imports()
+        # Windows rounds SizeOfImage up to SectionAlignment, and a section can end in the rounded part.
+        alignment = self.OPTIONAL_HEADER.SectionAlignment or 1
+        self.image_size: int = -(-self.OPTIONAL_HEADER.SizeOfImage // alignment) * alignment
+        self.mapped_image: bytes = self.get_mapped_image()
+        self.ep: int = self.OPTIONAL_HEADER.AddressOfEntryPoint
+        self.stack_commit: int = self.OPTIONAL_HEADER.SizeOfStackCommit
+        self.path: str = ""
+        self.name: str = ""
         if path:
             self.path = os.path.abspath(path)
-        self.emu_path = emu_path
-        self.arch = self._get_architecture()
+        self.emu_path: str = emu_path
+        self.arch: int = self._get_architecture()
         if self.arch == _arch.ARCH_X86:
-            self.ptr_size = 4
+            self.ptr_size: int = 4
         else:
             self.ptr_size = 8
 
+        # Local extensions: decoy/synthesized module and import-hook contracts.
+        self.exports: list = self._get_pe_exports()
+        self.import_table: dict[int, tuple[str, str]] = {}
+        self.is_mapped = True
+        self.pe_sections = self._get_pe_sections()
         self._patch_imports()
 
     def get_tls_callbacks(self):
@@ -336,10 +407,9 @@ class _PeParser(pefile.PE):
         magic = self.OPTIONAL_HEADER.Magic
         if magic & ddk.PE32_BIT:
             return _arch.ARCH_X86
-        elif magic & ddk.PE32_PLUS_BIT:
+        if magic & ddk.PE32_PLUS_BIT:
             return _arch.ARCH_AMD64
-        else:
-            raise ValueError(f"Unsupported architecture: 0x{magic:x}")
+        raise ValueError(f"Unsupported architecture: 0x{magic:x}")
 
     def _patch_imports(self):
         """
@@ -353,12 +423,9 @@ class _PeParser(pefile.PE):
         if not self.mapped_image:
             raise ValueError("PE image has not been mapped yet")
 
-        # fixP：旧实现对**每一个 import** 都复制一整张镜像
-        # （`tmp = bytearray(self.mapped_image)` → `self.mapped_image = bytes(tmp)`），
-        # 复杂度 O(导入数 × SizeOfImage)。大镜像样本因此加载极慢：
-        # 实测 04e004f9173e（SizeOfImage 214 MB、584 个导入）加载要 320 s，
-        # 04e004f9 这类样本在 1204 批里表现为"启动超时/0 调用"。
-        # 改成只建一次 bytearray、循环结束后统一写回 —— 语义完全等价。
+        # Local extension: the pre-merge implementation copied the whole image
+        # once per import (O(imports * SizeOfImage), which timed out on large
+        # images). One bytearray, written back after the loop, is equivalent.
         tmp = bytearray(self.mapped_image)
         for addr, imp in self.imports.items():
             offset = addr - self.base
@@ -384,8 +451,7 @@ class _PeParser(pefile.PE):
 
     def get_base_name(self):
         fn = os.path.basename(self.path)
-        bn = os.path.splitext(fn)[0]
-        return bn
+        return os.path.splitext(fn)[0]
 
     def is_decoy(self):
         return False
@@ -405,17 +471,45 @@ class _PeParser(pefile.PE):
             return True
 
     def is_dotnet(self):
-        """
-        Is the current PE file a .NET assembly?
-        """
-        for addr, imp in self.imports.items():
-            dll, func = imp
+        """Test whether the PE imports a .NET entry point or has a CLR header (data directory 14)."""
+        for dll, func in self.imports.values():
             if dll == "mscoree" and func in ["_CorExeMain", "_CorDllMain"]:
                 return True
-        return False
+        directories = self.OPTIONAL_HEADER.DATA_DIRECTORY
+        return len(directories) > 14 and bool(directories[14].VirtualAddress and directories[14].Size)
 
     def has_reloc_table(self):
         return len(self.OPTIONAL_HEADER.DATA_DIRECTORY) >= 6 and self.OPTIONAL_HEADER.DATA_DIRECTORY[5].Size > 0
+
+    def get_mapped_image(self) -> bytes:
+        """
+        Return the image with each section at its virtual address.
+
+        pefile ``get_memory_mapped_image`` leaves out a section whose raw data goes past the end of the
+        file. Windows maps the bytes that the file has and fills the rest with zeros, so this method
+        keeps the bytes that the file has.
+
+        pefile ``PE.header`` stops at the end of the section table when the raw data of a section starts
+        in the header. Windows maps the first SizeOfHeaders bytes of the file, so this method starts the
+        image with these bytes.
+        """
+        data = self.__data__
+        alignment = self.OPTIONAL_HEADER.SectionAlignment
+        file_alignment = self.OPTIONAL_HEADER.FileAlignment
+        mapped = bytearray(data[: self.OPTIONAL_HEADER.SizeOfHeaders])
+        for section in self.sections:
+            if section.Misc_VirtualSize == 0 and section.SizeOfRawData == 0:
+                continue
+            offset = self.adjust_PointerToRawData(section.PointerToRawData)
+            address = self.adjust_SectionAlignment(section.VirtualAddress, alignment, file_alignment)
+            if offset > len(data) or address >= 0xF0000000:
+                continue
+            if address > len(mapped):
+                mapped.extend(bytes(address - len(mapped)))
+            else:
+                del mapped[address:]
+            mapped += section.get_data()
+        return bytes(mapped[: self.image_size])
 
     def rebase(self, to):
         self.relocate_image(to)
@@ -423,15 +517,14 @@ class _PeParser(pefile.PE):
         self.base = to
         self.ep = self.OPTIONAL_HEADER.AddressOfEntryPoint
 
-        # After relocation, generate a new memory mapped image
-        self.mapped_image = self.get_memory_mapped_image(max_virtual_address=0xF0000000)
+        self.mapped_image = self.get_mapped_image()
 
+        # Local extensions: refresh the parsed views and re-patch the import
+        # slots at the new base, as the pre-merge implementation did.
         self.pe_sections = self._get_pe_sections()
         self.imports = self._get_pe_imports()
         self.exports = self._get_pe_exports()
         self._patch_imports()
-
-        return
 
 
 class JitPeFile:

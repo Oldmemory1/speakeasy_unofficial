@@ -7,6 +7,7 @@ from pathlib import Path
 from types import ModuleType
 
 from speakeasy import Speakeasy
+from speakeasy.winenv.defs.enums import REG_VALUE_TYPE
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = ROOT_DIR / "examples"
@@ -50,17 +51,16 @@ def test_emu_dll_example_exercises_hooks(config, load_test_bin, caplog):
     example = load_example_module("emu_dll")
     caplog.set_level(logging.INFO, logger=example.logger.name)
 
+    config["runs"] = {"exports": False}
     se = Speakeasy(config=config)
     try:
         module = se.load_module(data=load_test_bin("dll_test_x86.dll.xz"))
-        se.run_module(module, all_entrypoints=False)
+        se.run_module(module)
         se.add_api_hook(example.hook_messagebox, "user32", "MessageBox*")
         se.add_mem_write_hook(example.hook_mem_write)
 
         for export in module.get_exports():
-            if export.name == "emu_test_one":
-                se.call(export.address, [0x0, 0x1])
-            elif export.name == "emu_test_two":
+            if export.name in ("emu_test_one", "emu_test_two"):
                 se.call(export.address, [0x0, 0x1])
 
         report = se.get_report()
@@ -70,9 +70,9 @@ def test_emu_dll_example_exercises_hooks(config, load_test_bin, caplog):
     assert any(message.startswith("Stack written to:") for message in caplog.messages)
     assert "user32.MessageBoxA text: Inside emu_test_one" in caplog.messages
     assert "user32.MessageBoxW text: Inside emu_test_two" in caplog.messages
-    assert len(report.entry_points) == 3
-    assert report.entry_points[1].ret_val == 0x41414141
-    assert report.entry_points[2].ret_val == 0x42424242
+    assert len(report.runs) == 3
+    assert report.runs[1].return_value == 0x41414141
+    assert report.runs[2].return_value == 0x42424242
 
 
 def test_emu_exe_example_modifies_ntreadfile_buffer(config, load_test_bin, caplog):
@@ -90,11 +90,9 @@ def test_emu_exe_example_modifies_ntreadfile_buffer(config, load_test_bin, caplo
 
     assert any(message.startswith("b'") and "\\x90" in message for message in caplog.messages)
     printfs = [
-        event
-        for event in report.entry_points[0].events or []
-        if event.event == "api" and "__stdio_common_vfprintf" in event.api_name
+        event for event in report.runs[0].events if event.event == "api" and "__stdio_common_vfprintf" in event.api_name
     ]
-    assert printfs[-1].args[2].strip() == "File contained: 0x4141414141414141"
+    assert printfs[-1].args[2].display.strip() == "File contained: 0x4141414141414141"
 
 
 def test_upx_unpack_example_runs_and_dumps_file(tmp_path):
@@ -131,7 +129,7 @@ def test_usb_emu_example_runs_and_emits_report(load_test_bin):
         module = usb.load_module(data=load_test_bin("wdm_test_x86.sys.xz"))
         usb.run_module(module)
         param_key = usb.get_registry_key(path="HKLM\\System\\CurrentControlSet\\Services\\*\\Parameters")
-        param_key.create_value("MaximumTransferSize", example.reg.REG_DWORD, 65536)
+        param_key.create_value("MaximumTransferSize", REG_VALUE_TYPE.REG_DWORD, 65536)
         report = json.loads(usb.get_json_report())
     finally:
         usb.shutdown()
@@ -140,5 +138,5 @@ def test_usb_emu_example_runs_and_emits_report(load_test_bin):
     assert usb.ddesc.idVendor == 0x0547
     assert [endpoint.bEndpointAddress for endpoint in usb.endpoints] == [0x81, 0x06, 0x88]
     assert param_key.get_value("MaximumTransferSize").get_data() == 65536
-    assert report["entry_points"]
-    assert report["entry_points"][0]["ep_type"] == "entry_point"
+    assert report["runs"]
+    assert report["runs"][0]["type"] == "driver_entry"

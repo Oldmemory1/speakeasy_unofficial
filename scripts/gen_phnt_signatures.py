@@ -53,7 +53,16 @@ SKIP_HEADERS = {"phnt.h", "ntintsafe.h", "ntstrsafe.h", "nttypesafe.h"}
 # services are also ntoskrnl exports; speakeasy matches those by name).
 DLL = "ntdll"
 
-# C / Windows SDK scalar types -> type code. Pointer-sized integers are "p".
+# Curated restrictions verified in deps/phnt/ntrtl.h's _WIN64 blocks.
+# This parser does not preprocess architecture guards; other declarations
+# remain unrestricted unless explicitly curated here.
+FUNCTION_ARCHITECTURES = {
+    "RtlWow64GetThreadContext": ("x64",),
+    "RtlWow64SetThreadContext": ("x64",),
+    "RtlGetFunctionTableListHead": ("x64",),
+}
+
+# C / Windows SDK scalar types -> type code. Pointer-sized integers are "ip" and "up".
 BASE_TYPES: dict[str, str] = {
     "VOID": "v",
     "void": "v",
@@ -97,23 +106,23 @@ BASE_TYPES: dict[str, str] = {
     "UINT64": "u64",
     "DWORD64": "u64",
     "DWORDLONG": "u64",
-    "ULONG_PTR": "p",
-    "LONG_PTR": "p",
-    "DWORD_PTR": "p",
-    "SIZE_T": "p",
-    "SSIZE_T": "p",
-    "UINT_PTR": "p",
-    "INT_PTR": "p",
-    "KAFFINITY": "p",
-    "KSPIN_LOCK": "p",
-    "size_t": "p",
+    "ULONG_PTR": "up",
+    "LONG_PTR": "ip",
+    "DWORD_PTR": "up",
+    "SIZE_T": "up",
+    "SSIZE_T": "ip",
+    "UINT_PTR": "up",
+    "INT_PTR": "ip",
+    "KAFFINITY": "up",
+    "KSPIN_LOCK": "up",
+    "size_t": "up",
     "HANDLE": "h",
     "HMODULE": "h",
     "HINSTANCE": "h",
     "HKEY": "h",
     "HWND": "h",
     "HDC": "h",
-    "HANDLE_PTR": "p",
+    "HANDLE_PTR": "h",
     "PVOID": "p",
     "LPVOID": "p",
     "PCVOID": "p",
@@ -183,9 +192,9 @@ BASE_TYPES: dict[str, str] = {
     "HKL": "h",
     "ATOM": "u16",
     "COLORREF": "u32",
-    "LPARAM": "p",
-    "WPARAM": "p",
-    "LRESULT": "p",
+    "LPARAM": "ip",
+    "WPARAM": "up",
+    "LRESULT": "ip",
     "HGDIOBJ": "h",
     "HBRUSH": "h",
     "HFONT": "h",
@@ -330,8 +339,7 @@ class UnsupportedType(Exception):
 def strip_comments(text: str) -> str:
     text = text.replace("\r\n", "\n")
     text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
-    text = re.sub(r"//[^\n]*", "", text)
-    return text
+    return re.sub(r"//[^\n]*", "", text)
 
 
 def split_top_level(text: str, sep: str = ",") -> list[str]:
@@ -486,7 +494,7 @@ class TypeTable:
         else:
             base = self._resolve_name(words[0], depth)
         for _ in range(stars):
-            base = _pointer_to(base)
+            base = _pointer_to(base, words[0])
         return base
 
     def _resolve_name(self, name: str, depth: int) -> str:
@@ -516,7 +524,7 @@ class TypeTable:
                     or rest in self.aliases
                     or rest in SDK_SCALARS
                 ):
-                    return _pointer_to(self._resolve_name(rest, depth + 1))
+                    return _pointer_to(self._resolve_name(rest, depth + 1), rest)
                 if _looks_like_struct_name(rest):
                     # pointer to a Windows SDK struct phnt does not define itself
                     return f"ps:{rest}"
@@ -533,15 +541,20 @@ def _looks_like_struct_name(name: str) -> bool:
     return name.isupper() and "_" in name and not name.startswith("P_")
 
 
-def _pointer_to(code: str) -> str:
+def _pointer_to(code: str, name: str | None = None) -> str:
+    """Get the code of a pointer to ``code``. ``name`` is the C type name of the target, if known."""
     kind = code.split(":", 1)[0]
     if kind == "st":
         return "ps:" + code.split(":", 2)[1]
     if code == "v":
         return "p"
-    if code in ("u8", "i8"):
+    if code == "i8":
         return "s"
-    if code == "u16":
+    if code == "u8":
+        # UCHAR and BYTE pointers are binary buffers
+        return "a:u8"
+    if code == "u16" and name == "WCHAR":
+        # USHORT is also u16, but only a WCHAR pointer is a string
         return "S"
     return f"p:{code}"
 
@@ -601,7 +614,8 @@ def eval_const(expr: str, env: dict[str, int]) -> int:
         else:
             py.append(t)
     try:
-        return int(eval("".join(py), {"__builtins__": {}}, {}))  # noqa: S307 - tokens are validated above
+        # eval is safe here, because the tokens are validated above
+        return int(eval("".join(py), {"__builtins__": {}}, {}))
     except Exception as e:
         raise ValueError(expr) from e
 
@@ -670,7 +684,7 @@ PROTOTYPE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\s*$", re.M)
 
 
 def iter_prototypes(text: str) -> Iterator[tuple[list[str], str, str]]:
-    """Yield (prefix_lines, name, params_text) for each ``Name(\\n...)`` block."""
+    r"""Yield (prefix_lines, name, params_text) for each ``Name(\n...)`` block."""
     for m in PROTOTYPE.finditer(text):
         name = m.group(1)
         close = text.find(");", m.end())
@@ -789,12 +803,14 @@ def generate(phnt_root: str) -> tuple[dict, collections.Counter]:
     table: dict[str, list[dict]] = collections.defaultdict(list)
     stats: collections.Counter = collections.Counter()
     reasons: collections.Counter = collections.Counter()
-    for header, text in headers.items():
+    for text in headers.values():
         for prefix, name, params in iter_prototypes(text):
             entry = parse_prototype(prefix, name, params, types)
             if entry is None:
                 stats["ignored"] += 1
                 continue
+            if name in FUNCTION_ARCHITECTURES:
+                entry["arch"] = list(FUNCTION_ARCHITECTURES[name])
             if any(e == entry for e in table[name]):
                 stats["duplicates"] += 1
                 continue
@@ -850,9 +866,8 @@ def generate(phnt_root: str) -> tuple[dict, collections.Counter]:
 def write_output(doc: dict, output: str) -> int:
     os.makedirs(os.path.dirname(output), exist_ok=True)
     raw = json.dumps(doc, separators=(",", ":")).encode("utf-8")
-    with open(output, "wb") as f:
-        with gzip.GzipFile(filename="", fileobj=f, mode="wb", mtime=0) as gz:
-            gz.write(raw)
+    with open(output, "wb") as f, gzip.GzipFile(filename="", fileobj=f, mode="wb", mtime=0) as gz:
+        gz.write(raw)
     return len(raw)
 
 

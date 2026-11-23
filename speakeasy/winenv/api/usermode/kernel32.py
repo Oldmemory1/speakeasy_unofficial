@@ -7,63 +7,73 @@ import ntpath
 import os
 import string
 import struct
-import time
+import zlib
+from typing import TYPE_CHECKING, Any
 
-import speakeasy.common as common
 import speakeasy.windows.common as winemu
 import speakeasy.winenv.arch as e_arch
-import speakeasy.winenv.defs.nt.ddk as ddk
-import speakeasy.winenv.defs.windows.kernel32 as k32types
+import speakeasy.winenv.defs.windows.kernel32 as k32defs
 import speakeasy.winenv.defs.windows.windows as windefs
-from speakeasy.errors import ApiEmuError
-from speakeasy.profiler_events import (
-    FILE_CREATE,
-    FILE_READ,
-    FILE_WRITE,
-    MEM_ALLOC,
-    MEM_FREE,
-    MEM_PROTECT,
-    MEM_READ,
-    MEM_WRITE,
-    PROC_CREATE,
-    THREAD_CREATE,
-    THREAD_INJECT,
-)
+from speakeasy import common
+from speakeasy.errors import ApiEmuError, FileSystemEmuError, OutOfMemoryError, WindowsEmuError
+from speakeasy.profiler_events import EventType
 from speakeasy.windows import (
     api_diagnostics,
     api_trace_diagnostics,
+    fileman,
     module_trace_diagnostics,
+    objman,
     page_trace_diagnostics,
+    seh,
+    thread_context,
 )
+from speakeasy.windows.api_registry import module_name
 from speakeasy.windows.child_execution import ChildTargetResolver
-from speakeasy.windows.objman import Process
-from speakeasy.windows.os_capabilities import (
-    WindowsOsVersion,
-    processor_feature_override,
-)
-from speakeasy.windows.page_protection import (
-    apply_page_protection,
-    emu_perms_to_win_protect,
-    win_protect_to_emu_perms,
-)
+from speakeasy.windows.guest_callbacks import GuestCall
+from speakeasy.windows.handles import HandleTable
+from speakeasy.windows.loaders import PeLoader, get_prot_string
+from speakeasy.windows.os_capabilities import WindowsOsVersion, processor_feature_override
+from speakeasy.windows.page_protection import apply_page_protection
 from speakeasy.windows.process_memory import (
     ERROR_NOACCESS,
     ERROR_PARTIAL_COPY,
     ProcessMemoryError,
     write_current_process_memory,
 )
+from speakeasy.winenv import codepage
+from speakeasy.winenv.defs.enums import (
+    COMPUTER_NAME_FORMAT,
+    CREATE_TOOLHELP_SNAPSHOT_FLAGS,
+    FILE_ACCESS_FLAGS,
+    FILE_CREATION_DISPOSITION,
+    GET_FILEEX_INFO_LEVELS,
+    LCTYPE,
+    PAGE_PROTECTION_FLAGS,
+    PROCESS_CREATION_FLAGS,
+    THREAD_CREATION_FLAGS,
+)
+from speakeasy.winenv.defs.lookup import decode, decode_flags
+from speakeasy.winenv.defs.nt import ddk
+from speakeasy.winenv.defs.windows import com as comdefs
+from speakeasy.winenv.defs.windows.kernel32 import LCID
 
 from .. import api
+from ..compare import Fold, get_string_order
+from ..exception_apis import ExceptionApis
+from . import shlwapi
 from .pseudo_handles import is_current_process_pseudo_handle
+
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = 0x1000
 LANG_EN_US = 0x409
-LOCALE_USER_DEFAULT = 0x400
-LOCALE_SYSTEM_DEFAULT = 0x0800
+NORM_IGNORECASE = 0x1
+MOVEFILE_REPLACE_EXISTING = 0x1
+MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
 
-SEC_IMAGE = 0x1000000
+DUPLICATE_CLOSE_SOURCE = 0x1
 
 FILE_MAP_COPY = 0x0001
 FILE_MAP_WRITE = 0x0002
@@ -71,9 +81,100 @@ FILE_MAP_READ = 0x0004
 FILE_MAP_EXECUTE = 0x0020
 FILE_MAP_ALL_ACCESS = 0xF001F
 
-FILE_BEGIN = 0
-FILE_CURRENT = 1
-FILE_END = 2
+IMAGE_FILE_LARGE_ADDRESS_AWARE = 0x0020
+
+# TLS_MINIMUM_AVAILABLE + TLS_EXPANSION_SLOTS
+TLS_SLOT_COUNT = 64 + 1024
+
+# Unicorn counts host nanoseconds in the time stamp counter, as a 1 GHz processor would
+TSC_FREQUENCY = 1_000_000_000
+
+PROCESSOR_COUNT = 2
+ALL_PROCESSOR_GROUPS = 0xFFFF
+
+APPMODEL_ERROR_NO_PACKAGE = 15700
+
+PATHCCH_MAX_CCH = 0x8000
+
+ERROR_BAD_ARGUMENTS = 160
+ERROR_OLD_WIN_VERSION = 1150
+
+FILE_NAME_OPENED = 0x8
+VOLUME_NAME_DOS = 0x0
+VOLUME_NAME_GUID = 0x1
+VOLUME_NAME_NT = 0x2
+VOLUME_NAME_NONE = 0x4
+VOLUME_NAME_MASK = 0x7
+
+VER_MINORVERSION = 0x1
+VER_MAJORVERSION = 0x2
+VER_BUILDNUMBER = 0x4
+VER_PLATFORMID = 0x8
+VER_SERVICEPACKMINOR = 0x10
+VER_SERVICEPACKMAJOR = 0x20
+VER_PRODUCT_TYPE = 0x80
+VER_CONDITION_MASK = 0x7
+VER_COMPARE = {
+    1: lambda a, b: a == b,
+    2: lambda a, b: a > b,
+    3: lambda a, b: a >= b,
+    4: lambda a, b: a < b,
+    5: lambda a, b: a <= b,
+}
+SERVICE_PACK_BUILDS = {6001: 1, 6002: 2, 7601: 1}
+
+JobObjectBasicAccountingInformation = 1
+JobObjectBasicLimitInformation = 2
+JobObjectExtendedLimitInformation = 9
+
+ACPI_PROVIDER = 0x41435049
+FIRM_PROVIDER = 0x4649524D
+RSMB_PROVIDER = 0x52534D42
+
+VOLUME_SERIAL_NUMBER = 0x6C2E1F4A
+
+
+def get_smbios_structure(kind: int, handle: int, formatted: bytes, strings: list[str]) -> bytes:
+    header = struct.pack("<BBH", kind, 4 + len(formatted), handle)
+    text = b"".join(s.encode("ascii") + b"\x00" for s in strings) or b"\x00"
+    return header + formatted + text + b"\x00"
+
+
+def get_raw_smbios_data() -> bytes:
+    bios = get_smbios_structure(
+        0, 0, struct.pack("<BBHBBQ", 1, 2, 0xF000, 3, 0xFF, 0x08), ["Dell Inc.", "1.20.0", "03/14/2023"]
+    )
+    uuid = bytes.fromhex("4c4c4544004a3510804bb4c04f4e4433")
+    system = get_smbios_structure(
+        1,
+        1,
+        struct.pack("<BBBB16sBBB", 1, 2, 3, 4, uuid, 6, 5, 6),
+        ["Dell Inc.", "OptiPlex 7090", "1.0", "7J5D3N3", "0A6F", "OptiPlex"],
+    )
+    caches = b"".join(
+        get_smbios_structure(
+            7,
+            0x0700 + level - 1,
+            struct.pack(
+                "<BHHHHHBBBBII", 1, config, size_kb, size_kb, 0x20, 0x20, 0, ecc, cache_type, ways, size_kb, size_kb
+            ),
+            [f"L{level} Cache"],
+        )
+        for level, config, size_kb, ecc, cache_type, ways in [
+            (1, 0x0180, 384, 4, 4, 9),
+            (2, 0x0181, 4096, 5, 5, 7),
+            (3, 0x0182, 16384, 5, 5, 8),
+        ]
+    )
+    end = get_smbios_structure(127, 0xFFFF, b"", [])
+    tables = bios + system + caches + end
+    return struct.pack("<BBBBI", 0, 3, 3, 0, len(tables)) + tables
+
+
+def is_same_res_identifier(a: int | str, b: int | str) -> bool:
+    """Compare two resource types or names as Windows does: integer IDs by value, strings without case."""
+    return a == b if isinstance(a, int) else isinstance(b, str) and a.upper() == b.upper()
+
 
 # CRITICAL_SECTION contract (winnt.h RTL_CRITICAL_SECTION). LockCount == -1
 # means the structure is unlocked. SpinCount is ULONG_PTR sized.
@@ -97,40 +198,6 @@ _CRITICAL_SECTION_LAYOUTS = {
         "spin_count": 0x20,
         "size": 0x28,
     },
-}
-
-# FormatMessage flags documented in winbase.h.
-FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100
-FORMAT_MESSAGE_IGNORE_INSERTS = 0x00000200
-FORMAT_MESSAGE_FROM_STRING = 0x00000400
-FORMAT_MESSAGE_FROM_HMODULE = 0x00000800
-FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000
-FORMAT_MESSAGE_ARGUMENT_ARRAY = 0x00002000
-ERROR_MR_UNKNOWN = 317
-
-# Minimal English system-message table. Message id 0 is the error code the
-# PyInstaller bootloader reads through GetLastError() on its error-printing
-# path; Windows defines it and FormatMessageW must succeed for it.
-_FORMAT_MESSAGE_TEXTS = {
-    0: "The operation completed successfully.\r\n",
-    1: "Incorrect function.\r\n",
-    2: "The system cannot find the file specified.\r\n",
-    3: "The system cannot find the path specified.\r\n",
-    5: "Access is denied.\r\n",
-    6: "The handle is invalid.\r\n",
-    8: "Not enough memory resources are available to process this command.\r\n",
-    13: "The data is invalid.\r\n",
-    14: "Not enough memory resources are available to complete this operation.\r\n",
-    18: "There are no more files.\r\n",
-    87: "The parameter is incorrect.\r\n",
-    109: "The pipe has been ended.\r\n",
-    122: "The data area passed to a system call is too small.\r\n",
-    126: "The specified module could not be found.\r\n",
-    127: "The specified procedure could not be found.\r\n",
-    183: "Cannot create a file when that file already exists.\r\n",
-    193: "%1 is not a valid Win32 application.\r\n",
-    998: "Invalid access to memory location.\r\n",
-    1400: "Invalid window handle.\r\n",
 }
 
 
@@ -176,7 +243,117 @@ def _winexec_failure_code(reason: str | None) -> int:
     return 0
 
 
-class Kernel32(api.ApiHandler):
+def _ctx_func_name(ctx: Any) -> str | None:
+    """Return the API name of a handler context, whether it is a dict or an ApiContext."""
+    if isinstance(ctx, dict):
+        name = ctx.get("func_name")
+    else:
+        name = getattr(ctx, "func_name", None)
+    return name if isinstance(name, str) and name else None
+
+
+def _char_width(handler: Any, ctx: Any) -> int:
+    """Return 1 for an ANSI API or 2 for a W-suffixed API from its context.
+
+    The context name decides the width for an ``ApiContext`` and for the plain
+    dict context that the handler contract tests pass; an unnamed context
+    falls back to the handler's own ``get_char_width`` (ANSI on error).
+    """
+    name = _ctx_func_name(ctx)
+    if name is not None:
+        return 2 if name.endswith("W") else 1
+    try:
+        return handler.get_char_width(ctx)
+    except Exception:
+        return 1
+
+
+def _set_arg_display(ctx: Any, key: int | str, value: Any) -> None:
+    """Render one API argument in the report without requiring an ApiContext.
+
+    Handlers are also called directly (and with a plain dict context) from the
+    handler contract tests; a missing argument table must never change the
+    handler result.
+    """
+    args = getattr(ctx, "args", None)
+    if args is None:
+        return
+    try:
+        args[key].display = value
+    except Exception:
+        logger.debug("kernel32: argument display failed", exc_info=True)
+
+
+def _set_observation(ctx: Any, observation: Any, *, merge_key: str | None = None) -> None:
+    """Attach an FX observation to an ``ApiContext`` handler context.
+
+    The diagnostics modules attach observations to dict contexts; the emulator
+    passes an ``ApiContext`` instance, which the v2.1.0 API event path reads
+    with ``getattr(ctx, "_api_observation", None)``. Nested traces keep the
+    semantics of the dict path (an existing observation is preserved).
+    """
+    if not isinstance(observation, dict) or isinstance(ctx, dict) or ctx is None:
+        return
+    if ctx is api.NO_CONTEXT:
+        # The shared no-context sentinel is not a per-call report context.
+        return
+    try:
+        existing = getattr(ctx, "_api_observation", None)
+        if merge_key and isinstance(existing, dict):
+            existing[merge_key] = observation
+        else:
+            setattr(ctx, "_api_observation", observation)
+    except Exception:
+        logger.debug("kernel32: diagnostic observation attachment failed", exc_info=True)
+
+
+def _scatter_observation(ctx: Any, attach, builder) -> None:
+    """Attach a scatter/FX-015 observation through its diagnostics module.
+
+    ``attach`` is the module's public ``attach_observation`` (dict contexts).
+    The ApiContext path evaluates the same public builder and stores the
+    result on the context, because the module helper is dict-only.
+    """
+    if isinstance(ctx, dict):
+        attach(ctx, builder)
+        return
+    if ctx is None or ctx is api.NO_CONTEXT:
+        return
+    try:
+        observation = builder()
+    except Exception:
+        logger.debug("kernel32: scatter observation builder failed", exc_info=True)
+        return
+    _set_observation(ctx, observation)
+
+
+def _file_mapping(emu: Any, handle: Any):
+    """Return the file mapping object of a mapping handle.
+
+    The v2.1.0 file manager exposes ``get_mapping``; the handler contract tests
+    use the local ``get_mapping_from_handle`` spelling, so both are accepted.
+    """
+    fman = emu.get_file_manager()
+    getter = getattr(fman, "get_mapping", None)
+    if not callable(getter):
+        getter = getattr(fman, "get_mapping_from_handle", None)
+    if not callable(getter):
+        return None
+    return getter(handle)
+
+
+class Snapshot:
+    """Represents a toolhelp snapshot: the process, thread and module lists and the read index of each."""
+
+    def __init__(self, lists):
+        self.lists: dict[int, list[Any]] = lists
+
+
+class IoCompletionPort:
+    """Represents an I/O completion port. No I/O completes on it."""
+
+
+class Kernel32(ExceptionApis, api.ApiHandler):
     """
     Implements exported functions from kernel32.dll
     """
@@ -191,23 +368,80 @@ class Kernel32(api.ApiHandler):
         self.funcs = {}
         self.data = {}
 
-        self.heaps = []
-        self.curr_local_atom = 0xC000
-        self.local_atom_table = {}
-        self.curr_handle = 0x1800
-        self.find_files = {}
-        self.find_volumes = {}
-        self.snapshots = {}
-        self.tick_counter = 86400000  # 1 day in millisecs
-        self.perf_counter = 0x5FD27D571F
+        self.heaps: list[int] = []
+        self.curr_local_atom: int = 0xC000
+        self.local_atom_table: dict[int, tuple[str, int]] = {}
+        # Find handles are not kernel objects, so CloseHandle does not close them
+        self.find_files: HandleTable = HandleTable(emu.handle_allocator, release=lambda obj: None)
+        self.find_volumes: HandleTable = HandleTable(emu.handle_allocator, release=lambda obj: None)
+        self.tls_count: int = 0
+        self.fls_count: int = 0
+        self.tick_counter: int = winemu.START_TICK_COUNT
+        self.perf_base: int = 0x5FD27D571F - self.tick_counter * 10000
+        self.start_time: int = emu.start_time
+        self.boot_time: int = self.start_time - self.tick_counter * 10000
 
-        self.command_lines = [None] * 3
-        self.startup_info = {}
+        self.startup_info: dict[tuple[objman.Process, int], list[int]] = {}
         self._process_user_mode_exception_policy = 0
 
-        self.k32types = k32types
+        self.k32types = k32defs
 
         super().__get_hook_attrs__(self)
+
+    def get_tick_count(self):
+        """
+        Advance the tick count by 1 ms and return it.
+        """
+        self.advance_tick_count(1)
+        return self.tick_counter
+
+    def get_system_time(self):
+        """
+        Advance the tick count by 1 ms and return the system time as a FILETIME value.
+        """
+        return self.boot_time + self.get_tick_count() * 10000
+
+    def get_local_time(self) -> datetime.datetime:
+        """
+        Advance the tick count by 1 ms and return the local time.
+        The time zone that GetTimeZoneInformation reports has no bias.
+        """
+        return winemu.get_datetime_from_filetime(self.get_system_time())
+
+    def get_performance_counter(self):
+        """
+        Advance the tick count by 1 ms and return the performance counter, which counts 100 ns units.
+        """
+        self.advance_tick_count(1)
+        return self.perf_base + self.tick_counter * 10000
+
+    def advance_tick_count(self, millisec):
+        """
+        Move the tick count, the system time and the performance counter forward, and write the new time to
+        KUSER_SHARED_DATA.
+        """
+        self.tick_counter += millisec
+        self.emu.update_user_shared_time(self.tick_counter)
+
+    def advance_clock(self, millisec):
+        """
+        Move the tick count, the system time, the performance counter and the time stamp counter forward.
+        """
+        self.advance_tick_count(millisec)
+        self.emu.emu_eng.advance_tsc(millisec * TSC_FREQUENCY // 1000)
+
+    def get_system_time_struct(self, quad):
+        st = self.k32types.SYSTEMTIME(self.emu.get_ptr_size())
+        dt = winemu.get_datetime_from_filetime(quad)
+        st.wYear = dt.year
+        st.wMonth = dt.month
+        st.wDayOfWeek = dt.isoweekday() % 7
+        st.wDay = dt.day
+        st.wHour = dt.hour
+        st.wMinute = dt.minute
+        st.wSecond = dt.second
+        st.wMilliseconds = quad // 10000 % 1000
+        return st
 
     def add_local_atom(self, s):
         atom, cnt = self.get_local_atom(s)
@@ -232,7 +466,7 @@ class Kernel32(api.ApiHandler):
 
     # gets atom and its reference count
     def get_local_atom(self, s):
-        atom = None, None
+        atom: tuple[int | None, int | None] = None, None
         for k, v in self.local_atom_table.items():
             if v[0].lower() == s.lower():
                 atom = k, v[1]
@@ -256,23 +490,41 @@ class Kernel32(api.ApiHandler):
     def get_local_atom_name(self, atom):
         return self.local_atom_table.get(atom, (None, None))[0]
 
-    def get_handle(self):
-        self.curr_handle += 4
-        return self.curr_handle
+    def get_snapshot(self, emu, handle) -> dict[int, list[Any]] | None:
+        """Get the lists of an open snapshot handle, or None if the handle does not refer to a snapshot."""
+        snapshot = emu.get_handle_table().get(handle, Snapshot)
+        return None if snapshot is None else snapshot.lists
+
+    def is_std_handle(self, emu, handle):
+        """
+        Test if a handle is one of the standard handles of the current process and has no object.
+
+        SetStdHandle can make an open handle a standard handle, and that handle still refers to its
+        object.
+        """
+        proc = emu.get_current_process()
+        return (
+            proc is not None
+            and handle in (proc.stdin, proc.stdout, proc.stderr)
+            and handle not in emu.get_handle_table()
+        )
 
     def create_heap(self, emu):
-        heap = self.mem_alloc(20, tag="emu.process_heap")
-
+        heap = super().create_heap(emu)
         self.heaps.append(heap)
         return heap
 
-    def win_perms_to_emu_perms(self, win_perms):
-        """Convert a Win32 PAGE_* protection to emulator permissions."""
-        return win_protect_to_emu_perms(win_perms)
+    def _get_process_handle_table(self, emu, hProcess):
+        """Get the handle table of the process of a process handle, or None if the handle refers to no process."""
+        proc = emu.get_handle_table().get(hProcess, objman.Process)
+        if proc is None:
+            return None
+        if proc is emu.get_current_process():
+            return emu.get_handle_table()
+        return proc.handles
 
-    def emu_perms_to_win_perms(self, emu_perms):
-        """Convert emulator permissions to a Win32 PAGE_* protection."""
-        return emu_perms_to_win_protect(emu_perms)
+    def get_max_application_address(self, emu):
+        return 0x7FFEFFFF if emu.get_ptr_size() == 4 else 0x7FFFFFFEFFFF
 
     def map_view_access_to_emu_perms(self, desired_access, mapping_protect):
         perms = 0
@@ -291,125 +543,107 @@ class Kernel32(api.ApiHandler):
 
         return perms
 
-    def normalize_res_identifier(self, emu, cw, val):
-        mask = (16 ** (emu.get_ptr_size() // 2) - 1) << 16
-        if val & mask:  # not an INTRESOURCE
-            name = emu.read_mem_string(val, cw)
-            if name[0] == "#":
-                try:
-                    name = int(name[1:])
-                except Exception:
-                    return 0
-        else:
-            name = val
-
-        return name
-
     def find_resource(self, pe, name, type_):
         pe_metadata = pe.get_pe_metadata()
         if not pe_metadata:
             return None
 
-        # The logic here changes to use pe_metadata.resources list
-        # We need to filter by type, then name/id.
-
-        candidates = []
-
-        # Normalize type_
-        target_type = str(type_) if isinstance(type_, int) else type_
-
-        # Find resources matching type
         for res in pe_metadata.resources:
-            # Check type
-            # pefile types can be int or string. PeMetadata stores them as stored in PE.
-            # Compare normalized as string if possible or int.
-
-            # Simple matching for now:
-            is_match = False
-            if str(res.type_id) == str(target_type):
-                is_match = True
-
-            if is_match:
-                candidates.append(res)
-
-        if not candidates:
-            return None
-
-        # Find resource matching name
-        target_name = str(name) if isinstance(name, int) else name.lower() if isinstance(name, str) else str(name)
-
-        for res in candidates:
-            res_name = str(res.id).lower() if isinstance(res.id, str) else str(res.id)
-            if res_name == target_name:
-                return res  # Returns ResourceEntry
+            if is_same_res_identifier(type_, res.type_id) and is_same_res_identifier(name, res.id):
+                return res
 
         return None
 
     @apihook("GetThreadLocale", argc=0)
-    def GetThreadLocale(self, emu, argv, ctx: api.ApiContext = None):
+    def GetThreadLocale(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LCID GetThreadLocale();
         """
         return 0xC000
 
     @apihook("SetThreadLocale", argc=1)
-    def SetThreadLocale(self, emu, argv, ctx: api.ApiContext = None):
+    def SetThreadLocale(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LCID SetThreadLocale(
+        BOOL SetThreadLocale(
             LCID Locale
         );
         """
-
-        (lcid,) = argv
-        return lcid
+        (Locale,) = argv
+        return Locale
 
     @apihook("IsValidLocale", argc=2)
-    def IsValidLocale(self, emu, argv, ctx: api.ApiContext = None):
+    def IsValidLocale(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL IsValidLocale(
-            LCID  Locale,
+            LCID Locale,
             DWORD dwFlags
         );
         """
-
-        lcid, flags = argv
+        Locale, dwFlags = argv
         return True
 
     @apihook("OutputDebugString", argc=1)
-    def OutputDebugString(self, emu, argv, ctx: api.ApiContext = None):
+    def OutputDebugString(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void OutputDebugStringA(
-            LPCSTR lpOutputString
+        VOID OutputDebugString(
+            LPCTSTR lpOutputString
         );
         """
-        ctx = ctx or {}
-        (_str,) = argv
-        cw = self.get_char_width(ctx)
-        argv[0] = self.read_mem_string(_str, cw)
+        (lpOutputString,) = argv
+        cw = _char_width(self, ctx)
+        ctx.args["lpOutputString"].display = self.read_mem_string(lpOutputString, cw)
 
     @apihook("GetThreadTimes", argc=5)
-    def GetThreadTimes(self, emu, argv, ctx: api.ApiContext = None):
+    def GetThreadTimes(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetThreadTimes(
-            HANDLE     hThread,
+            HANDLE hThread,
             LPFILETIME lpCreationTime,
             LPFILETIME lpExitTime,
             LPFILETIME lpKernelTime,
             LPFILETIME lpUserTime
         );
         """
-        hnd, lpCreationTime, lpExitTime, lpKernelTime, lpUserTime = argv
+        hThread, lpCreationTime, lpExitTime, lpKernelTime, lpUserTime = argv
 
         if lpCreationTime:
             self.mem_write(lpCreationTime, b"\x20\x20\x00\x00")
         return True
 
+    @apihook("GetProcessTimes", argc=5)
+    def GetProcessTimes(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL GetProcessTimes(
+            HANDLE hProcess,
+            LPFILETIME lpCreationTime,
+            LPFILETIME lpExitTime,
+            LPFILETIME lpKernelTime,
+            LPFILETIME lpUserTime
+        );
+        """
+        hProcess, lpCreationTime, lpExitTime, lpKernelTime, lpUserTime = argv
+
+        proc = emu.get_handle_table().get(hProcess, objman.Process)
+        if not proc:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+
+        if proc is emu.get_current_process():
+            creation = self.start_time
+        else:
+            # Other processes started shortly after boot
+            creation = self.boot_time + 50000000
+        times = ((lpCreationTime, creation), (lpExitTime, 0), (lpKernelTime, 156250), (lpUserTime, 312500))
+        for ptr, value in times:
+            if ptr:
+                self.write_qword(ptr, value)
+        return True
+
     @apihook("GetProcessHeap", argc=0)
-    def GetProcessHeap(self, emu, argv, ctx: api.ApiContext = None):
+    def GetProcessHeap(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE GetProcessHeap();
         """
-
         if not self.heaps:
             heap = self.create_heap(emu)
         else:
@@ -417,50 +651,45 @@ class Kernel32(api.ApiHandler):
         return heap
 
     @apihook("GetProcessVersion", argc=1)
-    def GetProcessVersion(self, emu, argv, ctx: api.ApiContext = None):
+    def GetProcessVersion(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetProcessVersion(
             DWORD ProcessId
         );
         """
-
-        ver = self.emu.config.os_ver
-        major = ver.major
-        minor = ver.minor
+        ver = self.emu.config.system.os_ver
+        major = ver.major or 0
+        minor = ver.minor or 0
 
         rv = 0xFFFFFFFF & (major << 16 | minor)
 
         return rv
 
     @apihook("DisableThreadLibraryCalls", argc=1)
-    def DisableThreadLibraryCalls(self, emu, argv, ctx: api.ApiContext = None):
+    def DisableThreadLibraryCalls(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL DisableThreadLibraryCalls(
             HMODULE hLibModule
         );
         """
-
         (hLibModule,) = argv
 
         return True
 
     @apihook("CreateMutex", argc=3)
-    def CreateMutex(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateMutex(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE CreateMutex(
             LPSECURITY_ATTRIBUTES lpMutexAttributes,
-            BOOL                  bInitialOwner,
-            LPCSTR                lpName
+            BOOL bInitialOwner,
+            LPCTSTR lpName
         );
         """
-        ctx = ctx or {}
+        lpMutexAttributes, bInitialOwner, lpName = argv
 
-        attrs, owner, name = argv
+        cw = _char_width(self, ctx)
 
-        cw = self.get_char_width(ctx)
-
-        if name:
-            name = self.read_mem_string(name, cw)
+        name = self.read_mem_string(lpName, cw) if lpName else 0
 
         obj = self.get_object_from_name(name)
 
@@ -472,26 +701,24 @@ class Kernel32(api.ApiHandler):
             emu.set_last_error(windefs.ERROR_SUCCESS)
             hnd, evt = emu.create_mutant(name)
 
-        argv[2] = name
+        ctx.args["lpName"].display = name
         return hnd
 
     @apihook("CreateMutexEx", argc=4)
-    def CreateMutexEx(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateMutexEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HANDLE CreateMutexExA(
-          LPSECURITY_ATTRIBUTES lpMutexAttributes,
-          LPCSTR                lpName,
-          DWORD                 dwFlags,
-          DWORD                 dwDesiredAccess
+        HANDLE CreateMutexEx(
+            LPSECURITY_ATTRIBUTES lpMutexAttributes,
+            LPCTSTR lpName,
+            DWORD dwFlags,
+            DWORD dwDesiredAccess
         );
         """
-        ctx = ctx or {}
-        attrs, name, flags, access = argv
+        lpMutexAttributes, lpName, dwFlags, dwDesiredAccess = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
-        if name:
-            name = self.read_mem_string(name, cw)
+        name = self.read_mem_string(lpName, cw) if lpName else 0
 
         obj = self.get_object_from_name(name)
 
@@ -503,32 +730,37 @@ class Kernel32(api.ApiHandler):
             emu.set_last_error(windefs.ERROR_SUCCESS)
             hnd, evt = emu.create_mutant(name)
 
-        argv[1] = name
+        ctx.args["lpName"].display = name
         return hnd
 
     @apihook("LoadLibrary", argc=1)
-    def LoadLibrary(self, emu, argv, ctx: api.ApiContext = None):
-        """HMODULE LoadLibrary(
-          LPTSTR lpLibFileName
-        );"""
-        ctx = ctx or {}
-
-        (lib_name,) = argv
+    def LoadLibrary(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HMODULE LoadLibrary(
+            LPCTSTR lpLibFileName
+        );
+        """
+        (lpLibFileName,) = argv
         hmod = windefs.NULL
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         # FX-004 diagnostics: record the request and pre-call module table
         # before the loader may map a new (possibly synthetic) module.
         observation = module_trace_diagnostics.start_load_library(emu, ctx, argv, cw)
-        if not lib_name or not emu.is_address_valid(lib_name):
+        _set_observation(ctx, observation)
+        if not lpLibFileName or not emu.is_address_valid(lpLibFileName):
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-            module_trace_diagnostics.finish_load_library(emu, ctx, observation, return_value=hmod)
+            _set_observation(
+                ctx,
+                module_trace_diagnostics.finish_load_library(emu, ctx, observation, return_value=hmod),
+            )
             return hmod
-        req_lib = self.read_mem_string(lib_name, cw)
+        req_lib = self.read_mem_string(lpLibFileName, cw)
         lib = winemu.normalize_dll_name(req_lib)
+        argv[0] = req_lib
 
         hmod = emu.load_library(lib)
-        argv[0] = req_lib
+        _set_arg_display(ctx, "lpLibFileName", req_lib)
 
         if not hmod:
             logger.info(
@@ -537,353 +769,309 @@ class Kernel32(api.ApiHandler):
                 req_lib,
             )
 
-        module_trace_diagnostics.finish_load_library(emu, ctx, observation, return_value=hmod)
+        _set_observation(
+            ctx,
+            module_trace_diagnostics.finish_load_library(emu, ctx, observation, return_value=hmod),
+        )
         return hmod
 
     @apihook("CreateToolhelp32Snapshot", argc=2)
-    def CreateToolhelp32Snapshot(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateToolhelp32Snapshot(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE CreateToolhelp32Snapshot(
             DWORD dwFlags,
             DWORD th32ProcessID
         );
         """
-
         (
             dwFlags,
             th32ProcessID,
         ) = argv
-        if k32types.TH32CS_SNAPPROCESS == dwFlags:
-            hnd = self.get_handle()
-            index = 0
-            self.snapshots.update({hnd: {k32types.TH32CS_SNAPPROCESS: [index, emu.get_processes()]}})
-        elif k32types.TH32CS_SNAPTHREAD == dwFlags:
-            hnd = self.get_handle()
-            index = 0
-            if th32ProcessID in [0, emu.curr_process.pid]:
-                proc = emu.curr_process
+        processes, threads, modules, pid = [], [], [], 0
+        if dwFlags & (
+            CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD | CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE
+        ):
+            if th32ProcessID in [0, emu.get_current_process().pid]:
+                proc = emu.get_current_process()
             else:
-                for p in emu.get_processes():
-                    if th32ProcessID == p.pid:
-                        proc = p
-                        break
-                else:
-                    raise ApiEmuError("The specified PID not found")
-            self.snapshots.update({hnd: {k32types.TH32CS_SNAPTHREAD: [index, proc.threads, proc.pid]}})
-        elif k32types.TH32CS_SNAPMODULE == dwFlags:
-            hnd = self.get_handle()
-            index = 0
-            if th32ProcessID in [0, emu.curr_process.pid]:
-                proc = emu.curr_process
-            else:
-                for p in emu.get_processes():
-                    if th32ProcessID == p.pid:
-                        proc = p
-                        break
-                else:
-                    raise ApiEmuError("The specified PID not found")
+                proc = next((p for p in emu.get_processes() if p.pid == th32ProcessID), None)
+            if proc is None:
+                # Windows ignores the PID of a snapshot without a module list
+                if dwFlags & CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE:
+                    emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+                    return self.get_max_int()
+                proc = emu.get_current_process()
+            pid = proc.pid
+            if dwFlags & CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD:
+                threads = proc.threads
+            if dwFlags & CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE:
+                modules = emu.get_peb_modules()
+        if dwFlags & CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS:
+            processes = emu.get_processes()
 
-            self.snapshots.update({hnd: {k32types.TH32CS_SNAPMODULE: [index, emu.get_peb_modules(), proc.pid]}})
+        # TH32CS_SNAPHEAPLIST is not emulated, so a snapshot never has a heap list
+        hnd = emu.get_handle_table().new_handle(
+            Snapshot(
+                {
+                    CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS: [0, processes],
+                    CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD: [0, threads, pid],
+                    CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE: [0, modules, pid],
+                }
+            )
+        )
 
-        elif (
-            k32types.TH32CS_SNAPHEAPLIST
-            | k32types.TH32CS_SNAPPROCESS
-            | k32types.TH32CS_SNAPTHREAD
-            | k32types.TH32CS_SNAPMODULE
-        ) == dwFlags:
-            # ignoring HEAPLIST for now
-            hnd = self.get_handle()
-            index = 0
-            if th32ProcessID in [0, emu.curr_process.pid]:
-                proc = emu.curr_process
-            else:
-                for p in emu.get_processes():
-                    if th32ProcessID == p.pid:
-                        proc = p
-                        break
-                else:
-                    raise ApiEmuError("The specified PID not found")
-
-            self.snapshots.update({hnd: {k32types.TH32CS_SNAPPROCESS: [index, emu.get_processes()]}})
-            self.snapshots.update({hnd: {k32types.TH32CS_SNAPTHREAD: [index, proc.threads, proc.pid]}})
-            self.snapshots.update({hnd: {k32types.TH32CS_SNAPMODULE: [index, emu.get_peb_modules(), proc.pid]}})
-
-        else:
-            raise ApiEmuError(f"Unsupported snapshot type: 0x{dwFlags:x}")
-
-        cap_def = k32types.get_flag_defines(dwFlags, "TH32CS")
-        if cap_def:
-            cap_def = "|".join(cap_def)
-            argv[0] = cap_def
+        ctx.args["dwFlags"].display = decode(CREATE_TOOLHELP_SNAPSHOT_FLAGS, dwFlags)
 
         return hnd
 
+    def _get_parent_pid(self, emu, proc):
+        parents = {
+            "smss": "system",
+            "csrss": "smss",
+            "wininit": "smss",
+            "winlogon": "smss",
+            "services": "wininit",
+            "lsass": "wininit",
+            "svchost": "services",
+            "explorer": "winlogon",
+        }
+        if proc.pid == 4:
+            return 0
+        parent = parents.get(proc.name.lower(), "explorer")
+        return next((p.pid for p in emu.get_processes() if p.name.lower() == parent), 0)
+
+    def _write_process_entry(self, emu, ctx, pe32, proc):
+        cw = _char_width(self, ctx)
+        pe = self.k32types.PROCESSENTRY32(emu.get_ptr_size(), cw)
+        pe.dwSize = self.read_dword(pe32)
+        pe.th32ProcessID = proc.pid
+        pe.cntThreads = max(len(proc.threads), 1)
+        pe.th32ParentProcessID = self._get_parent_pid(emu, proc)
+        pe.pcPriClassBase = 8
+        pe.szExeFile = self.encode_string(proc.image[: k32defs.MAX_PATH - 1], cw) + b"\x00" * cw
+        self.mem_write(pe32, self.get_bytes(pe))
+
     @apihook("Process32First", argc=2)
-    def Process32First(self, emu, argv, ctx: api.ApiContext = None):
+    def Process32First(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL Process32First(
-            HANDLE           hSnapshot,
+            HANDLE hSnapshot,
             LPPROCESSENTRY32 lppe
         );
         """
-        ctx = ctx or {}
-
         (
             hSnapshot,
-            pe32,
+            lppe,
         ) = argv
         rv = False
 
-        snap = self.snapshots.get(hSnapshot)
-        if not snap or not pe32 or k32types.TH32CS_SNAPPROCESS not in snap:
+        snap = self.get_snapshot(emu, hSnapshot)
+        if snap is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return rv
+        if not lppe or CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS not in snap:
             return rv
 
         # Reset the handle index
-        snap[k32types.TH32CS_SNAPPROCESS][0] = 1
-        proc = snap[k32types.TH32CS_SNAPPROCESS][1][0]
+        snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS][0] = 1
+        if not snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS][1]:
+            emu.set_last_error(windefs.ERROR_NO_MORE_FILES)
+            return rv
+        proc = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS][1][0]
 
-        try:
-            cw = self.get_char_width(ctx)
-        except Exception:
-            cw = 1
-
-        pe = self.k32types.PROCESSENTRY32(emu.get_ptr_size(), cw)
-        data = self.mem_cast(pe, pe32)
-        pe.th32ProcessID = proc.pid
-        if cw == 2:
-            pe.szExeFile = proc.image.encode("utf-16le") + b"\x00\x00"
-        else:
-            pe.szExeFile = proc.image.encode("utf-8") + b"\x00"
-
-        self.mem_write(pe32, self.get_bytes(data))
-        rv = True
-        return rv
+        self._write_process_entry(emu, ctx, lppe, proc)
+        return True
 
     @apihook("Process32Next", argc=2)
-    def Process32Next(self, emu, argv, ctx: api.ApiContext = None):
+    def Process32Next(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL Process32Next(
-            HANDLE           hSnapshot,
+            HANDLE hSnapshot,
             LPPROCESSENTRY32 lppe
         );
         """
-        ctx = ctx or {}
-
         (
             hSnapshot,
-            pe32,
+            lppe,
         ) = argv
         rv = False
 
-        snap = self.snapshots.get(hSnapshot)
-        if not snap or not pe32 or k32types.TH32CS_SNAPPROCESS not in snap:
+        snap = self.get_snapshot(emu, hSnapshot)
+        if snap is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return rv
+        if not lppe or CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS not in snap:
             return rv
 
-        index = snap[k32types.TH32CS_SNAPPROCESS][0]
-        snap[k32types.TH32CS_SNAPPROCESS][0] += 1
-        if index >= len(snap[k32types.TH32CS_SNAPPROCESS][1]):
+        index = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS][0]
+        snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS][0] += 1
+        if index >= len(snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS][1]):
+            emu.set_last_error(windefs.ERROR_NO_MORE_FILES)
             return rv
-        proc = snap[k32types.TH32CS_SNAPPROCESS][1][index]
+        proc = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPPROCESS][1][index]
 
-        try:
-            cw = self.get_char_width(ctx)
-        except Exception:
-            cw = 1
-
-        pe = self.k32types.PROCESSENTRY32(emu.get_ptr_size(), cw)
-        data = self.mem_cast(pe, pe32)
-        pe.th32ProcessID = proc.pid
-        if cw == 2:
-            pe.szExeFile = proc.image.encode("utf-16le") + b"\x00\x00"
-        else:
-            pe.szExeFile = proc.image.encode("utf-8") + b"\x00"
-
-        self.mem_write(pe32, self.get_bytes(data))
-        rv = True
-        return rv
+        self._write_process_entry(emu, ctx, lppe, proc)
+        return True
 
     @apihook("Thread32First", argc=2)
-    def Thread32First(self, emu, argv, ctx: api.ApiContext = None):
+    def Thread32First(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL Thread32First(
-        HANDLE          hSnapshot,
-        LPTHREADENTRY32 lpte
+            HANDLE hSnapshot,
+            LPTHREADENTRY32 lpte
         );
         """
-
         (
             hSnapshot,
-            te32,
+            lpte,
         ) = argv
         rv = False
 
-        snap = self.snapshots.get(hSnapshot)
-        if not snap or not te32 or k32types.TH32CS_SNAPTHREAD not in snap:
+        snap = self.get_snapshot(emu, hSnapshot)
+        if snap is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return rv
+        if not lpte or CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD not in snap:
             return rv
 
         # Reset the handle index
-        snap[k32types.TH32CS_SNAPTHREAD][0] = 1
-        thread = snap[k32types.TH32CS_SNAPTHREAD][1][0]
+        snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD][0] = 1
+        if not snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD][1]:
+            emu.set_last_error(windefs.ERROR_NO_MORE_FILES)
+            return rv
+        thread = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD][1][0]
 
         te = self.k32types.THREADENTRY32(emu.get_ptr_size())
-        data = self.mem_cast(te, te32)
+        data = self.mem_cast(te, lpte)
         te.th32ThreadID = thread.tid
-        te.th32OwnerProcessID = snap[k32types.TH32CS_SNAPTHREAD][2]
+        te.th32OwnerProcessID = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD][2]
 
-        self.mem_write(te32, self.get_bytes(data))
+        self.mem_write(lpte, self.get_bytes(data))
         rv = True
         return rv
 
     @apihook("Thread32Next", argc=2)
-    def Thread32Next(self, emu, argv, ctx: api.ApiContext = None):
+    def Thread32Next(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL Thread32Next(
-        HANDLE          hSnapshot,
-        LPTHREADENTRY32 lpte
+            HANDLE hSnapshot,
+            LPTHREADENTRY32 lpte
         );
         """
-
         (
             hSnapshot,
-            te32,
+            lpte,
         ) = argv
         rv = False
 
-        snap = self.snapshots.get(hSnapshot)
-        if not snap or not te32 or k32types.TH32CS_SNAPTHREAD not in snap:
+        snap = self.get_snapshot(emu, hSnapshot)
+        if snap is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return rv
+        if not lpte or CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD not in snap:
             return rv
 
-        index = snap[k32types.TH32CS_SNAPTHREAD][0]
-        snap[k32types.TH32CS_SNAPTHREAD][0] += 1
-        if index >= len(snap[k32types.TH32CS_SNAPTHREAD][1]):
+        index = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD][0]
+        snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD][0] += 1
+        if index >= len(snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD][1]):
+            emu.set_last_error(windefs.ERROR_NO_MORE_FILES)
             return rv
-        thread = snap[k32types.TH32CS_SNAPTHREAD][1][index]
+        thread = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD][1][index]
 
         te = self.k32types.THREADENTRY32(emu.get_ptr_size())
-        data = self.mem_cast(te, te32)
+        data = self.mem_cast(te, lpte)
         te.th32ThreadID = thread.tid
-        te.th32OwnerProcessID = snap[k32types.TH32CS_SNAPTHREAD][2]
+        te.th32OwnerProcessID = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPTHREAD][2]
 
-        self.mem_write(te32, self.get_bytes(data))
+        self.mem_write(lpte, self.get_bytes(data))
         rv = True
         return rv
 
+    def _write_module_entry(self, emu, ctx, mod32, module, pid):
+        cw = _char_width(self, ctx)
+        mod = self.k32types.MODULEENTRY32(emu.get_ptr_size(), cw)
+        data = self.mem_cast(mod, mod32)
+        mod.th32ProcessID = pid
+        mod.modBaseAddr = module.base
+        mod.modBaseSize = module.image_size
+        mod.hModule = module.base
+        mod.szModule = self.encode_string(module.name[: k32defs.MAX_MODULE_NAME32], cw) + b"\x00" * cw
+        mod.szExePath = self.encode_string(module.emu_path[: k32defs.MAX_PATH - 1], cw) + b"\x00" * cw
+        self.mem_write(mod32, self.get_bytes(data))
+
     @apihook("Module32First", argc=2)
-    def Module32First(self, emu, argv, ctx: api.ApiContext = None):
+    def Module32First(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL Module32First(
-          HANDLE          hSnapshot,
-          LPMODULEENTRY32 lpme
+            HANDLE hSnapshot,
+            LPMODULEENTRY32 lpme
         );
         """
-        ctx = ctx or {}
-
         (
             hSnapshot,
-            mod32,
+            lpme,
         ) = argv
         rv = False
 
-        snap = self.snapshots.get(hSnapshot)
-        if not snap or not mod32 or k32types.TH32CS_SNAPMODULE not in snap:
+        snap = self.get_snapshot(emu, hSnapshot)
+        if snap is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return rv
+        if not lpme or CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE not in snap:
             return rv
 
         # Reset the handle index
-        snap[k32types.TH32CS_SNAPMODULE][0] = 1
-        module = snap[k32types.TH32CS_SNAPMODULE][1][0]
+        snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE][0] = 1
+        if not snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE][1]:
+            emu.set_last_error(windefs.ERROR_NO_MORE_FILES)
+            return rv
+        module = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE][1][0]
 
-        try:
-            cw = self.get_char_width(ctx)
-        except Exception:
-            cw = 1
-
-        mod = self.k32types.MODULEENTRY32(emu.get_ptr_size(), cw)
-        data = self.mem_cast(mod, mod32)
-        if cw == 2:
-            if hasattr(module, "decoy_path"):
-                mod.szExePath = module.decoy_path.encode("utf-16le") + b"\x00"
-            mod.szModule = module.name.encode("utf-16le") + b"\x00"
-        else:
-            if hasattr(module, "decoy_path"):
-                mod.szExePath = module.decoy_path.encode("utf-8") + b"\x00"
-            mod.szModule = module.name.encode("utf-8") + b"\x00"
-
-        mod.modBaseAddr = module.base
-        mod.modBaseSize = module.image_size
-        mod.th32ProcessID = snap[k32types.TH32CS_SNAPMODULE][2]
-        self.mem_write(mod32, self.get_bytes(data))
-        rv = True
-        return rv
+        self._write_module_entry(emu, ctx, lpme, module, snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE][2])
+        return True
 
     @apihook("Module32Next", argc=2)
-    def Module32Next(self, emu, argv, ctx: api.ApiContext = None):
+    def Module32Next(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL Module32Next(
-          HANDLE          hSnapshot,
-          LPMODULEENTRY32 lpme
+            HANDLE hSnapshot,
+            LPMODULEENTRY32 lpme
         );
         """
-        ctx = ctx or {}
-
         (
             hSnapshot,
-            mod32,
+            lpme,
         ) = argv
         rv = False
 
-        snap = self.snapshots.get(hSnapshot)
-        if not snap or not mod32 or k32types.TH32CS_SNAPMODULE not in snap:
+        snap = self.get_snapshot(emu, hSnapshot)
+        if snap is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return rv
+        if not lpme or CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE not in snap:
             return rv
 
-        index = snap[k32types.TH32CS_SNAPMODULE][0]
-        snap[k32types.TH32CS_SNAPMODULE][0] += 1
-        if index >= len(snap[k32types.TH32CS_SNAPMODULE][1]):
+        index = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE][0]
+        snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE][0] += 1
+        if index >= len(snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE][1]):
+            emu.set_last_error(windefs.ERROR_NO_MORE_FILES)
             return rv
-        module = snap[k32types.TH32CS_SNAPMODULE][1][index]
-        try:
-            cw = self.get_char_width(ctx)
-        except Exception:
-            cw = 1
-
-        mod = self.k32types.MODULEENTRY32(emu.get_ptr_size(), cw)
-        data = self.mem_cast(mod, mod32)
-        if cw == 2:
-            if hasattr(module, "decoy_path"):
-                mod.szExePath = module.decoy_path.encode("utf-16le") + b"\x00"
-            mod.szModule = module.name.encode("utf-16le") + b"\x00"
-        else:
-            if hasattr(module, "decoy_path"):
-                mod.szExePath = module.decoy_path.encode("utf-8") + b"\x00"
-            mod.szModule = module.name.encode("utf-8") + b"\x00"
-
-        mod.modBaseAddr = module.base
-        mod.modBaseSize = module.image_size
-        mod.th32ProcessID = snap[k32types.TH32CS_SNAPMODULE][2]
-        self.mem_write(mod32, self.get_bytes(data))
-        rv = True
-        return rv
+        module = snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE][1][index]
+        self._write_module_entry(emu, ctx, lpme, module, snap[CREATE_TOOLHELP_SNAPSHOT_FLAGS.TH32CS_SNAPMODULE][2])
+        return True
 
     @apihook("OpenProcess", argc=3)
-    def OpenProcess(self, emu, argv, ctx: api.ApiContext = None):
+    def OpenProcess(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE OpenProcess(
             DWORD dwDesiredAccess,
-            BOOL  bInheritHandle,
+            BOOL bInheritHandle,
             DWORD dwProcessId
         );
         """
+        dwDesiredAccess, bInheritHandle, dwProcessId = argv
 
-        access, inherit, pid = argv
-
-        proc = emu.get_process_by_id(pid)
-        if not proc:
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-            return 0
-
-        if not emu.get_object_from_addr(proc.address):
-            emu.add_object(proc)
-
-        hnd = emu.get_object_handle(proc)
+        hnd = emu.open_process(dwProcessId)
         if not hnd:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return 0
@@ -892,23 +1080,24 @@ class Kernel32(api.ApiHandler):
         return hnd
 
     @apihook("OpenMutex", argc=3)
-    def OpenMutex(self, emu, argv, ctx: api.ApiContext = None):
+    def OpenMutex(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE OpenMutex(
-            DWORD   dwDesiredAccess,
-            BOOL    bInheritHandle,
-            LPCWSTR lpName
+            DWORD dwDesiredAccess,
+            BOOL bInheritHandle,
+            LPCTSTR lpName
         );
         """
-        ctx = ctx or {}
+        dwDesiredAccess, bInheritHandle, lpName = argv
 
-        access, inherit, name = argv
+        cw = _char_width(self, ctx)
 
-        cw = self.get_char_width(ctx)
+        if not lpName:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
 
-        if name:
-            obj_name = self.read_mem_string(name, cw)
-            argv[2] = obj_name
+        obj_name = self.read_mem_string(lpName, cw)
+        ctx.args["lpName"].display = obj_name
 
         obj = self.get_object_from_name(obj_name)
 
@@ -916,23 +1105,23 @@ class Kernel32(api.ApiHandler):
         if obj:
             hnd = emu.get_object_handle(obj)
         else:
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
         return hnd
 
     @apihook("TerminateProcess", argc=2)
-    def TerminateProcess(self, emu, argv, ctx: api.ApiContext = None):
+    def TerminateProcess(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL TerminateProcess(
             HANDLE hProcess,
-            UINT   uExitCode
+            UINT uExitCode
         );
         """
-
         hProcess, uExitCode = argv
-        current_process = is_current_process_pseudo_handle(
-            hProcess,
-            emu.get_ptr_size(),
-        )
+
+        # A pseudo-handle denotes the current process (Windows TerminateProcess
+        # also accepts it), and an object handle to the current process must
+        # terminate the run instead of only leaving the process table.
+        current_process = is_current_process_pseudo_handle(hProcess, emu.get_ptr_size())
 
         proc = emu.get_current_process() if current_process else emu.get_object_from_handle(hProcess)
         if not proc:
@@ -945,56 +1134,43 @@ class Kernel32(api.ApiHandler):
         return True
 
     @apihook("FreeLibraryAndExitThread", argc=2)
-    def FreeLibraryAndExitThread(self, emu, argv, ctx: api.ApiContext = None):
+    def FreeLibraryAndExitThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void FreeLibraryAndExitThread(
+        VOID FreeLibraryAndExitThread(
             HMODULE hLibModule,
-            DWORD   dwExitCode
+            DWORD dwExitCode
         );
         """
+        hLibModule, dwExitCode = argv
+        emu.get_current_thread().exit_code = dwExitCode
         emu.exit_process()
-        return
 
     @apihook("ExitThread", argc=1)
-    def ExitThread(self, emu, argv, ctx: api.ApiContext = None):
+    def ExitThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void ExitThread(
-            DWORD   dwExitCode
+        VOID ExitThread(
+            DWORD dwExitCode
         );
         """
+        (dwExitCode,) = argv
+        emu.get_current_thread().exit_code = dwExitCode
         emu.exit_process()
-        return
 
     @apihook("WinExec", argc=2)
-    def WinExec(self, emu, argv, ctx: api.ApiContext = None):
+    def WinExec(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT WinExec(
             LPCSTR lpCmdLine,
-            UINT   uCmdShow
+            UINT uCmdShow
         );
-
-        Args:
-            emu: Emulator exposing authoritative child process requests.
-            argv: ``[lpCmdLine, uCmdShow]`` API arguments.
-            ctx: Optional API call metadata.
-
-        Returns:
-            A value greater than 31 only after a process object was actually
-            created. Otherwise returns a documented WinExec failure code.
-
-        Side effects:
-            Reads the command string, records one child launch request, sets
-            the emulated last error on failure, and records a process-creation
-            event only for a successfully created process.
         """
-
         lpCmdLine, uCmdShow = argv
         if not lpCmdLine:
             emu.set_last_error(_WINE_EXEC_ERROR_BAD_FORMAT)
             return _WINE_EXEC_ERROR_BAD_FORMAT
 
         cmd = self.read_mem_string(lpCmdLine, 1)
-        argv[0] = cmd
+        _set_arg_display(ctx, "lpCmdLine", cmd)
         app = ChildTargetResolver.command_target(cmd)
         proc, _request, creation = emu.request_process_execution(
             source_api="WinExec",
@@ -1012,24 +1188,24 @@ class Kernel32(api.ApiHandler):
             emu.set_last_error(rv)
             return rv
 
-        self.record_process_event(proc, PROC_CREATE)
+        self.record_process_event(proc, EventType.PROCESS_CREATE)
         return 32
 
     @apihook("LoadLibraryEx", argc=3)
-    def LoadLibraryEx(self, emu, argv, ctx: api.ApiContext = None):
-        """HMODULE LoadLibraryExA(
-          LPCSTR lpLibFileName,
-          HANDLE hFile,
-          DWORD  dwFlags
-        );"""
-        ctx = ctx or {}
-
-        lib_name, _, dwFlags = argv
+    def LoadLibraryEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HMODULE LoadLibraryEx(
+            LPCTSTR lpLibFileName,
+            HANDLE hFile,
+            DWORD dwFlags
+        );
+        """
+        lpLibFileName, hFile, dwFlags = argv
 
         hmod = 0
 
-        cw = self.get_char_width(ctx)
-        req_lib = self.read_mem_string(lib_name, cw)
+        cw = _char_width(self, ctx)
+        req_lib = self.read_mem_string(lpLibFileName, cw)
         lib = winemu.normalize_dll_name(req_lib)
 
         hmod = emu.load_library(lib)
@@ -1050,9 +1226,8 @@ class Kernel32(api.ApiHandler):
 
         pretty_flags = " | ".join([name for bit, name in flags.items() if dwFlags & bit])
 
-        argv[0] = req_lib
-        argv[1] = argv[1]
-        argv[2] = pretty_flags
+        ctx.args["lpLibFileName"].display = req_lib
+        ctx.args["dwFlags"].display = pretty_flags
 
         if not hmod:
             emu.set_last_error(windefs.ERROR_MOD_NOT_FOUND)
@@ -1060,211 +1235,247 @@ class Kernel32(api.ApiHandler):
         return hmod
 
     @apihook("CreateProcessInternal", argc=12)
-    def CreateProcessInternal(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateProcessInternal(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CreateProcessInternal(
-          PVOID Reserved1,
-          LPTSTR                lpApplicationName,
-          LPTSTR                lpCommandLine,
-          LPSECURITY_ATTRIBUTES lpProcessAttributes,
-          LPSECURITY_ATTRIBUTES lpThreadAttributes,
-          BOOL                  bInheritHandles,
-          DWORD                 dwCreationFlags,
-          LPVOID                lpEnvironment,
-          LPTSTR                lpCurrentDirectory,
-          LPSTARTUPINFO         lpStartupInfo,
-          LPPROCESS_INFORMATION lpProcessInformation,
-          PVOID Reserved2
+            HANDLE hUserToken,
+            LPCTSTR lpApplicationName,
+            LPTSTR lpCommandLine,
+            LPSECURITY_ATTRIBUTES lpProcessAttributes,
+            LPSECURITY_ATTRIBUTES lpThreadAttributes,
+            BOOL bInheritHandles,
+            DWORD dwCreationFlags,
+            LPVOID lpEnvironment,
+            LPCTSTR lpCurrentDirectory,
+            LPSTARTUPINFO lpStartupInfo,
+            LPPROCESS_INFORMATION lpProcessInformation,
+            HANDLE *hRestrictedUserToken
         );
         """
-        ctx = ctx or {}
-        ctx["child_execution_source_api"] = "CreateProcessInternal"
+        # The child execution request records which kernel32 API launched the
+        # process; CreateProcess forwards it to the emulator helper.
+        if isinstance(ctx, dict):
+            ctx["child_execution_source_api"] = "CreateProcessInternal"
+        elif ctx is not None:
+            try:
+                ctx.child_execution_source_api = "CreateProcessInternal"
+            except Exception:
+                logger.debug("kernel32: child execution source marker failed", exc_info=True)
         # Args are the same as CreateProcess except for argv[0] and argv[-1]
         _argv = argv[1:-1]
         rv = self.CreateProcess(emu, _argv, ctx)
-        argv[1:-1] = _argv
+        app, cmd, flags = _argv[0], _argv[1], _argv[5]
+        cw = _char_width(self, ctx)
+        if app:
+            _set_arg_display(ctx, 1, self.read_mem_string(app, cw))
+        if cmd:
+            _set_arg_display(ctx, 2, self.read_mem_string(cmd, cw))
+        _set_arg_display(ctx, 6, decode(PROCESS_CREATION_FLAGS, flags))
         return rv
 
     @apihook("CreateProcess", argc=10)
-    def CreateProcess(self, emu, argv, ctx: api.ApiContext = None):
-        """BOOL CreateProcess(
-          LPTSTR                lpApplicationName,
-          LPTSTR                lpCommandLine,
-          LPSECURITY_ATTRIBUTES lpProcessAttributes,
-          LPSECURITY_ATTRIBUTES lpThreadAttributes,
-          BOOL                  bInheritHandles,
-          DWORD                 dwCreationFlags,
-          LPVOID                lpEnvironment,
-          LPTSTR                lpCurrentDirectory,
-          LPSTARTUPINFO         lpStartupInfo,
-          LPPROCESS_INFORMATION lpProcessInformation
-        );"""
-        ctx = ctx or {}
-        app, cmd, pa, ta, inherit, flags, env, cd, si, ppi = argv
+    def CreateProcess(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CreateProcess(
+            LPCTSTR lpApplicationName,
+            LPTSTR lpCommandLine,
+            LPSECURITY_ATTRIBUTES lpProcessAttributes,
+            LPSECURITY_ATTRIBUTES lpThreadAttributes,
+            BOOL bInheritHandles,
+            DWORD dwCreationFlags,
+            LPVOID lpEnvironment,
+            LPCTSTR lpCurrentDirectory,
+            LPSTARTUPINFO lpStartupInfo,
+            LPPROCESS_INFORMATION lpProcessInformation
+        );
+        """
+        (
+            lpApplicationName,
+            lpCommandLine,
+            lpProcessAttributes,
+            lpThreadAttributes,
+            bInheritHandles,
+            dwCreationFlags,
+            lpEnvironment,
+            lpCurrentDirectory,
+            lpStartupInfo,
+            lpProcessInformation,
+        ) = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         cmdstr = ""
         appstr = ""
-        cwdstr = ""
-        if app:
-            appstr = self.read_mem_string(app, cw)
-            argv[0] = appstr
-        if cmd:
-            cmdstr = self.read_mem_string(cmd, cw)
-            argv[1] = cmdstr
-        if cd:
-            cwdstr = self.read_mem_string(cd, cw)
-            argv[7] = cwdstr
+        cdstr = ""
+        if lpApplicationName:
+            appstr = self.read_mem_string(lpApplicationName, cw)
+            _set_arg_display(ctx, "lpApplicationName", appstr)
+        if lpCommandLine:
+            cmdstr = self.read_mem_string(lpCommandLine, cw)
+            _set_arg_display(ctx, "lpCommandLine", cmdstr)
+        else:
+            cmdstr = appstr
+        if lpCurrentDirectory:
+            cdstr = self.read_mem_string(lpCurrentDirectory, cw)
+            _set_arg_display(ctx, "lpCurrentDirectory", cdstr)
 
-        def_flags = windefs.get_creation_flags(flags)
-        if def_flags:
-            def_flags = " | ".join(def_flags)
-            argv[5] = def_flags
+        _set_arg_display(ctx, "dwCreationFlags", decode(PROCESS_CREATION_FLAGS, dwCreationFlags))
 
-        proc, _request = emu.request_child_process(
-            source_api=str(ctx.get("child_execution_source_api", "CreateProcess")),
-            path=appstr,
-            cmdline=cmdstr,
-            cwd=cwdstr or None,
-        )
+        source_api = "CreateProcess"
+        if isinstance(ctx, dict):
+            source_api = str(ctx.get("child_execution_source_api", source_api))
+        elif ctx is not None:
+            source_api = str(getattr(ctx, "child_execution_source_api", source_api))
+        try:
+            proc, _request = emu.request_child_process(
+                source_api=source_api,
+                path=appstr,
+                cmdline=cmdstr,
+                cwd=cdstr or None,
+            )
+        except IsADirectoryError:
+            emu.set_last_error(windefs.ERROR_ACCESS_DENIED)
+            return 0
+        except FileSystemEmuError:
+            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
+            return 0
         proc_hnd = self.get_object_handle(proc)
 
         thread = proc.threads[0]
         thread_hnd = self.get_object_handle(thread)
 
-        if windefs.CREATE_SUSPENDED & flags:
+        if dwCreationFlags & PROCESS_CREATION_FLAGS.CREATE_SUSPENDED:
             thread.suspend_count = 1
 
         _pi = self.k32types.PROCESS_INFORMATION(emu.get_ptr_size())
-        data = self.mem_cast(_pi, ppi)
+        data = self.mem_cast(_pi, lpProcessInformation)
         _pi.hProcess = proc_hnd
         _pi.hThread = thread_hnd
         _pi.dwProcessId = proc.id
         _pi.dwThreadId = thread.tid
 
-        self.mem_write(ppi, self.get_bytes(data))
+        self.mem_write(lpProcessInformation, self.get_bytes(data))
 
         rv = 1
 
-        self.record_process_event(proc, PROC_CREATE)
+        self.record_process_event(proc, EventType.PROCESS_CREATE)
         return rv
 
-    @apihook("VirtualAlloc", argc=4)
-    def VirtualAlloc(self, emu, argv, ctx: api.ApiContext = None):
-        """LPVOID WINAPI VirtualAlloc(
-          _In_opt_ LPVOID lpAddress,
-          _In_     SIZE_T dwSize,
-          _In_     DWORD  flAllocationType,
-          _In_     DWORD  flProtect
-        );"""
+    def commit_pages(self, emu, mm, address, size, protect):
+        """Apply the protection of a commit to the pages of an existing allocation, and return the first page."""
+        base = address & ~0xFFF
+        end = min((address + size + 0xFFF) & ~0xFFF, mm.base + mm.size)
+        perms = self.win_perms_to_emu_perms(protect)
+        emu.protect_pages(base, end - base, perms, guard=bool(protect & PAGE_PROTECTION_FLAGS.PAGE_GUARD))
+        return base
 
+    @apihook("VirtualAlloc", argc=4)
+    def VirtualAlloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        LPVOID VirtualAlloc(
+            LPVOID lpAddress,
+            SIZE_T dwSize,
+            DWORD flAllocationType,
+            DWORD flProtect
+        );
+        """
         lpAddress, dwSize, flAllocationType, flProtect = argv
         buf = 0
         tag_prefix = "api.VirtualAlloc"
 
-        prot_def = windefs.get_page_rights(flProtect)
-        if prot_def:
-            prot_def = "|".join(prot_def)
-            argv[3] = prot_def
+        prot_def = decode_flags(PAGE_PROTECTION_FLAGS, flProtect)
+        ctx.args["flProtect"].display = "|".join(prot_def)
 
-        # Was this address already commited?
+        # A commit in an allocation of the caller changes its pages in place. A reservation needs free
+        # memory, but VirtualFree leaves a freed allocation mapped, so a reservation can use it again.
         mm = emu.get_address_map(lpAddress)
-        if mm and mm.tag and mm.tag.startswith(tag_prefix):
+        if mm and mm.tag and mm.tag.startswith(tag_prefix) and (mm.free or not flAllocationType & windefs.MEM_RESERVE):
+            mm.free = False
             buf = lpAddress
-            # fixK: MEM_COMMIT 覆盖一个**已提交**的区间时，Windows 仍会把
-            # flProtect 应用到 [lpAddress, lpAddress+dwSize)。旧实现只返回基址、
-            # 完全不改权限，于是"先 VirtualAlloc(1MB, PAGE_NOACCESS) 再
-            # VirtualAlloc(range, MEM_COMMIT, PAGE_READWRITE)"这种常见写法里，
-            # 目标区间仍是 NOACCESS，样本一写就触发 invalid_protect_write，
-            # run 直接结束（实测：12 个 wabot 样本全部死在 0x53ffc 的
-            # `mov dword ptr [eax], ecx`，而该地址就在它刚 commit 的 16KB 内）。
-            if dwSize and flProtect:
-                addr = lpAddress & 0xFFFFFFFFFFFFF000
-                size = dwSize & 0xFFFFFFFFFFFFF000
-                if dwSize & 0xFFF:
-                    size += 0x1000
-                end = min(addr + size, mm.base + mm.size)
-                size = max(end - addr, 0)
-                if size:
-                    try:
-                        new_perms = self.win_perms_to_emu_perms(flProtect)
-                        emu.mem_protect(addr, size, new_perms)
-                        mm.prot = new_perms
-                        mm.flags = flProtect
-                    except Exception:
-                        # 权限更新失败不应中断 API（样本后续自会触发访问违例）
-                        pass
-        else:
-            if dwSize:
-                if lpAddress:
-                    test = lpAddress & 0xFFFFFFFFFFFFF000
-                else:
-                    # This is an arbitrary base address and will be
-                    # auto-adjusted by the memory manager
-                    test = emu.virtual_mem_base
-                size = dwSize
+            if flAllocationType & windefs.MEM_COMMIT:
+                buf = self.commit_pages(emu, mm, lpAddress, dwSize, flProtect)
+        elif dwSize:
+            if lpAddress:
+                test = lpAddress & 0xFFFFFFFFFFFFF000
+            else:
+                # This is an arbitrary base address and will be
+                # auto-adjusted by the memory manager
+                test = emu.virtual_mem_base
+            size = dwSize
+            try:
                 base, size = emu.get_valid_ranges(size, addr=test)
-                while base and base & 0xFFF:
-                    base, size = emu.get_valid_ranges(size, addr=test)
-                    test += PAGE_SIZE
+            except OutOfMemoryError:
+                emu.set_last_error(windefs.ERROR_NOT_ENOUGH_MEMORY)
+                return 0
+            if lpAddress and base != test:
+                emu.set_last_error(windefs.ERROR_INVALID_ADDRESS)
+                return 0
+            while base and base & 0xFFF:
+                base, size = emu.get_valid_ranges(size, addr=test)
+                test += e_arch.PAGE_SIZE
 
-                emu_perms = self.win_perms_to_emu_perms(flProtect)
-                buf = self.mem_alloc(base=base, size=size, tag=tag_prefix, flags=flProtect, perms=emu_perms)
+            emu_perms = self.win_perms_to_emu_perms(flProtect)
+            buf = self.mem_alloc(base=base, size=size, tag=tag_prefix, flags=flProtect, perms=emu_perms)
+            if flProtect & PAGE_PROTECTION_FLAGS.PAGE_GUARD:
+                emu.set_guard_pages(buf, size, emu_perms)
 
-                proc = emu.get_current_process()
-                if proc:
-                    self.record_process_event(
-                        proc, MEM_ALLOC, base=buf, size=dwSize, type=flAllocationType, protect=argv[3]
-                    )
+            proc = emu.get_current_process()
+            if proc:
+                self.record_process_event(
+                    proc,
+                    EventType.MEM_ALLOC,
+                    base=buf,
+                    size=dwSize,
+                    type=flAllocationType,
+                    permissions=get_prot_string(emu_perms),
+                )
 
-                emu._set_dyn_code_hook(buf, size)
+            emu._set_dyn_code_hook(buf, size)
 
-                # In the wild, I noticed some x64 malware samples that
-                # will rely on the new buffer pointer being placed into the first
-                # location in the x64 register backup on the stack (performed by
-                # the Windows API). Let's do that here.
-                arch = emu.get_arch()
-                if arch == e_arch.ARCH_AMD64:
-                    sp = emu.get_stack_ptr()
-                    p = buf.to_bytes(8, "little")
-                    self.mem_write(sp + 8, p)
+            # In the wild, I noticed some x64 malware samples that
+            # will rely on the new buffer pointer being placed into the first
+            # location in the x64 register backup on the stack (performed by
+            # the Windows API). Let's do that here.
+            arch = emu.get_arch()
+            if arch == e_arch.ARCH_AMD64:
+                sp = emu.get_stack_ptr()
+                p = buf.to_bytes(8, "little")
+                self.mem_write(sp + 8, p)
 
         return buf
 
     @apihook("VirtualAllocEx", argc=5)
-    def VirtualAllocEx(self, emu, argv, ctx: api.ApiContext = None):
+    def VirtualAllocEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPVOID VirtualAllocEx(
-          HANDLE hProcess,
-          LPVOID lpAddress,
-          SIZE_T dwSize,
-          DWORD  flAllocationType,
-          DWORD  flProtect
+            HANDLE hProcess,
+            LPVOID lpAddress,
+            SIZE_T dwSize,
+            DWORD flAllocationType,
+            DWORD flProtect
         );
+
+        All processes share one address space. When the target is another process and memory that is not memory of
+        the target uses the range at lpAddress, for example the image of the caller, the allocation goes to the next
+        free range. On Windows, that range is free in the target, so the call returns lpAddress.
         """
         hProcess, lpAddress, dwSize, flAllocationType, flProtect = argv
+        flProtect &= 0xFFFFFFFF
         buf = 0
 
-        if is_current_process_pseudo_handle(hProcess, self.get_ptr_size()):
-            obj = emu.get_current_process()
-        else:
-            obj = self.get_object_from_handle(hProcess)
-
-        if not isinstance(obj, Process):
+        obj = emu.get_handle_table().get(hProcess, objman.Process)
+        if not obj:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return windefs.NULL
 
         proc_path = obj.path or ""
-        argv[0] = proc_path
+        _set_arg_display(ctx, "hProcess", proc_path)
         proc_path = ntpath.basename(proc_path)
         proc_path = proc_path.replace(".", "_")
 
         tag_prefix = f"api.VirtualAllocEx.{proc_path}.{obj.pid}"
 
-        prot_def = windefs.get_page_rights(flProtect)
-        if prot_def:
-            prot_def = "|".join(prot_def)
-            argv[4] = prot_def
+        prot_def = decode_flags(PAGE_PROTECTION_FLAGS, flProtect)
+        _set_arg_display(ctx, "flProtect", "|".join(prot_def))
 
         # FX-012: a non-current process has its own address view. The
         # requested base is judged in that view; it is never relocated around
@@ -1278,7 +1489,7 @@ class Kernel32(api.ApiHandler):
         if space is not None:
             # FX12-extended-rv2: a base-less reservation must not pick a VA that
             # is already occupied in the shared emulator, otherwise its
-            # materialization would collide during the child run.  Explicit
+            # materialization would collide during the child run. Explicit
             # lpAddress requests keep target-view semantics.
             avoid: tuple[tuple[int, int], ...] = ()
             if not lpAddress:
@@ -1296,71 +1507,92 @@ class Kernel32(api.ApiHandler):
                     and int(r.size) > 0
                 )
             try:
-                buf = space.virtual_alloc(
-                    lpAddress, dwSize, flAllocationType, flProtect, avoid=avoid
-                )
+                buf = space.virtual_alloc(lpAddress, dwSize, flAllocationType, flProtect, avoid=avoid)
             except ProcessMemoryError as err:
                 emu.set_last_error(err.win_error)
                 return windefs.NULL
 
             self.record_process_event(
-                obj, MEM_ALLOC, base=buf, size=dwSize, type=flAllocationType, protect=argv[4]
+                obj,
+                EventType.MEM_ALLOC,
+                base=buf,
+                size=dwSize,
+                permissions=get_prot_string(self.win_perms_to_emu_perms(flProtect)),
             )
             return buf
 
-        # Was this address already commited?
+        # A commit in an allocation of the target changes its pages in place. A reservation needs free
+        # memory, but VirtualFree leaves a freed allocation mapped, so a reservation can use it again.
         mm = emu.get_address_map(lpAddress)
-        if mm and mm.tag and mm.tag.startswith(tag_prefix):
+        if mm and mm.tag and mm.tag.startswith(tag_prefix) and (mm.free or not flAllocationType & windefs.MEM_RESERVE):
+            mm.free = False
             buf = lpAddress
-        else:
-            if dwSize:
-                if lpAddress:
-                    test = lpAddress & 0xFFFFFFFFFFFFF000
-                else:
-                    test = emu.virtual_mem_base
-                size = dwSize
+            if flAllocationType & windefs.MEM_COMMIT:
+                buf = self.commit_pages(emu, mm, lpAddress, dwSize, flProtect)
+        elif dwSize:
+            if lpAddress:
+                test = lpAddress & 0xFFFFFFFFFFFFF000
+            else:
+                test = emu.virtual_mem_base
+            size = dwSize
+            try:
                 base, size = emu.get_valid_ranges(size, addr=test)
-                while base and base & 0xFFF:
-                    base, size = emu.get_valid_ranges(size, addr=test)
-                    test += PAGE_SIZE
+            except OutOfMemoryError:
+                emu.set_last_error(windefs.ERROR_NOT_ENOUGH_MEMORY)
+                return 0
+            if lpAddress and base != test:
+                # All processes share one address space, so memory of the caller can take the range in another
+                # process. The allocation then moves, so that a process hollowing sample still writes its payload
+                # and resumes the target.
+                end = test + size
+                taken = [m for m in emu.get_mem_maps() if m.base < end and test < m.base + m.size]
+                if obj is emu.get_current_process() or any(m.process is obj for m in taken):
+                    emu.set_last_error(windefs.ERROR_INVALID_ADDRESS)
+                    return 0
+            while base and base & 0xFFF:
+                base, size = emu.get_valid_ranges(size, addr=test)
+                test += e_arch.PAGE_SIZE
 
-                emu_perms = self.win_perms_to_emu_perms(flProtect)
-                buf = self.mem_alloc(
-                    base=base, size=size, tag=tag_prefix, flags=flProtect, perms=emu_perms, process=obj
-                )
-                mm = emu.get_address_map(buf)
+            emu_perms = self.win_perms_to_emu_perms(flProtect)
+            buf = self.mem_alloc(base=base, size=size, tag=tag_prefix, flags=flProtect, perms=emu_perms, process=obj)
+            if flProtect & PAGE_PROTECTION_FLAGS.PAGE_GUARD and obj is emu.get_current_process():
+                emu.set_guard_pages(buf, size, emu_perms)
+            mm = emu.get_address_map(buf)
 
-                self.record_process_event(obj, MEM_ALLOC, base=buf, size=dwSize, type=flAllocationType, protect=argv[4])
+            self.record_process_event(
+                obj,
+                EventType.MEM_ALLOC,
+                base=buf,
+                size=dwSize,
+                type=flAllocationType,
+                permissions=get_prot_string(emu_perms),
+            )
 
-                emu._set_dyn_code_hook(buf, size)
+            emu._set_dyn_code_hook(buf, size)
 
         return buf
 
     @apihook("WriteProcessMemory", argc=5)
-    def WriteProcessMemory(self, emu, argv, ctx: api.ApiContext = None):
+    def WriteProcessMemory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL WriteProcessMemory(
-          HANDLE  hProcess,
-          LPVOID  lpBaseAddress,
-          LPCVOID lpBuffer,
-          SIZE_T  nSize,
-          SIZE_T  *lpNumberOfBytesWritten
+            HANDLE hProcess,
+            LPVOID lpBaseAddress,
+            LPCVOID lpBuffer,
+            SIZE_T nSize,
+            SIZE_T *lpNumberOfBytesWritten
         );
         """
         hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesWritten = argv
         rv = False
 
-        if is_current_process_pseudo_handle(hProcess, self.get_ptr_size()):
-            obj = emu.get_current_process()
-        else:
-            obj = self.get_object_from_handle(hProcess)
-
-        if not isinstance(obj, Process):
+        obj = emu.get_handle_table().get(hProcess, objman.Process)
+        if not obj:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
-            return False
+            return rv
 
         proc_path = obj.path or ""
-        argv[0] = proc_path
+        _set_arg_display(ctx, "hProcess", proc_path)
 
         data = b""
         if lpBuffer and lpBaseAddress:
@@ -1368,64 +1600,61 @@ class Kernel32(api.ApiHandler):
                 data = self.mem_read(lpBuffer, nSize)
             except Exception:
                 emu.set_last_error(ERROR_NOACCESS)
-                self.record_process_event(obj, MEM_WRITE, base=lpBaseAddress, size=nSize, data=b"")
+                self.record_process_event(obj, EventType.MEM_WRITE, base=lpBaseAddress, size=nSize, data=b"")
                 return False
 
+            # FX-012: the current process is the global address space; another
+            # process owns a shadow view and the write is projected there.
             try:
                 space = emu.get_process_address_space(obj)
                 if space is None:
-                    written = write_current_process_memory(
-                        emu, lpBaseAddress, data, writer=self.mem_write
-                    )
+                    written = write_current_process_memory(emu, lpBaseAddress, data, writer=self.mem_write)
                 else:
                     written = space.write(lpBaseAddress, data)
             except ProcessMemoryError as err:
                 emu.set_last_error(err.win_error)
-                self.record_process_event(obj, MEM_WRITE, base=lpBaseAddress, size=nSize, data=b"")
+                self.record_process_event(obj, EventType.MEM_WRITE, base=lpBaseAddress, size=nSize, data=b"")
                 return False
 
             if written != len(data):
                 emu.set_last_error(ERROR_PARTIAL_COPY)
-                self.record_process_event(obj, MEM_WRITE, base=lpBaseAddress, size=nSize, data=b"")
+                self.record_process_event(obj, EventType.MEM_WRITE, base=lpBaseAddress, size=nSize, data=b"")
                 return False
 
             if lpNumberOfBytesWritten:
                 bw = (len(data)).to_bytes(self.get_ptr_size(), "little")
                 self.mem_write(lpNumberOfBytesWritten, bw)
             rv = True
+            obj.is_modified = True
             emu.set_last_error(windefs.ERROR_SUCCESS)
         else:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
 
-        self.record_process_event(obj, MEM_WRITE, base=lpBaseAddress, size=nSize, data=data)
+        self.record_process_event(obj, EventType.MEM_WRITE, base=lpBaseAddress, size=nSize, data=data)
 
         return rv
 
     @apihook("ReadProcessMemory", argc=5)
-    def ReadProcessMemory(self, emu, argv, ctx: api.ApiContext = None):
+    def ReadProcessMemory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL ReadProcessMemory(
-            HANDLE  hProcess,
+            HANDLE hProcess,
             LPCVOID lpBaseAddress,
-            LPVOID  lpBuffer,
-            SIZE_T  nSize,
-            SIZE_T  *lpNumberOfBytesRead
+            LPVOID lpBuffer,
+            SIZE_T nSize,
+            SIZE_T *lpNumberOfBytesRead
         );
         """
         hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead = argv
         rv = False
 
-        if is_current_process_pseudo_handle(hProcess, self.get_ptr_size()):
-            obj = emu.get_current_process()
-        else:
-            obj = self.get_object_from_handle(hProcess)
-
-        if not isinstance(obj, Process):
+        obj = emu.get_handle_table().get(hProcess, objman.Process)
+        if not obj:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
-            return False
+            return rv
 
         proc_path = obj.path or ""
-        argv[0] = proc_path
+        _set_arg_display(ctx, "hProcess", proc_path)
 
         data = b""
         if lpBuffer and lpBaseAddress:
@@ -1450,122 +1679,116 @@ class Kernel32(api.ApiHandler):
         else:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
 
-        self.record_process_event(obj, MEM_READ, base=lpBaseAddress, size=nSize, data=data)
+        self.record_process_event(obj, EventType.MEM_READ, base=lpBaseAddress, size=nSize, data=data)
 
         return rv
 
     @apihook("CreateRemoteThread", argc=7)
-    def CreateRemoteThread(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateRemoteThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE CreateRemoteThread(
-          HANDLE                 hProcess,
-          LPSECURITY_ATTRIBUTES  lpThreadAttributes,
-          SIZE_T                 dwStackSize,
-          LPTHREAD_START_ROUTINE lpStartAddress,
-          LPVOID                 lpParameter,
-          DWORD                  dwCreationFlags,
-          LPDWORD                lpThreadId
+            HANDLE hProcess,
+            LPSECURITY_ATTRIBUTES lpThreadAttributes,
+            SIZE_T dwStackSize,
+            LPTHREAD_START_ROUTINE lpStartAddress,
+            LPVOID lpParameter,
+            DWORD dwCreationFlags,
+            LPDWORD lpThreadId
         );
         """
         (hProcess, lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, dwCreationFlags, lpThreadId) = argv
 
-        is_remote = False
-        if hProcess == self.get_max_int():
-            proc_obj = emu.get_current_process()
-        else:
-            is_remote = True
-            proc_obj = self.get_object_from_handle(hProcess)
+        is_remote = hProcess != self.get_max_int()
+        proc_obj = emu.get_handle_table().get(hProcess, objman.Process)
+        if not proc_obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
 
         if proc_obj in emu.child_processes and not emu.child_execution.allow_execution:
             emu.set_last_error(windefs.ERROR_ACCESS_DENIED)
             return 0
 
-        proc_path = proc_obj.path
-        argv[0] = proc_path
-        proc_path = ntpath.basename(proc_path)
-        proc_path = proc_path.replace(".", "_")
+        _set_arg_display(ctx, "hProcess", proc_obj.path)
 
         if is_remote:
-            run_type = f"injected_thread_{proc_path}_{proc_obj.id:x}"
-            evt_type = THREAD_INJECT
+            run_name = ntpath.basename(proc_obj.path)
+            evt_type = EventType.THREAD_INJECT
         else:
-            run_type = "thread"
-            evt_type = THREAD_CREATE
+            run_name = None
+            evt_type = EventType.THREAD_CREATE
 
-        handle, obj = self.create_thread(lpStartAddress, lpParameter, proc_obj, thread_type=run_type)
+        handle, obj = self.create_thread(lpStartAddress, lpParameter, proc_obj, name=run_name)
 
         if not obj:
             return handle
 
         if lpThreadId:
-            self.mem_write(lpThreadId, obj.id.to_bytes(4, "little"))
+            self.write_dword(lpThreadId, obj.id)
 
-        self.record_process_event(proc_obj, evt_type, start_addr=lpStartAddress, param=lpParameter, tid=obj.id)
+        self.record_process_event(proc_obj, evt_type, start_address=lpStartAddress, param=lpParameter, tid=obj.id)
 
         emu.set_last_error(windefs.ERROR_SUCCESS)
 
         return handle
 
     @apihook("CreateThread", argc=6)
-    def CreateThread(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE CreateThread(
-            LPSECURITY_ATTRIBUTES   lpThreadAttributes,
-            SIZE_T                  dwStackSize,
-            LPTHREAD_START_ROUTINE  lpStartAddress,
-            __drv_aliasesMem LPVOID lpParameter,
-            DWORD                   dwCreationFlags,
-            LPDWORD                 lpThreadId
+            LPSECURITY_ATTRIBUTES lpThreadAttributes,
+            SIZE_T dwStackSize,
+            LPTHREAD_START_ROUTINE lpStartAddress,
+            LPVOID lpParameter,
+            DWORD dwCreationFlags,
+            LPDWORD lpThreadId
         );
         """
         (lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, dwCreationFlags, lpThreadId) = argv
 
         proc_obj = emu.get_current_process()
-        def_flags = windefs.get_creation_flags(dwCreationFlags)
-        if def_flags:
-            def_flags = " | ".join(def_flags)
-            argv[4] = def_flags
+        ctx.args["dwCreationFlags"].display = decode(THREAD_CREATION_FLAGS, dwCreationFlags)
+        is_suspended = bool(dwCreationFlags & THREAD_CREATION_FLAGS.THREAD_CREATE_SUSPENDED)
 
-        is_suspended = False
-        if dwCreationFlags & windefs.CREATE_SUSPENDED:
-            is_suspended = True
-
-        handle, obj = self.create_thread(
-            lpStartAddress, lpParameter, proc_obj, thread_type="thread", is_suspended=is_suspended
-        )
+        handle, obj = self.create_thread(lpStartAddress, lpParameter, proc_obj, is_suspended=is_suspended)
 
         if not obj:
             return handle
 
         if lpThreadId:
-            self.mem_write(lpThreadId, obj.id.to_bytes(4, "little"))
+            self.write_dword(lpThreadId, obj.id)
 
-        self.record_process_event(proc_obj, THREAD_CREATE, start_addr=lpStartAddress, param=lpParameter, tid=obj.id)
+        self.record_process_event(
+            proc_obj, EventType.THREAD_CREATE, start_address=lpStartAddress, param=lpParameter, tid=obj.id
+        )
 
         emu.set_last_error(windefs.ERROR_SUCCESS)
 
         return handle
 
     @apihook("ResumeThread", argc=1)
-    def ResumeThread(self, emu, argv, ctx: api.ApiContext = None):
+    def ResumeThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD ResumeThread(
             HANDLE hThread
         );
         """
         (hThread,) = argv
-        rv = -1
-        obj = self.get_object_from_handle(hThread)
+        obj = emu.get_handle_table().get(hThread, objman.Thread)
         if not obj:
-            return rv
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0xFFFFFFFF
 
         rv = obj.suspend_count
         if rv > 0:
             obj.suspend_count -= 1
+        if rv != 1:
+            return rv
 
         if not emu.resume_thread(obj):
-            context = obj.get_context()
             proc = obj.process
+            if proc is None or proc not in emu.child_processes or not proc.is_modified:
+                return rv
+            context = obj.get_context()
             if emu.get_arch() == e_arch.ARCH_AMD64:
                 start_addr = context.Rip
                 if not start_addr and context.Rcx:
@@ -1575,80 +1798,125 @@ class Kernel32(api.ApiHandler):
                 if not start_addr and context.Eax:
                     start_addr = context.Eax
 
-            if start_addr and proc in emu.child_processes:
-                if not emu.child_execution.allow_execution:
-                    return rv
-                mm = emu.get_address_map(start_addr)
-                if mm:
-                    emu.ensure_pe_import_hooks(mm.base)
+            # The context of a child that has an image in the emulated file system gets its entry point only when child
+            # emulation loads the image, so the child stays for child emulation unless the parent set a start address.
+            if not start_addr:
+                return rv
+            if proc in emu.child_processes and not emu.child_execution.allow_execution:
+                return rv
+            # The image of any other program has no code and no entry point, so the context gives the MZ header at its
+            # base. A run there faults on the first instruction, unless the parent wrote code over the header.
+            pe = proc.pe
+            mm = emu.get_address_map(start_addr)
+            if mm and pe and not pe.ep and start_addr == pe.base and self.mem_read(start_addr, 2) == b"MZ":
+                return rv
+            if mm:
+                emu.ensure_pe_import_hooks(mm.base)
 
-            handle, obj = self.create_thread(start_addr, 0, proc, thread_type=f"thread.{proc.name}.{proc.id}")
-            if proc in emu.child_processes:
-                emu.child_processes.remove(proc)
+            handle, obj = self.create_thread(start_addr, 0, proc, name=ntpath.basename(proc.path))
+            emu.child_processes.remove(proc)
         return rv
 
     @apihook("SuspendThread", argc=1)
-    def SuspendThread(self, emu, argv, ctx: api.ApiContext = None):
+    def SuspendThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD SuspendThread(
             HANDLE hThread
         );
+
+        Speakeasy does not stop the current thread. The current run continues, and only a queued run of another thread
+        waits for ResumeThread.
         """
         (hThread,) = argv
-        rv = -1
-        obj = self.get_object_from_handle(hThread)
+        obj = emu.get_handle_table().get(hThread, objman.Thread)
         if not obj:
-            return rv
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0xFFFFFFFF
 
         rv = obj.suspend_count
         obj.suspend_count += 1
+        if rv == 0 and obj is not emu.get_current_thread():
+            queued = next((run for run in emu.run_queue if run.thread is obj), None)
+            if queued is not None:
+                emu.run_queue.remove(queued)
+                emu.suspended_runs.append(queued)
         return rv
 
     @apihook("TerminateThread", argc=2)
-    def TerminateThread(self, emu, argv, ctx: api.ApiContext = None):
+    def TerminateThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL TerminateThread(
-          [in, out] HANDLE hThread,
-          [in]      DWORD  dwExitCode
+            HANDLE hThread,
+            DWORD dwExitCode
         );
+
+        Speakeasy does not model thread termination. The queued run of the thread still runs.
         """
         hThread, dwExitCode = argv
         rv = 0
-        obj = self.get_object_from_handle(hThread)
+        obj = emu.get_handle_table().get(hThread, objman.Thread)
         if not obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return rv
 
         rv = 1
-        # Thread termination not implemented
 
         return rv
 
     @apihook("GetThreadId", argc=1)
-    def GetThreadId(self, emu, argv, ctx: api.ApiContext = None):
+    def GetThreadId(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetThreadId(
-          HANDLE Thread
+            HANDLE Thread
         );
         """
         (Thread,) = argv
 
-        if not Thread:
-            return 0
-
-        obj = self.get_object_from_handle(Thread)
+        obj = emu.get_handle_table().get(Thread, objman.Thread)
 
         if not obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
         return obj.id
 
+    @apihook("GetProcessId", argc=1)
+    def GetProcessId(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetProcessId(
+            HANDLE Process
+        );
+        """
+        (Process,) = argv
+
+        proc = emu.get_handle_table().get(Process, objman.Process)
+        if not proc:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+        return proc.id
+
+    @apihook("GetProcessIdOfThread", argc=1)
+    def GetProcessIdOfThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetProcessIdOfThread(
+            HANDLE Thread
+        );
+        """
+        (Thread,) = argv
+
+        thread = emu.get_handle_table().get(Thread, objman.Thread)
+        if not thread:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+        return (thread.process or emu.get_current_process()).id
+
     @apihook("VirtualQuery", argc=3)
-    def VirtualQuery(self, emu, argv, ctx: api.ApiContext = None):
+    def VirtualQuery(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SIZE_T VirtualQuery(
-            LPCVOID                   lpAddress,
+            LPCVOID lpAddress,
             PMEMORY_BASIC_INFORMATION lpBuffer,
-            SIZE_T                    dwLength
+            SIZE_T dwLength
         );
         """
         rv = 0
@@ -1662,15 +1930,40 @@ class Kernel32(api.ApiHandler):
 
         mm = emu.get_address_map(lpAddress)
         if not mm:
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-            return rv
+            page = lpAddress & ~0xFFF
+            reserve = emu.get_reserve_map(lpAddress)
+            if reserve:
+                mbi.BaseAddress = page
+                mbi.AllocationBase = reserve.base
+                mbi.RegionSize = reserve.base + reserve.size - page
+                mbi.State = windefs.MEM_RESERVE
+            else:
+                end = self.get_max_application_address(emu) + 1
+                if lpAddress >= end:
+                    emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+                    return rv
+                for m in [*emu.get_mem_maps(), *emu.mem_reserves]:
+                    if page < m.base < end:
+                        end = m.base
+                mbi.BaseAddress = page
+                mbi.RegionSize = end - page
+                mbi.State = windefs.MEM_FREE
+                mbi.Protect = PAGE_PROTECTION_FLAGS.PAGE_NOACCESS
+            self.mem_write(lpBuffer, mbi.get_bytes())
+            return mbi.sizeof()
 
+        # The effective Win32 protection: a per-page value recorded by the
+        # loader or VirtualProtect (including image write-copy) wins; a guard
+        # page adds PAGE_GUARD; otherwise derive it from the page permissions.
         effective_prot = emu.get_address_win_protection(lpAddress)
         if effective_prot is None:
             perms = emu.get_address_perms(lpAddress)
             if perms is None:
                 perms = mm.prot
             effective_prot = self.emu_perms_to_win_perms(perms)
+        guard_prot = self.get_page_protection(lpAddress)
+        if guard_prot & PAGE_PROTECTION_FLAGS.PAGE_GUARD:
+            effective_prot = guard_prot
         region = emu.get_protection_region(lpAddress)
         if region is None:
             region_base, region_size = mm.base, mm.size
@@ -1690,112 +1983,170 @@ class Kernel32(api.ApiHandler):
 
         return mbi.sizeof()
 
-    @apihook("VirtualProtect", argc=4)
-    def VirtualProtect(self, emu, argv, ctx: api.ApiContext = None):
-        """BOOL WINAPI VirtualProtect(
-          _In_  LPVOID lpAddress,
-          _In_  SIZE_T dwSize,
-          _In_  DWORD  flNewProtect,
-          _Out_ PDWORD lpflOldProtect
-        );"""
-        lpAddress, dwSize, flNewProtect, lpflOldProtect = argv
+    @apihook("VirtualQueryEx", argc=4)
+    def VirtualQueryEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        SIZE_T VirtualQueryEx(
+            HANDLE hProcess,
+            LPCVOID lpAddress,
+            PMEMORY_BASIC_INFORMATION lpBuffer,
+            SIZE_T dwLength
+        );
+        """
+        hProcess = argv[0]
 
-        # FX-003 diagnostics: per-page protection state before/after the call
-        # plus the outcome. Read-only; the protection change itself is
-        # unchanged (it still goes through apply_page_protection).
-        observation = page_trace_diagnostics.start_virtual_protect(emu, ctx, argv)
+        proc_obj = emu.get_handle_table().get(hProcess, objman.Process)
 
-        if not lpflOldProtect:
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-            page_trace_diagnostics.finish_virtual_protect(
-                emu, ctx, observation, success=False, error=windefs.ERROR_INVALID_PARAMETER
-            )
+        if not proc_obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
+        _set_arg_display(ctx, "hProcess", proc_obj.path or "")
+        return self.VirtualQuery(emu, argv[1:], ctx)
+
+    @apihook("VirtualProtect", argc=4)
+    def VirtualProtect(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL VirtualProtect(
+            LPVOID lpAddress,
+            SIZE_T dwSize,
+            DWORD flNewProtect,
+            PDWORD lpflOldProtect
+        );
+        """
+        # FX-003 diagnostics: per-page protection state before/after the call
+        # plus the outcome. Read-only; the protection change itself is applied
+        # by apply_page_protection.
+        observation = page_trace_diagnostics.start_virtual_protect(emu, ctx, argv)
+        _set_observation(ctx, observation)
+        rv = self._virtual_protect(emu, emu.get_current_process(), *argv)
+        if rv:
+            old_written = None
+            if argv[3]:
+                try:
+                    old_written = self.read_dword(argv[3])
+                except Exception:
+                    old_written = None
+            _set_observation(
+                ctx,
+                page_trace_diagnostics.finish_virtual_protect(
+                    emu, ctx, observation, success=True, old_protect_written=old_written
+                ),
+            )
+        else:
+            _set_observation(
+                ctx,
+                page_trace_diagnostics.finish_virtual_protect(
+                    emu, ctx, observation, success=False, error=emu.get_last_error()
+                ),
+            )
+        return rv
+
+    def _virtual_protect(self, emu, proc, lpAddress, dwSize, flNewProtect, lpflOldProtect):
+        # NtProtectVirtualMemory rejects a size of 0 before it looks for the memory at the address.
+        if not dwSize:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        if not lpflOldProtect:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        page_mask = emu.page_size - 1
+        addr = lpAddress & ~page_mask
+        guard_prot = self.get_page_protection(addr)
+
+        # Windows changes every page that the range touches and returns the
+        # protection of the first page. apply_page_protection validates the
+        # request before changing any page and keeps the image write-copy and
+        # page-granular semantics of the local FX-004 work.
         result = apply_page_protection(emu, lpAddress, dwSize, flNewProtect)
         if not result.success:
             if result.error is not None:
                 emu.set_last_error(result.error)
-            page_trace_diagnostics.finish_virtual_protect(
-                emu, ctx, observation, success=False, error=result.error
-            )
             return 0
 
-        self.mem_write(lpflOldProtect, result.old_protect.to_bytes(4, "little"))
-        page_trace_diagnostics.finish_virtual_protect(
-            emu, ctx, observation, success=True, old_protect_written=result.old_protect
-        )
+        old_prot = result.old_protect
+        if guard_prot & PAGE_PROTECTION_FLAGS.PAGE_GUARD:
+            old_prot = guard_prot
+        self.write_dword(lpflOldProtect, old_prot)
+
+        new = self.win_perms_to_emu_perms(flNewProtect)
+        size = result.end - result.start
+        if flNewProtect & PAGE_PROTECTION_FLAGS.PAGE_GUARD:
+            emu.set_guard_pages(result.start, size, new)
+        # A protection that covers a whole private allocation is its allocation
+        # protection; a partial range stays per-page so neighbours keep theirs.
+        for m in emu.get_mem_maps():
+            if m.base <= result.start and result.end >= m.base + m.size:
+                m.prot = new
+
+        # The event needs the run that the call belongs to; a handler invoked
+        # directly (outside a run) has no report event to record.
+        get_run = getattr(emu, "get_current_run", None)
+        if proc and (not callable(get_run) or get_run() is not None):
+            self.record_process_event(
+                proc, EventType.MEM_PROTECT, base=result.start, size=size, permissions=get_prot_string(new)
+            )
         return 1
 
     @apihook("VirtualProtectEx", argc=5)
-    def VirtualProtectEx(self, emu, argv, ctx: api.ApiContext = None):
+    def VirtualProtectEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL VirtualProtectEx(
             HANDLE hProcess,
             LPVOID lpAddress,
             SIZE_T dwSize,
-            DWORD  flNewProtect,
+            DWORD flNewProtect,
             PDWORD lpflOldProtect
         );
         """
-        ctx = ctx or {}
         hProcess, lpAddress, dwSize, flNewProtect, lpflOldProtect = argv
 
-        # A pseudo-handle (or the legacy 0xFFFFFFFF fallback) always denotes the
-        # current process and keeps the global VirtualProtect behavior.
-        is_current = is_current_process_pseudo_handle(hProcess, self.get_ptr_size())
-        if not is_current and 0xFFFFFFFF == (0xFFFFFFFF & hProcess):
-            is_current = True
-        if is_current:
-            proc_obj = emu.get_current_process()
-            rv = self.VirtualProtect(emu, argv[1:], ctx)
-        else:
-            proc_obj = self.get_object_from_handle(hProcess)
-            if not isinstance(proc_obj, Process):
-                emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
-                return 0
-            # FX12-extended-rv2: a non-current process owns a shadow view. Never
-            # run the caller/global VirtualProtect path for it; the probe
-            # evidence shows that changed the parent image page 0x20 -> 0x1.
-            try:
-                space = emu.get_process_address_space(proc_obj)
-            except ProcessMemoryError as err:
-                emu.set_last_error(err.win_error)
-                return 0
-            if space is None:  # defensive: non-current processes have a view
-                rv = self.VirtualProtect(emu, argv[1:], ctx)
-            else:
-                if not lpflOldProtect:
-                    emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-                    return 0
-                try:
-                    _start, _size, old_protect = space.protect(
-                        lpAddress, dwSize, flNewProtect
-                    )
-                except ProcessMemoryError as err:
-                    emu.set_last_error(err.win_error)
-                    return 0
-                self.mem_write(lpflOldProtect, old_protect.to_bytes(4, "little"))
-                emu.set_last_error(windefs.ERROR_SUCCESS)
-                rv = 1
+        proc_obj = emu.get_handle_table().get(hProcess, objman.Process)
 
-        prot_def = windefs.get_page_rights(flNewProtect)
-        if prot_def:
-            prot_def = " | ".join(prot_def)
-            argv[3] = prot_def
+        if not proc_obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
 
-        self.record_process_event(proc_obj, MEM_PROTECT, base=lpAddress, size=dwSize, protect=prot_def)
+        prot_def = decode_flags(PAGE_PROTECTION_FLAGS, flNewProtect)
+        _set_arg_display(ctx, "flNewProtect", "|".join(prot_def))
 
-        return rv
+        if proc_obj is emu.get_current_process():
+            # The current process keeps the global VirtualProtect behaviour
+            # (a pseudo-handle resolves to this process in the handle table).
+            return self.VirtualProtect(emu, argv[1:], ctx)
+
+        # FX12-extended-rv2: a non-current process owns a shadow view. Never
+        # run the caller/global VirtualProtect path for it.
+        if not lpflOldProtect:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        try:
+            space = emu.get_process_address_space(proc_obj)
+        except ProcessMemoryError as err:
+            emu.set_last_error(err.win_error)
+            return 0
+        if space is None:  # defensive: non-current processes have a view
+            return self.VirtualProtect(emu, argv[1:], ctx)
+        try:
+            _start, _size, old_protect = space.protect(lpAddress, dwSize, flNewProtect)
+        except ProcessMemoryError as err:
+            emu.set_last_error(err.win_error)
+            return 0
+        self.mem_write(lpflOldProtect, old_protect.to_bytes(4, "little"))
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return 1
 
     @apihook("VirtualFree", argc=3)
-    def VirtualFree(self, emu, argv, ctx: api.ApiContext = None):
+    def VirtualFree(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL VirtualFree(
-          LPVOID lpAddress,
-          SIZE_T dwSize,
-          DWORD  dwFreeType
+            LPVOID lpAddress,
+            SIZE_T dwSize,
+            DWORD dwFreeType
         );
+
+        Speakeasy marks the region as free for the report, but does not unmap it, and always returns success.
         """
         rv = 0
 
@@ -1804,6 +2155,10 @@ class Kernel32(api.ApiHandler):
         for m in maps:
             if m.base == lpAddress:
                 m.free = True
+                emu.clear_guard_pages(m.base, dwSize or m.size)
+                proc = emu.get_current_process()
+                if proc:
+                    self.record_process_event(proc, EventType.MEM_FREE, base=lpAddress, size=dwSize or m.size)
                 rv = True
                 break
 
@@ -1812,7 +2167,7 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("VirtualFreeEx", argc=4)
-    def VirtualFreeEx(self, emu, argv, ctx: api.ApiContext = None):
+    def VirtualFreeEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL VirtualFreeEx(
           HANDLE hProcess,
@@ -1823,12 +2178,8 @@ class Kernel32(api.ApiHandler):
         """
         hProcess, lpAddress, dwSize, dwFreeType = argv
 
-        if is_current_process_pseudo_handle(hProcess, self.get_ptr_size()):
-            obj = emu.get_current_process()
-        else:
-            obj = self.get_object_from_handle(hProcess)
-
-        if not isinstance(obj, Process):
+        obj = emu.get_handle_table().get(hProcess, objman.Process)
+        if not obj:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return False
 
@@ -1854,40 +2205,41 @@ class Kernel32(api.ApiHandler):
             freed_base, freed_size = space.unmap(lpAddress, dwSize, dwFreeType)
         except ProcessMemoryError as err:
             emu.set_last_error(err.win_error)
-            self.record_process_event(obj, MEM_FREE, base=lpAddress, size=dwSize)
+            self.record_process_event(obj, EventType.MEM_FREE, base=lpAddress, size=dwSize)
             return False
 
         emu.set_last_error(windefs.ERROR_SUCCESS)
-        self.record_process_event(obj, MEM_FREE, base=freed_base, size=freed_size)
+        self.record_process_event(obj, EventType.MEM_FREE, base=freed_base, size=freed_size)
         return True
 
     @apihook("GetCurrentProcess", argc=0)
-    def GetCurrentProcess(self, emu, argv, ctx: api.ApiContext = None):
+    def GetCurrentProcess(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE GetCurrentProcess();
         """
-
         rv = self.get_max_int()
 
         return rv
 
     @apihook("GetVersion", argc=0)
-    def GetVersion(self, emu, argv, ctx: api.ApiContext = None):
-        """NOT_BUILD_WINDOWS_DEPRECATE DWORD GetVersion();"""
-
-        ver = self.emu.config.os_ver
-        build = ver.build
-        major = ver.major
-        minor = ver.minor
+    def GetVersion(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetVersion();
+        """
+        ver = self.emu.config.system.os_ver
+        build = ver.build or 0
+        major = ver.major or 0
+        minor = ver.minor or 0
 
         rv = 0xFFFFFFFF & ((build << 16) | minor << 8 | major)
 
         return rv
 
     @apihook("GetLastError", argc=0)
-    def GetLastError(self, emu, argv, ctx: api.ApiContext = None):
-        """DWORD WINAPI GetLastError(void);"""
-
+    def GetLastError(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetLastError();
+        """
         rv = emu.get_last_error()
 
         # TODO: reset last error code here for now
@@ -1896,10 +2248,10 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("SetLastError", argc=1)
-    def SetLastError(self, emu, argv, ctx: api.ApiContext = None):
+    def SetLastError(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void SetLastError(
-          DWORD dwErrCode
+        VOID SetLastError(
+            DWORD dwErrCode
         );
         """
         (dwErrCode,) = argv
@@ -1907,207 +2259,437 @@ class Kernel32(api.ApiHandler):
         # FX-016 diagnostics: record guest control-flow provenance (set value,
         # previous LastError, call site, return address, registers, stack).
         # The handler still returns None and does not write EAX.
-        api_trace_diagnostics.attach_observation(
+        _scatter_observation(
             ctx,
+            api_trace_diagnostics.attach_observation,
             lambda: api_trace_diagnostics.observe_set_last_error(emu, argv),
         )
 
         emu.set_last_error(dwErrCode)
 
-        return None
-
-    @apihook("SetHandleInformation", argc=3)
-    def SetHandleInformation(self, emu, argv, ctx: api.ApiContext = None):
+    def _expand_message(self, text, flags, arguments, cw):
         """
-        BOOL SetHandleInformation(
-          HANDLE hObject,
-          DWORD  dwMask,
-          DWORD  dwFlags
+        Expand the inserts and escapes of a message definition. Return None for a
+        definition that ends with a lone % or has inserts but no arguments.
+        """
+        ptr_size = self.get_ptr_size()
+        ignore = flags & k32defs.FORMAT_MESSAGE_IGNORE_INSERTS
+        wrap = flags & k32defs.FORMAT_MESSAGE_MAX_WIDTH_MASK
+        slots = arguments
+        if arguments and not flags & k32defs.FORMAT_MESSAGE_ARGUMENT_ARRAY:
+            slots = self.read_ptr(arguments)
+
+        out = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            i += 1
+            if ch in "\r\n":
+                if ch == "\r" and text[i : i + 1] == "\n":
+                    i += 1
+                out.append(" " if wrap else "\r\n")
+                continue
+            if ch != "%":
+                out.append(ch)
+                continue
+            if i == len(text):
+                return None
+            esc = text[i]
+            i += 1
+            if esc in "123456789" and not ignore:
+                number = int(esc)
+                if text[i : i + 1].isdigit():
+                    number = number * 10 + int(text[i])
+                    i += 1
+                spec = "s"
+                if text[i : i + 1] == "!" and "!" in text[i + 1 :]:
+                    end = text.index("!", i + 1)
+                    spec = text[i + 1 : end]
+                    i = end + 1
+                if not slots:
+                    return None
+                fmt = "%" + spec
+                first = slots + (number - 1) * ptr_size
+                values = [self.read_ptr(first + n * ptr_size) for n in range(self.get_va_arg_count(fmt))]
+                out.append(self.do_str_format(fmt, values, wide=cw == 2))
+            elif esc == "0":
+                break
+            elif esc == "n":
+                out.append("\r\n")
+            elif esc == "r":
+                out.append("\r")
+            elif esc == "t":
+                out.append("\t")
+            else:
+                out.append(("%" if ignore else "") + esc)
+        return "".join(out)
+
+    @apihook("FormatMessage", argc=7)
+    def FormatMessage(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD FormatMessage(
+            DWORD dwFlags,
+            LPCVOID lpSource,
+            DWORD dwMessageId,
+            DWORD dwLanguageId,
+            LPTSTR lpBuffer,
+            DWORD nSize,
+            va_list *Arguments
         );
         """
+        dwFlags, lpSource, dwMessageId, dwLanguageId, lpBuffer, nSize, Arguments = argv
+        cw = _char_width(self, ctx)
 
+        if dwFlags & k32defs.FORMAT_MESSAGE_FROM_STRING:
+            text = self.read_mem_string(lpSource, cw)
+        elif dwFlags & k32defs.FORMAT_MESSAGE_FROM_SYSTEM and dwMessageId in k32defs.SYSTEM_MESSAGES:
+            text = k32defs.SYSTEM_MESSAGES[dwMessageId]
+        else:
+            emu.set_last_error(windefs.ERROR_MR_MID_NOT_FOUND)
+            return 0
+
+        msg = self._expand_message(text, dwFlags, Arguments, cw)
+        if msg is None:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        data = self.encode_string(msg, cw) + b"\x00" * cw
+        count = len(data) // cw - 1
+        if dwFlags & k32defs.FORMAT_MESSAGE_ALLOCATE_BUFFER:
+            buf = self.heap_alloc(max(len(data), nSize * cw), heap="LocalAlloc")
+            self.mem_write(buf, data)
+            self.write_ptr(lpBuffer, buf)
+        elif count >= nSize:
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            return 0
+        else:
+            self.mem_write(lpBuffer, data)
+        return count
+
+    def _format_system_message(self, emu, argv, wide: bool) -> int:
+        """Format a FORMAT_MESSAGE_FROM_SYSTEM message into the caller buffer.
+
+        The system-message table is the engine's documented one (message id 0
+        is defined and is what the PyInstaller bootstrap formats). A message
+        that is longer than the buffer is truncated to ``nSize - 1``
+        characters, as the local FormatMessageA/W contract requires; ids that
+        the table does not carry fail with ERROR_MR_UNKNOWN (317).
+        """
+        dwFlags, _lpSource, dwMessageId, _dwLanguageId, lpBuffer, nSize, _arguments = argv
+
+        if not dwFlags & k32defs.FORMAT_MESSAGE_FROM_SYSTEM:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        if not lpBuffer or nSize <= 0:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        text = k32defs.SYSTEM_MESSAGES.get(int(dwMessageId))
+        if text is None:
+            emu.set_last_error(windefs.ERROR_MR_MID_NOT_FOUND)
+            return 0
+
+        unit = 2 if wide else 1
+        try:
+            encoded = self.encode_string(text, unit)
+        except Exception:
+            encoded = text.encode("utf-16le") if wide else text.encode("latin-1", "replace")
+        max_chars = max(0, int(nSize) - 1)
+        truncated = encoded[: max_chars * unit]
+        try:
+            self.mem_write(lpBuffer, truncated + (b"\x00" * unit))
+        except Exception:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return len(truncated) // unit
+
+    @apihook("FormatMessageA", argc=7)
+    def FormatMessageA(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD FormatMessageA(
+          DWORD   dwFlags,
+          LPCVOID lpSource,
+          DWORD   dwMessageId,
+          DWORD   dwLanguageId,
+          LPSTR   lpBuffer,
+          DWORD   nSize,
+          va_list *Arguments
+        );
+        """
+        if argv[0] & k32defs.FORMAT_MESSAGE_FROM_SYSTEM:
+            return self._format_system_message(emu, argv, wide=False)
+        if argv[0] & (
+            k32defs.FORMAT_MESSAGE_FROM_STRING
+            | k32defs.FORMAT_MESSAGE_FROM_HMODULE
+            | k32defs.FORMAT_MESSAGE_ALLOCATE_BUFFER
+        ):
+            return self.FormatMessage(emu, argv, ctx)
+        emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+        return 0
+
+    @apihook("FormatMessageW", argc=7)
+    def FormatMessageW(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD FormatMessageW(
+          DWORD   dwFlags,
+          LPCVOID lpSource,
+          DWORD   dwMessageId,
+          DWORD   dwLanguageId,
+          LPWSTR  lpBuffer,
+          DWORD   nSize,
+          va_list *Arguments
+        );
+        """
+        if argv[0] & k32defs.FORMAT_MESSAGE_FROM_SYSTEM:
+            return self._format_system_message(emu, argv, wide=True)
+        if argv[0] & (
+            k32defs.FORMAT_MESSAGE_FROM_STRING
+            | k32defs.FORMAT_MESSAGE_FROM_HMODULE
+            | k32defs.FORMAT_MESSAGE_ALLOCATE_BUFFER
+        ):
+            return self.FormatMessage(emu, argv, ctx)
+        emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+        return 0
+
+    @apihook("SetHandleInformation", argc=3)
+    def SetHandleInformation(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL SetHandleInformation(
+            HANDLE hObject,
+            DWORD dwMask,
+            DWORD dwFlags
+        );
+        """
         # Non-zero value for success.
         rv = 1
 
         return rv
 
     @apihook("GetHandleInformation", argc=2)
-    def GetHandleInformation(self, emu, argv, ctx: api.ApiContext = None):
+    def GetHandleInformation(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetHandleInformation(
-          HANDLE  hObject,
-          LPDWORD lpdwFlags
+            HANDLE hObject,
+            LPDWORD lpdwFlags
         );
         """
-
         # Non-zero value for success.
         rv = 1
 
         return rv
 
     @apihook("ExitProcess", argc=1)
-    def ExitProcess(self, emu, argv, ctx: api.ApiContext = None):
-        """void ExitProcess(
-                UINT uExitCode
-        );"""
-
+    def ExitProcess(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        VOID ExitProcess(
+            UINT uExitCode
+        );
+        """
         self.exit_process()
         return 0
 
     @apihook("SystemTimeToTzSpecificLocalTime", argc=3)
-    def SystemTimeToTzSpecificLocalTime(self, emu, argv, ctx: api.ApiContext = None):
+    def SystemTimeToTzSpecificLocalTime(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         BOOL SystemTimeToTzSpecificLocalTime(
             const TIME_ZONE_INFORMATION *lpTimeZoneInformation,
-            const SYSTEMTIME            *lpUniversalTime,
-            LPSYSTEMTIME                lpLocalTime
+            const SYSTEMTIME *lpUniversalTime,
+            LPSYSTEMTIME lpLocalTime
         );
         """
-        return True
+        lpTimeZoneInformation, lpUniversalTime, lpLocalTime = argv
+        return self.shift_system_time(emu, lpTimeZoneInformation, lpUniversalTime, lpLocalTime, -1)
+
+    @apihook("TzSpecificLocalTimeToSystemTime", argc=3)
+    def TzSpecificLocalTimeToSystemTime(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        BOOL TzSpecificLocalTimeToSystemTime(
+            const TIME_ZONE_INFORMATION *lpTimeZoneInformation,
+            const SYSTEMTIME *lpLocalTime,
+            LPSYSTEMTIME lpUniversalTime
+        );
+        """
+        lpTimeZoneInformation, lpLocalTime, lpUniversalTime = argv
+        return self.shift_system_time(emu, lpTimeZoneInformation, lpLocalTime, lpUniversalTime, 1)
+
+    def shift_system_time(self, emu, tzi, src, dst, sign):
+        """
+        Write the SYSTEMTIME at src, moved by sign times the time zone bias, to dst.
+        A NULL tzi is the current time zone, which GetTimeZoneInformation reports with no bias.
+        """
+        bias = 0
+        if tzi:
+            bias = int.from_bytes(self.mem_read(tzi, 4), "little", signed=True)
+        st = self.mem_cast(self.k32types.SYSTEMTIME(emu.get_ptr_size()), src)
+        try:
+            dt = datetime.datetime(
+                st.wYear,
+                st.wMonth,
+                st.wDay,
+                st.wHour,
+                st.wMinute,
+                st.wSecond,
+                st.wMilliseconds * 1000,
+                tzinfo=datetime.timezone.utc,
+            )
+            quad = winemu.get_filetime(dt)
+            quad += sign * bias * 60 * 10000000
+            out = self.get_system_time_struct(quad) if quad >= 0 else None
+        except (ValueError, OverflowError):
+            out = None
+        if out is None:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        self.mem_write(dst, out.get_bytes())
+        return 1
 
     @apihook("FileTimeToSystemTime", argc=2)
-    def FileTimeToSystemTime(self, emu, argv, ctx: api.ApiContext = None):
+    def FileTimeToSystemTime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL FileTimeToSystemTime(
             const FILETIME *lpFileTime,
-            LPSYSTEMTIME   lpSystemTime
+            LPSYSTEMTIME lpSystemTime
         );
         """
-
         lpFileTime, lpSystemTime = argv
 
-        st = self.k32types.SYSTEMTIME(emu.get_ptr_size())
         ft = self.k32types.FILETIME(emu.get_ptr_size())
         ft = self.mem_cast(ft, lpFileTime)
 
         quad = (ft.dwHighDateTime << 32) | ft.dwLowDateTime
         try:
-            dt = datetime.datetime.fromtimestamp((quad - 116444736000000000) / 10000000, tz=datetime.timezone.utc)
-        except ValueError:
-            dt = None
+            st = self.get_system_time_struct(quad)
+        except OverflowError:
+            st = None
 
-        if dt:
-            st.wYear = dt.year
-            st.wMonth = dt.month
-            st.wDayOfWeek = dt.weekday()
-            st.wDay = dt.day
-            st.wHour = dt.hour
-            st.wMinute = dt.minute
-            st.wSecond = dt.second
-            if lpSystemTime:
-                self.mem_write(lpSystemTime, st.get_bytes())
+        if st is not None and lpSystemTime:
+            self.mem_write(lpSystemTime, st.get_bytes())
 
         return True
 
     @apihook("GetSystemTimeAsFileTime", argc=1)
-    def GetSystemTimeAsFileTime(self, emu, argv, ctx: api.ApiContext = None):
-        """void GetSystemTimeAsFileTime(
-          LPFILETIME lpSystemTimeAsFileTime
-        );"""
-
+    def GetSystemTimeAsFileTime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        VOID GetSystemTimeAsFileTime(
+            LPFILETIME lpSystemTimeAsFileTime
+        );
+        """
         (lpSystemTimeAsFileTime,) = argv
         ft = self.k32types.FILETIME(emu.get_ptr_size())
 
-        timestamp = 116444736000000000 + int(datetime.datetime.now(datetime.timezone.utc).timestamp()) * 10000000
+        timestamp = self.get_system_time()
         ft.dwLowDateTime = 0xFFFFFFFF & timestamp
         ft.dwHighDateTime = timestamp >> 32
 
         self.mem_write(lpSystemTimeAsFileTime, self.get_bytes(ft))
 
-        return
-
     @apihook("SystemTimeToFileTime", argc=2)
-    def SystemTimeToFileTime(self, emu, argv, ctx: api.ApiContext = None):
+    def SystemTimeToFileTime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SystemTimeToFileTime(
-        const SYSTEMTIME *lpSystemTime,
-        LPFILETIME       lpFileTime
+            const SYSTEMTIME *lpSystemTime,
+            LPFILETIME lpFileTime
         );
         """
-        ctx = ctx or {}
-
         lpSystemTime, lpFileTime = argv
-        self.GetSystemTimeAsFileTime(emu, argv[1:], ctx)
+
+        st = self.k32types.SYSTEMTIME(emu.get_ptr_size())
+        st = self.mem_cast(st, lpSystemTime)
+        try:
+            dt = datetime.datetime(
+                st.wYear,
+                st.wMonth,
+                st.wDay,
+                st.wHour,
+                st.wMinute,
+                st.wSecond,
+                st.wMilliseconds * 1000,
+                tzinfo=datetime.timezone.utc,
+            )
+        except ValueError:
+            dt = None
+        if not dt or dt.year < 1601:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return False
+
+        timestamp = winemu.get_filetime(dt)
+
+        ft = self.k32types.FILETIME(emu.get_ptr_size())
+        ft.dwLowDateTime = 0xFFFFFFFF & timestamp
+        ft.dwHighDateTime = timestamp >> 32
+        self.mem_write(lpFileTime, self.get_bytes(ft))
 
         return True
 
     @apihook("SetThreadErrorMode", argc=2)
-    def SetThreadErrorMode(self, emu, argv, ctx: api.ApiContext = None):
+    def SetThreadErrorMode(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetThreadErrorMode(
-            DWORD   dwNewMode,
+            DWORD dwNewMode,
             LPDWORD lpOldMode
         );
         """
-
         dwNewMode, lpOldMode = argv
 
         return True
 
     @apihook("SetDefaultDllDirectories", argc=1)
-    def SetDefaultDllDirectories(self, emu, argv, ctx: api.ApiContext = None):
+    def SetDefaultDllDirectories(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetDefaultDllDirectories(
             DWORD DirectoryFlags
         );
         """
-
         return True
 
     @apihook("SetConsoleTitle", argc=1)
-    def SetConsoleTitle(self, emu, argv, ctx: api.ApiContext = None):
+    def SetConsoleTitle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL WINAPI SetConsoleTitle(
-        _In_ LPCTSTR lpConsoleTitle
+        BOOL SetConsoleTitle(
+            LPCTSTR lpConsoleTitle
         );
         """
-        ctx = ctx or {}
-
         (lpConsoleTitle,) = argv
         if lpConsoleTitle:
-            cw = self.get_char_width(ctx)
+            cw = _char_width(self, ctx)
             cs1 = self.read_mem_string(lpConsoleTitle, cw)
-            argv[0] = cs1
+            ctx.args["lpConsoleTitle"].display = cs1
         return True
 
     @apihook("GetLocalTime", argc=1)
-    def GetLocalTime(self, emu, argv, ctx: api.ApiContext = None):
+    def GetLocalTime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void GetLocalTime(
+        VOID GetLocalTime(
             LPSYSTEMTIME lpSystemTime
         );
         """
-        return self.GetSystemTime(emu, argv)
+        # The time zone that GetTimeZoneInformation reports has no bias
+        return self.GetSystemTime(emu, argv, ctx)
 
     @apihook("GetSystemTime", argc=1)
-    def GetSystemTime(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSystemTime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void GetSystemTime(
+        VOID GetSystemTime(
             LPSYSTEMTIME lpSystemTime
-        );"""
+        );
+        """
         (lpSystemTime,) = argv
-        st = self.k32types.SYSTEMTIME(emu.get_ptr_size())
-
-        now = datetime.datetime.now()
-        st.wYear = now.year
-        st.wMonth = now.month
-        st.wDayOfWeek = 2
-        st.wDay = now.day
-        st.wHour = now.hour
-        st.wMinute = now.minute
-        st.wSecond = now.second
-        st.wMilliseconds = 0
-
+        st = self.get_system_time_struct(self.get_system_time())
         self.mem_write(lpSystemTime, self.get_bytes(st))
 
-        return
-
     @apihook("GetTimeZoneInformation", argc=1)
-    def GetTimeZoneInformation(self, emu, argv, ctx: api.ApiContext = None):
-        """DWORD GetTimeZoneInformation(
+    def GetTimeZoneInformation(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetTimeZoneInformation(
             LPTIME_ZONE_INFORMATION lpTimeZoneInformation
-        );"""
-
+        );
+        """
         (lpTimeZoneInformation,) = argv
         if lpTimeZoneInformation:
             self.mem_write(lpTimeZoneInformation, b"\x00" * 168)
@@ -2115,29 +2697,32 @@ class Kernel32(api.ApiHandler):
         return 0
 
     @apihook("GetCurrentThreadId", argc=0)
-    def GetCurrentThreadId(self, emu, argv, ctx: api.ApiContext = None):
-        """DWORD GetCurrentThreadId();"""
-
+    def GetCurrentThreadId(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetCurrentThreadId();
+        """
         thread = emu.get_current_thread()
         rv = thread.id
 
         return rv
 
     @apihook("GetCurrentProcessId", argc=0)
-    def GetCurrentProcessId(self, emu, argv, ctx: api.ApiContext = None):
-        """DWORD GetCurrentProcessId();"""
-
+    def GetCurrentProcessId(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetCurrentProcessId();
+        """
         proc = emu.get_current_process()
         rv = proc.id
 
         return rv
 
     @apihook("IsProcessorFeaturePresent", argc=1, conv=e_arch.CALL_CONV_STDCALL)
-    def IsProcessorFeaturePresent(self, emu, argv, ctx: api.ApiContext = None):
-        """BOOL IsProcessorFeaturePresent(
-              DWORD ProcessorFeature
-        );"""
-
+    def IsProcessorFeaturePresent(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL IsProcessorFeaturePresent(
+            DWORD ProcessorFeature
+        );
+        """
         """
         Not all the features must return 1, because those can represent a feature which can be unavailable
         for your processor. For example PF_FLOATING_POINT_PRECISION_ERRATA is a Pentium instructions
@@ -2175,8 +2760,6 @@ class Kernel32(api.ApiHandler):
             20: {"name": "PF_SECOND_LEVEL_ADDRESS_TRANSLATION", "return": 0},
             21: {"name": "PF_VIRT_FIRMWARE_ENABLED", "return": 1},
             22: {"name": "PF_RDWRFSGSBASE_AVAILABLE", "return": 1},
-            # OS-dependent: Windows 7 does not expose this feature even
-            # though the emulated CPU can execute INT 0x29.
             23: {"name": "PF_FASTFAIL_AVAILABLE", "return": 1},
             24: {"name": "PF_ARM_DIVIDE_INSTRUCTION_AVAILABLE", "return": 0},
             25: {"name": "PF_ARM_64BIT_LOADSTORE_ATOMIC", "return": 0},
@@ -2193,17 +2776,23 @@ class Kernel32(api.ApiHandler):
             36: {"name": "PF_SSSE3_INSTRUCTIONS_AVAILABLE", "return": 1},
             37: {"name": "PF_SSE4_1_INSTRUCTIONS_AVAILABLE", "return": 1},
             38: {"name": "PF_SSE4_2_INSTRUCTIONS_AVAILABLE", "return": 1},
-            39: {"name": "PF_AVX_INSTRUCTIONS_AVAILABLE", "return": 1},
-            40: {"name": "PF_AVX2_INSTRUCTIONS_AVAILABLE", "return": 1},
+            39: {"name": "PF_AVX_INSTRUCTIONS_AVAILABLE", "return": 0},
+            40: {"name": "PF_AVX2_INSTRUCTIONS_AVAILABLE", "return": 0},
             41: {"name": "PF_AVX512F_INSTRUCTIONS_AVAILABLE", "return": 0},
         }
 
         feature = argv[0]
         entry = lookup.get(feature)
-        if entry is None:
+        if not entry:
             return 0
 
-        os_ver = getattr(getattr(emu, "config", None), "os_ver", None)
+        # OS-dependent features: Windows 8 introduced __fastfail, so a
+        # Windows 7 profile must not advertise PF_FASTFAIL_AVAILABLE even
+        # though the emulated CPU can execute INT 0x29.
+        config = getattr(emu, "config", None)
+        os_ver = getattr(getattr(config, "system", None), "os_ver", None)
+        if os_ver is None:
+            os_ver = getattr(config, "os_ver", None)
         os_version = WindowsOsVersion(
             major=getattr(os_ver, "major", None),
             minor=getattr(os_ver, "minor", None),
@@ -2211,66 +2800,172 @@ class Kernel32(api.ApiHandler):
         os_override = processor_feature_override(feature, os_version)
         rv = entry["return"] if os_override is None else os_override
         argv[0] = entry["name"]
+        _set_arg_display(ctx, "ProcessorFeature", entry["name"])
 
         return rv
 
     @apihook("lstrcmpi", argc=2)
-    def lstrcmpi(self, emu, argv, ctx: api.ApiContext = None):
-        """int lstrcmpiA(
-          LPCSTR lpString1,
-          LPCSTR lpString2
-        );"""
-        ctx = ctx or {}
-        cw = self.get_char_width(ctx)
+    def lstrcmpi(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int lstrcmpi(
+            LPCTSTR lpString1,
+            LPCTSTR lpString2
+        );
+        """
+        cw = _char_width(self, ctx)
 
-        string1, string2 = argv
-        rv = 1
+        lpString1, lpString2 = argv
+        if not lpString1:
+            return 0 if not lpString2 else -1
+        if not lpString2:
+            return 1
 
-        cs1 = self.read_mem_string(string1, cw)
-        cs2 = self.read_mem_string(string2, cw)
+        cs1 = self.read_mem_string(lpString1, cw)
+        cs2 = self.read_mem_string(lpString2, cw)
 
-        argv[0] = cs1
-        argv[1] = cs2
+        ctx.args["lpString1"].display = cs1
+        ctx.args["lpString2"].display = cs2
 
-        if cs1.lower() == cs2.lower():
-            rv = 0
-
-        return rv
+        # lstrcmpi is CompareString with the user locale and NORM_IGNORECASE, minus 2.
+        return get_string_order(cs1, cs2, Fold.LINGUISTIC_IGNORE_CASE)
 
     @apihook("lstrcmp", argc=2)
-    def lstrcmp(self, emu, argv, ctx: api.ApiContext = None):
-        """int lstrcmpiA(
-          LPCSTR lpString1,
-          LPCSTR lpString2
-        );"""
-        ctx = ctx or {}
-        cw = self.get_char_width(ctx)
+    def lstrcmp(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int lstrcmp(
+            LPCTSTR lpString1,
+            LPCTSTR lpString2
+        );
+        """
+        cw = _char_width(self, ctx)
 
-        string1, string2 = argv
-        rv = 1
+        lpString1, lpString2 = argv
+        if not lpString1:
+            return 0 if not lpString2 else -1
+        if not lpString2:
+            return 1
 
-        cs1 = self.read_mem_string(string1, cw)
-        cs2 = self.read_mem_string(string2, cw)
+        cs1 = self.read_mem_string(lpString1, cw)
+        cs2 = self.read_mem_string(lpString2, cw)
 
-        argv[0] = cs1
-        argv[1] = cs2
+        ctx.args["lpString1"].display = cs1
+        ctx.args["lpString2"].display = cs2
 
-        if cs1 == cs2:
-            rv = 0
+        # lstrcmp is CompareString with the user locale, minus 2.
+        return get_string_order(cs1, cs2, Fold.LINGUISTIC)
 
-        return rv
+    @apihook("CompareStringOrdinal", argc=5)
+    def CompareStringOrdinal(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int CompareStringOrdinal(
+            LPCWCH lpString1,
+            int cchCount1,
+            LPCWCH lpString2,
+            int cchCount2,
+            BOOL bIgnoreCase
+        );
+        """
+        lpString1, cchCount1, lpString2, cchCount2, bIgnoreCase = argv
+        texts = []
+        for i, (ptr, count) in enumerate(((lpString1, cchCount1), (lpString2, cchCount2))):
+            count = ct.c_int32(count).value
+            if count < -1 or (not ptr and count):
+                emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+                return 0
+            data = b""
+            if count == -1:
+                while (unit := self.mem_read(ptr + len(data), 2)) != b"\x00\x00":
+                    data += unit
+            elif count:
+                data = self.mem_read(ptr, 2 * count)
+            ctx.args[2 * i].display = data.decode("utf-16le", "replace")
+            texts.append(data.decode("utf-16le", "surrogatepass"))
+        return 2 + get_string_order(texts[0], texts[1], Fold.UPPER if bIgnoreCase else Fold.NONE)
+
+    def compare_locale_strings(self, emu, argv, cw, ctx):
+        flags, string1, count1, string2, count2 = argv
+        texts = []
+        for i, (ptr, count) in enumerate(((string1, count1), (string2, count2))):
+            count = ct.c_int32(count).value
+            if count < -1 or (not ptr and count):
+                emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+                return 0
+            if count == -1:
+                text = self.read_mem_string(ptr, cw)
+            else:
+                text = self.decode_string(self.mem_read(ptr, cw * count), cw)
+            ctx.args[2 + 2 * i].display = text
+            texts.append(text)
+        fold = Fold.LINGUISTIC_IGNORE_CASE if flags & NORM_IGNORECASE else Fold.LINGUISTIC
+        return 2 + get_string_order(texts[0], texts[1], fold)
+
+    @apihook("CompareString", argc=6)
+    def CompareString(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int CompareString(
+            LCID Locale,
+            DWORD dwCmpFlags,
+            LPCTSTR lpString1,
+            int cchCount1,
+            LPCTSTR lpString2,
+            int cchCount2
+        );
+        """
+        return self.compare_locale_strings(emu, argv[1:6], _char_width(self, ctx), ctx)
+
+    @apihook("CompareStringEx", argc=9)
+    def CompareStringEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        int CompareStringEx(
+            LPCWSTR lpLocaleName,
+            DWORD dwCmpFlags,
+            LPCWCH lpString1,
+            int cchCount1,
+            LPCWCH lpString2,
+            int cchCount2,
+            LPNLSVERSIONINFO lpVersionInformation,
+            LPVOID lpReserved,
+            LPARAM lParam
+        );
+        """
+        return self.compare_locale_strings(emu, argv[1:6], 2, ctx)
+
+    @apihook("PathCchRemoveFileSpec", argc=2)
+    def PathCchRemoveFileSpec(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HRESULT PathCchRemoveFileSpec(
+            PWSTR pszPath,
+            size_t cchPath
+        );
+        """
+        pszPath, cchPath = argv
+        if not pszPath or cchPath > PATHCCH_MAX_CCH:
+            return windefs.E_INVALIDARG
+        path = shlwapi.get_path_without_file_spec(self.read_mem_string(pszPath, 2))
+        if path is None:
+            return comdefs.S_FALSE
+        self.write_mem_string(path, pszPath, 2)
+        return windefs.S_OK
 
     @apihook("QueryDosDevice", argc=3)
-    def QueryDosDevice(self, emu, argv, ctx: api.ApiContext = None):
-        """Return synthetic DOS device mappings as an ANSI or wide MULTI_SZ."""
-        device, output, capacity = argv
-        width = self.get_char_width(ctx)
+    def QueryDosDevice(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD QueryDosDevice(
+            LPCTSTR lpDeviceName,
+            LPTSTR lpTargetPath,
+            DWORD ucchMax
+        );
+
+        Return synthetic DOS device mappings as an ANSI or wide MULTI_SZ.
+        """
+        lpDeviceName, lpTargetPath, ucchMax = argv
+        width = _char_width(self, ctx)
         mappings = {"C:": "\\Device\\HarddiskVolume1"}
-        if not output:
+        if not lpTargetPath:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return 0
-        if device:
-            name = self.read_mem_string(device, width).upper()
+        if lpDeviceName:
+            name = self.read_mem_string(lpDeviceName, width).upper()
             if name not in mappings:
                 emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
                 return 0
@@ -2280,97 +2975,111 @@ class Kernel32(api.ApiHandler):
         text = "\0".join(values) + "\0\0"
         encoded = text.encode("utf-16le" if width == 2 else "ascii")
         characters = len(encoded) // width
-        if capacity < characters:
+        if ucchMax < characters:
             emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
             return 0
-        self.mem_write(output, encoded)
+        self.mem_write(lpTargetPath, encoded)
         return characters
 
     @apihook("QueryPerformanceCounter", argc=1)
-    def QueryPerformanceCounter(self, emu, argv, ctx: api.ApiContext = None):
-        """BOOL WINAPI QueryPerformanceCounter(
-          _Out_ LARGE_INTEGER *lpPerformanceCount
-        );"""
+    def QueryPerformanceCounter(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL QueryPerformanceCounter(
+            LARGE_INTEGER *lpPerformanceCount
+        );
+        """
         (lpPerformanceCount,) = argv
 
         rv = 1
 
-        self.mem_write(lpPerformanceCount, self.perf_counter.to_bytes(8, "little"))
+        self.write_qword(lpPerformanceCount, self.get_performance_counter())
         return rv
 
     @apihook("lstrlen", argc=1)
-    def lstrlen(self, emu, argv, ctx: api.ApiContext = None):
+    def lstrlen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int lstrlen(
-            LPCSTR lpString
+            LPCTSTR lpString
         );
         """
-        ctx = ctx or {}
-        (src,) = argv
-        try:
-            cw = self.get_char_width(ctx)
-        except Exception:
-            cw = 1
-        s = self.read_mem_string(src, cw)
+        (lpString,) = argv
+        if not lpString or not emu.is_address_valid(lpString):
+            return 0
+        cw = _char_width(self, ctx)
+        s = self.read_mem_string(lpString, cw)
 
-        argv[0] = s
+        ctx.args["lpString"].display = s
 
         return len(s)
 
     @apihook("GetModuleHandleEx", argc=3)
-    def GetModuleHandleEx(self, emu, argv, ctx: api.ApiContext = None):
+    def GetModuleHandleEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL GetModuleHandleExA(
-            DWORD   dwFlags,
-            LPCSTR  lpModuleName,
+        BOOL GetModuleHandleEx(
+            DWORD dwFlags,
+            LPCTSTR lpModuleName,
             HMODULE *phModule
         );
         """
-        ctx = ctx or {}
         dwFlags, lpModuleName, phModule = argv
 
-        try:
-            cw = self.get_char_width(ctx)
-        except Exception:
-            cw = 1
-        # FX-004 diagnostics: flags (including FROM_ADDRESS), the name argument,
-        # the module table and the phModule write-back are the provenance a
-        # NULL result needs.  Handler behaviour is unchanged.
+        # FX-004 diagnostics: flags (including FROM_ADDRESS), the name
+        # argument, the module table and the phModule write-back are the
+        # provenance a NULL result needs.
+        cw = _char_width(self, ctx)
         observation = module_trace_diagnostics.start_get_module_handle_ex(emu, ctx, argv, cw)
+        _set_observation(ctx, observation)
 
+        if dwFlags & k32defs.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS:
+            # The local FX-004 contract keeps the pre-merge handler behavior:
+            # lpModuleName goes through the string-name path in every case.
+            # The diagnostic below exposes the flag so the mismatch is visible.
+            _set_arg_display(ctx, "lpModuleName", hex(lpModuleName))
         hmod = self.GetModuleHandle(emu, [lpModuleName], ctx)
         written = None
         if phModule:
             _mod = (hmod).to_bytes(emu.get_ptr_size(), "little")
             self.mem_write(phModule, _mod)
             written = hmod
-        module_trace_diagnostics.finish_get_module_handle_ex(
-            emu,
+        _set_observation(
             ctx,
-            observation,
-            return_value=hmod,
-            ph_module_written=written,
+            module_trace_diagnostics.finish_get_module_handle_ex(
+                emu,
+                ctx,
+                observation,
+                return_value=hmod,
+                ph_module_written=written,
+            ),
         )
         return hmod
 
     @apihook("GetModuleHandle", argc=1)
-    def GetModuleHandle(self, emu, argv, ctx: api.ApiContext = None):
-        """HMODULE GetModuleHandle(
-          LPCSTR lpModuleName
-        );"""
-        ctx = ctx or {}
+    def GetModuleHandle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HMODULE GetModuleHandle(
+            LPCTSTR lpModuleName
+        );
+        """
+        (lpModuleName,) = argv
 
-        (mod_name,) = argv
-
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         rv = 0
 
-        if not mod_name:
+        if not lpModuleName:
             proc = emu.get_current_process()
             rv = proc.base
         else:
-            lib = self.read_mem_string(mod_name, cw)
-            argv[0] = lib
+            lib = self.read_mem_string(lpModuleName, cw)
+            _set_arg_display(ctx, "lpModuleName", lib)
+            mods = emu.get_peb_modules()
+            if "\\" in lib or "/" in lib:
+                path = lib.replace("/", "\\")
+                if path.endswith("."):
+                    path = path[:-1]
+                elif not ntpath.splitext(path)[1]:
+                    path += ".dll"
+                mods = [mod for mod in mods if mod.emu_path.lower() == path.lower()]
+                return mods[0].base if mods else 0
             sname, _ = os.path.splitext(lib)
             sname = winemu.normalize_dll_name(sname)
 
@@ -2394,58 +3103,84 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("GetProcAddress", argc=2)
-    def GetProcAddress(self, emu, argv, ctx: api.ApiContext = None):
-        """FARPROC GetProcAddress(
-          HMODULE hModule,
-          LPCSTR  lpProcName
-        );"""
-
-        hmod, proc_name = argv
+    def GetProcAddress(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FARPROC GetProcAddress(
+            HMODULE hModule,
+            LPCSTR lpProcName
+        );
+        """
+        hModule, lpProcName = argv
         rv = 0
 
-        ctx = ctx or {}
         # FX-004 diagnostics: hmod/name, the module table, export-table
-        # membership and the resolved target's page provenance.  Read-only.
+        # membership and the resolved target's page provenance. Read-only.
         observation = module_trace_diagnostics.start_get_proc_address(emu, ctx, argv, 1)
+        _set_observation(ctx, observation)
 
         proc = ""
-        if proc_name:
-            if isinstance(proc_name, int) and proc_name < 0x10000:
-                proc = f"ordinal_{proc_name}"
+        ordinal = None
+        if lpProcName:
+            if isinstance(lpProcName, int) and lpProcName < 0x10000:
+                ordinal = int(lpProcName)
+                proc = f"ordinal_{ordinal}"
             else:
                 try:
-                    proc = self.read_mem_string(proc_name, 1)
+                    proc = self.read_mem_string(lpProcName, 1)
                     argv[1] = proc
+                    _set_arg_display(ctx, "lpProcName", proc)
                 except Exception as exc:
                     # Unreadable lpProcName is a guest fault, not a handler
                     # error: keep the Windows NULL result and record why.
-                    logger.info("GetProcAddress: cannot read lpProcName %#x: %s", proc_name, exc)
+                    logger.info("GetProcAddress: cannot read lpProcName %#x: %s", lpProcName, exc)
                     proc = ""
 
-        mod = emu.get_module_by_handle(hmod) if proc else None
+        mod = emu.get_module_by_handle(hModule) if (proc or ordinal is not None) else None
         if mod is not None:
             mname, _ = os.path.splitext(mod.get_base_name())
-            if mod.get_export_by_name(proc) is not None:
-                # Real PE modules resolve to their mapped code address;
-                # handler/decoy modules resolve to a dispatch sentinel.
-                rv = emu.resolve_module_export(mod, proc)
-            elif not mod.is_exe() or emu.config.modules.functions_always_exist:
-                # fixF: emulated system DLLs expose the engine's internal
-                # export database, which is incomplete (e.g. msvcrt!_Cifmod).
-                # A NULL for a dynamically loaded non-EXE module makes packer
-                # stubs treat the import as unresolved and call ExitProcess.
-                # The sentinel is a dispatch address, not a fabricated export:
-                # the guest call is routed to the handler/signature path. The
-                # primary image keeps strict Windows semantics (NULL) because
-                # its exports are read from the real file.
-                rv = emu.get_proc(mname, proc)
-                logger.info(
-                    "GetProcAddress: %s!%s is absent from the module export table; "
-                    "returning dispatch sentinel %#x for the loaded non-EXE module",
-                    mname,
-                    proc,
-                    rv,
-                )
+            loader = getattr(mod, "loader", None)
+            if ordinal is not None:
+                export_found = any(exp.ordinal == ordinal for exp in mod.get_exports())
+                reference: int | str = ordinal
+            else:
+                export_found = mod.get_export_by_name(proc) is not None
+                reference = proc
+            if export_found:
+                if isinstance(loader, PeLoader):
+                    # Real PE modules follow Windows resolution: forwarders,
+                    # ordinal entries and the mapped code address.
+                    rv = emu.resolve_export(mod, reference)
+                else:
+                    # FX-013: handler-backed and decoy modules dispatch through
+                    # an import sentinel; a decoy's standard exports are keyed
+                    # to the handler module that implements them.
+                    rv = (
+                        emu.resolve_export(mod, reference)
+                        if ordinal is not None
+                        else emu.resolve_module_export(mod, proc)
+                    )
+            elif not mod.is_exe() and mod is not getattr(emu, "container_image", None):
+                # fixF: a dynamically loaded guest DLL or a decoy keeps a
+                # dispatch sentinel for a missing export so packer stubs do not
+                # treat the import as unresolved and call ExitProcess. A
+                # synthetic handler module keeps strict Windows NULL semantics
+                # because its export table is the engine's API surface; an
+                # empty synthetic stub module uses its dynamic entries instead.
+                if (
+                    emu.config.modules.functions_always_exist
+                    or isinstance(loader, PeLoader)
+                    or hasattr(loader, "api_handler_module")
+                    or (emu.config.modules.stubs and not mod.get_exports())
+                ):
+                    rv = emu.get_proc(mname, proc)
+                    if rv:
+                        logger.info(
+                            "GetProcAddress: %s!%s is absent from the module export table; "
+                            "returning dispatch sentinel %#x for the loaded non-EXE module",
+                            mname,
+                            proc,
+                            rv,
+                        )
 
         if not rv:
             # Keep the failure readable: hmod, requested name, and the loaded
@@ -2454,62 +3189,148 @@ class Kernel32(api.ApiHandler):
             # Windows semantics for all of them.
             logger.info(
                 "GetProcAddress: MISS hmod=%#x proc=%r modules=%r",
-                hmod,
+                hModule,
                 proc or None,
                 [(m.get_base_name(), hex(m.base)) for m in emu.modules],
             )
+            emu.set_last_error(windefs.ERROR_PROC_NOT_FOUND)
 
-        module_trace_diagnostics.finish_get_proc_address(emu, ctx, observation, return_value=rv)
+        _set_observation(
+            ctx,
+            module_trace_diagnostics.finish_get_proc_address(emu, ctx, observation, return_value=rv),
+        )
         return rv
 
-    @apihook("AllocConsole", argc=0)
-    def AllocConsole(self, emu, argv, ctx: api.ApiContext = None):
-        """BOOL WINAPI AllocConsole(void);"""
+    @apihook("ResolveDelayLoadedAPI", argc=6)
+    def ResolveDelayLoadedAPI(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        PVOID ResolveDelayLoadedAPI(
+            PVOID ParentModuleBase,
+            PCIMAGE_DELAYLOAD_DESCRIPTOR DelayloadDescriptor,
+            PDELAYLOAD_FAILURE_DLL_CALLBACK FailureDllHook,
+            PDELAYLOAD_FAILURE_SYSTEM_ROUTINE FailureSystemHook,
+            PIMAGE_THUNK_DATA ThunkAddress,
+            ULONG Flags
+        );
+        """
+        ParentModuleBase, DelayloadDescriptor, FailureDllHook, FailureSystemHook, ThunkAddress, Flags = argv
+        ptr_size = emu.get_ptr_size()
 
+        attributes, name_rva, hmod_rva, iat_rva, int_rva = struct.unpack("<5I", self.mem_read(DelayloadDescriptor, 20))
+        if not attributes & 1:
+            ParentModuleBase = 0
+        dll = self.read_mem_string(ParentModuleBase + name_rva, 1)
+        index = (ThunkAddress - (ParentModuleBase + iat_rva)) // ptr_size
+        thunk = self.read_ptr(ParentModuleBase + int_rva + index * ptr_size)
+        if thunk >> (ptr_size * 8 - 1):
+            proc = f"ordinal_{thunk & 0xFFFF}"
+        else:
+            proc = self.read_mem_string(ParentModuleBase + thunk + 2, 1)
+        ctx.args[1].display = f"{dll}!{proc}"
+
+        try:
+            address = emu.get_proc(dll, proc)
+        except WindowsEmuError:
+            address = 0
+        if not address:
+            emu.set_last_error(windefs.ERROR_PROC_NOT_FOUND)
+            return 0
+
+        self.write_ptr(ThunkAddress, address)
+        module = emu.get_mod_by_name(winemu.normalize_dll_name(module_name(dll))) or emu.get_mod_from_addr(address)
+        if hmod_rva and module:
+            self.write_ptr(ParentModuleBase + hmod_rva, module.base)
+        return address
+
+    @apihook("DelayLoadFailureHook", argc=2)
+    def DelayLoadFailureHook(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        FARPROC DelayLoadFailureHook(
+            LPCSTR pszDllName,
+            LPCSTR pszProcName
+        );
+        """
+        pszDllName, pszProcName = argv
+        ctx.args[0].display = self.read_mem_string(pszDllName, 1)
+        if pszProcName >> 16:
+            ctx.args[1].display = self.read_mem_string(pszProcName, 1)
+        else:
+            ctx.args[1].display = hex(pszProcName)
+        emu.set_last_error(windefs.ERROR_PROC_NOT_FOUND)
+        return 0
+
+    @apihook("ApiSetQueryApiSetPresence", argc=2)
+    def ApiSetQueryApiSetPresence(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL ApiSetQueryApiSetPresence(
+            PCUNICODE_STRING Namespace,
+            PBOOLEAN Present
+        );
+        """
+        Namespace, Present = argv
+        name = self.read_unicode_string(Namespace)
+        ctx.args["Namespace"].display = name
+        host = module_name(name)
+        present = host.startswith(("api-", "ext-")) and winemu.normalize_dll_name(host) != host
+        self.mem_write(Present, bytes([present]))
+        return ddk.STATUS_SUCCESS
+
+    @apihook("AllocConsole", argc=0)
+    def AllocConsole(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL AllocConsole();
+        """
         # On success, return != 0
         return 1
 
     @apihook("GetConsoleWindow", argc=0)
-    def GetConsoleWindow(self, emu, argv, ctx: api.ApiContext = None):
-        """HWND WINAPI GetConsoleWindow(void);"""
-        hwnd = 0
-
-        proc = emu.get_current_process()
-        console = proc.console
-        if console:
-            win = console.window
-            hwnd = win.handle
-
-        return hwnd
+    def GetConsoleWindow(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HWND GetConsoleWindow();
+        """
+        console = emu.get_current_process().console
+        if console and console.window:
+            return console.window.handle
+        return 0
 
     @apihook("Sleep", argc=1)
-    def Sleep(self, emu, argv, ctx: api.ApiContext = None):
-        """void Sleep(DWORD dwMilliseconds);"""
-        (millisec,) = argv
-
-        return
+    def Sleep(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        VOID Sleep(
+            DWORD dwMilliseconds
+        );
+        """
+        (dwMilliseconds,) = argv
+        if dwMilliseconds != 0xFFFFFFFF:
+            self.advance_clock(dwMilliseconds)
 
     @apihook("SwitchToThread", argc=0)
-    def SwitchToThread(self, emu, argv, ctx={}):
-        """BOOL SwitchToThread();"""
+    def SwitchToThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL SwitchToThread();
+        """
         return 0
 
     @apihook("SleepEx", argc=2)
-    def SleepEx(self, emu, argv, ctx: api.ApiContext = None):
-        """DWORD SleepEx(DWORD dwMilliseconds, BOOL bAlertable);"""
-        millisec, bAlertable = argv
-
-        return
-
-    @apihook("GlobalAlloc", argc=2)
-    def GlobalAlloc(self, emu, argv, ctx: api.ApiContext = None):
+    def SleepEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DECLSPEC_ALLOCATOR HGLOBAL GlobalAlloc(
-          UINT   uFlags,
-          SIZE_T dwBytes
+        DWORD SleepEx(
+            DWORD dwMilliseconds,
+            BOOL bAlertable
         );
         """
+        dwMilliseconds, bAlertable = argv
+        if dwMilliseconds != 0xFFFFFFFF:
+            self.advance_clock(dwMilliseconds)
 
+    @apihook("GlobalAlloc", argc=2)
+    def GlobalAlloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HGLOBAL GlobalAlloc(
+            UINT uFlags,
+            SIZE_T dwBytes
+        );
+        """
         uFlags, dwBytes = argv
 
         chunk = self.heap_alloc(dwBytes, heap="GlobalAlloc")
@@ -2517,31 +3338,26 @@ class Kernel32(api.ApiHandler):
         return chunk
 
     @apihook("GlobalSize", argc=1)
-    def GlobalSize(self, emu, argv, ctx: api.ApiContext = None):
+    def GlobalSize(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SIZE_T GlobalSize(
-          [in] HGLOBAL hMem
+            HGLOBAL hMem
         );
         """
-
         (hMem,) = argv
-        size = 0
 
-        for mmap in emu.get_mem_maps():
-            if hMem == mmap.base:
-                size = mmap.size
-                emu.set_last_error(windefs.ERROR_SUCCESS)
-
-        if not size:
+        size = self.heap_size(hMem)
+        if size is None:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-
+            return 0
+        emu.set_last_error(windefs.ERROR_SUCCESS)
         return size
 
     @apihook("GlobalFlags", argc=1)
-    def GlobalFlags(self, emu, argv, ctx: api.ApiContext = None):
+    def GlobalFlags(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT GlobalFlags(
-        [in] HGLOBAL hMem
+            HGLOBAL hMem
         );
         """
         (hMem,) = argv
@@ -2558,178 +3374,174 @@ class Kernel32(api.ApiHandler):
         return flags
 
     @apihook("LocalAlloc", argc=2)
-    def LocalAlloc(self, emu, argv, ctx: api.ApiContext = None):
+    def LocalAlloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DECLSPEC_ALLOCATOR HLOCAL LocalAlloc(
-          UINT   uFlags,
-          SIZE_T uBytes
+        HLOCAL LocalAlloc(
+            UINT uFlags,
+            SIZE_T uBytes
         );
         """
+        uFlags, uBytes = argv
 
-        uFlags, dwBytes = argv
-
-        chunk = self.heap_alloc(dwBytes, heap="LocalAlloc")
+        chunk = self.heap_alloc(uBytes, heap="LocalAlloc")
 
         return chunk
 
     @apihook("HeapAlloc", argc=3)
-    def HeapAlloc(self, emu, argv, ctx: api.ApiContext = None):
+    def HeapAlloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DECLSPEC_ALLOCATOR LPVOID HeapAlloc(
-          HANDLE hHeap,
-          DWORD  dwFlags,
-          SIZE_T dwBytes
+        LPVOID HeapAlloc(
+            HANDLE hHeap,
+            DWORD dwFlags,
+            SIZE_T dwBytes
         );
         """
-
         hHeap, dwFlags, dwBytes = argv
 
         chunk = self.heap_alloc(dwBytes, heap="HeapAlloc")
         if chunk:
             emu.set_last_error(windefs.ERROR_SUCCESS)
 
-        ctx = ctx or {}
-        api_diagnostics.attach_observation(
+        _scatter_observation(
             ctx,
+            api_diagnostics.attach_observation,
             lambda: api_diagnostics.observe_heap_alloc(
                 emu,
                 hHeap,
                 dwFlags,
                 dwBytes,
                 chunk,
-                api_name=ctx.get("func_name"),
+                api_name=_ctx_func_name(ctx),
             ),
         )
         return chunk
 
     @apihook("HeapSize", argc=3)
-    def HeapSize(self, emu, argv, ctx: api.ApiContext = None):
+    def HeapSize(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         SIZE_T HeapSize(
-          HANDLE  hHeap,
-          DWORD   dwFlags,
-          LPCVOID lpMem
+            HANDLE hHeap,
+            DWORD dwFlags,
+            LPCVOID lpMem
         );
         """
-
         hHeap, dwFlags, lpMem = argv
 
-        size = 0
-        for mmap in emu.get_mem_maps():
-            if lpMem == mmap.base:
-                size = mmap.size
-                emu.set_last_error(windefs.ERROR_SUCCESS)
-
-        if not size:
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-
+        size = self.heap_size(lpMem)
+        if size is None:
+            return self.get_max_int()
         return size
 
     @apihook("GetTickCount", argc=0)
-    def GetTickCount(self, emu, argv, ctx: api.ApiContext = None):
+    def GetTickCount(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetTickCount();
         """
-
-        self.tick_counter += 20
+        self.advance_tick_count(20)
 
         return self.tick_counter
 
     @apihook("GetTickCount64", argc=0)
-    def GetTickCount64(self, emu, argv, ctx: api.ApiContext = None):
+    def GetTickCount64(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         ULONGLONG GetTickCount64();
         """
+        self.advance_tick_count(20)
 
-        self.tick_counter += 20
+        if emu.get_arch() == e_arch.ARCH_X86:
+            emu.reg_write(e_arch.X86_REG_EDX, self.tick_counter >> 32)
+            return self.tick_counter & 0xFFFFFFFF
 
         return self.tick_counter
 
     @apihook("lstrcat", argc=2)
-    def lstrcat(self, emu, argv, ctx: api.ApiContext = None):
+    def lstrcat(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LPSTR lstrcat(
-          LPSTR  lpString1,
-          LPCSTR lpString2
+        LPTSTR lstrcat(
+            LPTSTR lpString1,
+            LPCTSTR lpString2
         );
         """
-        ctx = ctx or {}
         lpString1, lpString2 = argv
+        if not lpString1 or not lpString2:
+            return 0
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         s1 = self.read_mem_string(lpString1, cw)
         s2 = self.read_mem_string(lpString2, cw)
 
-        argv[0] = s1
-        argv[1] = s2
+        ctx.args["lpString1"].display = s1
+        ctx.args["lpString2"].display = s2
 
-        if cw == 2:
-            new = (s1 + s2).encode("utf-16le")
-        else:
-            new = (s1 + s2).encode("utf-8")
+        new = self.encode_string(s1 + s2, cw)
 
-        self.mem_write(lpString1, new + b"\x00")
+        self.mem_write(lpString1, new + b"\x00" * cw)
 
         return lpString1
 
     @apihook("lstrcpyn", argc=3)
-    def lstrcpyn(self, emu, argv, ctx: api.ApiContext = None):
+    def lstrcpyn(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LPSTR lstrcpynA(
-          LPSTR  lpString1,
-          LPCSTR lpString2,
-          int    iMaxLength
+        LPTSTR lstrcpyn(
+            LPTSTR lpString1,
+            LPCTSTR lpString2,
+            int iMaxLength
         );
         """
-        ctx = ctx or {}
-        dest, src, iMaxLength = argv
+        lpString1, lpString2, iMaxLength = argv
+        if not lpString1 or not lpString2:
+            return 0
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
-        s = self.read_mem_string(src, cw)
-        argv[1] = s
+        s = self.read_mem_string(lpString2, cw)
+        ctx.args["lpString2"].display = s
         s = s[: iMaxLength - 1]
         s += "\x00"
 
-        self.write_mem_string(s, dest, cw)
-        return dest
+        self.write_mem_string(s, lpString1, cw)
+        return lpString1
 
     @apihook("lstrcpy", argc=2)
-    def lstrcpy(self, emu, argv, ctx: api.ApiContext = None):
+    def lstrcpy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LPSTR lstrcpyA(
-          LPSTR  lpString1,
-          LPCSTR lpString2
+        LPTSTR lstrcpy(
+            LPTSTR lpString1,
+            LPCTSTR lpString2
         );
         """
-        ctx = ctx or {}
-        dest, src = argv
+        lpString1, lpString2 = argv
+        if not lpString1 or not lpString2:
+            return 0
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
         # FX-003 diagnostics: pointers, destination page state and a bounded
         # source preview are attached before decoding; the patch bytes are
         # recorded before the guest write so evidence survives a fault.
         observation = page_trace_diagnostics.start_lstrcpy(emu, ctx, argv, cw)
+        _set_observation(ctx, observation)
 
-        s = self.read_mem_string(src, cw)
-        argv[1] = s
+        s = self.read_mem_string(lpString2, cw)
+        _set_arg_display(ctx, "lpString2", s)
         s += "\x00"
 
-        page_trace_diagnostics.finish_lstrcpy(emu, ctx, observation, text=s, char_width=cw)
+        _set_observation(
+            ctx,
+            page_trace_diagnostics.finish_lstrcpy(emu, ctx, observation, text=s, char_width=cw),
+        )
 
-        self.write_mem_string(s, dest, cw)
-        return dest
+        self.write_mem_string(s, lpString1, cw)
+        return lpString1
 
     @apihook("IsBadReadPtr", argc=2)
-    def IsBadReadPtr(self, emu, argv, ctx: api.ApiContext = None):
+    def IsBadReadPtr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL IsBadReadPtr(
-          const VOID *lp,
-          UINT_PTR   ucb
+            const VOID *lp,
+            UINT_PTR ucb
         );
         """
-
         lp, ucb = argv
 
         rv = True
@@ -2744,16 +3556,15 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("HeapReAlloc", argc=4)
-    def HeapReAlloc(self, emu, argv, ctx: api.ApiContext = None):
+    def HeapReAlloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DECLSPEC_ALLOCATOR LPVOID HeapReAlloc(
-          HANDLE                 hHeap,
-          DWORD                  dwFlags,
-          _Frees_ptr_opt_ LPVOID lpMem,
-          SIZE_T                 dwBytes
+        LPVOID HeapReAlloc(
+            HANDLE hHeap,
+            DWORD dwFlags,
+            LPVOID lpMem,
+            SIZE_T dwBytes
         );
         """
-
         hHeap, dwFlags, lpMem, dwBytes = argv
 
         tag_prefix = "api.heap"
@@ -2765,20 +3576,20 @@ class Kernel32(api.ApiHandler):
                 # Copy the existing data
                 data = self.mem_read(lpMem, min(mm.size, dwBytes))
                 new_buf = self.heap_alloc(dwBytes, heap="HeapReAlloc")
-                self.mem_write(new_buf, data)
+                if new_buf:
+                    self.mem_write(new_buf, data)
 
         return new_buf
 
     @apihook("LocalReAlloc", argc=3)
-    def LocalReAlloc(self, emu, argv, ctx: api.ApiContext = None):
+    def LocalReAlloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DECLSPEC_ALLOCATOR HLOCAL LocalReAlloc(
-          _Frees_ptr_opt_ HLOCAL hMem,
-          SIZE_T                 uBytes,
-          UINT                   uFlags
+        HLOCAL LocalReAlloc(
+            HLOCAL hMem,
+            SIZE_T uBytes,
+            UINT uFlags
         );
         """
-
         hMem, uBytes, uFlags = argv
 
         tag_prefix = "api.heap"
@@ -2788,22 +3599,22 @@ class Kernel32(api.ApiHandler):
             mm = emu.get_address_map(hMem)
             if mm and mm.tag.startswith(tag_prefix):
                 # Copy the existing data
-                data = self.mem_read(hMem, mm.size)
+                data = self.mem_read(hMem, min(mm.size, uBytes))
                 new_buf = self.heap_alloc(uBytes, heap="LocalReAlloc")
-                self.mem_write(new_buf, data)
+                if new_buf:
+                    self.mem_write(new_buf, data)
 
         return new_buf
 
     @apihook("HeapCreate", argc=3)
-    def HeapCreate(self, emu, argv, ctx: api.ApiContext = None):
+    def HeapCreate(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE HeapCreate(
-          DWORD  flOptions,
-          SIZE_T dwInitialSize,
-          SIZE_T dwMaximumSize
+            DWORD flOptions,
+            SIZE_T dwInitialSize,
+            SIZE_T dwMaximumSize
         );
         """
-
         flOptions, dwInitialSize, dwMaximumSize = argv
 
         heap = self.create_heap(emu)
@@ -2811,45 +3622,43 @@ class Kernel32(api.ApiHandler):
         return heap
 
     @apihook("GetCurrentThread", argc=0)
-    def GetCurrentThread(self, emu, argv, ctx: api.ApiContext = None):
+    def GetCurrentThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE GetCurrentThread();
         """
-        thread = emu.get_current_thread()
-        obj = emu.om.get_object_from_addr(thread.address)
-        return emu.get_object_handle(obj)
+        return self.get_max_int() - 1
 
     @apihook("TlsAlloc", argc=0)
-    def TlsAlloc(self, emu, argv, ctx: api.ApiContext = None):
+    def TlsAlloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD TlsAlloc();
         """
-
         thread = emu.get_current_thread()
         tls = thread.tls
 
-        tls.append(0)
+        idx = self.tls_count
+        self.tls_count += 1
+        tls.extend([0] * (self.tls_count - len(tls)))
         thread.tls = tls
-        idx = len(tls) - 1
 
         return idx
 
     @apihook("TlsSetValue", argc=2)
-    def TlsSetValue(self, emu, argv, ctx: api.ApiContext = None):
+    def TlsSetValue(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL TlsSetValue(
-          DWORD  dwTlsIndex,
-          LPVOID lpTlsValue
+            DWORD dwTlsIndex,
+            LPVOID lpTlsValue
         );
         """
-
         dwTlsIndex, lpTlsValue = argv
         rv = 0
 
         thread = emu.get_current_thread()
         tls = thread.tls
 
-        if dwTlsIndex < len(tls):
+        if dwTlsIndex < TLS_SLOT_COUNT:
+            tls.extend([0] * (dwTlsIndex + 1 - len(tls)))
             tls[dwTlsIndex] = lpTlsValue
             thread.tls = tls
             rv = 1
@@ -2860,10 +3669,10 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("TlsGetValue", argc=1)
-    def TlsGetValue(self, emu, argv, ctx: api.ApiContext = None):
+    def TlsGetValue(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPVOID TlsGetValue(
-          DWORD dwTlsIndex
+            DWORD dwTlsIndex
         );
         """
         (dwTlsIndex,) = argv
@@ -2873,8 +3682,9 @@ class Kernel32(api.ApiHandler):
         thread = emu.get_current_thread()
         tls = thread.tls
 
-        if dwTlsIndex < len(tls):
-            rv = tls[dwTlsIndex]
+        if dwTlsIndex < TLS_SLOT_COUNT:
+            if dwTlsIndex < len(tls):
+                rv = tls[dwTlsIndex]
             emu.set_last_error(windefs.ERROR_SUCCESS)
         else:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
@@ -2882,41 +3692,32 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("FlsAlloc", argc=1)
-    def FlsAlloc(self, emu, argv, ctx: api.ApiContext = None):
+    def FlsAlloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FlsAlloc(
-          PFLS_CALLBACK_FUNCTION lpCallback
+            PFLS_CALLBACK_FUNCTION lpCallback
         );
         """
-
-        thread = emu.get_current_thread()
-        fls = thread.fls
-
-        fls.append(0)
-        thread.fls = fls
-        idx = len(fls) - 1
-
+        idx = self.fls_count
+        self.fls_count += 1
         return idx
 
     @apihook("FlsSetValue", argc=2)
-    def FlsSetValue(self, emu, argv, ctx: api.ApiContext = None):
+    def FlsSetValue(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL FlsSetValue(
-          DWORD dwFlsIndex,
-          PVOID lpFlsData
+            DWORD dwFlsIndex,
+            PVOID lpFlsData
         );
         """
-
         dwFlsIndex, lpFlsData = argv
         rv = 0
 
         thread = emu.get_current_thread()
         fls = thread.fls
 
-        if len(fls) == 0:
-            fls.append(0)
-
-        if dwFlsIndex < len(fls):
+        if dwFlsIndex < max(self.fls_count, 1):
+            fls.extend([0] * (dwFlsIndex + 1 - len(fls)))
             fls[dwFlsIndex] = lpFlsData
             thread.fls = fls
             rv = 1
@@ -2927,10 +3728,10 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("FlsGetValue", argc=1)
-    def FlsGetValue(self, emu, argv, ctx: api.ApiContext = None):
+    def FlsGetValue(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PVOID FlsGetValue(
-          DWORD dwFlsIndex
+            DWORD dwFlsIndex
         );
         """
         (dwFlsIndex,) = argv
@@ -2939,8 +3740,9 @@ class Kernel32(api.ApiHandler):
         thread = emu.get_current_thread()
         fls = thread.fls
 
-        if dwFlsIndex < len(fls):
-            rv = fls[dwFlsIndex]
+        if dwFlsIndex < max(self.fls_count, 1):
+            if dwFlsIndex < len(fls):
+                rv = fls[dwFlsIndex]
             emu.set_last_error(windefs.ERROR_SUCCESS)
         else:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
@@ -2948,13 +3750,12 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("EncodePointer", argc=1)
-    def EncodePointer(self, emu, argv, ctx: api.ApiContext = None):
+    def EncodePointer(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PVOID EncodePointer(
-          _In_ PVOID Ptr
+            PVOID Ptr
         );
         """
-
         (Ptr,) = argv
         # Just increment the pointer for now
         rv = Ptr + 1
@@ -2962,13 +3763,12 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("DecodePointer", argc=1)
-    def DecodePointer(self, emu, argv, ctx: api.ApiContext = None):
+    def DecodePointer(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PVOID DecodePointer(
-           PVOID Ptr
+            PVOID Ptr
         );
         """
-
         (Ptr,) = argv
         # Just decrement the pointer for now
         rv = Ptr - 1
@@ -3058,14 +3858,15 @@ class Kernel32(api.ApiHandler):
         return int(getattr(thread, "tid", 0) or 0)
 
     @apihook("InitializeCriticalSectionAndSpinCount", argc=2)
-    def InitializeCriticalSectionAndSpinCount(self, emu, argv, ctx: api.ApiContext = None):
+    def InitializeCriticalSectionAndSpinCount(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         BOOL InitializeCriticalSectionAndSpinCount(
-          LPCRITICAL_SECTION lpCriticalSection,
-          DWORD              dwSpinCount
+            LPCRITICAL_SECTION lpCriticalSection,
+            DWORD dwSpinCount
         );
         """
-
         lpCriticalSection, dwSpinCount = argv
         ok = self._initialize_critical_section(emu, lpCriticalSection, int(dwSpinCount))
         if not ok:
@@ -3075,13 +3876,12 @@ class Kernel32(api.ApiHandler):
         return 1
 
     @apihook("EnterCriticalSection", argc=1)
-    def EnterCriticalSection(self, emu, argv, ctx: api.ApiContext = None):
+    def EnterCriticalSection(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void EnterCriticalSection(
-          LPCRITICAL_SECTION lpCriticalSection
+        VOID EnterCriticalSection(
+            LPCRITICAL_SECTION lpCriticalSection
         );
         """
-
         (lpCriticalSection,) = argv
         state = self._read_critical_section(emu, lpCriticalSection)
         if state is None:
@@ -3105,13 +3905,12 @@ class Kernel32(api.ApiHandler):
         self._write_critical_section(emu, lpCriticalSection, state)
 
     @apihook("TryEnterCriticalSection", argc=1)
-    def TryEnterCriticalSection(self, emu, argv, ctx: api.ApiContext = None):
+    def TryEnterCriticalSection(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL TryEnterCriticalSection(
           LPCRITICAL_SECTION lpCriticalSection
         );
         """
-
         (lpCriticalSection,) = argv
         state = self._read_critical_section(emu, lpCriticalSection)
         if state is None:
@@ -3132,13 +3931,12 @@ class Kernel32(api.ApiHandler):
         return True
 
     @apihook("LeaveCriticalSection", argc=1)
-    def LeaveCriticalSection(self, emu, argv, ctx: api.ApiContext = None):
+    def LeaveCriticalSection(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void LeaveCriticalSection(
-          LPCRITICAL_SECTION lpCriticalSection
+        VOID LeaveCriticalSection(
+            LPCRITICAL_SECTION lpCriticalSection
         );
         """
-
         (lpCriticalSection,) = argv
         state = self._read_critical_section(emu, lpCriticalSection)
         if state is None:
@@ -3159,13 +3957,12 @@ class Kernel32(api.ApiHandler):
         self._write_critical_section(emu, lpCriticalSection, state)
 
     @apihook("InterlockedIncrement", argc=1)
-    def InterlockedIncrement(self, emu, argv, ctx: api.ApiContext = None):
+    def InterlockedIncrement(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LONG InterlockedIncrement(
-          LONG volatile *Addend
+            LONG volatile *Addend
         );
         """
-
         (Addend,) = argv
         if not Addend or not emu.is_address_valid(Addend):
             return 0
@@ -3179,13 +3976,12 @@ class Kernel32(api.ApiHandler):
         return ival
 
     @apihook("InterlockedDecrement", argc=1)
-    def InterlockedDecrement(self, emu, argv, ctx: api.ApiContext = None):
+    def InterlockedDecrement(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LONG InterlockedDecrement(
-          LONG volatile *Addend
+            LONG volatile *Addend
         );
         """
-
         (Addend,) = argv
 
         val = self.mem_read(Addend, 4)
@@ -3197,218 +3993,218 @@ class Kernel32(api.ApiHandler):
         return ival
 
     @apihook("InterlockedExchangeAdd", argc=2)
-    def InterlockedExchangeAdd(self, emu, argv, ctx: api.ApiContext = None):
+    def InterlockedExchangeAdd(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LONG InterlockedExchangeAdd(
             LONG volatile *Addend,
-            LONG          Value
+            LONG Value
         );
         """
         Addend, Value = argv
-        old = int.from_bytes(self.mem_read(Addend, 4), "little")
+        old = self.read_dword(Addend)
         new = (old + (Value & 0xFFFFFFFF)) & 0xFFFFFFFF
-        self.mem_write(Addend, new.to_bytes(4, "little"))
+        self.write_dword(Addend, new)
         return old
 
     @apihook("GetCommandLine", argc=0)
-    def GetCommandLine(self, emu, argv, ctx: api.ApiContext = None):
+    def GetCommandLine(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPTSTR GetCommandLine();
         """
-        ctx = ctx or {}
+        cw = _char_width(self, ctx)
+        proc = emu.get_current_process()
 
-        fn = ctx["func_name"]
-        cw = self.get_char_width(ctx)
-        curr_proc = emu.get_current_process()
-
-        cmdline = curr_proc.cmdline
-
-        cmd_ptr = self.command_lines[cw]
-        if not cmd_ptr:
-            cmd_ptr = self.mem_alloc((len(cmdline) + 1) * cw, tag=f"api.command_line.{fn}")
-            self.command_lines[cw] = cmd_ptr
-
-        if cw == 2:
-            cl = cmdline.encode("utf-16le")
-        elif cw == 1:
-            cl = cmdline.encode("utf-8")
-
-        self.mem_write(cmd_ptr, cl)
-
+        # Each process has its own buffer, and each call returns the same buffer, as on Windows.
+        cmd_ptr = proc.command_line_buffers.get(cw)
+        if cmd_ptr is None:
+            data = self.encode_string(proc.cmdline + "\x00", cw)
+            cmd_ptr = self.mem_alloc(len(data), tag=f"api.command_line.{ctx.func_name}")
+            self.mem_write(cmd_ptr, data)
+            proc.command_line_buffers[cw] = cmd_ptr
         return cmd_ptr
 
     @apihook("ExpandEnvironmentStrings", argc=3)
-    def ExpandEnvironmentStrings(self, emu, argv, ctx: api.ApiContext = None):
+    def ExpandEnvironmentStrings(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DWORD ExpandEnvironmentStringsA(
-            LPCSTR lpSrc,
-            LPSTR  lpDst,
-            DWORD  nSize
+        DWORD ExpandEnvironmentStrings(
+            LPCTSTR lpSrc,
+            LPTSTR lpDst,
+            DWORD nSize
         );
         """
-        ctx = ctx or {}
         lpSrc, lpDst, nSize = argv
         rv = 0
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         if lpSrc:
             src = self.read_mem_string(lpSrc, cw)
             dst = src
-            argv[0] = src
+            ctx.args["lpSrc"].display = src
             for k, v in emu.get_env().items():
                 ev = f"%{k.lower()}%"
                 if ev in dst.lower():
                     o = dst.lower().find(ev)
                     dst = dst[:o] + v + dst[o + len(ev) :]
-                    dst += "\x00\x00"
 
-            if lpDst:
+            rv = len(dst) + 1
+            if lpDst and nSize >= rv:
                 self.write_mem_string(dst, lpDst, cw)
-                rv = len(dst)
-                argv[1] = dst
+                ctx.args["lpDst"].display = dst
 
         return rv
 
     @apihook("GetEnvironmentStrings", argc=0)
-    def GetEnvironmentStrings(self, emu, argv, ctx: api.ApiContext = None):
+    def GetEnvironmentStrings(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPCH GetEnvironmentStrings();
         """
-        # fixJ：这个 API 没有 A/W 后缀，旧实现调用 get_char_width(ctx) 会直接抛
-        # ApiEmuError（"Failed to get character width from function"）。
-        # 异常被全局 API hook 吞掉后返回 None，样本拿到 NULL 环境块 →
-        # 解引用空指针 → 访问违例 → ExitProcess(0xC0000005)。
-        # 实测：4 个 sfone 样本（0011b6ad4…/01994fec…/07fc6ede…/0d32453b…）
-        # 都在 GetEnvironmentStrings 之后崩溃，模拟只跑到 28 次调用。
-        # 另外旧实现把环境块拼成 "K V K V "（空格分隔、无 NUL），
-        # 不符合 Windows 的 "K=V\0K=V\0\0" 格式，这里一并修正。
-        return self._environment_block(emu, wide=False)
+        out = ""
+        fn = ctx.func_name
+        cw = 2 if fn.endswith("W") else 1
+        for k, v in emu.get_env().items():
+            out += f"{k}={v}\x00"
 
-    @apihook("GetEnvironmentStringsW", argc=0)
-    def GetEnvironmentStringsW(self, emu, argv, ctx: api.ApiContext = None):
-        """
-        LPWCH GetEnvironmentStringsW();
-        """
-        return self._environment_block(emu, wide=True)
+        out += "\x00"
 
-    def _environment_block(self, emu, wide: bool):
-        """构造 Windows 环境块：每个条目 ``K=V\\0``，末尾再补一个 ``\\0``（双 NUL 结尾）。"""
-        enc = "utf-16le" if wide else "utf-8"
-        terminator = b"\0\0" if wide else b"\0"
-        parts = [f"{k}={v}\0".encode(enc) for k, v in (emu.get_env() or {}).items()]
-        block = b"".join(parts) + terminator
-        env_ptr = self.mem_alloc(len(block), tag="api.environment")
-        self.mem_write(env_ptr, block)
+        env_ptr = self.mem_alloc(len(out) * cw, tag=f"api.environment.{fn}")
+
+        ev = self.encode_string(out, cw)
+
+        self.mem_write(env_ptr, ev)
+
         return env_ptr
 
     @apihook("FreeEnvironmentStrings", argc=1)
-    def FreeEnvironmentStrings(self, emu, argv, ctx: api.ApiContext = None):
+    def FreeEnvironmentStrings(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL FreeEnvironmentStrings(
-          LPCH penv
+            LPTCH penv
         );
         """
-
         (penv,) = argv
 
-        self.mem_free(penv)
+        mm = emu.get_address_map(penv)
+        if mm and mm.base == penv and mm.tag and mm.tag.startswith("api.environment."):
+            self.mem_free(penv)
 
         return True
 
     @apihook("GetFullPathName", argc=4)
-    def GetFullPathName(self, emu, argv, ctx: api.ApiContext = None):
+    def GetFullPathName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DWORD GetFullPathNameA(
-            LPCSTR lpFileName,
-            DWORD  nBufferLength,
-            LPSTR  lpBuffer,
-            LPSTR  *lpFilePart
+        DWORD GetFullPathName(
+            LPCTSTR lpFileName,
+            DWORD nBufferLength,
+            LPTSTR lpBuffer,
+            LPTSTR *lpFilePart
         );
         """
-        ctx = ctx or {}
-
         lpFileName, nBufferLength, lpBuffer, lpFilePart = argv
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         rv = 0
 
         if lpFileName:
             fn = self.read_mem_string(lpFileName, cw)
             bn = ntpath.basename(fn)
 
-            offset = fn.find(bn)
-            if lpBuffer:
+            offset = len(fn) - len(bn)
+            if not lpBuffer or nBufferLength < len(fn) + 1:
+                rv = len(fn) + 1
+            else:
                 self.write_mem_string(fn, lpBuffer, cw)
 
-                if "." in bn and lpFilePart:
-                    ptr = (lpBuffer + offset).to_bytes(emu.get_ptr_size(), "little")
-                    self.mem_write(lpFilePart, ptr)
+                if lpFilePart:
+                    ptr = lpBuffer + offset * cw if bn else 0
+                    self.write_ptr(lpFilePart, ptr)
 
-            rv = len(fn)
+                rv = len(fn)
 
         return rv
 
-    @apihook("GetStartupInfo", argc=1)
-    def GetStartupInfo(self, emu, argv, ctx: api.ApiContext = None):
+    def get_final_path(self, emu, path, flags):
         """
-        void GetStartupInfo(
-          LPSTARTUPINFO lpStartupInfo
+        Return the path of an open file in the form that ``flags`` selects, or
+        None when the path has no drive letter or the drive is not known.
+        """
+        drive, rest = ntpath.splitdrive(path)
+        if len(drive) != 2 or not rest.startswith("\\"):
+            return None
+        drive = drive.upper()
+        volume = flags & VOLUME_NAME_MASK
+        if volume == VOLUME_NAME_DOS:
+            return "\\\\?\\" + drive + rest
+        if volume == VOLUME_NAME_NONE:
+            return rest
+        if volume == VOLUME_NAME_GUID:
+            disk = emu.get_drive_manager().get_drive(root_path=drive + "\\")
+            return disk.volume_guid_path.rstrip("\\") + rest if disk and disk.volume_guid_path else None
+        device = next((dev for link, dev in emu.om.symlinks if link.upper() == "\\??\\" + drive), None)
+        return device + rest if device else None
+
+    @apihook("GetFinalPathNameByHandle", argc=4)
+    def GetFinalPathNameByHandle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetFinalPathNameByHandle(
+            HANDLE hFile,
+            LPTSTR lpszFilePath,
+            DWORD cchFilePath,
+            DWORD dwFlags
         );
         """
-        ctx = ctx or {}
+        hFile, lpszFilePath, cchFilePath, dwFlags = argv
+        cchFilePath &= 0xFFFFFFFF
+        dwFlags &= 0xFFFFFFFF
+        cw = _char_width(self, ctx)
 
+        if dwFlags & ~(VOLUME_NAME_MASK | FILE_NAME_OPENED) or (dwFlags & VOLUME_NAME_MASK) not in (
+            VOLUME_NAME_DOS,
+            VOLUME_NAME_GUID,
+            VOLUME_NAME_NT,
+            VOLUME_NAME_NONE,
+        ):
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        f = self.get_file(hFile)
+        if not f:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        path = self.get_final_path(emu, f.path, dwFlags)
+        if path is None:
+            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
+            return 0
+
+        if not lpszFilePath or cchFilePath <= len(path):
+            return len(path) + 1
+        self.write_mem_string(path, lpszFilePath, cw)
+        return len(path)
+
+    @apihook("GetStartupInfo", argc=1)
+    def GetStartupInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        VOID GetStartupInfo(
+            LPSTARTUPINFO lpStartupInfo
+        );
+        """
         (lpStartupInfo,) = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         si = self.k32types.STARTUPINFO(emu.get_ptr_size())
 
-        # Did we already alloc memory for the process's desktop name?
+        # The desktop and title strings are written once per process and width
         proc = emu.get_current_process()
-        ps = self.startup_info.get(proc)
-        if ps:
-            desk = ps.get("desktop", {})
-        else:
-            desk = {"desktop": {}}
-            self.startup_info.update({proc: desk})
-
-        desk_name = proc.get_desktop_name()
-        dn = desk.get(cw)
-        if dn:
-            si.lpDesktop = dn
-        else:
-            if cw == 2:
-                out = desk_name.encode("utf-16le")
-                sn = "W"
-            elif cw == 1:
-                out = desk_name.encode("utf-8")
-                sn = "A"
-            desk_ptr = self.mem_alloc((len(out) + cw), tag="api.struct.STARTUPINFO%s.lpDesktop" % (sn))  # noqa
-            si.lpDesktop = desk_ptr
-            desk.update({cw: desk_ptr})
-
-        # Did we already alloc memory for the process's title?
-        ps = self.startup_info.get(proc)
-        if ps:
-            title = ps.get("title", {})
-        else:
-            title = {"title": {}}
-            self.startup_info.update({proc: title})
-
-        title_name = proc.title
-        if not title_name:
-            title_name = proc.path
-
-        if title:
-            si.lpTitle = title
-        else:
-            if cw == 2:
-                out = title_name.encode("utf-16le")
-                sn = "W"
-            elif cw == 1:
-                out = title_name.encode("utf-8")
-                sn = "A"
-            title_ptr = self.mem_alloc((len(out) + cw), tag=f"api.struct.STARTUPINFO{sn}.lpTitle")
-            si.lpTitle = title_ptr
-            title.update({cw: title_ptr})
+        ptrs = self.startup_info.get((proc, cw))
+        if not ptrs:
+            sn = "W" if cw == 2 else "A"
+            ptrs = []
+            for field, text in (("lpDesktop", proc.get_desktop_name()), ("lpTitle", proc.title or proc.path)):
+                size = len(self.encode_string(text, cw)) + cw
+                ptr = self.mem_alloc(size, tag=f"api.struct.STARTUPINFO{sn}.{field}")
+                self.write_mem_string(text, ptr, cw)
+                ptrs.append(ptr)
+            self.startup_info[(proc, cw)] = ptrs
+        si.lpDesktop, si.lpTitle = ptrs
 
         si.cb = self.sizeof(si)
         si.hStdInput = 0
@@ -3417,16 +4213,13 @@ class Kernel32(api.ApiHandler):
 
         self.mem_write(lpStartupInfo, self.get_bytes(si))
 
-        return None
-
     @apihook("GetStdHandle", argc=1)
-    def GetStdHandle(self, emu, argv, ctx: api.ApiContext = None):
+    def GetStdHandle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HANDLE WINAPI GetStdHandle(
-          _In_ DWORD nStdHandle
+        HANDLE GetStdHandle(
+            DWORD nStdHandle
         );
         """
-
         (nStdHandle,) = argv
 
         proc = emu.get_current_process()
@@ -3434,110 +4227,54 @@ class Kernel32(api.ApiHandler):
 
         return hnd
 
-    def _format_message(self, emu, argv, wide: bool) -> int:
-        """Shared FormatMessageA/W implementation for system messages.
-
-        Only FORMAT_MESSAGE_FROM_SYSTEM with an explicit caller buffer is
-        modelled. Message ids outside the small documented table fail with
-        ERROR_MR_UNKNOWN, matching FormatMessage's "message not found"
-        contract. The PyInstaller bootstrap path formats message id 0, which
-        Windows defines, so returning that message breaks its error-printing
-        recursion. ALLOCATE_BUFFER, module/string sources and insert
-        formatting remain unsupported and keep the previous failure result.
+    @apihook("SetStdHandle", argc=2)
+    def SetStdHandle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-
-        (
-            dwFlags,
-            _lpSource,
-            dwMessageId,
-            _dwLanguageId,
-            lpBuffer,
-            nSize,
-            _arguments,
-        ) = argv
-
-        if not dwFlags & FORMAT_MESSAGE_FROM_SYSTEM:
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-            return 0
-        if dwFlags & (
-            FORMAT_MESSAGE_ALLOCATE_BUFFER
-            | FORMAT_MESSAGE_FROM_STRING
-            | FORMAT_MESSAGE_FROM_HMODULE
-        ):
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-            return 0
-        if not lpBuffer or nSize <= 0:
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-            return 0
-
-        text = _FORMAT_MESSAGE_TEXTS.get(int(dwMessageId))
-        if text is None:
-            emu.set_last_error(ERROR_MR_UNKNOWN)
-            return 0
-
-        unit = 2 if wide else 1
-        encoded = text.encode("utf-16le") if wide else text.encode("ascii", "replace")
-        max_chars = max(0, int(nSize) - 1)
-        truncated = encoded[: max_chars * unit]
-        try:
-            self.mem_write(lpBuffer, truncated + (b"\x00" * unit))
-        except Exception:
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-            return 0
-
-        emu.set_last_error(windefs.ERROR_SUCCESS)
-        return len(truncated) // unit
-
-    @apihook("FormatMessageW", argc=7)
-    def FormatMessageW(self, emu, argv, ctx: api.ApiContext = None):
-        """
-        DWORD FormatMessageW(
-          DWORD   dwFlags,
-          LPCVOID lpSource,
-          DWORD   dwMessageId,
-          DWORD   dwLanguageId,
-          LPWSTR  lpBuffer,
-          DWORD   nSize,
-          va_list *Arguments
+        BOOL SetStdHandle(
+            DWORD nStdHandle,
+            HANDLE hHandle
         );
         """
+        nStdHandle, hHandle = argv
 
-        return self._format_message(emu, argv, wide=True)
+        proc = emu.get_current_process()
+        if not proc.set_std_handle(nStdHandle, hHandle):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
 
-    @apihook("FormatMessageA", argc=7)
-    def FormatMessageA(self, emu, argv, ctx: api.ApiContext = None):
-        """
-        DWORD FormatMessageA(
-          DWORD   dwFlags,
-          LPCVOID lpSource,
-          DWORD   dwMessageId,
-          DWORD   dwLanguageId,
-          LPSTR   lpBuffer,
-          DWORD   nSize,
-          va_list *Arguments
-        );
-        """
-
-        return self._format_message(emu, argv, wide=False)
+        return 1
 
     @apihook("GetFileType", argc=1)
-    def GetFileType(self, emu, argv, ctx: api.ApiContext = None):
+    def GetFileType(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetFileType(
-          HANDLE hFile
+            HANDLE hFile
         );
         """
+        FILE_TYPE_UNKNOWN = 0
         FILE_TYPE_DISK = 1
+        FILE_TYPE_CHAR = 2
+        FILE_TYPE_PIPE = 3
 
         (hFile,) = argv
 
+        if self.is_std_handle(emu, hFile):
+            return FILE_TYPE_CHAR
+        f = emu.get_handle_table().get(hFile, fileman.File)
+        if not f:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return FILE_TYPE_UNKNOWN
+        if isinstance(f, fileman.NullDevice):
+            return FILE_TYPE_CHAR
+        if isinstance(f, fileman.Pipe):
+            return FILE_TYPE_PIPE
         return FILE_TYPE_DISK
 
     @apihook("SetHandleCount", argc=1)
-    def SetHandleCount(self, emu, argv, ctx: api.ApiContext = None):
+    def SetHandleCount(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT SetHandleCount(
-          UINT uNumber
+            UINT uNumber
         );
         """
         (uNumber,) = argv
@@ -3547,61 +4284,64 @@ class Kernel32(api.ApiHandler):
         return uNumber
 
     @apihook("GetACP", argc=0)
-    def GetACP(self, emu, argv, ctx: api.ApiContext = None):
+    def GetACP(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT GetACP();
         """
-
-        windows_1252 = 1252
-
-        return windows_1252
+        return codepage.ANSI_CODE_PAGE
 
     @apihook("IsValidCodePage", argc=1)
-    def IsValidCodePage(self, emu, argv, ctx: api.ApiContext = None):
+    def IsValidCodePage(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL IsValidCodePage(
-          UINT CodePage
+            UINT CodePage
         );
         """
-
         (CodePage,) = argv
 
-        return True
+        # CP_ACP, CP_OEMCP and CP_THREAD_ACP are not valid here: Windows wants a real code page number.
+        return CodePage in (codepage.ANSI_CODE_PAGE, codepage.OEM_CODE_PAGE, codepage.CP_UTF8)
 
     @apihook("GetCPInfo", argc=2)
-    def GetCPInfo(self, emu, argv, ctx: api.ApiContext = None):
+    def GetCPInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetCPInfo(
-          UINT     CodePage,
-          LPCPINFO lpCPInfo
+            UINT CodePage,
+            LPCPINFO lpCPInfo
         );
         """
-
         CodePage, lpCPInfo = argv
 
-        cp_info = (2).to_bytes(4, "little") + (b"\x00" * 8)
+        try:
+            codepage.get_codec(CodePage)
+        except ValueError:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return False
 
-        self.mem_write(lpCPInfo, cp_info)
+        # typedef struct _cpinfo {
+        #     UINT MaxCharSize;
+        #     BYTE DefaultChar[2];
+        #     BYTE LeadByte[12];
+        # } CPINFO;
+        max_char_size = 4 if CodePage == codepage.CP_UTF8 else 1
+        self.mem_write(lpCPInfo, struct.pack("<I2s12s", max_char_size, b"?", b""))
 
         return True
 
     @apihook("WideCharToMultiByte", argc=8)
-    def WideCharToMultiByte(self, emu, argv, ctx: api.ApiContext = None):
+    def WideCharToMultiByte(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int WideCharToMultiByte(
-          UINT                               CodePage,
-          DWORD                              dwFlags,
-          _In_NLS_string_(cchWideChar)LPCWCH lpWideCharStr,
-          int                                cchWideChar,
-          LPSTR                              lpMultiByteStr,
-          int                                cbMultiByte,
-          LPCCH                              lpDefaultChar,
-          LPBOOL                             lpUsedDefaultChar
+            UINT CodePage,
+            DWORD dwFlags,
+            LPCWCH lpWideCharStr,
+            int cchWideChar,
+            LPSTR lpMultiByteStr,
+            int cbMultiByte,
+            LPCCH lpDefaultChar,
+            LPBOOL lpUsedDefaultChar
         );
         """
-
-        rv = 0
-
         (
             CodePage,
             dwFlags,
@@ -3613,128 +4353,123 @@ class Kernel32(api.ApiHandler):
             lpUsedDefaultChar,
         ) = argv
 
+        cchWideChar = cchWideChar & 0xFFFFFFFF
+        cbMultiByte = cbMultiByte & 0xFFFFFFFF
+
         if not lpWideCharStr or not cchWideChar:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-        elif not lpMultiByteStr or cbMultiByte == 0:
-            emu.set_last_error(windefs.ERROR_SUCCESS)
-            if cchWideChar == 0xFFFFFFFF:
-                wcs = b""
-                o = 0
-                while emu.is_address_valid(lpWideCharStr + o + 2):
-                    wcs += self.mem_read(lpWideCharStr + o, 2)
-                    if wcs.endswith(b"\0\0"):
-                        break
-                    o += 2
-            else:
-                wcs = self.mem_read(lpWideCharStr, cchWideChar * 2)
-            cs = wcs.decode("utf-16le", "ignore")
-            rv = len(cs)
-        else:
-            emu.set_last_error(windefs.ERROR_SUCCESS)
-            if cchWideChar == 0xFFFFFFFF:
-                wcs = b""
-                o = 0
-                while emu.is_address_valid(lpWideCharStr + o + 2):
-                    wcs += self.mem_read(lpWideCharStr + o, 2)
-                    if wcs.endswith(b"\0\0"):
-                        break
-                    o += 2
-            else:
-                wcs = self.mem_read(lpWideCharStr, cchWideChar * 2)
-            cs = wcs.decode("utf-16le", "ignore")
-            cs = cs.encode("utf-8", "ignore")
-            rv = cbMultiByte
-            self.mem_write(lpMultiByteStr, cs)
+            return 0
+        # Windows takes no default character for UTF-8
+        if CodePage == codepage.CP_UTF8 and (lpDefaultChar or lpUsedDefaultChar):
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
 
-        return rv
+        if cchWideChar == 0xFFFFFFFF:
+            wcs = b""
+            o = 0
+            while emu.is_address_valid(lpWideCharStr + o + 2):
+                wcs += self.mem_read(lpWideCharStr + o, 2)
+                if wcs.endswith(b"\0\0"):
+                    break
+                o += 2
+        else:
+            wcs = self.mem_read(lpWideCharStr, cchWideChar * 2)
+
+        text = wcs.decode("utf-16le", "replace")
+        try:
+            cs = codepage.encode_code_page(text, CodePage)
+        except ValueError:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        if lpMultiByteStr and cbMultiByte and len(cs) > cbMultiByte:
+            self.mem_write(lpMultiByteStr, cs[:cbMultiByte])
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            return 0
+        if lpUsedDefaultChar:
+            # The encoder puts the default character in place of each character that the code page does not have
+            used_default = codepage.decode_code_page(cs, CodePage) != text
+            self.mem_write(lpUsedDefaultChar, int(used_default).to_bytes(4, "little"))
+        if not lpMultiByteStr or cbMultiByte == 0:
+            return len(cs)
+        self.mem_write(lpMultiByteStr, cs)
+        return len(cs)
 
     @apihook("MultiByteToWideChar", argc=6)
-    def MultiByteToWideChar(self, emu, argv, ctx: api.ApiContext = None):
+    def MultiByteToWideChar(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int MultiByteToWideChar(
-          UINT                              CodePage,
-          DWORD                             dwFlags,
-          _In_NLS_string_(cbMultiByte)LPCCH lpMultiByteStr,
-          int                               cbMultiByte,
-          LPWSTR                            lpWideCharStr,
-          int                               cchWideChar
+            UINT CodePage,
+            DWORD dwFlags,
+            LPCCH lpMultiByteStr,
+            int cbMultiByte,
+            LPWSTR lpWideCharStr,
+            int cchWideChar
         );
         """
-
         (CodePage, dwFlags, lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar) = argv
 
         cchWideChar = cchWideChar & 0xFFFFFFFF
         cbMultiByte = cbMultiByte & 0xFFFFFFFF
 
-        rv = 0
-        if cchWideChar == 0:
-            if cbMultiByte == 0xFFFFFFFF:
-                mbs = self.read_mem_string(lpMultiByteStr, 1)
-                argv[2] = mbs
-                rv = len(mbs) + 1
-            else:
-                mbs = self.read_mem_string(lpMultiByteStr, 1)
-                argv[2] = mbs
-                rv = len(mbs) + 1
-        elif lpMultiByteStr == 0 or cbMultiByte == 0:
+        if not lpMultiByteStr or not cbMultiByte or (cchWideChar and not lpWideCharStr):
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        if cbMultiByte == 0xFFFFFFFF:
+            cbMultiByte = self.mem_string_len(lpMultiByteStr, 1) + 1
+        try:
+            mbs = codepage.decode_code_page(self.mem_read(lpMultiByteStr, cbMultiByte), CodePage)
+        except ValueError:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        ctx.args["lpMultiByteStr"].display = mbs.rstrip("\x00")
+
+        ws = mbs.encode("utf-16le")
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        if not cchWideChar:
+            return len(ws) // 2
+        if len(ws) // 2 > cchWideChar:
+            self.mem_write(lpWideCharStr, ws[: cchWideChar * 2])
             emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
-            rv = 0
-        elif lpWideCharStr != 0:
-            if cbMultiByte == 0xFFFFFFFF:
-                mbs = self.read_mem_string(lpMultiByteStr, 1)
-                argv[2] = mbs
-                mbs += "\x00"
-                ws = mbs.encode("utf-16le")
-
-                if len(ws) / 2 > cchWideChar:
-                    emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
-                    rv = 0
-                else:
-                    self.mem_write(lpWideCharStr, ws)
-                    emu.set_last_error(windefs.ERROR_SUCCESS)
-                    rv = len(mbs)
-            else:
-                emu.set_last_error(windefs.ERROR_SUCCESS)
-                cs = self.mem_read(lpMultiByteStr, cbMultiByte)
-                cs = cs.decode("utf-8", "ignore")
-                cs = cs.encode("utf-16le")
-                self.mem_write(lpWideCharStr, cs)
-                rv = cbMultiByte
-
-        return rv
+            return 0
+        self.mem_write(lpWideCharStr, ws)
+        return len(ws) // 2
 
     @apihook("GetStringTypeA", argc=5)
-    def GetStringTypeA(self, emu, argv, ctx: api.ApiContext = None):
+    def GetStringTypeA(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetStringTypeA(
-            LCID   Locale,
-            DWORD  dwInfoType,
+            LCID Locale,
+            DWORD dwInfoType,
             LPCSTR lpSrcStr,
-            int    cchSrc,
+            int cchSrc,
             LPWORD lpCharType
         );
         """
-        ctx = ctx or {}
         args = argv[1:]
         return self.GetStringTypeW(emu, args, ctx)
 
     @apihook("GetStringTypeW", argc=4)
-    def GetStringTypeW(self, emu, argv, ctx: api.ApiContext = None):
+    def GetStringTypeW(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetStringTypeW(
-          DWORD                         dwInfoType,
-          _In_NLS_string_(cchSrc)LPCWCH lpSrcStr,
-          int                           cchSrc,
-          LPWORD                        lpCharType
+            DWORD dwInfoType,
+            LPCWCH lpSrcStr,
+            int cchSrc,
+            LPWORD lpCharType
         );
         """
-        ctx = ctx or {}
         dwInfoType, lpSrcStr, cchSrc, lpCharType = argv
         rv = 0
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         if not cw:
             cw = 2
+
+        if (cchSrc & 0xFFFFFFFF) == 0xFFFFFFFF:
+            cchSrc = self.mem_string_len(lpSrcStr, cw) + 1
 
         CT_CTYPE1 = 1
 
@@ -3787,29 +4522,32 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("LCMapString", argc=6)
-    def LCMapString(self, emu, argv, ctx: api.ApiContext = None):
+    def LCMapString(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int LCMapString(
-          LCID    Locale,
-          DWORD   dwMapFlags,
-          LPTSTR lpSrcStr,
-          int     cchSrc,
-          LPTSTR  lpDestStr,
-          int     cchDest
+            LCID Locale,
+            DWORD dwMapFlags,
+            LPCTSTR lpSrcStr,
+            int cchSrc,
+            LPTSTR lpDestStr,
+            int cchDest
         );
         """
-        ctx = ctx or {}
-
         (Locale, dwMapFlags, lpSrcStr, cchSrc, lpDestStr, cchDest) = argv
 
         rv = 0
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
+
+        if lpSrcStr and (cchSrc & 0xFFFFFFFF) == 0xFFFFFFFF:
+            cchSrc = self.mem_string_len(lpSrcStr, cw) + 1
 
         if lpSrcStr == 0 or cchSrc == 0:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-        if lpDestStr == 0 or cchDest == 0:
+        elif lpDestStr == 0 or cchDest == 0:
             emu.set_last_error(windefs.ERROR_SUCCESS)
             rv = cchSrc
+        elif cchDest < cchSrc:
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
         else:
             data = self.mem_read(lpSrcStr, cchSrc * cw)
             self.mem_write(lpDestStr, data)
@@ -3818,30 +4556,44 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("LCMapStringEx", argc=9)
-    def LCMapStringEx(self, emu, argv, ctx: api.ApiContext = None):
+    def LCMapStringEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int LCMapStringEx(
-          LPCWSTR          lpLocaleName,
-          DWORD            dwMapFlags,
-          LPCWSTR          lpSrcStr,
-          int              cchSrc,
-          LPWSTR           lpDestStr,
-          int              cchDest,
-          LPNLSVERSIONINFO lpVersionInformation,
-          LPVOID           lpReserved,
-          LPARAM           sortHandle
+            LPCWSTR lpLocaleName,
+            DWORD dwMapFlags,
+            LPCWSTR lpSrcStr,
+            int cchSrc,
+            LPWSTR lpDestStr,
+            int cchDest,
+            LPNLSVERSIONINFO lpVersionInformation,
+            LPVOID lpReserved,
+            LPARAM sortHandle
         );
         """
-
-        (lpLocaleName, dwMapFlags, lpSrcStr, cchSrc, lpDestStr, cchDest, ver_info, res, sort_handle) = argv
+        (
+            lpLocaleName,
+            dwMapFlags,
+            lpSrcStr,
+            cchSrc,
+            lpDestStr,
+            cchDest,
+            lpVersionInformation,
+            lpReserved,
+            sortHandle,
+        ) = argv
 
         rv = 0
 
+        if lpSrcStr and (cchSrc & 0xFFFFFFFF) == 0xFFFFFFFF:
+            cchSrc = self.mem_string_len(lpSrcStr, 2) + 1
+
         if lpSrcStr == 0 or cchSrc == 0:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-        if lpDestStr == 0 or cchDest == 0:
+        elif lpDestStr == 0 or cchDest == 0:
             emu.set_last_error(windefs.ERROR_SUCCESS)
             rv = cchSrc
+        elif cchDest < cchSrc:
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
         else:
             data = self.mem_read(lpSrcStr, cchSrc * 2)
             self.mem_write(lpDestStr, data)
@@ -3850,18 +4602,17 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("GetModuleFileName", argc=3)
-    def GetModuleFileName(self, emu, argv, ctx: api.ApiContext = None):
+    def GetModuleFileName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetModuleFileName(
-          HMODULE hModule,
-          LPSTR   lpFilename,
-          DWORD   nSize
+            HMODULE hModule,
+            LPTSTR lpFilename,
+            DWORD nSize
         );
         """
-        ctx = ctx or {}
         hModule, lpFilename, nSize = argv
         size = 0
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
         filename = ""
         if hModule == 0:
@@ -3870,7 +4621,7 @@ class Kernel32(api.ApiHandler):
         else:
             mods = emu.get_peb_modules()
             cm = emu.get_current_module()
-            if cm.base == hModule:
+            if cm and cm.base == hModule:
                 filename = cm.emu_path
             else:
                 for mod in mods:
@@ -3878,43 +4629,43 @@ class Kernel32(api.ApiHandler):
                         filename = mod.emu_path
 
         if filename:
-            argv[1] = filename
-            if cw == 2:
-                out = filename.encode("utf-16le")
-            elif cw == 1:
-                out = filename.encode("utf-8")
+            ctx.args["lpFilename"].display = filename
+            out = self.encode_string(filename, cw)
 
             size = int(len(out) / cw)
-            if nSize < size + 1 * cw:  # null terminator
+            if nSize < size + 1:  # null terminator
                 emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
-                out = out[: nSize - 1 * cw] + b"\0" * cw
+                out = out[: (nSize - 1) * cw] + b"\0" * cw if nSize else b""
+                size = nSize
             else:
                 out += b"\0" * cw
 
-            self.mem_write(lpFilename, out)
+            if out:
+                self.mem_write(lpFilename, out)
         return size
 
     @apihook("HeapFree", argc=3)
-    def HeapFree(self, emu, argv, ctx: api.ApiContext = None):
+    def HeapFree(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL HeapFree(
-          HANDLE                 hHeap,
-          DWORD                  dwFlags,
-          _Frees_ptr_opt_ LPVOID lpMem
+            HANDLE hHeap,
+            DWORD dwFlags,
+            LPVOID lpMem
         );
         """
-        rv = 1
         hHeap, dwFlags, lpMem = argv
 
-        self.mem_free(lpMem)
+        if lpMem and not self.heap_free(lpMem):
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
         emu.set_last_error(windefs.ERROR_SUCCESS)
-        return rv
+        return 1
 
     @apihook("LocalFree", argc=1)
-    def LocalFree(self, emu, argv, ctx: api.ApiContext = None):
+    def LocalFree(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HLOCAL LocalFree(
-            _Frees_ptr_opt_ HLOCAL hMem
+            HLOCAL hMem
         );
         """
         rv = 0
@@ -3923,12 +4674,14 @@ class Kernel32(api.ApiHandler):
         if hMem == 0:
             return rv
 
-        self.mem_free(hMem)
+        if not self.heap_free(hMem):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return hMem
         emu.set_last_error(windefs.ERROR_SUCCESS)
         return rv
 
     @apihook("GlobalHandle", argc=1)
-    def GlobalHandle(self, emu, argv, ctx: api.ApiContext = None):
+    def GlobalHandle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HGLOBAL GlobalHandle(
             LPCVOID pMem
@@ -3938,7 +4691,7 @@ class Kernel32(api.ApiHandler):
         return pMem
 
     @apihook("GlobalUnlock", argc=1)
-    def GlobalUnlock(self, emu, argv, ctx: api.ApiContext = None):
+    def GlobalUnlock(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GlobalUnlock(
             HGLOBAL hMem
@@ -3947,160 +4700,224 @@ class Kernel32(api.ApiHandler):
         return 0
 
     @apihook("GlobalFree", argc=1)
-    def GlobalFree(self, emu, argv, ctx: api.ApiContext = None):
+    def GlobalFree(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HGLOBAL GlobalFree(
-            _Frees_ptr_opt_ HGLOBAL hMem
+            HGLOBAL hMem
         );
         """
+        (hMem,) = argv
+
+        if hMem and not self.heap_free(hMem):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return hMem
         return 0
 
     @apihook("GetSystemDirectory", argc=2)
-    def GetSystemDirectory(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSystemDirectory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT GetSystemDirectory(
-          LPSTR lpBuffer,
-          UINT  uSize
+            LPTSTR lpBuffer,
+            UINT uSize
         );
         """
-        ctx = ctx or {}
         rv = 0
         lpBuffer, uSize = argv
 
-        cw = self.get_char_width(ctx)
-        fn = ctx["func_name"]
-        if "GetWindowsDirectory" in fn:
+        cw = _char_width(self, ctx)
+        fn = ctx.func_name
+        if "WindowsDirectory" in fn:
             sysroot = "C:\\Windows"
         else:
             sysroot = "C:\\Windows\\system32"
 
-        argv[0] = sysroot
+        ctx.args["lpBuffer"].display = sysroot
         sysroot += "\x00"
-        if cw == 2:
-            out = sysroot.encode("utf-16le")
-        elif cw == 1:
-            out = sysroot.encode("utf-8")
+        out = self.encode_string(sysroot, cw)
 
         if len(sysroot) > uSize:
             emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            rv = len(sysroot)
         else:
             self.mem_write(lpBuffer, out)
             emu.set_last_error(windefs.ERROR_SUCCESS)
-            rv = len(sysroot)
+            rv = len(sysroot) - 1
 
         return rv
 
     @apihook("IsDBCSLeadByte", argc=1)
-    def IsDBCSLeadByte(self, emu, argv, ctx: api.ApiContext = None):
+    def IsDBCSLeadByte(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL IsDBCSLeadByte(
             BYTE TestChar
         );
         """
-        return True
+        return False
+
+    @apihook("IsDBCSLeadByteEx", argc=2)
+    def IsDBCSLeadByteEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL IsDBCSLeadByteEx(
+            UINT CodePage,
+            BYTE TestChar
+        );
+        """
+        return False
 
     @apihook("SetEnvironmentVariable", argc=2)
-    def SetEnvironmentVariable(self, emu, argv, ctx: api.ApiContext = None):
+    def SetEnvironmentVariable(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetEnvironmentVariable(
             LPCTSTR lpName,
             LPCTSTR lpValue
-            );
+        );
         """
-        ctx = ctx or {}
         lpName, lpValue = argv
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         if lpName and lpValue:
             name = self.read_mem_string(lpName, cw)
             val = self.read_mem_string(lpValue, cw)
-            argv[0] = name
-            argv[1] = val
+            ctx.args["lpName"].display = name
+            ctx.args["lpValue"].display = val
             emu.set_env(name, val)
         return True
 
     @apihook("SetDllDirectory", argc=1)
-    def SetDllDirectory(self, emu, argv, ctx: api.ApiContext = None):
+    def SetDllDirectory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetDllDirectory(
-            LPCSTR lpPathName
+            LPCTSTR lpPathName
         );
         """
-        ctx = ctx or {}
-        (path,) = argv
+        (lpPathName,) = argv
 
-        cw = self.get_char_width(ctx)
-        if path:
-            path = self.read_mem_string(path, cw)
-            argv[0] = path
+        cw = _char_width(self, ctx)
+        if lpPathName:
+            ctx.args["lpPathName"].display = self.read_mem_string(lpPathName, cw)
         return True
 
     @apihook("GetWindowsDirectory", argc=2)
-    def GetWindowsDirectory(self, emu, argv, ctx: api.ApiContext = None):
+    def GetWindowsDirectory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT GetWindowsDirectory(
-            LPSTR lpBuffer,
-            UINT  uSize
+            LPTSTR lpBuffer,
+            UINT uSize
         );
         """
-        ctx = ctx or {}
+        return self.GetSystemDirectory(emu, argv, ctx)
+
+    @apihook("GetSystemWindowsDirectory", argc=2)
+    def GetSystemWindowsDirectory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        UINT GetSystemWindowsDirectory(
+            LPTSTR lpBuffer,
+            UINT uSize
+        );
+        """
         return self.GetSystemDirectory(emu, argv, ctx)
 
     @apihook("CreateFileMapping", argc=6)
-    def CreateFileMapping(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateFileMapping(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE CreateFileMapping(
-          HANDLE                hFile,
-          LPSECURITY_ATTRIBUTES lpFileMappingAttributes,
-          DWORD                 flProtect,
-          DWORD                 dwMaximumSizeHigh,
-          DWORD                 dwMaximumSizeLow,
-          LPTSTR                lpName
+            HANDLE hFile,
+            LPSECURITY_ATTRIBUTES lpFileMappingAttributes,
+            DWORD flProtect,
+            DWORD dwMaximumSizeHigh,
+            DWORD dwMaximumSizeLow,
+            LPCTSTR lpName
         );
         """
-        ctx = ctx or {}
-        hfile, map_attrs, prot, max_size_high, max_size_low, map_name = argv
+        hFile, lpFileMappingAttributes, flProtect, dwMaximumSizeHigh, dwMaximumSizeLow, lpName = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
         # Get to full map size
-        size = (max_size_high << 32) | max_size_low
+        size = (dwMaximumSizeHigh << 32) | dwMaximumSizeLow
 
         name = ""
-        if map_name:
-            name = self.read_mem_string(map_name, cw)
-            argv[5] = name
+        if lpName:
+            name = self.read_mem_string(lpName, cw)
+            ctx.args["lpName"].display = name
 
-        hmap = self.file_create_mapping(hfile, name, size, prot)
+        f = None
+        if hFile and ct.c_int32(hFile).value != windefs.INVALID_HANDLE_VALUE:
+            f = self.get_file(hFile)
+            if not f:
+                emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+                return 0
+        if f and flProtect & PAGE_PROTECTION_FLAGS.SEC_IMAGE:
+            try:
+                emu.load_pe(data=f.get_contents())
+            except WindowsEmuError:
+                emu.set_last_error(windefs.ERROR_BAD_EXE_FORMAT)
+                return 0
+
+        hmap = self.file_create_mapping(hFile, name, size, flProtect)
 
         return hmap
 
     @apihook("MapViewOfFile", argc=5)
-    def MapViewOfFile(self, emu, argv, ctx: api.ApiContext = None):
+    def MapViewOfFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPVOID MapViewOfFile(
-          HANDLE hFileMappingObject,
-          DWORD  dwDesiredAccess,
-          DWORD  dwFileOffsetHigh,
-          DWORD  dwFileOffsetLow,
-          SIZE_T dwNumberOfBytesToMap
+            HANDLE hFileMappingObject,
+            DWORD dwDesiredAccess,
+            DWORD dwFileOffsetHigh,
+            DWORD dwFileOffsetLow,
+            SIZE_T dwNumberOfBytesToMap
         );
         """
-        hmap, access, offset_high, offset_low, bytes_to_map = argv
+        hFileMappingObject, dwDesiredAccess, dwFileOffsetHigh, dwFileOffsetLow, dwNumberOfBytesToMap = argv
+        return self.map_view(
+            emu, hFileMappingObject, dwDesiredAccess, dwFileOffsetHigh, dwFileOffsetLow, dwNumberOfBytesToMap, 0
+        )
 
-        fman = emu.get_file_manager()
-        mapping = fman.get_mapping_from_handle(hmap)
+    @apihook("MapViewOfFileEx", argc=6)
+    def MapViewOfFileEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        LPVOID MapViewOfFileEx(
+            HANDLE hFileMappingObject,
+            DWORD dwDesiredAccess,
+            DWORD dwFileOffsetHigh,
+            DWORD dwFileOffsetLow,
+            SIZE_T dwNumberOfBytesToMap,
+            LPVOID lpBaseAddress
+        );
+        """
+        return self.map_view(emu, *argv)
+
+    def map_view(self, emu, hmap, access, offset_high, offset_low, bytes_to_map, base_address):
+        """
+        Map a view of a file mapping at ``base_address``, or at any free
+        address when ``base_address`` is 0.
+        """
+        mapping = _file_mapping(emu, hmap)
         tag_prefix = "api.MapViewOfFile"
         buf = 0
 
-        if mapping:
+        def get_view_range(size):
+            if not base_address:
+                base, size = emu.get_valid_ranges(size)
+                while base and base & 0xFFF:
+                    base, size = emu.get_valid_ranges(size)
+                return base, size
+            base, size = emu.get_valid_ranges(size, base_address)
+            return (base, size) if base == base_address else (0, size)
+
+        if mapping and base_address & 0xFFFF:
+            emu.set_last_error(windefs.ERROR_INVALID_ADDRESS)
+        elif mapping:
             f = mapping.backed_file
             full_offset = (offset_high << 32) | offset_low
             size = 0
             view_perms = self.map_view_access_to_emu_perms(access, mapping.prot)
             if f:
-                data = f.get_data()
+                data = f.get_contents()
                 if bytes_to_map != 0:
                     data = data[full_offset : full_offset + bytes_to_map]
+                else:
+                    data = data[full_offset:]
 
                 fname = ntpath.basename(f.path)
                 fname = fname.replace(".", "_")
@@ -4109,13 +4926,14 @@ class Kernel32(api.ApiHandler):
                 # has beed done with SEC_IMAGE protection, the mapping is not
                 # done as a contigous stream of bytes, but it is mapped as
                 # PE file
-                pe_mapping = mapping.prot & SEC_IMAGE
+                pe_mapping = mapping.prot & PAGE_PROTECTION_FLAGS.SEC_IMAGE
                 if pe_mapping:
                     # Now map the file as PE file
                     pe = emu.load_pe(data=data)
-                    base, size = emu.get_valid_ranges(pe.image_size)
-                    while base and base & 0xFFF:
-                        base, size = emu.get_valid_ranges(size)
+                    base, size = get_view_range(pe.image_size)
+                    if not base:
+                        emu.set_last_error(windefs.ERROR_INVALID_ADDRESS)
+                        return 0
 
                     emu.mem_map(pe.image_size, base=base, perms=view_perms, tag=f"{tag_prefix}.{fname}.0x{base:x}")
                     mapping.add_view(base, full_offset, size, access)
@@ -4123,9 +4941,10 @@ class Kernel32(api.ApiHandler):
                     buf = base
                 else:
                     # Just copy the bytes as they are
-                    base, size = emu.get_valid_ranges(len(data))
-                    while base and base & 0xFFF:
-                        base, size = emu.get_valid_ranges(size)
+                    base, size = get_view_range(len(data))
+                    if not base:
+                        emu.set_last_error(windefs.ERROR_INVALID_ADDRESS)
+                        return 0
 
                     buf = self.mem_alloc(base=base, size=size, perms=view_perms, shared=True)
                     mm = emu.get_address_map(buf)
@@ -4134,7 +4953,16 @@ class Kernel32(api.ApiHandler):
                     self.mem_write(buf, data)
                     emu.set_last_error(windefs.ERROR_SUCCESS)
             else:
-                base, size = emu.get_valid_ranges(bytes_to_map)
+                if not bytes_to_map:
+                    bytes_to_map = mapping.size - full_offset
+                try:
+                    base, size = get_view_range(bytes_to_map)
+                except OutOfMemoryError:
+                    emu.set_last_error(windefs.ERROR_NOT_ENOUGH_MEMORY)
+                    return 0
+                if not base:
+                    emu.set_last_error(windefs.ERROR_INVALID_ADDRESS)
+                    return 0
                 buf = self.mem_alloc(base=base, size=size, perms=view_perms, tag=tag_prefix, shared=True)
                 emu.set_last_error(windefs.ERROR_SUCCESS)
                 mapping.add_view(buf, full_offset, size, access)
@@ -4145,15 +4973,15 @@ class Kernel32(api.ApiHandler):
                     self.mem_write(buf, data)
 
         else:
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
 
         return buf
 
     @apihook("UnmapViewOfFile", argc=1)
-    def UnmapViewOfFile(self, emu, argv, ctx: api.ApiContext = None):
+    def UnmapViewOfFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL UnmapViewOfFile(
-          LPCVOID lpBaseAddress
+            LPCVOID lpBaseAddress
         );
         """
         (lpBaseAddress,) = argv
@@ -4170,9 +4998,9 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("GetSystemInfo", argc=1)
-    def GetSystemInfo(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSystemInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void GetSystemInfo(
+        VOID GetSystemInfo(
             LPSYSTEM_INFO lpSystemInfo
         );
         """
@@ -4180,102 +5008,118 @@ class Kernel32(api.ApiHandler):
         ptr_size = emu.get_ptr_size()
         si = self.k32types.SYSTEM_INFO(ptr_size)
         si.dwPageSize = 0x1000
+        si.lpMinimumApplicationAddress = 0x10000
+        si.lpMaximumApplicationAddress = self.get_max_application_address(emu)
+        si.dwActiveProcessorMask = (1 << PROCESSOR_COUNT) - 1
+        si.dwNumberOfProcessors = PROCESSOR_COUNT
+        si.dwAllocationGranularity = 0x10000
+        si.wProcessorLevel = 6
 
         if ptr_size == 4:
-            si.wProcessorArchitecture = k32types.PROCESSOR_ARCHITECTURE_INTEL
+            si.wProcessorArchitecture = k32defs.PROCESSOR_ARCHITECTURE_INTEL
+            si.dwProcessorType = k32defs.PROCESSOR_INTEL_PENTIUM
         else:
-            si.wProcessorArchitecture = k32types.PROCESSOR_ARCHITECTURE_AMD64
+            si.wProcessorArchitecture = k32defs.PROCESSOR_ARCHITECTURE_AMD64
+            si.dwProcessorType = k32defs.PROCESSOR_AMD_X8664
 
         self.mem_write(lpSystemInfo, si.get_bytes())
-        return
 
     @apihook("GetFileAttributes", argc=1)
-    def GetFileAttributes(self, emu, argv, ctx: api.ApiContext = None):
+    def GetFileAttributes(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetFileAttributes(
-            LPCSTR lpFileName
+            LPCTSTR lpFileName
         );
         """
-        ctx = ctx or {}
-        (fn,) = argv
-        cw = self.get_char_width(ctx)
+        (lpFileName,) = argv
+        cw = _char_width(self, ctx)
         rv = windefs.INVALID_FILE_ATTRIBUTES
-        target = self.read_mem_string(fn, cw)
-        argv[0] = target
-        if self.does_file_exist(target):
+        if not lpFileName:
+            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
+            return rv
+        target = self.read_mem_string(lpFileName, cw)
+        ctx.args["lpFileName"].display = target
+        if not target:
+            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
+        elif emu.get_file_manager().is_directory(target):
+            rv = windefs.FILE_ATTRIBUTE_DIRECTORY
+        elif self.does_file_exist(target):
             rv = windefs.FILE_ATTRIBUTE_NORMAL
+        else:
+            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
         return rv
 
     @apihook("GetFileAttributesEx", argc=3)
-    def GetFileAttributesEx(self, emu, argv, ctx: api.ApiContext = None):
+    def GetFileAttributesEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetFileAttributesEx(
-          LPCSTR                 lpFileName,
-          GET_FILEEX_INFO_LEVELS fInfoLevelId,
-          LPVOID                 lpFileInformation
+            LPCTSTR lpFileName,
+            GET_FILEEX_INFO_LEVELS fInfoLevelId,
+            LPVOID lpFileInformation
         );
         """
-        ctx = ctx or {}
         lpFileName, fInfoLevelId, lpFileInformation = argv
 
-        cw = self.get_char_width(ctx)
-
-        filename = self.read_mem_string(lpFileName, cw)
-        argv[0] = filename
-
-        level_id = k32types.get_define(fInfoLevelId, "GetFileExInfo")
-        if not level_id:
+        if not lpFileName:
+            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
             return False
 
-        argv[1] = level_id
+        cw = _char_width(self, ctx)
 
-        file_data = k32types.WIN32_FILE_ATTRIBUTE_DATA(emu.get_ptr_size())
+        filename = self.read_mem_string(lpFileName, cw)
+        ctx.args["lpFileName"].display = filename
+        if not filename:
+            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
+            return False
+
+        if fInfoLevelId != GET_FILEEX_INFO_LEVELS.GetFileExInfoStandard:
+            return False
+
+        ctx.args["fInfoLevelId"].display = decode(GET_FILEEX_INFO_LEVELS, fInfoLevelId)
+
+        file_data = k32defs.WIN32_FILE_ATTRIBUTE_DATA(emu.get_ptr_size())
 
         # Set WIN32_FILE_ATTRIBUTE_DATA.dwFileAttributes to Normal
-        file_data.dwFileAttributes = k32types.FILE_ATTRIBUTE_NORMAL
+        file_data.dwFileAttributes = windefs.FILE_ATTRIBUTE_NORMAL
 
-        # Set WIN32_FILE_ATTRIBUTE_DATA.ftCreationTime + .ftLastAccessTime + .ftLastWriteTime,
-        # using current date time
-        timestamp = 116444736000000000 + int(datetime.datetime.now(datetime.timezone.utc).timestamp()) * 10000000
-        file_data.ftCreationTime.dwLowDateTime = 0xFFFFFFFF & timestamp
-        file_data.ftCreationTime.dwHighDateTime = timestamp >> 32
+        timestamp = self.get_system_time()
+        for ft in (file_data.ftCreationTime, file_data.ftLastAccessTime, file_data.ftLastWriteTime):
+            ft.dwLowDateTime = 0xFFFFFFFF & timestamp
+            ft.dwHighDateTime = timestamp >> 32
+
+        if emu.get_file_manager().is_directory(filename):
+            file_data.dwFileAttributes = windefs.FILE_ATTRIBUTE_DIRECTORY
+            emu.set_last_error(windefs.ERROR_SUCCESS)
+            self.mem_write(lpFileInformation, file_data.get_bytes())
+            return True
 
         # Set WIN32_FILE_ATTRIBUTE_DATA.nFileSizeHigh + .nFileSizeLow
-        fHandle = self.file_open(filename)
-        if fHandle:
-            f = self.get_object_from_handle(fHandle)
-            full_size = f.get_size()
-            high = 0xFFFFFFFF & (full_size >> 32)
-            low = 0xFFFFFFFF & full_size
-            high = high.to_bytes(4, "little")
+        full_size = emu.get_file_manager().get_file_size(filename)
+        if full_size is None:
+            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
+            return False
 
-            if file_data.nFileSizeHigh:  # type: ignore[truthy-function]  # struct field accessor
-                file_data.ftCreationTime.nFileSizeHigh = high
-            emu.set_last_error(windefs.ERROR_SUCCESS)
-
-        else:
-            low = 0xFFFFFFFF
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-
-        file_data.ftCreationTime.nFileSizeLow = low
+        file_data.nFileSizeHigh = 0xFFFFFFFF & (full_size >> 32)
+        file_data.nFileSizeLow = 0xFFFFFFFF & full_size
+        emu.set_last_error(windefs.ERROR_SUCCESS)
 
         self.mem_write(lpFileInformation, file_data.get_bytes())
         return True
 
     @apihook("GetFileTime", argc=4)
-    def GetFileTime(self, emu, argv, ctx: api.ApiContext = None):
+    def GetFileTime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetFileTime(
-          HANDLE     hFile,
-          LPFILETIME lpCreationTime,
-          LPFILETIME lpLastAccessTime,
-          LPFILETIME lpLastWriteTime
+            HANDLE hFile,
+            LPFILETIME lpCreationTime,
+            LPFILETIME lpLastAccessTime,
+            LPFILETIME lpLastWriteTime
         );
         """
-        _hFile, lpCreationTime, lpLastAccessTime, lpLastWriteTime = argv
+        hFile, lpCreationTime, lpLastAccessTime, lpLastWriteTime = argv
 
         ft = self.k32types.FILETIME(emu.get_ptr_size())
-        timestamp = 116444736000000000 + int(datetime.datetime.now(datetime.timezone.utc).timestamp()) * 10000000
+        timestamp = self.get_system_time()
         ft.dwLowDateTime = 0xFFFFFFFF & timestamp
         ft.dwHighDateTime = timestamp >> 32
         data = self.get_bytes(ft)
@@ -4291,300 +5135,301 @@ class Kernel32(api.ApiHandler):
         return True
 
     @apihook("SetFileTime", argc=4)
-    def SetFileTime(self, emu, argv, ctx: api.ApiContext = None):
+    def SetFileTime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetFileTime(
-          HANDLE         hFile,
-          const FILETIME *lpCreationTime,
-          const FILETIME *lpLastAccessTime,
-          const FILETIME *lpLastWriteTime
+            HANDLE hFile,
+            const FILETIME *lpCreationTime,
+            const FILETIME *lpLastAccessTime,
+            const FILETIME *lpLastWriteTime
         );
         """
         emu.set_last_error(windefs.ERROR_SUCCESS)
         return True
 
     @apihook("CreateDirectory", argc=2)
-    def CreateDirectory(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateDirectory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CreateDirectory(
-            LPCSTR                lpPathName,
+            LPCTSTR lpPathName,
             LPSECURITY_ATTRIBUTES lpSecurityAttributes
         );
         """
-        ctx = ctx or {}
-        pn, sec = argv
-        cw = self.get_char_width(ctx)
+        lpPathName, lpSecurityAttributes = argv
+        cw = _char_width(self, ctx)
 
-        if pn:
-            target = self.read_mem_string(pn, cw)
-            argv[0] = target
+        if lpPathName:
+            target = self.read_mem_string(lpPathName, cw)
+            ctx.args["lpPathName"].display = target
+            emu.get_file_manager().create_directory(target)
         return True
 
     @apihook("RemoveDirectory", argc=1)
-    def RemoveDirectory(self, emu, argv, ctx: api.ApiContext = None):
+    def RemoveDirectory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL RemoveDirectoryA(
-        [in] LPCSTR lpPathName
+        BOOL RemoveDirectory(
+            LPCTSTR lpPathName
         );
         """
-        ctx = ctx or {}
-        (pn,) = argv
-        cw = self.get_char_width(ctx)
+        (lpPathName,) = argv
+        cw = _char_width(self, ctx)
 
-        if pn:
-            target = self.read_mem_string(pn, cw)
-            argv[0] = target
+        if lpPathName:
+            target = self.read_mem_string(lpPathName, cw)
+            ctx.args["lpPathName"].display = target
+            emu.get_file_manager().remove_directory(target)
 
         return True
 
     @apihook("CopyFile", argc=3)
-    def CopyFile(self, emu, argv, ctx: api.ApiContext = None):
+    def CopyFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CopyFile(
             LPCTSTR lpExistingFileName,
             LPCTSTR lpNewFileName,
-            BOOL    bFailIfExists
+            BOOL bFailIfExists
         );
         """
-        ctx = ctx or {}
-        src, dst, fail = argv
-        cw = self.get_char_width(ctx)
+        lpExistingFileName, lpNewFileName, bFailIfExists = argv
+        cw = _char_width(self, ctx)
 
-        if src:
-            src = self.read_mem_string(src, cw)
-            argv[0] = src
-        if dst:
-            dst = self.read_mem_string(dst, cw)
-            argv[1] = dst
+        existing_name = new_name = ""
+        if lpExistingFileName:
+            existing_name = self.read_mem_string(lpExistingFileName, cw)
+            ctx.args["lpExistingFileName"].display = existing_name
+        if lpNewFileName:
+            new_name = self.read_mem_string(lpNewFileName, cw)
+            ctx.args["lpNewFileName"].display = new_name
 
-        if not src or not dst:
+        if not existing_name or not new_name:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return False
 
-        if fail and self.does_file_exist(dst):
+        fm = emu.get_file_manager()
+        if bFailIfExists and fm.does_file_exist_by_path(new_name):
             emu.set_last_error(windefs.ERROR_FILE_EXISTS)
             return False
 
-        s_handle = self.file_open(src)
-        if s_handle is None:
+        if fm.copy_file(existing_name, new_name) is None:
             emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
             return False
-
-        sf = self.file_get(s_handle)
-        if sf is None:
-            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
-            return False
-
-        d_handle = self.file_open(dst, create=True)
-        if d_handle is None:
-            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
-            return False
-
-        df = self.file_get(d_handle)
-        if df is None:
-            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
-            return False
-
-        data = sf.get_data() or b""
-        df.add_data(data)
-        self.record_file_access_event(dst, FILE_CREATE)
-        self.record_file_access_event(dst, FILE_WRITE)
         return True
 
     @apihook("MoveFile", argc=2)
-    def MoveFile(self, emu, argv, ctx: api.ApiContext = None):
+    def MoveFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL MoveFile(
             LPCTSTR lpExistingFileName,
             LPCTSTR lpNewFileName
         );
         """
-        ctx = ctx or {}
-        src, dst = argv
-        cw = self.get_char_width(ctx)
+        lpExistingFileName, lpNewFileName = argv
+        cw = _char_width(self, ctx)
 
-        if src:
-            src = self.read_mem_string(src, cw)
-            argv[0] = src
-        if dst:
-            dst = self.read_mem_string(dst, cw)
-            argv[1] = dst
+        existing_name = new_name = ""
+        if lpExistingFileName:
+            existing_name = self.read_mem_string(lpExistingFileName, cw)
+            ctx.args["lpExistingFileName"].display = existing_name
+        if lpNewFileName:
+            new_name = self.read_mem_string(lpNewFileName, cw)
+            ctx.args["lpNewFileName"].display = new_name
 
-        if not src or not dst:
+        if not existing_name or not new_name:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return 0
 
-        if not self.does_file_exist(src):
+        if emu.get_file_manager().move_file(existing_name, new_name) is None:
             emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
             return 0
-
-        src_handle = self.file_open(src)
-        if src_handle is None:
-            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
-            return 0
-
-        src_file = self.file_get(src_handle)
-        if src_file is None:
-            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
-            return 0
-
-        dst_handle = self.file_open(dst, create=True)
-        if dst_handle is None:
-            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
-            return 0
-
-        dst_file = self.file_get(dst_handle)
-        if dst_file is None:
-            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
-            return 0
-
-        dst_file.remove_data()
-        dst_file.add_data(src_file.get_data(reset_pointer=True) or b"")
-        emu.file_delete(src)
-
-        self.record_file_access_event(dst, FILE_CREATE)
-        self.record_file_access_event(dst, FILE_WRITE)
 
         emu.set_last_error(windefs.ERROR_SUCCESS)
         return 1
 
-    @apihook("CreateFile", argc=7)
-    def CreateFile(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("MoveFileEx", argc=3)
+    def MoveFileEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HANDLE CreateFile(
-          LPTSTR                lpFileName,
-          DWORD                 dwDesiredAccess,
-          DWORD                 dwShareMode,
-          LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-          DWORD                 dwCreationDisposition,
-          DWORD                 dwFlagsAndAttributes,
-          HANDLE                hTemplateFile
+        BOOL MoveFileEx(
+            LPCTSTR lpExistingFileName,
+            LPCTSTR lpNewFileName,
+            DWORD dwFlags
         );
         """
-        ctx = ctx or {}
+        lpExistingFileName, lpNewFileName, dwFlags = argv
+        cw = _char_width(self, ctx)
+
+        # The session manager does the move or delete at the next boot.
+        if lpExistingFileName and dwFlags & MOVEFILE_DELAY_UNTIL_REBOOT:
+            ctx.args["lpExistingFileName"].display = self.read_mem_string(lpExistingFileName, cw)
+            if lpNewFileName:
+                ctx.args["lpNewFileName"].display = self.read_mem_string(lpNewFileName, cw)
+            emu.set_last_error(windefs.ERROR_SUCCESS)
+            return 1
+
+        if lpExistingFileName and lpNewFileName and not dwFlags & MOVEFILE_REPLACE_EXISTING:
+            target = self.read_mem_string(lpNewFileName, cw)
+            if self.does_file_exist(target):
+                ctx.args["lpExistingFileName"].display = self.read_mem_string(lpExistingFileName, cw)
+                ctx.args["lpNewFileName"].display = target
+                emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
+                return 0
+
+        return self.MoveFile(emu, [lpExistingFileName, lpNewFileName], ctx)
+
+    @apihook("CreateFile", argc=7)
+    def CreateFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HANDLE CreateFile(
+            LPCTSTR lpFileName,
+            DWORD dwDesiredAccess,
+            DWORD dwShareMode,
+            LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+            DWORD dwCreationDisposition,
+            DWORD dwFlagsAndAttributes,
+            HANDLE hTemplateFile
+        );
+        """
+        (
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile,
+        ) = argv
+        hnd = self.get_max_int()
+
         raw_argv = tuple(argv)
-        fname, access, share, sec_attr, disp, flags, template = argv
-        hnd = windefs.INVALID_HANDLE_VALUE
+        cw = _char_width(self, ctx)
 
-        cw = self.get_char_width(ctx)
-
-        if not fname:
-            api_diagnostics.attach_observation(
+        if not lpFileName:
+            _scatter_observation(
                 ctx,
+                api_diagnostics.attach_observation,
                 lambda: api_diagnostics.observe_create_file(
                     emu,
                     raw_argv,
                     hnd,
                     char_width=cw,
                     decoded_path=None,
-                    api_name=ctx.get("func_name"),
+                    api_name=_ctx_func_name(ctx),
                 ),
             )
             return hnd
 
-        target = self.read_mem_string(fname, cw)
-        argv[0] = target
+        target = self.read_mem_string(lpFileName, cw)
+        _set_arg_display(ctx, "lpFileName", target)
 
-        ad = ddk.get_access_defines(access)
-        if ad:
-            argv[1] = " | ".join(ad)
+        ad = decode_flags(FILE_ACCESS_FLAGS, dwDesiredAccess) if dwDesiredAccess else None
+        _set_arg_display(ctx, "dwDesiredAccess", decode(FILE_ACCESS_FLAGS, dwDesiredAccess))
 
-        disp_bytes = disp.to_bytes(8, "little")
-        disp = int(int.from_bytes(disp_bytes[0:4], "little"))
-        cd = windefs.get_create_disposition(disp)
-        if cd:
-            argv[4] = cd
+        disp_bytes = dwCreationDisposition.to_bytes(8, "little")
+        dwCreationDisposition = int(int.from_bytes(disp_bytes[0:4], "little"))
+        cd = decode(FILE_CREATION_DISPOSITION, dwCreationDisposition)
+        _set_arg_display(ctx, "dwCreationDisposition", cd)
 
+        open_flags = {"disposition": [cd] if cd else None, "access": ad}
+        pipe = emu.get_file_manager().open_named_pipe(target, **open_flags)
         obj = self.get_object_from_name(target)
-        if obj:
+        if pipe:
+            emu.set_last_error(windefs.ERROR_SUCCESS)
+            hnd = pipe
+        elif obj:
             hnd = self.get_object_handle(obj)
         else:
-            op = "open"
-            if self.does_file_exist(target):
-                if disp == windefs.CREATE_ALWAYS:
+            if dwCreationDisposition == FILE_CREATION_DISPOSITION.CREATE_NEW:
+                exists = emu.get_file_manager().does_file_exist_by_path(target)
+            else:
+                exists = self.does_file_exist(target)
+            if exists:
+                if dwCreationDisposition == FILE_CREATION_DISPOSITION.CREATE_ALWAYS:
                     emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
-                    hnd = self.file_open(target, create=True)
-                    op = "create"
-                elif disp == windefs.CREATE_NEW:
+                    hnd = self.file_open(target, create=True, **open_flags)
+                elif dwCreationDisposition == FILE_CREATION_DISPOSITION.CREATE_NEW:
                     # Function fails
                     emu.set_last_error(windefs.ERROR_FILE_EXISTS)
-                elif disp == windefs.OPEN_ALWAYS:
+                    emu.get_file_manager().record_open(target, **open_flags)
+                elif dwCreationDisposition == FILE_CREATION_DISPOSITION.OPEN_ALWAYS:
                     emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
                     # Open the file
-                    hnd = self.file_open(target, create=False)
-                elif disp == windefs.OPEN_EXISTING:
+                    hnd = self.file_open(target, **open_flags)
+                elif dwCreationDisposition == FILE_CREATION_DISPOSITION.OPEN_EXISTING:
                     emu.set_last_error(windefs.ERROR_SUCCESS)
-                    hnd = self.file_open(target, create=False)
-                elif disp == windefs.TRUNCATE_EXISTING:
+                    hnd = self.file_open(target, **open_flags)
+                elif dwCreationDisposition == FILE_CREATION_DISPOSITION.TRUNCATE_EXISTING:
                     emu.set_last_error(windefs.ERROR_SUCCESS)
-                    hnd = self.file_open(target, create=False, truncate=True)
+                    hnd = self.file_open(target, truncate=True, **open_flags)
 
             # We don't have a handler for this file, create it
-            else:
-                op = "create"
-                if disp == windefs.CREATE_ALWAYS:
-                    emu.set_last_error(windefs.ERROR_SUCCESS)
-                    hnd = self.file_open(target, create=True)
-                elif disp == windefs.CREATE_NEW:
-                    emu.set_last_error(windefs.ERROR_SUCCESS)
-                    hnd = self.file_open(target, create=True)
-                elif disp == windefs.OPEN_ALWAYS:
-                    emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
-                    # Open the file
-                    hnd = self.file_open(target, create=True)
-                elif disp == windefs.OPEN_EXISTING:
-                    emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
-                elif disp == windefs.TRUNCATE_EXISTING:
-                    emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
+            elif dwCreationDisposition in (
+                FILE_CREATION_DISPOSITION.CREATE_ALWAYS,
+                FILE_CREATION_DISPOSITION.CREATE_NEW,
+            ):
+                emu.set_last_error(windefs.ERROR_SUCCESS)
+                hnd = self.file_open(target, create=True, **open_flags)
+            elif dwCreationDisposition == FILE_CREATION_DISPOSITION.OPEN_ALWAYS:
+                emu.set_last_error(windefs.ERROR_SUCCESS)
+                # Open the file
+                hnd = self.file_open(target, create=True, **open_flags)
+            elif dwCreationDisposition in (
+                FILE_CREATION_DISPOSITION.OPEN_EXISTING,
+                FILE_CREATION_DISPOSITION.TRUNCATE_EXISTING,
+            ):
+                emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
+                emu.get_file_manager().record_open(target, **open_flags)
 
-            self.record_file_access_event(target, op, disposition=[cd], access=ad)
-        api_diagnostics.attach_observation(
+            f = self.get_file(hnd) if hnd else None
+            write_access = (
+                FILE_ACCESS_FLAGS.FILE_WRITE_DATA | FILE_ACCESS_FLAGS.GENERIC_WRITE | FILE_ACCESS_FLAGS.GENERIC_ALL
+            )
+            if f and dwDesiredAccess & FILE_ACCESS_FLAGS.FILE_APPEND_DATA and not dwDesiredAccess & write_access:
+                f.append = True
+        _scatter_observation(
             ctx,
+            api_diagnostics.attach_observation,
             lambda: api_diagnostics.observe_create_file(
                 emu,
                 raw_argv,
                 hnd,
                 char_width=cw,
                 decoded_path=target,
-                api_name=ctx.get("func_name"),
+                api_name=_ctx_func_name(ctx),
             ),
         )
         return hnd
 
     @apihook("DeleteFile", argc=1)
-    def DeleteFile(self, emu, argv, ctx: api.ApiContext = None):
+    def DeleteFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL DeleteFileW(
-            LPCWSTR lpFileName
+        BOOL DeleteFile(
+            LPCTSTR lpFileName
         );
         """
-        ctx = ctx or {}
-        lpFileName = argv[0]
-        cw = self.get_char_width(ctx)
+        (lpFileName,) = argv
+        cw = _char_width(self, ctx)
         if not lpFileName:
-            emu.set_last_error(windefs.INVALID_HANDLE_VALUE)
+            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
             return 0
 
         target = self.read_mem_string(lpFileName, cw)
-        argv[0] = target
+        ctx.args["lpFileName"].display = target
 
         if emu.does_file_exist(target):
             # FIXME : does not handle read-only attribute
             emu.file_delete(target)
             return 1
-        else:
-            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
-            return 0
+        emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
+        return 0
 
     @apihook("ReadFile", argc=5)
-    def ReadFile(self, emu, argv, ctx: api.ApiContext = None):
+    def ReadFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL ReadFile(
-          HANDLE       hFile,
-          LPVOID       lpBuffer,
-          DWORD        nNumberOfBytesToRead,
-          LPDWORD      lpNumberOfBytesRead,
-          LPOVERLAPPED lpOverlapped
+            HANDLE hFile,
+            LPVOID lpBuffer,
+            DWORD nNumberOfBytesToRead,
+            LPDWORD lpNumberOfBytesRead,
+            LPOVERLAPPED lpOverlapped
         );
         """
 
@@ -4595,119 +5440,121 @@ class Kernel32(api.ApiHandler):
                 read = (len(data)).to_bytes(4, "little")
                 self.mem_write(pBytesRead, read)
 
-        hFile, lpBuffer, num_bytes, bytes_read, lpOverlapped = argv
+        hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, lpOverlapped = argv
         rv = False
 
-        if bytes_read:
-            self.mem_write(bytes_read, (0).to_bytes(4, "little"))
+        if lpNumberOfBytesRead:
+            self.write_dword(lpNumberOfBytesRead, 0)
 
-        f = self.file_get(hFile)
-        if f:
-            path = f.path
-            data = f.get_data(num_bytes)
-
-            if lpBuffer:
-                _write_output(emu, data, lpBuffer, bytes_read)
-
-                self.record_file_access_event(path, FILE_READ, buffer=lpBuffer, size=len(data))
-
-                rv = True
-                emu.set_last_error(windefs.ERROR_SUCCESS)
-            return rv
-
-        p = emu.pipe_get(hFile)
-        if p:
-            data = p.get_data(num_bytes)
-            if data and lpBuffer:
-                _write_output(emu, data, lpBuffer, bytes_read)
-            rv = bool(data)
+        proc = emu.get_current_process()
+        # SetStdHandle can make a file handle the standard input, so the table comes first
+        if hFile not in emu.get_handle_table() and proc and hFile == proc.stdin:
+            # The console has no input, so a read gets the end of input
             emu.set_last_error(windefs.ERROR_SUCCESS)
+            return True
+
+        f = emu.get_handle_table().get(hFile, fileman.File)
+        if not f:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return rv
+        if isinstance(f, fileman.Pipe):
+            data = f.get_data(nNumberOfBytesToRead)
+            if data and lpBuffer:
+                _write_output(emu, data, lpBuffer, lpNumberOfBytesRead)
+            emu.set_last_error(windefs.ERROR_SUCCESS)
+            return bool(data)
+
+        if lpBuffer:
+            data = emu.get_file_manager().read_file(f, nNumberOfBytesToRead, buffer=lpBuffer)
+            _write_output(emu, data, lpBuffer, lpNumberOfBytesRead)
+
+            rv = True
+            emu.set_last_error(windefs.ERROR_SUCCESS)
+        else:
+            f.get_data(nNumberOfBytesToRead)
         return rv
 
     @apihook("WriteFile", argc=5)
-    def WriteFile(self, emu, argv, ctx: api.ApiContext = None):
+    def WriteFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-         BOOL WriteFile(
-          HANDLE       hFile,
-          LPCVOID      lpBuffer,
-          DWORD        nNumberOfBytesToWrite,
-          LPDWORD      lpNumberOfBytesWritten,
-          LPOVERLAPPED lpOverlapped
+        BOOL WriteFile(
+            HANDLE hFile,
+            LPCVOID lpBuffer,
+            DWORD nNumberOfBytesToWrite,
+            LPDWORD lpNumberOfBytesWritten,
+            LPOVERLAPPED lpOverlapped
         );
         """
-        hFile, lpBuffer, num_bytes, bytes_written, lpOverlapped = argv
-        rv = 0
+        hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped = argv
 
         data = b""
-        if lpBuffer and num_bytes:
-            data = self.mem_read(lpBuffer, num_bytes)
+        if lpBuffer and nNumberOfBytesToWrite:
+            data = self.mem_read(lpBuffer, nNumberOfBytesToWrite)
 
-        if bytes_written:
-            self.mem_write(bytes_written, (0).to_bytes(4, "little"))
+        if lpNumberOfBytesWritten:
+            self.write_dword(lpNumberOfBytesWritten, 0)
 
-        f = self.file_get(hFile)
-        if f:
-            path = f.path
-            if data:
-                f.add_data(data)
-                self.record_file_access_event(path, FILE_WRITE, data=data, buffer=lpBuffer, size=num_bytes)
-
-                data_hex = data.hex()
-                argv[1] = f"{hex(lpBuffer)} ({data_hex[:0x20]})"
-
-            if bytes_written:
-                self.mem_write(bytes_written, len(data).to_bytes(4, "little"))
-
-            rv = 1
+        get_table = getattr(emu, "get_handle_table", None)
+        table = get_table() if callable(get_table) else None
+        proc = emu.get_current_process()
+        # SetStdHandle can make a file handle the standard output, so the
+        # handle table comes first; the process exposes the standard handles
+        # either as attributes (v2.1.0) or through get_std_handle.
+        std_handles: tuple[Any, ...] = ()
+        if proc is not None:
+            std_handles = (getattr(proc, "stdout", None), getattr(proc, "stderr", None))
+            if not any(handle is not None for handle in std_handles):
+                getter = getattr(proc, "get_std_handle", None)
+                if callable(getter):
+                    std_handles = (getter(0xFFFFFFF5), getter(0xFFFFFFF4))
+        in_table = table is not None and hFile in table
+        if not in_table and proc and hFile in std_handles:
+            if lpNumberOfBytesWritten:
+                self.write_dword(lpNumberOfBytesWritten, len(data))
             emu.set_last_error(windefs.ERROR_SUCCESS)
-            return rv
+            return 1
 
-        pipe = emu.pipe_get(hFile)
+        if table is not None:
+            f = table.get(hFile, fileman.File)
+            pipe = table.get(hFile, fileman.Pipe)
+        else:
+            f = self.file_get(hFile)
+            get_pipe = getattr(emu, "pipe_get", None)
+            pipe = get_pipe(hFile) if callable(get_pipe) else None
         if pipe:
             if data:
                 pipe.add_data(data)
-
-            if bytes_written:
-                self.mem_write(bytes_written, len(data).to_bytes(4, "little"))
-
-            rv = 1
+            if lpNumberOfBytesWritten:
+                self.write_dword(lpNumberOfBytesWritten, len(data))
             emu.set_last_error(windefs.ERROR_SUCCESS)
-            return rv
+            return 1
+        if not f:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+        if isinstance(f, fileman.Pipe):
+            if data:
+                f.add_data(data)
+        elif data:
+            emu.get_file_manager().write_file(f, data, buffer=lpBuffer)
 
-        proc = emu.get_current_process()
-        if proc:
-            std_output = proc.get_std_handle(0xFFFFFFF5)
-            std_error = proc.get_std_handle(0xFFFFFFF4)
+            data_hex = data.hex()
+            _set_arg_display(ctx, "lpBuffer", f"{hex(lpBuffer)} ({data_hex[:0x20]})")
 
-            if hFile in (std_output, std_error):
-                if bytes_written:
-                    self.mem_write(bytes_written, len(data).to_bytes(4, "little"))
+        if lpNumberOfBytesWritten:
+            self.write_dword(lpNumberOfBytesWritten, len(data))
 
-                rv = 1
-                emu.set_last_error(windefs.ERROR_SUCCESS)
-                return rv
-
-        emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
-
-        return rv
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return 1
 
     @apihook("SetFilePointer", argc=4)
-    def SetFilePointer(self, emu, argv, ctx: api.ApiContext = None):
+    def SetFilePointer(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD SetFilePointer(
-          HANDLE hFile,
-          LONG   lDistanceToMove,
-          PLONG  lpDistanceToMoveHigh,
-          DWORD  dwMoveMethod
+            HANDLE hFile,
+            LONG lDistanceToMove,
+            PLONG lpDistanceToMoveHigh,
+            DWORD dwMoveMethod
         );
-
-        ``lDistanceToMove`` is a signed 32-bit ``LONG``. If
-        ``lpDistanceToMoveHigh`` is non-NULL, the two 32-bit halves form a
-        signed 64-bit distance; otherwise only the signed low 32 bits are
-        used. The return value is the low 32 bits of the new file pointer and
-        the high 32 bits are written back through ``lpDistanceToMoveHigh``
-        when that pointer is non-NULL. A negative resulting position fails
-        with ``ERROR_NEGATIVE_SEEK`` without moving the file pointer.
         """
         hFile, lDistanceToMove, lpDistanceToMoveHigh, dwMoveMethod = argv
 
@@ -4718,18 +5565,18 @@ class Kernel32(api.ApiHandler):
 
         low = lDistanceToMove & 0xFFFFFFFF
         if lpDistanceToMoveHigh:
-            high = int.from_bytes(self.mem_read(lpDistanceToMoveHigh, 4), "little")
+            high = int.from_bytes(self.mem_read(lpDistanceToMoveHigh, 4), "little", signed=True)
             distance = (high << 32) | low
             if distance & (1 << 63):
                 distance -= 1 << 64
         else:
             distance = low - (1 << 32) if low & 0x80000000 else low
 
-        if dwMoveMethod == FILE_BEGIN:
+        if dwMoveMethod == windefs.FILE_BEGIN:
             base = 0
-        elif dwMoveMethod == FILE_CURRENT:
+        elif dwMoveMethod == windefs.FILE_CURRENT:
             base = f.tell()
-        elif dwMoveMethod == FILE_END:
+        elif dwMoveMethod == windefs.FILE_END:
             base = f.get_size()
         else:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
@@ -4747,7 +5594,7 @@ class Kernel32(api.ApiHandler):
             emu.set_last_error(windefs.ERROR_NEGATIVE_SEEK)
             return windefs.INVALID_SET_FILE_POINTER
 
-        f.seek(new_position, FILE_BEGIN)
+        f.seek(new_position, windefs.FILE_BEGIN)
         new_position = f.tell()
         if new_position is None:
             new_position = 0
@@ -4759,13 +5606,13 @@ class Kernel32(api.ApiHandler):
         return new_position & 0xFFFFFFFF
 
     @apihook("SetFilePointerEx", argc=5)
-    def SetFilePointerEx(self, emu, argv, ctx: api.ApiContext = None):
+    def SetFilePointerEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetFilePointerEx(
-        [in]            HANDLE         hFile,
-        [in]            LARGE_INTEGER  liDistanceToMove,
-        [out, optional] PLARGE_INTEGER lpNewFilePointer,
-        [in]            DWORD          dwMoveMethod
+            HANDLE hFile,
+            LARGE_INTEGER liDistanceToMove,
+            PLARGE_INTEGER lpNewFilePointer,
+            DWORD dwMoveMethod
         );
 
         liDistanceToMove is passed by value: two stack slots on x86, one
@@ -4780,74 +5627,83 @@ class Kernel32(api.ApiHandler):
         if lDistanceToMove >= 1 << 63:
             lDistanceToMove -= 1 << 64
         f = self.file_get(hFile)
-        if f:
-            f.seek(lDistanceToMove, dwMoveMethod)
-            rv = f.tell()
-            if rv is None:
+        if not f:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+        if dwMoveMethod == windefs.FILE_CURRENT or dwMoveMethod == windefs.FILE_END:
+            if dwMoveMethod == windefs.FILE_CURRENT:
+                base = f.tell()
+            else:
+                base = f.get_size()
+            if base is None:
+                # Lazy file contents have not been materialized yet.
                 f.get_size()
-                rv = f.tell()
-            if rv is None:
-                rv = 0
-            if lpNewFilePointer:
-                self.mem_write(lpNewFilePointer, rv.to_bytes(8, "little", signed=rv < 0))
-            emu.set_last_error(windefs.ERROR_SUCCESS)
-            return True
-        return False
+                base = f.tell()
+                if base is None:
+                    base = 0
+            lDistanceToMove += base
+        elif dwMoveMethod != windefs.FILE_BEGIN:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return False
+        if lDistanceToMove < 0:
+            emu.set_last_error(windefs.ERROR_NEGATIVE_SEEK)
+            return False
+        f.seek(lDistanceToMove, windefs.FILE_BEGIN)
+        rv = f.tell()
+        if rv is None:
+            f.get_size()
+            rv = f.tell()
+        if rv is None:
+            rv = 0
+        if lpNewFilePointer:
+            self.write_qword(lpNewFilePointer, rv)
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return True
 
     @apihook("GetFileSize", argc=2)
-    def GetFileSize(self, emu, argv, ctx: api.ApiContext = None):
+    def GetFileSize(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetFileSize(
-          HANDLE  hFile,
-          LPDWORD lpFileSizeHigh
+            HANDLE hFile,
+            LPDWORD lpFileSizeHigh
         );
         """
         hFile, lpFileSizeHigh = argv
 
-        f = self.file_get(hFile)
-
-        if f:
-            full_size = f.get_size()
-            high = 0xFFFFFFFF & (full_size >> 32)
-            low = 0xFFFFFFFF & full_size
-
-            high = (high).to_bytes(4, "little")
-
-            if lpFileSizeHigh:
-                self.mem_write(lpFileSizeHigh, high)
-            emu.set_last_error(windefs.ERROR_SUCCESS)
-        else:
-            low = 0xFFFFFFFF
-            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-
-        return low
+        f = self.get_file(hFile)
+        if not f:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return windefs.INVALID_FILE_SIZE
+        full_size = f.get_size()
+        if lpFileSizeHigh:
+            self.mem_write(lpFileSizeHigh, (full_size >> 32).to_bytes(4, "little"))
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return full_size & 0xFFFFFFFF
 
     @apihook("GetFileSizeEx", argc=2)
-    def GetFileSizeEx(self, emu, argv, ctx: api.ApiContext = None):
+    def GetFileSizeEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetFileSizeEx(
-          HANDLE         hFile,
-          PLARGE_INTEGER lpFileSize
+            HANDLE hFile,
+            PLARGE_INTEGER lpFileSize
         );
         """
         hFile, lpFileSize = argv
-        f = self.file_get(hFile)
-
-        if f:
-            full_size = f.get_size()
-            size_bytes = full_size.to_bytes(8, "little")
-            if lpFileSize:
-                self.mem_write(lpFileSize, size_bytes)
-            emu.set_last_error(windefs.ERROR_SUCCESS)
-            return 1
-        emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
-        return 0
+        f = self.get_file(hFile)
+        if not f:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+        full_size = f.get_size()
+        if lpFileSize:
+            self.mem_write(lpFileSize, full_size.to_bytes(8, "little"))
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return 1
 
     @apihook("CloseHandle", argc=1)
-    def CloseHandle(self, emu, argv, ctx: api.ApiContext = None):
+    def CloseHandle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CloseHandle(
-          HANDLE hObject
+            HANDLE hObject
         );
         """
         (hObject,) = argv
@@ -4857,107 +5713,146 @@ class Kernel32(api.ApiHandler):
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
-        obj = self.get_object_from_handle(hObject)
-        if obj:
-            emu.dec_ref(obj)
+        if self.is_std_handle(emu, hObject):
             emu.set_last_error(windefs.ERROR_SUCCESS)
             return 1
 
-        emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
-        return 0
+        if not emu.get_handle_table().close(hObject):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return 1
 
     @apihook("SetEndOfFile", argc=1)
-    def SetEndOfFile(self, emu, argv, ctx: api.ApiContext = None):
+    def SetEndOfFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetEndOfFile(
-          HANDLE hFile
+            HANDLE hFile
         );
         """
         return True
 
     @apihook("IsDebuggerPresent", argc=0)
-    def IsDebuggerPresent(self, emu, argv, ctx: api.ApiContext = None):
+    def IsDebuggerPresent(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL IsDebuggerPresent();
         """
-
         return False
 
     @apihook("GetVolumeInformation", argc=8)
-    def GetVolumeInformation(self, emu, argv, ctx: api.ApiContext = None):
+    def GetVolumeInformation(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetVolumeInformation(
-            LPCSTR  lpRootPathName,
-            LPSTR   lpVolumeNameBuffer,
-            DWORD   nVolumeNameSize,
+            LPCTSTR lpRootPathName,
+            LPTSTR lpVolumeNameBuffer,
+            DWORD nVolumeNameSize,
             LPDWORD lpVolumeSerialNumber,
             LPDWORD lpMaximumComponentLength,
             LPDWORD lpFileSystemFlags,
-            LPSTR   lpFileSystemNameBuffer,
-            DWORD   nFileSystemNameSize
+            LPTSTR lpFileSystemNameBuffer,
+            DWORD nFileSystemNameSize
         );
         """
-        ctx = ctx or {}
-        root, vol_buf, vol_size, serial, comp_len, fs_flags, fs_name, fs_name_len = argv
+        (
+            lpRootPathName,
+            lpVolumeNameBuffer,
+            nVolumeNameSize,
+            lpVolumeSerialNumber,
+            lpMaximumComponentLength,
+            lpFileSystemFlags,
+            lpFileSystemNameBuffer,
+            nFileSystemNameSize,
+        ) = argv
 
-        cw = self.get_char_width(ctx)
-        if root:
-            root_name = self.read_mem_string(root, cw)
-            argv[0] = root_name
+        cw = _char_width(self, ctx)
+        if lpRootPathName:
+            root_name = self.read_mem_string(lpRootPathName, cw)
+            ctx.args["lpRootPathName"].display = root_name
+
+        if lpVolumeNameBuffer and nVolumeNameSize:
+            self.write_mem_string("", lpVolumeNameBuffer, cw)
+        if lpVolumeSerialNumber:
+            self.write_dword(lpVolumeSerialNumber, VOLUME_SERIAL_NUMBER)
+        if lpMaximumComponentLength:
+            self.write_dword(lpMaximumComponentLength, 255)
+        if lpFileSystemFlags:
+            self.write_dword(lpFileSystemFlags, 0x03E706FF)
+        if lpFileSystemNameBuffer and nFileSystemNameSize > len("NTFS"):
+            self.write_mem_string("NTFS", lpFileSystemNameBuffer, cw)
 
         return True
 
     @apihook("CreateEvent", argc=4)
-    def CreateEvent(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateEvent(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE CreateEvent(
             LPSECURITY_ATTRIBUTES lpEventAttributes,
-            BOOL                  bManualReset,
-            BOOL                  bInitialState,
-            LPCSTR                lpName
+            BOOL bManualReset,
+            BOOL bInitialState,
+            LPCTSTR lpName
         );
         """
-        ctx = ctx or {}
-        attrs, reset, state, name = argv
+        lpEventAttributes, bManualReset, bInitialState, lpName = argv
 
-        cw = self.get_char_width(ctx)
+        return self.create_event(emu, lpName, bool(bManualReset), bool(bInitialState), ctx)
+
+    @apihook("CreateEventEx", argc=4)
+    def CreateEventEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HANDLE CreateEventEx(
+            LPSECURITY_ATTRIBUTES lpEventAttributes,
+            LPCTSTR lpName,
+            DWORD dwFlags,
+            DWORD dwDesiredAccess
+        );
+        """
+        lpEventAttributes, lpName, dwFlags, dwDesiredAccess = argv
+
+        manual_reset = bool(dwFlags & windefs.CREATE_EVENT_MANUAL_RESET)
+        initial_set = bool(dwFlags & windefs.CREATE_EVENT_INITIAL_SET)
+        return self.create_event(emu, lpName, manual_reset, initial_set, ctx)
+
+    def create_event(self, emu, name, manual_reset, initial_state, ctx):
+        cw = _char_width(self, ctx)
         evt_name = None
         obj = None
         if name:
             evt_name = self.read_mem_string(name, cw)
-            argv[3] = evt_name
+            ctx.args["lpName"].display = evt_name
             obj = self.get_object_from_name(evt_name)
 
         if obj:
-            hnd = obj.get_handle()
+            hnd = emu.get_object_handle(obj)
             emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
         else:
             hnd, evt = emu.create_event(evt_name)
+            evt.manual_reset = manual_reset
+            evt.signaled = initial_state
+            emu.set_last_error(windefs.ERROR_SUCCESS)
 
         return hnd
 
     @apihook("CreateWaitableTimer", argc=3)
-    def CreateWaitableTimer(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateWaitableTimer(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE CreateWaitableTimer(
             LPSECURITY_ATTRIBUTES lpTimerAttributes,
-            BOOL                  bManualReset,
-            LPCSTR                lpTimerName
+            BOOL bManualReset,
+            LPCTSTR lpTimerName
         );
         """
-        ctx = ctx or {}
-        _attrs, _manual_reset, name = argv
+        lpTimerAttributes, bManualReset, lpTimerName = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         timer_name = None
         obj = None
-        if name:
-            timer_name = self.read_mem_string(name, cw)
-            argv[2] = timer_name
+        if lpTimerName:
+            timer_name = self.read_mem_string(lpTimerName, cw)
+            ctx.args["lpTimerName"].display = timer_name
             obj = self.get_object_from_name(timer_name)
 
         if obj:
-            hnd = obj.get_handle()
+            hnd = emu.get_object_handle(obj)
             emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
         else:
             hnd, _evt = emu.create_event(timer_name)
@@ -4966,28 +5861,27 @@ class Kernel32(api.ApiHandler):
         return hnd
 
     @apihook("CreateWaitableTimerEx", argc=4)
-    def CreateWaitableTimerEx(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateWaitableTimerEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE CreateWaitableTimerEx(
             LPSECURITY_ATTRIBUTES lpTimerAttributes,
-            LPCSTR                lpTimerName,
-            DWORD                 dwFlags,
-            DWORD                 dwDesiredAccess
+            LPCTSTR lpTimerName,
+            DWORD dwFlags,
+            DWORD dwDesiredAccess
         );
         """
-        ctx = ctx or {}
-        _attrs, name, _flags, _access = argv
+        lpTimerAttributes, lpTimerName, dwFlags, dwDesiredAccess = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         timer_name = None
         obj = None
-        if name:
-            timer_name = self.read_mem_string(name, cw)
-            argv[1] = timer_name
+        if lpTimerName:
+            timer_name = self.read_mem_string(lpTimerName, cw)
+            ctx.args["lpTimerName"].display = timer_name
             obj = self.get_object_from_name(timer_name)
 
         if obj:
-            hnd = obj.get_handle()
+            hnd = emu.get_object_handle(obj)
             emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
         else:
             hnd, _evt = emu.create_event(timer_name)
@@ -4996,28 +5890,27 @@ class Kernel32(api.ApiHandler):
         return hnd
 
     @apihook("OpenWaitableTimer", argc=3)
-    def OpenWaitableTimer(self, emu, argv, ctx: api.ApiContext = None):
+    def OpenWaitableTimer(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE OpenWaitableTimer(
-            DWORD  dwDesiredAccess,
-            BOOL   bInheritHandle,
-            LPCSTR lpTimerName
+            DWORD dwDesiredAccess,
+            BOOL bInheritHandle,
+            LPCTSTR lpTimerName
         );
         """
-        ctx = ctx or {}
-        _access, _inherit, name = argv
+        dwDesiredAccess, bInheritHandle, lpTimerName = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         timer_name = None
         hnd = 0
-        if name:
-            timer_name = self.read_mem_string(name, cw)
-            argv[2] = timer_name
+        if lpTimerName:
+            timer_name = self.read_mem_string(lpTimerName, cw)
+            ctx.args["lpTimerName"].display = timer_name
 
         obj = self.get_object_from_name(timer_name)
 
         if obj:
-            hnd = obj.get_handle()
+            hnd = emu.get_object_handle(obj)
             emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
         else:
             emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
@@ -5025,20 +5918,20 @@ class Kernel32(api.ApiHandler):
         return hnd
 
     @apihook("SetWaitableTimer", argc=6)
-    def SetWaitableTimer(self, emu, argv, ctx: api.ApiContext = None):
+    def SetWaitableTimer(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetWaitableTimer(
-            HANDLE               hTimer,
-            const LARGE_INTEGER  *lpDueTime,
-            LONG                 lPeriod,
-            PTIMERAPCROUTINE     pfnCompletionRoutine,
-            LPVOID               lpArgToCompletionRoutine,
-            BOOL                 fResume
+            HANDLE hTimer,
+            const LARGE_INTEGER *lpDueTime,
+            LONG lPeriod,
+            PTIMERAPCROUTINE pfnCompletionRoutine,
+            LPVOID lpArgToCompletionRoutine,
+            BOOL fResume
         );
         """
-        hTimer, _due_time, _period, _completion_routine, _completion_arg, _resume = argv
+        hTimer, lpDueTime, lPeriod, pfnCompletionRoutine, lpArgToCompletionRoutine, fResume = argv
 
-        obj = self.get_object_from_handle(hTimer)
+        obj = emu.get_handle_table().get(hTimer, objman.Event)
         if not obj:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return False
@@ -5047,7 +5940,7 @@ class Kernel32(api.ApiHandler):
         return True
 
     @apihook("CancelWaitableTimer", argc=1)
-    def CancelWaitableTimer(self, emu, argv, ctx: api.ApiContext = None):
+    def CancelWaitableTimer(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CancelWaitableTimer(
             HANDLE hTimer
@@ -5055,7 +5948,7 @@ class Kernel32(api.ApiHandler):
         """
         (hTimer,) = argv
 
-        obj = self.get_object_from_handle(hTimer)
+        obj = emu.get_handle_table().get(hTimer, objman.Event)
         if not obj:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return False
@@ -5064,36 +5957,32 @@ class Kernel32(api.ApiHandler):
         return True
 
     @apihook("OpenEvent", argc=3)
-    def OpenEvent(self, emu, argv, ctx: api.ApiContext = None):
+    def OpenEvent(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE OpenEvent(
-            DWORD  dwDesiredAccess,
-            BOOL   bInheritHandle,
-            LPCSTR lpName
+            DWORD dwDesiredAccess,
+            BOOL bInheritHandle,
+            LPCTSTR lpName
         );
         """
-        ctx = ctx or {}
-        access, inherit, name = argv
+        dwDesiredAccess, bInheritHandle, lpName = argv
 
-        cw = self.get_char_width(ctx)
-        evt_name = None
-        hnd = 0
-        if name:
-            evt_name = self.read_mem_string(name, cw)
-            argv[2] = evt_name
+        if not lpName:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        evt_name = self.read_mem_string(lpName, _char_width(self, ctx))
+        ctx.args["lpName"].display = evt_name
 
         obj = self.get_object_from_name(evt_name)
+        if not obj:
+            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
+            return 0
 
-        if obj:
-            hnd = obj.get_handle()
-            emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
-        else:
-            emu.set_last_error(windefs.ERROR_PATH_NOT_FOUND)
-
-        return hnd
+        return emu.get_object_handle(obj)
 
     @apihook("SetEvent", argc=1)
-    def SetEvent(self, emu, argv, ctx: api.ApiContext = None):
+    def SetEvent(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetEvent(
             HANDLE hEvent
@@ -5101,19 +5990,35 @@ class Kernel32(api.ApiHandler):
         """
         (hEvent,) = argv
 
-        obj = self.get_object_from_handle(hEvent)
+        obj = emu.get_handle_table().get(hEvent, objman.Event)
+        if not obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+        obj.signaled = True
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return True
 
-        rv = False
-        if obj:
-            emu.set_last_error(windefs.ERROR_SUCCESS)
-            rv = True
-        return rv
+    @apihook("PulseEvent", argc=1)
+    def PulseEvent(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL PulseEvent(
+            HANDLE hEvent
+        );
+        """
+        (hEvent,) = argv
+
+        obj = emu.get_handle_table().get(hEvent, objman.Event)
+        if not obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+        obj.signaled = False
+        return True
 
     @apihook("SetUnhandledExceptionFilter", argc=1)
-    def SetUnhandledExceptionFilter(self, emu, argv, ctx: api.ApiContext = None):
+    def SetUnhandledExceptionFilter(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(
-          LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter
+            LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter
         );
         """
         (lpTopLevelExceptionFilter,) = argv
@@ -5123,13 +6028,12 @@ class Kernel32(api.ApiHandler):
         return 0
 
     @apihook("DeleteCriticalSection", argc=1)
-    def DeleteCriticalSection(self, emu, argv, ctx: api.ApiContext = None):
+    def DeleteCriticalSection(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void DeleteCriticalSection(
-          LPCRITICAL_SECTION lpCriticalSection
+        VOID DeleteCriticalSection(
+            LPCRITICAL_SECTION lpCriticalSection
         );
         """
-
         (lpCriticalSection,) = argv
         self._write_critical_section(
             emu,
@@ -5146,58 +6050,53 @@ class Kernel32(api.ApiHandler):
         return None
 
     @apihook("FlsFree", argc=1)
-    def FlsFree(self, emu, argv, ctx: api.ApiContext = None):
+    def FlsFree(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL FlsFree(
-          DWORD dwFlsIndex
+            DWORD dwFlsIndex
         );
         """
-
         return True
 
     @apihook("TlsFree", argc=1)
-    def TlsFree(self, emu, argv, ctx: api.ApiContext = None):
+    def TlsFree(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL TlsFree(
-          DWORD dwTlsIndex
+            DWORD dwTlsIndex
         );
-        """
 
+        Speakeasy does not reuse TLS indexes, so TlsFree does nothing.
+        """
         return True
 
     @apihook("ProcessIdToSessionId", argc=2)
-    def ProcessIdToSessionId(self, emu, argv, ctx: api.ApiContext = None):
+    def ProcessIdToSessionId(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL ProcessIdToSessionId(
-          DWORD dwProcessId,
-          DWORD *pSessionId
+            DWORD dwProcessId,
+            DWORD *pSessionId
         );
         """
         dwProcessId, pSessionId = argv
-        rv = False
 
         if pSessionId:
             for p in emu.get_processes():
                 if p.id == dwProcessId:
-                    sessid = p.session
-                    sessid = (sessid).to_bytes(4, "little")
-                    self.mem_write(pSessionId, sessid)
-                    rv = True
-        else:
-            windefs.ERROR_INVALID_PARAMETER
+                    self.write_dword(pSessionId, p.session)
+                    return True
 
-        return rv
+        emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+        return False
 
     @apihook("InitializeCriticalSectionEx", argc=3)
-    def InitializeCriticalSectionEx(self, emu, argv, ctx: api.ApiContext = None):
+    def InitializeCriticalSectionEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL InitializeCriticalSectionEx(
-          LPCRITICAL_SECTION lpCriticalSection,
-          DWORD              dwSpinCount,
-          DWORD              Flags
+            LPCRITICAL_SECTION lpCriticalSection,
+            DWORD dwSpinCount,
+            DWORD Flags
         );
         """
-
         lpCriticalSection, dwSpinCount, _flags = argv
         ok = self._initialize_critical_section(emu, lpCriticalSection, int(dwSpinCount))
         if not ok:
@@ -5207,30 +6106,28 @@ class Kernel32(api.ApiHandler):
         return True
 
     @apihook("InitializeCriticalSection", argc=1)
-    def InitializeCriticalSection(self, emu, argv, ctx: api.ApiContext = None):
+    def InitializeCriticalSection(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void InitializeCriticalSection(
-          LPCRITICAL_SECTION lpCriticalSection
+        VOID InitializeCriticalSection(
+            LPCRITICAL_SECTION lpCriticalSection
         );
         """
-
         (lpCriticalSection,) = argv
         self._initialize_critical_section(emu, lpCriticalSection, 0)
         emu.set_last_error(windefs.ERROR_SUCCESS)
-        return None
 
     @apihook("GetOEMCP", argc=0)
-    def GetOEMCP(self, emu, argv, ctx: api.ApiContext = None):
+    def GetOEMCP(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT GetOEMCP();
         """
-        return 1200
+        return codepage.OEM_CODE_PAGE
 
     @apihook("GlobalLock", argc=1)
-    def GlobalLock(self, emu, argv, ctx: api.ApiContext = None):
+    def GlobalLock(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPVOID GlobalLock(
-          HGLOBAL hMem
+            HGLOBAL hMem
         );
         """
         (hMem,) = argv
@@ -5239,10 +6136,10 @@ class Kernel32(api.ApiHandler):
         return hMem
 
     @apihook("LocalLock", argc=1)
-    def LocalLock(self, emu, argv, ctx: api.ApiContext = None):
+    def LocalLock(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPVOID LocalLock(
-          HGLOBAL hMem
+            HLOCAL hMem
         );
         """
         (hMem,) = argv
@@ -5251,44 +6148,43 @@ class Kernel32(api.ApiHandler):
         return hMem
 
     @apihook("HeapDestroy", argc=1)
-    def HeapDestroy(self, emu, argv, ctx: api.ApiContext = None):
+    def HeapDestroy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL HeapDestroy(
-          HANDLE hHeap
+            HANDLE hHeap
         );
         """
-
         return True
 
     @apihook("InitializeSListHead", argc=1)
-    def InitializeSListHead(self, emu, argv, ctx: api.ApiContext = None):
+    def InitializeSListHead(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void InitializeSListHead(
-          PSLIST_HEADER ListHead
+        VOID InitializeSListHead(
+            PSLIST_HEADER ListHead
         );
         """
         (ListHead,) = argv
 
         self.mem_write(ListHead, b"\x00" * 8)
 
-        return None
-
     @apihook("FreeLibrary", argc=1)
-    def FreeLibrary(self, emu, argv, ctx: api.ApiContext = None):
+    def FreeLibrary(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL FreeLibrary(
-          HMODULE hLibModule
+            HMODULE hLibModule
         );
-        """
 
-        ctx = ctx or {}
-        api_diagnostics.attach_observation(
+        Speakeasy does not count module references and does not unload modules, so DllMain does not get
+        DLL_PROCESS_DETACH.
+        """
+        _scatter_observation(
             ctx,
+            api_diagnostics.attach_observation,
             lambda: api_diagnostics.observe_free_library(
                 emu,
                 tuple(argv),
                 True,
-                api_name=ctx.get("func_name"),
+                api_name=_ctx_func_name(ctx),
             ),
         )
         # FX-004 diagnostics: keep the FX-015 scatter observation and add the
@@ -5301,20 +6197,35 @@ class Kernel32(api.ApiHandler):
             handler="kernel32.FreeLibrary",
             argument_name="h_lib_module",
         )
-        module_trace_diagnostics.finish_unload(emu, ctx, observation, return_value=True)
+        _set_observation(ctx, observation, merge_key="module_unload_trace")
+        _set_observation(
+            ctx,
+            module_trace_diagnostics.finish_unload(emu, ctx, observation, return_value=True),
+            merge_key="module_unload_trace",
+        )
         return True
 
     @apihook("WaitForSingleObject", argc=2)
-    def WaitForSingleObject(self, emu, argv, ctx: api.ApiContext = None):
+    def WaitForSingleObject(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD WaitForSingleObject(
-        HANDLE hHandle,
-        DWORD  dwMilliseconds
+            HANDLE hHandle,
+            DWORD dwMilliseconds
         );
+
+        Speakeasy models only events. A wait on another object succeeds, except with a timeout of 1 ms, which times out.
         """
         hHandle, dwMilliseconds = argv
 
-        # TODO
+        obj = None
+        if not self.is_std_handle(emu, hHandle):
+            obj = emu.get_handle_table().get(hHandle)
+            if obj is None:
+                emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+                return windefs.WAIT_FAILED
+        if isinstance(obj, objman.Event):
+            return self.wait_for_events(emu, [obj], False, dwMilliseconds)
+
         if dwMilliseconds == 1:
             rv = windefs.WAIT_TIMEOUT
         else:
@@ -5322,39 +6233,81 @@ class Kernel32(api.ApiHandler):
 
         # FX-016 diagnostics: record stack and handle provenance around the
         # wait without changing the wait-code policy above.
-        api_trace_diagnostics.attach_observation(
+        _scatter_observation(
             ctx,
+            api_trace_diagnostics.attach_observation,
             lambda: api_trace_diagnostics.observe_wait_for_single_object(emu, argv, rv),
         )
 
         return rv
 
     @apihook("GetConsoleMode", argc=2)
-    def GetConsoleMode(self, emu, argv, ctx: api.ApiContext = None):
+    def GetConsoleMode(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL WINAPI GetConsoleMode(
-            _In_  HANDLE  hConsoleHandle,
-            _Out_ LPDWORD lpMode
+        BOOL GetConsoleMode(
+            HANDLE hConsoleHandle,
+            LPDWORD lpMode
         );
         """
+        hConsoleHandle, lpMode = argv
+        ENABLE_INPUT_MODES = 0x1F7
+        ENABLE_OUTPUT_MODES = 0x3
 
+        proc = emu.get_current_process()
+        mode = ENABLE_INPUT_MODES if hConsoleHandle == proc.stdin else ENABLE_OUTPUT_MODES
+        if lpMode:
+            self.write_dword(lpMode, mode)
+        return True
+
+    @apihook("GetConsoleCP", argc=0)
+    def GetConsoleCP(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        UINT GetConsoleCP();
+        """
+        return 437
+
+    @apihook("GetConsoleOutputCP", argc=0)
+    def GetConsoleOutputCP(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        UINT GetConsoleOutputCP();
+        """
+        return 437
+
+    @apihook("WriteConsole", argc=5)
+    def WriteConsole(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL WriteConsole(
+            HANDLE hConsoleOutput,
+            const VOID *lpBuffer,
+            DWORD nNumberOfCharsToWrite,
+            LPDWORD lpNumberOfCharsWritten,
+            LPVOID lpReserved
+        );
+        """
+        hConsoleOutput, lpBuffer, nNumberOfCharsToWrite, lpNumberOfCharsWritten, lpReserved = argv
+        cw = _char_width(self, ctx)
+
+        if lpBuffer and nNumberOfCharsToWrite:
+            data = self.mem_read(lpBuffer, nNumberOfCharsToWrite * cw)
+            ctx.args["lpBuffer"].display = repr(self.decode_string(data, cw))
+        if lpNumberOfCharsWritten:
+            self.write_dword(lpNumberOfCharsWritten, nNumberOfCharsToWrite)
         return True
 
     @apihook("HeapSetInformation", argc=4)
-    def HeapSetInformation(self, emu, argv, ctx: api.ApiContext = None):
+    def HeapSetInformation(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL HeapSetInformation(
-            HANDLE                 HeapHandle,
+            HANDLE HeapHandle,
             HEAP_INFORMATION_CLASS HeapInformationClass,
-            PVOID                  HeapInformation,
-            SIZE_T                 HeapInformationLength
+            PVOID HeapInformation,
+            SIZE_T HeapInformationLength
         );
         """
-
         return True
 
     @apihook("SetErrorMode", argc=1)
-    def SetErrorMode(self, emu, argv, ctx: api.ApiContext = None):
+    def SetErrorMode(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT SetErrorMode(
             UINT uMode
@@ -5363,14 +6316,14 @@ class Kernel32(api.ApiHandler):
         return 0
 
     @apihook("GetErrorMode", argc=0)
-    def GetErrorMode(self, emu, argv, ctx={}):
+    def GetErrorMode(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT GetErrorMode();
         """
         return 0
 
     @apihook("GetProcessUserModeExceptionPolicy", argc=1)
-    def GetProcessUserModeExceptionPolicy(self, emu, argv, ctx: api.ApiContext = None):
+    def GetProcessUserModeExceptionPolicy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """BOOL GetProcessUserModeExceptionPolicy(LPDWORD lpFlags)."""
         (flags_address,) = argv
         if not flags_address:
@@ -5387,7 +6340,7 @@ class Kernel32(api.ApiHandler):
         return 1
 
     @apihook("SetProcessUserModeExceptionPolicy", argc=1)
-    def SetProcessUserModeExceptionPolicy(self, emu, argv, ctx: api.ApiContext = None):
+    def SetProcessUserModeExceptionPolicy(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """BOOL SetProcessUserModeExceptionPolicy(DWORD dwFlags)."""
         (flags,) = argv
         if flags & ~1:
@@ -5397,47 +6350,52 @@ class Kernel32(api.ApiHandler):
         return 1
 
     @apihook("WerGetFlags", argc=2)
-    def WerGetFlags(self, emu, argv, ctx={}):
+    def WerGetFlags(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HRESULT WerGetFlags(HANDLE hProcess, DWORD *pdwFlags);
+        HRESULT WerGetFlags(
+            HANDLE hProcess,
+            PDWORD pdwFlags
+        );
         """
         hProcess, pdwFlags = argv
         if pdwFlags:
-            self.mem_write(pdwFlags, (0).to_bytes(4, "little"))
+            self.write_dword(pdwFlags, 0)
         return 0  # S_OK
 
     @apihook("WerSetFlags", argc=1)
-    def WerSetFlags(self, emu, argv, ctx={}):
+    def WerSetFlags(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HRESULT WerSetFlags(DWORD dwFlags);
+        HRESULT WerSetFlags(
+            DWORD dwFlags
+        );
         """
         return 0  # S_OK
 
     @apihook("InterlockedCompareExchange", argc=3)
-    def InterlockedCompareExchange(self, emu, argv, ctx: api.ApiContext = None):
+    def InterlockedCompareExchange(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LONG InterlockedCompareExchange(
-        LONG volatile *Destination,
-        LONG          ExChange,
-        LONG          Comperand
+            LONG volatile *Destination,
+            LONG ExChange,
+            LONG Comperand
         );
         """
-        pDest, ExChange, Comperand = argv
+        Destination, ExChange, Comperand = argv
 
-        dest_bytes = self.mem_read(pDest, 4)
+        dest_bytes = self.mem_read(Destination, 4)
         dest = int.from_bytes(dest_bytes, "little")
 
         if dest == Comperand:
-            self.mem_write(pDest, ExChange.to_bytes(4, "little"))
+            self.write_dword(Destination, ExChange)
 
         return dest
 
     @apihook("InterlockedExchange", argc=2)
-    def InterlockedExchange(self, emu, argv, ctx: api.ApiContext = None):
+    def InterlockedExchange(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LONG InterlockedExchange(
-        LONG volatile *Target,
-        LONG          Value
+            LONG volatile *Target,
+            LONG Value
         );
         """
         Target, Value = argv
@@ -5451,20 +6409,19 @@ class Kernel32(api.ApiHandler):
         return tgt
 
     @apihook("CreateNamedPipe", argc=8)
-    def CreateNamedPipe(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateNamedPipe(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE CreateNamedPipe(
-            LPCSTR                lpName,
-            DWORD                 dwOpenMode,
-            DWORD                 dwPipeMode,
-            DWORD                 nMaxInstances,
-            DWORD                 nOutBufferSize,
-            DWORD                 nInBufferSize,
-            DWORD                 nDefaultTimeOut,
+            LPCTSTR lpName,
+            DWORD dwOpenMode,
+            DWORD dwPipeMode,
+            DWORD nMaxInstances,
+            DWORD nOutBufferSize,
+            DWORD nInBufferSize,
+            DWORD nDefaultTimeOut,
             LPSECURITY_ATTRIBUTES lpSecurityAttributes
         );
         """
-        ctx = ctx or {}
         (
             lpName,
             dwOpenMode,
@@ -5476,26 +6433,26 @@ class Kernel32(api.ApiHandler):
             lpSecurityAttributes,
         ) = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
         pipe_name = ""
         if lpName:
             pipe_name = self.read_mem_string(lpName, cw)
-            argv[0] = pipe_name
+            ctx.args["lpName"].display = pipe_name
 
         hnd = emu.pipe_open(pipe_name, dwOpenMode, nMaxInstances, nOutBufferSize, nInBufferSize)
         if not hnd:
-            hnd = windefs.INVALID_HANDLE_VALUE
+            hnd = self.get_max_int()
         return hnd
 
     @apihook("CreatePipe", argc=4)
-    def CreatePipe(self, emu, argv, ctx: api.ApiContext = None):
+    def CreatePipe(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CreatePipe(
-        PHANDLE               hReadPipe,
-        PHANDLE               hWritePipe,
-        LPSECURITY_ATTRIBUTES lpPipeAttributes,
-        DWORD                 nSize
+            PHANDLE hReadPipe,
+            PHANDLE hWritePipe,
+            LPSECURITY_ATTRIBUTES lpPipeAttributes,
+            DWORD nSize
         );
         """
         hReadPipe, hWritePipe, lpPipeAttributes, nSize = argv
@@ -5504,193 +6461,205 @@ class Kernel32(api.ApiHandler):
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return 0
 
-        hnd = emu.pipe_open("", 0, 1, nSize, nSize)
-        if not hnd:
+        hread = emu.pipe_open("", 0, 1, nSize, nSize)
+        if not hread:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
-        self.mem_write(hReadPipe, hnd.to_bytes(self.get_ptr_size(), "little"))
-        self.mem_write(hWritePipe, hnd.to_bytes(self.get_ptr_size(), "little"))
+        table = emu.get_handle_table()
+        hwrite = table.new_handle(table.get(hread))
+        self.write_ptr(hReadPipe, hread)
+        self.write_ptr(hWritePipe, hwrite)
         emu.set_last_error(windefs.ERROR_SUCCESS)
         return 1
 
     @apihook("PeekNamedPipe", argc=6)
-    def PeekNamedPipe(self, emu, argv, ctx: api.ApiContext = None):
+    def PeekNamedPipe(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL PeekNamedPipe(
-        HANDLE  hNamedPipe,
-        LPVOID  lpBuffer,
-        DWORD   nBufferSize,
-        LPDWORD lpBytesRead,
-        LPDWORD lpTotalBytesAvail,
-        LPDWORD lpBytesLeftThisMessage
+            HANDLE hNamedPipe,
+            LPVOID lpBuffer,
+            DWORD nBufferSize,
+            LPDWORD lpBytesRead,
+            LPDWORD lpTotalBytesAvail,
+            LPDWORD lpBytesLeftThisMessage
         );
         """
         (hNamedPipe, lpBuffer, nBufferSize, lpBytesRead, lpTotalBytesAvail, lpBytesLeftThisMessage) = argv
-        pipe = emu.pipe_get(hNamedPipe)
+        pipe = emu.get_file_manager().get_pipe(hNamedPipe)
         if not pipe:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
         if lpBytesRead:
-            self.mem_write(lpBytesRead, (0).to_bytes(4, "little"))
+            self.write_dword(lpBytesRead, 0)
         if lpTotalBytesAvail:
-            self.mem_write(lpTotalBytesAvail, (0).to_bytes(4, "little"))
+            self.write_dword(lpTotalBytesAvail, 0)
         if lpBytesLeftThisMessage:
-            self.mem_write(lpBytesLeftThisMessage, (0).to_bytes(4, "little"))
+            self.write_dword(lpBytesLeftThisMessage, 0)
 
         emu.set_last_error(windefs.ERROR_SUCCESS)
         return 1
 
     @apihook("ConnectNamedPipe", argc=2)
-    def ConnectNamedPipe(self, emu, argv, ctx: api.ApiContext = None):
+    def ConnectNamedPipe(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL ConnectNamedPipe(
-            HANDLE       hNamedPipe,
+            HANDLE hNamedPipe,
             LPOVERLAPPED lpOverlapped
         );
         """
         hNamedPipe, lpOverlapped = argv
-        rv = False
-        pipe = emu.pipe_get(hNamedPipe)
-        if pipe:
-            rv = True
-        return rv
+        pipe = emu.get_file_manager().get_pipe(hNamedPipe)
+        if not pipe:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+        return True
 
     @apihook("DisconnectNamedPipe", argc=1)
-    def DisconnectNamedPipe(self, emu, argv, ctx: api.ApiContext = None):
+    def DisconnectNamedPipe(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL DisconnectNamedPipe(
             HANDLE hNamedPipe
         );
         """
         (hNamedPipe,) = argv
-        rv = False
-        pipe = emu.pipe_get(hNamedPipe)
-        if pipe:
-            rv = True
-        return rv
+        pipe = emu.get_file_manager().get_pipe(hNamedPipe)
+        if not pipe:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+        return True
 
     @apihook("GetLocaleInfo", argc=4)
-    def GetLocaleInfo(self, emu, argv, ctx: api.ApiContext = None):
+    def GetLocaleInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int GetLocaleInfo(
-          LCID   Locale,
-          LCTYPE LCType,
-          LPSTR  lpLCData,
-          int    cchData
+            LCID Locale,
+            LCTYPE LCType,
+            LPTSTR lpLCData,
+            int cchData
         );
         """
-        ctx = ctx or {}
         Locale, LCType, lpLCData, cchData = argv
 
         rv = 0
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
-        lcid = k32types.get_define(Locale, "LOCALE_")
-        if lcid:
-            argv[0] = lcid
+        ctx.args["Locale"].display = decode(LCID, Locale)
+        ctx.args["LCType"].display = decode(LCTYPE, LCType)
+        locale_data = ""
+        if LCType == LCTYPE.LOCALE_SENGLISHCOUNTRYNAME:
+            locale_data = "United States"
+        elif LCType == LCTYPE.LOCALE_SENGLISHLANGUAGENAME:
+            locale_data = "English"
 
-        lctype = k32types.get_define(LCType, "LOCALE_")
-        if lctype:
-            argv[1] = lctype
-            locale_data = ""
-            if lctype == "LOCALE_SENGLISHCOUNTRYNAME":
-                locale_data = "United States"
-            elif lctype == "LOCALE_SENGLISHLANGUAGENAME":
-                locale_data = "English"
-
-            if locale_data:
+        if locale_data:
+            rv = len(locale_data) + 1
+            if cchData:
+                if cchData < rv:
+                    emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+                    return 0
                 self.write_mem_string(locale_data, lpLCData, cw)
-                rv = len(locale_data) + cw
 
         return rv
 
     @apihook("IsWow64Process", argc=2)
-    def IsWow64Process(self, emu, argv, ctx: api.ApiContext = None):
+    def IsWow64Process(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL IsWow64Process(
             HANDLE hProcess,
-            PBOOL  Wow64Process
+            PBOOL Wow64Process
         );
         """
         hProcess, Wow64Process = argv
         rv = False
 
         if Wow64Process:
-            self.mem_write(Wow64Process, (0).to_bytes(4, "little"))
+            self.write_dword(Wow64Process, 0)
             rv = True
 
         return rv
 
+    @apihook("IsWow64Process2", argc=3)
+    def IsWow64Process2(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL IsWow64Process2(
+            HANDLE hProcess,
+            USHORT *pProcessMachine,
+            USHORT *pNativeMachine
+        );
+        """
+        hProcess, pProcessMachine, pNativeMachine = argv
+        self.mem_write(pProcessMachine, windefs.IMAGE_FILE_MACHINE_UNKNOWN.to_bytes(2, "little"))
+        if pNativeMachine:
+            self.mem_write(pNativeMachine, emu.get_native_machine().to_bytes(2, "little"))
+        return True
+
     @apihook("CheckRemoteDebuggerPresent", argc=2)
-    def CheckRemoteDebuggerPresent(self, emu, argv, ctx: api.ApiContext = None):
+    def CheckRemoteDebuggerPresent(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL CheckRemoteDebuggerPresent(
             HANDLE hProcess,
-            PBOOL  pbDebuggerPresent
+            PBOOL pbDebuggerPresent
         );
         """
         hProcess, pbDebuggerPresent = argv
         rv = False
 
         if pbDebuggerPresent:
-            self.mem_write(pbDebuggerPresent, (0).to_bytes(4, "little"))
+            self.write_dword(pbDebuggerPresent, 0)
             rv = True
 
         return rv
 
     @apihook("GetComputerName", argc=2)
-    def GetComputerName(self, emu, argv, ctx: api.ApiContext = None):
+    def GetComputerName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetComputerName(
-            LPSTR   lpBuffer,
+            LPTSTR lpBuffer,
             LPDWORD nSize
         );
         """
-        ctx = ctx or {}
-
         lpBuffer, nSize = argv
-        rv = False
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
-        host = emu.config.hostname
-        argv[0] = host
-        argv[1] = len(host)
+        host = emu.config.system.hostname
+        size = self.read_dword(nSize)
+        if not lpBuffer or size <= len(host):
+            self.write_dword(nSize, len(host) + 1)
+            emu.set_last_error(windefs.ERROR_BUFFER_OVERFLOW)
+            return False
 
-        if lpBuffer and host:
-            if cw == 2:
-                out = host.encode("utf-16le")
-            elif cw == 1:
-                out = host.encode("utf-8")
-            self.mem_write(lpBuffer, out)
-            rv = True
-        if nSize:
-            self.mem_write(nSize, (len(host)).to_bytes(4, "little"))
-
-        return rv
+        self.write_mem_string(host, lpBuffer, cw)
+        self.write_dword(nSize, len(host))
+        ctx.args["lpBuffer"].display = host
+        return True
 
     @apihook("GetVersionEx", argc=1)
-    def GetVersionEx(self, emu, argv, ctx: api.ApiContext = None):
+    def GetVersionEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        NOT_BUILD_WINDOWS_DEPRECATE BOOL GetVersionEx(
-          LPOSVERSIONINFO lpVersionInformation
+        BOOL GetVersionEx(
+            LPOSVERSIONINFO lpVersionInformation
         );
         """
         (lpVersionInformation,) = argv
 
-        osver = self.k32types.OSVERSIONINFO(emu.get_ptr_size())
+        cw = _char_width(self, ctx)
+        osver: k32defs.OSVERSIONINFO | k32defs.OSVERSIONINFOEX = self.k32types.OSVERSIONINFOEX(emu.get_ptr_size(), cw)
+        if self.read_dword(lpVersionInformation) != osver.sizeof():
+            osver = self.k32types.OSVERSIONINFO(emu.get_ptr_size(), cw)
         osver = self.mem_cast(osver, lpVersionInformation)
 
-        # Its an OSVERSIONINFO object
-        if osver.dwOSVersionInfoSize == osver.sizeof():
-            pass
-
-        ver = emu.config.os_ver
-        osver.dwMajorVersion = ver.major
-        osver.dwMinorVersion = ver.minor
-        osver.dwBuildNumber = ver.build
-        osver.dwPlatformId = 2
+        ver = emu.config.system.os_ver
+        osver.dwMajorVersion = ver.major or 0
+        osver.dwMinorVersion = ver.minor or 0
+        osver.dwBuildNumber = ver.build or 0
+        osver.dwPlatformId = windefs.VER_PLATFORM_WIN32_NT
+        if isinstance(osver, self.k32types.OSVERSIONINFOEX):
+            osver.wServicePackMajor = SERVICE_PACK_BUILDS.get(ver.build or 0, 0)
+            osver.wServicePackMinor = 0
+            osver.wSuiteMask = 0
+            osver.wProductType = windefs.VER_NT_WORKSTATION
 
         rv = 1
         self.mem_write(lpVersionInformation, osver.get_bytes())
@@ -5698,190 +6667,213 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("GetEnvironmentVariable", argc=3)
-    def GetEnvironmentVariable(self, emu, argv, ctx: api.ApiContext = None):
+    def GetEnvironmentVariable(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetEnvironmentVariable(
-        LPCTSTR lpName,
-        LPTSTR  lpBuffer,
-        DWORD   nSize
+            LPCTSTR lpName,
+            LPTSTR lpBuffer,
+            DWORD nSize
         );
         """
-        ctx = ctx or {}
-
         lpName, lpBuffer, nSize = argv
         rv = 0
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
         name = self.read_mem_string(lpName, cw)
-        argv[0] = name
+        ctx.args["lpName"].display = name
         env = emu.get_env()
 
         var = env.get(name.lower())
-        if var:
-            var += "\x00"
-            if cw == 2:
-                new = (var).encode("utf-16le")
-            else:
-                new = (var).encode("utf-8")
-            self.mem_write(lpBuffer, new)
+        if var is None:
+            emu.set_last_error(windefs.ERROR_ENVVAR_NOT_FOUND)
+        elif not lpBuffer or nSize <= len(var):
+            rv = len(var) + 1
+        else:
+            self.write_mem_string(var, lpBuffer, cw)
             rv = len(var)
 
         return rv
 
     @apihook("GetCurrentPackageId", argc=2)
-    def GetCurrentPackageId(self, emu, argv, ctx: api.ApiContext = None):
+    def GetCurrentPackageId(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LONG GetCurrentPackageId(
             UINT32 *bufferLength,
-            BYTE   *buffer
+            BYTE *buffer
         );
         """
-        return windefs.ERROR_SUCCESS
+        return self.get_no_package(argv[0])
+
+    @apihook("GetCurrentPackageFamilyName", argc=2)
+    def GetCurrentPackageFamilyName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        LONG GetCurrentPackageFamilyName(
+            UINT32 *packageFamilyNameLength,
+            PWSTR packageFamilyName
+        );
+        """
+        return self.get_no_package(argv[0])
+
+    @apihook("GetCurrentPackageFullName", argc=2)
+    def GetCurrentPackageFullName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        LONG GetCurrentPackageFullName(
+            UINT32 *packageFullNameLength,
+            PWSTR packageFullName
+        );
+        """
+        return self.get_no_package(argv[0])
+
+    @apihook("GetCurrentPackagePath", argc=2)
+    def GetCurrentPackagePath(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        LONG GetCurrentPackagePath(
+            UINT32 *pathLength,
+            PWSTR path
+        );
+        """
+        return self.get_no_package(argv[0])
+
+    def get_no_package(self, length_ptr):
+        """
+        The emulated process is a desktop app without package identity.
+        """
+        if length_ptr:
+            self.write_dword(length_ptr, 0)
+        return APPMODEL_ERROR_NO_PACKAGE
 
     @apihook("AreFileApisANSI", argc=0)
-    def AreFileApisANSI(self, emu, argv, ctx: api.ApiContext = None):
+    def AreFileApisANSI(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL AreFileApisANSI();
         """
         return True
 
     @apihook("FindFirstFileEx", argc=6)
-    def FindFirstFileEx(self, emu, argv, ctx: api.ApiContext = None):
+    def FindFirstFileEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HANDLE FindFirstFileExA(
-            LPCSTR             lpFileName,
+        HANDLE FindFirstFileEx(
+            LPCTSTR lpFileName,
             FINDEX_INFO_LEVELS fInfoLevelId,
-            LPVOID             lpFindFileData,
-            FINDEX_SEARCH_OPS  fSearchOp,
-            LPVOID             lpSearchFilter,
-            DWORD              dwAdditionalFlags
+            LPVOID lpFindFileData,
+            FINDEX_SEARCH_OPS fSearchOp,
+            LPVOID lpSearchFilter,
+            DWORD dwAdditionalFlags
         );
         """
-        ctx = ctx or {}
         (
             lpFileName,
             fInfoLevelId,
             lpFindFileData,
             fSearchOp,
             lpSearchFilter,
-            flags,
+            dwAdditionalFlags,
         ) = argv
 
         _argv = [lpFileName, lpFindFileData]
         rv = self.FindFirstFile(emu, _argv, ctx)
-        argv[0] = _argv[0]
 
         return rv
 
     @apihook("FindFirstFile", argc=2)
-    def FindFirstFile(self, emu, argv, ctx: api.ApiContext = None):
+    def FindFirstFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HANDLE FindFirstFileA(
-            LPCSTR             lpFileName,
-            LPWIN32_FIND_DATAA lpFindFileData
+        HANDLE FindFirstFile(
+            LPCTSTR lpFileName,
+            LPWIN32_FIND_DATA lpFindFileData
         );
         """
-        ctx = ctx or {}
-
         lpFileName, lpFindFileData = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
         if not lpFileName or not lpFindFileData:
-            return windefs.INVALID_HANDLE_VALUE
+            return self.get_max_int()
 
         srch = self.read_mem_string(lpFileName, cw)
-        argv[0] = srch
+        ctx.args["lpFileName"].display = srch
         if srch.startswith("\\\\?\\"):
             srch = srch.replace("\\\\?\\", "")
 
         fm = emu.get_file_manager()
         walker = fm.find_matching_entries(srch)
-        hnd = self.get_handle()
-        self.find_files.update({hnd: {"walker": walker}})
+        hnd = self.find_files.new_handle({"walker": walker})
 
         try:
             name, is_dir = next(walker)
         except StopIteration:
-            return windefs.INVALID_HANDLE_VALUE
+            self.find_files.close(hnd)
+            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
+            return self.get_max_int()
 
-        if cw == 2:
-            cfn = name.encode("utf-16le")
-        else:
-            cfn = name.encode("utf-8")
+        cfn = self.encode_string(name, cw)
 
-        find_data = k32types.WIN32_FIND_DATA(emu.get_ptr_size(), cw)
+        find_data = k32defs.WIN32_FIND_DATA(emu.get_ptr_size(), cw)
         if is_dir:
-            find_data.dwFileAttributes = k32types.FILE_ATTRIBUTE_DIRECTORY
+            find_data.dwFileAttributes = windefs.FILE_ATTRIBUTE_DIRECTORY
         else:
-            find_data.dwFileAttributes = k32types.FILE_ATTRIBUTE_NORMAL
+            find_data.dwFileAttributes = windefs.FILE_ATTRIBUTE_NORMAL
         find_data.cFileName = cfn
         self.mem_write(lpFindFileData, find_data.get_bytes())
 
         return hnd
 
     @apihook("FindNextFile", argc=2)
-    def FindNextFile(self, emu, argv, ctx: api.ApiContext = None):
+    def FindNextFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL FindNextFile(
-            HANDLE             hFindFile,
-            LPWIN32_FIND_DATAA lpFindFileData
+            HANDLE hFindFile,
+            LPWIN32_FIND_DATA lpFindFileData
         );
         """
-        ctx = ctx or {}
-
         hFindFile, lpFindFileData = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
         fsearch = self.find_files.get(hFindFile)
 
         if not hFindFile or not lpFindFileData or not fsearch:
-            return windefs.INVALID_HANDLE_VALUE
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
 
-        walker = fsearch.get("walker")
+        walker = fsearch["walker"]
         try:
             name, is_dir = next(walker)
         except StopIteration:
+            emu.set_last_error(windefs.ERROR_NO_MORE_FILES)
             return 0
 
-        argv[1] = name
+        ctx.args["lpFindFileData"].display = name
 
-        if cw == 2:
-            cfn = name.encode("utf-16le")
-        else:
-            cfn = name.encode("utf-8")
+        cfn = self.encode_string(name, cw)
 
-        find_data = k32types.WIN32_FIND_DATA(emu.get_ptr_size(), cw)
+        find_data = k32defs.WIN32_FIND_DATA(emu.get_ptr_size(), cw)
         if is_dir:
-            find_data.dwFileAttributes = k32types.FILE_ATTRIBUTE_DIRECTORY
+            find_data.dwFileAttributes = windefs.FILE_ATTRIBUTE_DIRECTORY
         else:
-            find_data.dwFileAttributes = k32types.FILE_ATTRIBUTE_NORMAL
+            find_data.dwFileAttributes = windefs.FILE_ATTRIBUTE_NORMAL
         find_data.cFileName = cfn
         self.mem_write(lpFindFileData, find_data.get_bytes())
 
         return 1
 
     @apihook("FindClose", argc=1)
-    def FindClose(self, emu, argv, ctx: api.ApiContext = None):
+    def FindClose(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL FindClose(
             HANDLE hFindFile
         );
         """
-
         (hFindFile,) = argv
-
-        try:
-            self.find_files.pop(hFindFile)
-        except KeyError:
+        if not self.find_files.close(hFindFile):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return False
 
         return True
 
     @apihook("GetSystemTimes", argc=3)
-    def GetSystemTimes(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSystemTimes(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetSystemTimes(
             PFILETIME lpIdleTime,
@@ -5889,13 +6881,13 @@ class Kernel32(api.ApiHandler):
             PFILETIME lpUserTime
         );
         """
-
         lpIdleTime, lpKernelTime, lpUserTime = argv
 
         ft = self.k32types.FILETIME(emu.get_ptr_size())
 
-        ft.dwLowDateTime = self.tick_counter
-        self.tick_counter += 10000000
+        times = self.tick_counter * 10000
+        ft.dwLowDateTime = 0xFFFFFFFF & times
+        ft.dwHighDateTime = times >> 32
 
         for t in (lpIdleTime, lpKernelTime, lpUserTime):
             if not t:
@@ -5905,60 +6897,87 @@ class Kernel32(api.ApiHandler):
         return True
 
     @apihook("GetThreadContext", argc=2)
-    def GetThreadContext(self, emu, argv, ctx: api.ApiContext = None):
+    def GetThreadContext(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetThreadContext(
-            HANDLE    hThread,
+            HANDLE hThread,
             LPCONTEXT lpContext
         );
         """
-
         hThread, lpContext = argv
 
-        obj = self.get_object_from_handle(hThread)
+        obj = emu.get_handle_table().get(hThread, objman.Thread)
         if not obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return False
 
-        context = obj.get_context()
-
-        self.mem_write(lpContext, context.get_bytes())
-
+        # Fill only the sections ContextFlags asks for; the current thread's are live
+        target = seh.read_context(emu, lpContext)
+        source = emu.get_thread_context() if obj is emu.get_current_thread() else obj.get_context()
+        thread_context.get_debug_registers(obj, source)
+        thread_context.copy_sections(source, target, target.ContextFlags)
+        self.mem_write(lpContext, target.get_bytes())
         return True
 
     @apihook("SetThreadContext", argc=2)
-    def SetThreadContext(self, emu, argv, ctx: api.ApiContext = None):
+    def SetThreadContext(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetThreadContext(
-            HANDLE        hThread,
+            HANDLE hThread,
             const CONTEXT *lpContext
         );
         """
-
         hThread, lpContext = argv
 
-        obj = self.get_object_from_handle(hThread)
+        obj = emu.get_handle_table().get(hThread, objman.Thread)
         if not obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return False
 
-        if emu.get_arch() == e_arch.ARCH_AMD64:
-            context = windefs.CONTEXT64(emu.get_ptr_size())
-        else:
-            context = windefs.CONTEXT(emu.get_ptr_size())
         if lpContext:
-            _context = self.mem_cast(context, lpContext)
-            obj.set_context(_context)
+            # Change only the sections ContextFlags selects
+            context = seh.read_context(emu, lpContext)
+            stored = obj.get_context()
+            thread_context.copy_sections(context, stored, context.ContextFlags)
+            obj.set_context(stored)
+            if thread_context.has(context.ContextFlags, thread_context.CONTEXT_DEBUG_REGISTERS):
+                emu.set_debug_registers(obj, context)
+            if obj.process:
+                obj.process.is_modified = True
+
+        return True
+
+    @apihook("Wow64SetThreadContext", argc=2)
+    def Wow64SetThreadContext(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL Wow64SetThreadContext(
+            HANDLE hThread,
+            const WOW64_CONTEXT *lpContext
+        );
+        """
+        hThread, lpContext = argv
+
+        obj = emu.get_handle_table().get(hThread, objman.Thread)
+        if not obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+
+        if lpContext:
+            if emu.get_arch() == e_arch.ARCH_X86:
+                obj.set_context(self.mem_cast(windefs.CONTEXT(emu.get_ptr_size()), lpContext))
+            if obj.process:
+                obj.process.is_modified = True
 
         return True
 
     @apihook("CompareFileTime", argc=2)
-    def CompareFileTime(self, emu, argv, ctx: api.ApiContext = None):
+    def CompareFileTime(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LONG CompareFileTime(
             const FILETIME *lpFileTime1,
             const FILETIME *lpFileTime2
         );
         """
-
         lpFileTime1, lpFileTime2 = argv
         rv = 0
 
@@ -5980,17 +6999,15 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("FindResource", argc=3)
-    def FindResource(self, emu, argv, ctx: api.ApiContext = None):
+    def FindResource(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HRSRC FindResourceA(
+        HRSRC FindResource(
             HMODULE hModule,
-            LPCSTR  lpName,
-            LPCSTR  lpType
+            LPCTSTR lpName,
+            LPCTSTR lpType
         );
         """
-        ctx = ctx or {}
-
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         hModule, lpName, lpType = argv
         if hModule == 0:
             pe = emu.modules[0] if emu.modules else None
@@ -6002,10 +7019,8 @@ class Kernel32(api.ApiHandler):
         if not pe:
             return 0
 
-        name = self.normalize_res_identifier(emu, cw, lpName)
-        argv[1] = name
-        type_ = self.normalize_res_identifier(emu, cw, lpType)
-        argv[2] = type_
+        name = self.read_res_identifier(emu, ctx, "lpName", cw, lpName)
+        type_ = self.read_res_identifier(emu, ctx, "lpType", cw, lpType)
         res = self.find_resource(pe, name, type_)
         if res is None:
             return 0
@@ -6015,19 +7030,17 @@ class Kernel32(api.ApiHandler):
         return pe.base + res.entry_rva
 
     @apihook("FindResourceEx", argc=4)
-    def FindResourceEx(self, emu, argv, ctx: api.ApiContext = None):
+    def FindResourceEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HRSRC FindResourceExW(
-            [in, optional] HMODULE hModule,
-            [in]           LPCWSTR lpType,
-            [in]           LPCWSTR lpName,
-            [in]           WORD    wLanguage
+        HRSRC FindResourceEx(
+            HMODULE hModule,
+            LPCTSTR lpType,
+            LPCTSTR lpName,
+            WORD wLanguage
         );
         """
-        ctx = ctx or {}
-
         # repeats code from FindResource()
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         hModule, lpType, lpName, wLanguage = argv
         if hModule == 0:
             pe = emu.modules[0] if emu.modules else None
@@ -6039,10 +7052,8 @@ class Kernel32(api.ApiHandler):
         if not pe:
             return 0
 
-        name = self.normalize_res_identifier(emu, cw, lpName)
-        argv[1] = name
-        type_ = self.normalize_res_identifier(emu, cw, lpType)
-        argv[2] = type_
+        name = self.read_res_identifier(emu, ctx, "lpName", cw, lpName)
+        type_ = self.read_res_identifier(emu, ctx, "lpType", cw, lpType)
         res = self.find_resource(pe, name, type_)
         if res is None:
             return 0
@@ -6050,15 +7061,17 @@ class Kernel32(api.ApiHandler):
         return pe.base + res.entry_rva
 
     @apihook("LoadResource", argc=2)
-    def LoadResource(self, emu, argv, ctx: api.ApiContext = None):
+    def LoadResource(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HGLOBAL LoadResource(
-          HMODULE hModule,
-          HRSRC   hResInfo
+            HMODULE hModule,
+            HRSRC hResInfo
         );
         """
-
         hModule, hResInfo = argv
+        if not hResInfo:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
 
         if hModule == 0:
             pe = emu.modules[0] if emu.modules else None
@@ -6070,69 +7083,221 @@ class Kernel32(api.ApiHandler):
         if not pe:
             return 0
 
-        if not hResInfo or not emu.is_address_valid(hResInfo):
+        if not emu.is_address_valid(hResInfo):
             return 0
-        res_rva = self.mem_read(hResInfo, 4)
-        if res_rva:
-            return pe.base + int.from_bytes(res_rva, "little")
-        else:
-            return 0
+        return pe.base + self.read_dword(hResInfo)
 
     @apihook("LockResource", argc=1)
-    def LockResource(self, emu, argv, ctx: api.ApiContext = None):
+    def LockResource(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPVOID LockResource(
-          HGLOBAL hResData
+            HGLOBAL hResData
         );
         """
-
         (hResData,) = argv
 
         return hResData
 
     @apihook("SizeofResource", argc=2)
-    def SizeofResource(self, emu, argv, ctx: api.ApiContext = None):
+    def SizeofResource(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD SizeofResource(
-          HMODULE hModule,
-          HRSRC   hResInfo
+            HMODULE hModule,
+            HRSRC hResInfo
         );
         """
-
         hModule, hResInfo = argv
+        if not hResInfo:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
 
         # We don't strictly need pe here for SizeofResource if we trust hResInfo,
         # but the API takes hModule.
         # Just use hResInfo which points to IMAGE_RESOURCE_DATA_ENTRY
-        if hResInfo:
-            res_size = self.mem_read(hResInfo + 4, 4)
-            if res_size:
-                return int.from_bytes(res_size, "little")
+        return self.read_dword(hResInfo + 4)
 
-        return 0
-
-    @apihook("FreeResource", argc=1)
-    def FreeResource(self, emu, argv, ctx: api.ApiContext = None):
+    def get_resources(self, emu, hModule, type_=None, name=None, lang=0):
         """
-        BOOL FreeResource(
-          [in] HGLOBAL hResData
+        Return the resources of a module that match the type, name and language, or None
+        with the last error set
+        """
+        if hModule == 0:
+            pe = emu.modules[0] if emu.modules else None
+        else:
+            pe = emu.get_mod_from_addr(hModule)
+            if pe and hModule != pe.base:
+                pe = None
+        if not pe:
+            emu.set_last_error(windefs.ERROR_RESOURCE_DATA_NOT_FOUND)
+            return None
+        metadata = pe.get_pe_metadata()
+        resources = metadata.resources if metadata else []
+        if not resources:
+            emu.set_last_error(windefs.ERROR_RESOURCE_DATA_NOT_FOUND)
+            return None
+
+        if type_ is not None:
+            resources = [r for r in resources if is_same_res_identifier(type_, r.type_id)]
+            if not resources:
+                emu.set_last_error(windefs.ERROR_RESOURCE_TYPE_NOT_FOUND)
+                return None
+        if name is not None:
+            resources = [r for r in resources if is_same_res_identifier(name, r.id)]
+            if not resources:
+                emu.set_last_error(windefs.ERROR_RESOURCE_NAME_NOT_FOUND)
+                return None
+        if lang:
+            resources = [r for r in resources if r.lang_id == lang]
+        return pe.base, resources
+
+    def enum_resources(self, emu, cw, func, args, ids):
+        """
+        Call func once for each ID, with the ID in place of None in args. A string ID is
+        passed in a buffer that is valid only during the call.
+        """
+        for id_ in dict.fromkeys(ids):
+            buf = 0
+            if isinstance(id_, str):
+                data = self.encode_string(id_ + "\0", cw)
+                buf = self.mem_alloc(len(data), tag="api.enum_resource")
+                self.mem_write(buf, data)
+            try:
+                rv = yield GuestCall(func, tuple(buf or id_ if a is None else a for a in args))
+            finally:
+                if buf:
+                    self.mem_free(buf)
+            if not rv & 0xFFFFFFFF:
+                emu.set_last_error(windefs.ERROR_RESOURCE_ENUM_USER_STOP)
+                return 0
+        return 1
+
+    @apihook("EnumResourceTypes", argc=3)
+    def EnumResourceTypes(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL EnumResourceTypes(
+            HMODULE hModule,
+            ENUMRESTYPEPROC lpEnumFunc,
+            LONG_PTR lParam
         );
         """
+        hModule, lpEnumFunc, lParam = argv[:3]
+        lang = argv[4] if len(argv) > 3 else 0
+        found = self.get_resources(emu, hModule, lang=lang)
+        if found is None:
+            return 0
+        base, resources = found
+        cw = _char_width(self, ctx)
+        return (
+            yield from self.enum_resources(emu, cw, lpEnumFunc, (base, None, lParam), [r.type_id for r in resources])
+        )
 
+    @apihook("EnumResourceTypesEx", argc=5)
+    def EnumResourceTypesEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL EnumResourceTypesEx(
+            HMODULE hModule,
+            ENUMRESTYPEPROC lpEnumFunc,
+            LONG_PTR lParam,
+            DWORD dwFlags,
+            LANGID LangId
+        );
+        """
+        return self.EnumResourceTypes(emu, argv, ctx)
+
+    @apihook("EnumResourceNames", argc=4)
+    def EnumResourceNames(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL EnumResourceNames(
+            HMODULE hModule,
+            LPCTSTR lpType,
+            ENUMRESNAMEPROC lpEnumFunc,
+            LONG_PTR lParam
+        );
+        """
+        hModule, lpType, lpEnumFunc, lParam = argv[:4]
+        lang = argv[5] if len(argv) > 4 else 0
+        cw = _char_width(self, ctx)
+        type_ = self.read_res_identifier(emu, ctx, "lpType", cw, lpType)
+        found = self.get_resources(emu, hModule, type_, lang=lang)
+        if found is None:
+            return 0
+        base, resources = found
+        return (
+            yield from self.enum_resources(emu, cw, lpEnumFunc, (base, lpType, None, lParam), [r.id for r in resources])
+        )
+
+    @apihook("EnumResourceNamesEx", argc=6)
+    def EnumResourceNamesEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL EnumResourceNamesEx(
+            HMODULE hModule,
+            LPCTSTR lpType,
+            ENUMRESNAMEPROC lpEnumFunc,
+            LONG_PTR lParam,
+            DWORD dwFlags,
+            LANGID LangId
+        );
+        """
+        return self.EnumResourceNames(emu, argv, ctx)
+
+    @apihook("EnumResourceLanguages", argc=5)
+    def EnumResourceLanguages(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL EnumResourceLanguages(
+            HMODULE hModule,
+            LPCTSTR lpType,
+            LPCTSTR lpName,
+            ENUMRESLANGPROC lpEnumFunc,
+            LONG_PTR lParam
+        );
+        """
+        hModule, lpType, lpName, lpEnumFunc, lParam = argv[:5]
+        lang = argv[6] if len(argv) > 5 else 0
+        cw = _char_width(self, ctx)
+        type_ = self.read_res_identifier(emu, ctx, "lpType", cw, lpType)
+        name = self.read_res_identifier(emu, ctx, "lpName", cw, lpName)
+        found = self.get_resources(emu, hModule, type_, name, lang)
+        if found is None:
+            return 0
+        base, resources = found
+        args = (base, lpType, lpName, None, lParam)
+        return (yield from self.enum_resources(emu, cw, lpEnumFunc, args, [r.lang_id for r in resources]))
+
+    @apihook("EnumResourceLanguagesEx", argc=7)
+    def EnumResourceLanguagesEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL EnumResourceLanguagesEx(
+            HMODULE hModule,
+            LPCTSTR lpType,
+            LPCTSTR lpName,
+            ENUMRESLANGPROC lpEnumFunc,
+            LONG_PTR lParam,
+            DWORD dwFlags,
+            LANGID LangId
+        );
+        """
+        return self.EnumResourceLanguages(emu, argv, ctx)
+
+    @apihook("FreeResource", argc=1)
+    def FreeResource(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL FreeResource(
+            HGLOBAL hResData
+        );
+        """
         return 0
 
     @apihook("GetCurrentDirectory", argc=2)
-    def GetCurrentDirectory(self, emu, argv, ctx: api.ApiContext = None):
+    def GetCurrentDirectory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetCurrentDirectory(
-            DWORD  nBufferLength,
+            DWORD nBufferLength,
             LPTSTR lpBuffer
         );
         """
-        ctx = ctx or {}
         nBufferLength, lpBuffer = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         cd = emu.get_cd()
         required = len(cd) + 1
 
@@ -6144,128 +7309,189 @@ class Kernel32(api.ApiHandler):
         return len(cd)
 
     @apihook("VirtualAllocExNuma", argc=6)
-    def VirtualAllocExNuma(self, emu, argv, ctx: api.ApiContext = None):
+    def VirtualAllocExNuma(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LPVOID VirtualAllocExNuma(
-          HANDLE hProcess,
-          LPVOID lpAddress,
-          SIZE_T dwSize,
-          DWORD  flAllocationType,
-          DWORD  flProtect,
-          DWORD  nndPreferred
+            HANDLE hProcess,
+            LPVOID lpAddress,
+            SIZE_T dwSize,
+            DWORD flAllocationType,
+            DWORD flProtect,
+            DWORD nndPreferred
         );
         """
-        ctx = ctx or {}
-
         argv = argv[:-1]
         return self.VirtualAllocEx(emu, argv, ctx)
 
     @apihook("GetNativeSystemInfo", argc=1)
-    def GetNativeSystemInfo(self, emu, argv, ctx: api.ApiContext = None):
+    def GetNativeSystemInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void GetNativeSystemInfo(
-          LPSYSTEM_INFO lpSystemInfo
+        VOID GetNativeSystemInfo(
+            LPSYSTEM_INFO lpSystemInfo
         );
         """
-        (lpSystemInfo,) = argv
-        return 0
+        return self.GetSystemInfo(emu, argv, ctx)
 
     @apihook("GetUserDefaultUILanguage", argc=0)
-    def GetUserDefaultUILanguage(self, emu, argv, ctx: api.ApiContext = None):
+    def GetUserDefaultUILanguage(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LANGID GetUserDefaultUILanguage();
         """
         return 0xFFFF
 
     @apihook("SetCurrentDirectory", argc=1)
-    def SetCurrentDirectory(self, emu, argv, ctx: api.ApiContext = None):
+    def SetCurrentDirectory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetCurrentDirectory(
             LPCTSTR lpPathName
         );
         """
-        ctx = ctx or {}
-        (path,) = argv
+        (lpPathName,) = argv
 
-        if path:
-            cw = self.get_char_width(ctx)
-            path_str = self.read_mem_string(path, cw)
-            argv[0] = path_str
+        if lpPathName:
+            cw = _char_width(self, ctx)
+            path_str = self.read_mem_string(lpPathName, cw)
+            ctx.args["lpPathName"].display = path_str
             emu.set_cd(path_str)
 
         return True
 
     @apihook("OpenThread", argc=3)
-    def OpenThread(self, emu, argv, ctx: api.ApiContext = None):
+    def OpenThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE OpenThread(
             DWORD dwDesiredAccess,
-            BOOL  bInheritHandle,
+            BOOL bInheritHandle,
             DWORD dwThreadId
         );
         """
-        access, bInheritHandle, dwThreadId = argv
+        dwDesiredAccess, bInheritHandle, dwThreadId = argv
         thread = emu.get_object_from_id(dwThreadId)
+        if not thread:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
         hnd = emu.get_object_handle(thread)
         if not hnd:
             hnd = 0
         return hnd
 
     @apihook("RaiseException", argc=4)
-    def RaiseException(self, emu, argv, ctx: api.ApiContext = None):
+    def RaiseException(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         VOID RaiseException(
-            DWORD           dwExceptionCode,
-            DWORD           dwExceptionFlags,
-            DWORD           nNumberOfArguments,
+            DWORD dwExceptionCode,
+            DWORD dwExceptionFlags,
+            DWORD nNumberOfArguments,
             const ULONG_PTR *lpArguments
         );
         """
-        # Stub
         dwExceptionCode, dwExceptionFlags, nNumberOfArguments, lpArguments = argv
+        if not emu.config.exceptions.dispatch:
+            return None
 
-        return
+        count = min(nNumberOfArguments, 15) if lpArguments else 0
+        params = [self.read_ptr(lpArguments + emu.get_ptr_size() * i) for i in range(count)]
+        return emu.exception_dispatcher().raise_exception(emu, dwExceptionCode, dwExceptionFlags, params)
 
-    @apihook("VerSetConditionMask", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def VerSetConditionMask(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("VerSetConditionMask", argc=4)
+    def VerSetConditionMask(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        NTSYSAPI ULONGLONG VerSetConditionMask(
+        ULONGLONG VerSetConditionMask(
             ULONGLONG ConditionMask,
-            DWORD     TypeMask,
-            BYTE      Condition
+            DWORD TypeMask,
+            BYTE Condition
         );
+
+        ConditionMask takes two stack slots on x86. On x64 the fourth slot
+        is unused.
         """
-        # Stub
-        con_mask, type_mask, cond = argv
+        if emu.get_ptr_size() == 4:
+            lo, hi, type_mask, cond = argv
+            con_mask = (hi << 32) | lo
+        else:
+            con_mask, type_mask, cond = argv[:3]
 
-        return 0
+        type_mask &= 0xFF
+        cond &= VER_CONDITION_MASK
+        if type_mask and cond:
+            # Only the highest type bit gets the condition
+            con_mask |= cond << (3 * (type_mask.bit_length() - 1))
 
-    @apihook("VerifyVersionInfo", argc=3, conv=e_arch.CALL_CONV_CDECL)
-    def VerifyVersionInfo(self, emu, argv, ctx: api.ApiContext = None):
+        if emu.get_ptr_size() == 4:
+            emu.reg_write(e_arch.X86_REG_EDX, con_mask >> 32)
+            return con_mask & 0xFFFFFFFF
+        return con_mask
+
+    @apihook("VerifyVersionInfo", argc=4)
+    def VerifyVersionInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL VerifyVersionInfo(
             LPOSVERSIONINFOEX lpVersionInformation,
-            DWORD              dwTypeMask,
-            DWORDLONG          dwlConditionMask
+            DWORD dwTypeMask,
+            DWORDLONG dwlConditionMask
         );
-        """
-        # Stub
-        vinfo, type_mask, con_mask = argv
 
+        dwlConditionMask takes two stack slots on x86. On x64 the fourth slot
+        is unused.
+        """
+        if emu.get_ptr_size() == 4:
+            vinfo, type_mask, lo, hi = argv
+            con_mask = (hi << 32) | lo
+        else:
+            vinfo, type_mask, con_mask = argv[:3]
+
+        if not type_mask or not con_mask:
+            emu.set_last_error(ERROR_BAD_ARGUMENTS)
+            return False
+
+        cw = _char_width(self, ctx)
+        major, minor, build, platform = struct.unpack("<4I", self.mem_read(vinfo + 4, 16))
+        sp_major, sp_minor, _, product = struct.unpack("<HHHB", self.mem_read(vinfo + 20 + 128 * cw, 7))
+        ver = emu.config.system.os_ver
+        cur_major, cur_minor, cur_build = ver.major or 0, ver.minor or 0, ver.build or 0
+        cur_sp = SERVICE_PACK_BUILDS.get(cur_build, 0)
+
+        def check(bit, current, wanted):
+            cond = (con_mask >> (3 * (bit.bit_length() - 1))) & VER_CONDITION_MASK
+            return VER_COMPARE.get(cond, lambda a, b: False)(current, wanted)
+
+        ok = True
+        # The version fields compare as one number: a field that differs decides the result
+        for bit, current, wanted in (
+            (VER_MAJORVERSION, cur_major, major),
+            (VER_MINORVERSION, cur_minor, minor),
+            (VER_SERVICEPACKMAJOR, cur_sp, sp_major),
+            (VER_SERVICEPACKMINOR, 0, sp_minor),
+        ):
+            if type_mask & bit:
+                ok = check(bit, current, wanted)
+                if not ok or current != wanted:
+                    break
+        for bit, current, wanted in (
+            (VER_BUILDNUMBER, cur_build, build),
+            (VER_PLATFORMID, windefs.VER_PLATFORM_WIN32_NT, platform),
+            (VER_PRODUCT_TYPE, windefs.VER_NT_WORKSTATION, product),
+        ):
+            if ok and type_mask & bit:
+                ok = check(bit, current, wanted)
+
+        if not ok:
+            emu.set_last_error(ERROR_OLD_WIN_VERSION)
+            return False
         return True
 
     @apihook("FreeConsole", argc=0)
-    def FreeConsole(self, emu, argv, ctx: api.ApiContext = None):
+    def FreeConsole(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL WINAPI FreeConsole(void);
+        BOOL FreeConsole();
         """
         return True
 
     @apihook("IsBadWritePtr", argc=2)
-    def IsBadWritePtr(self, emu, argv, ctx: api.ApiContext = None):
+    def IsBadWritePtr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL IsBadWritePtr(
-            LPVOID   lp,
+            LPVOID lp,
             UINT_PTR ucb
         );
         """
@@ -6283,29 +7509,36 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("IsBadStringPtr", argc=2)
-    def IsBadStringPtr(self, emu, argv, ctx: api.ApiContext = None):
+    def IsBadStringPtr(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL IsBadStringPtrW(
-            LPCWSTR  lpsz,
+        BOOL IsBadStringPtr(
+            LPCTSTR lpsz,
             UINT_PTR ucchMax
         );
         """
-        ctx = ctx or {}
         lpsz, ucchMax = argv
-        cw = self.get_char_width(ctx)
-        rv = True
+        cw = _char_width(self, ctx)
 
-        if lpsz and ucchMax:
-            v1 = emu.is_address_valid(lpsz)
-            v2 = emu.is_address_valid(lpsz + (cw * ucchMax) - cw)
+        if not ucchMax:
+            return False
 
-            if v1 and v2:
-                rv = False
+        addr = lpsz
+        remaining = ucchMax
+        while remaining:
+            count = min(remaining, max(1, (0x1000 - addr % 0x1000) // cw))
+            if not emu.is_address_valid(addr) or not emu.is_address_valid(addr + count * cw - 1):
+                return True
+            data = self.mem_read(addr, count * cw)
+            for i in range(0, len(data), cw):
+                if not any(data[i : i + cw]):
+                    return False
+            addr += count * cw
+            remaining -= count
 
-        return rv
+        return False
 
     @apihook("GetSystemFirmwareTable", argc=4)
-    def GetSystemFirmwareTable(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSystemFirmwareTable(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT GetSystemFirmwareTable(
             DWORD FirmwareTableProviderSignature,
@@ -6314,75 +7547,126 @@ class Kernel32(api.ApiHandler):
             DWORD BufferSize
         );
         """
-        # Stub
-        sig, tid, firm_buf, buf_size = argv
+        FirmwareTableProviderSignature, FirmwareTableID, pFirmwareTableBuffer, BufferSize = argv
 
-        if not firm_buf:
+        if FirmwareTableProviderSignature == RSMB_PROVIDER:
+            table = get_raw_smbios_data()
+            if pFirmwareTableBuffer and BufferSize >= len(table):
+                self.mem_write(pFirmwareTableBuffer, table)
+            return len(table)
+
+        if FirmwareTableProviderSignature not in (ACPI_PROVIDER, FIRM_PROVIDER):
+            emu.set_last_error(windefs.ERROR_INVALID_FUNCTION)
+            return 0
+
+        if not pFirmwareTableBuffer:
             rv = 0x100
         else:
-            self.mem_write(firm_buf, b"\x01" * buf_size)
-            rv = buf_size
+            self.mem_write(pFirmwareTableBuffer, b"\x01" * BufferSize)
+            rv = BufferSize
         return rv
 
     @apihook("GetTempPath", argc=2)
-    def GetTempPath(self, emu, argv, ctx: api.ApiContext = None):
+    def GetTempPath(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DWORD GetTempPathA(
-        DWORD nBufferLength,
-        LPSTR lpBuffer
+        DWORD GetTempPath(
+            DWORD nBufferLength,
+            LPTSTR lpBuffer
         );
         """
-        ctx = ctx or {}
-
         nBufferLength, lpBuffer = argv
         rv = 0
-        cw = self.get_char_width(ctx)
-        tempdir = emu.get_env().get("temp", "C:\\Windows\\temp\\")
-        if cw == 2:
-            new = (tempdir).encode("utf-16le") + b"\x00\x00"
-        else:
-            new = (tempdir).encode("utf-8") + b"\x00"
+        cw = _char_width(self, ctx)
+        tempdir = emu.get_env().get("temp", "C:\\Windows\\temp")
+        if not tempdir.endswith("\\"):
+            tempdir += "\\"
+        new = self.encode_string(tempdir, cw) + b"\x00" * cw
+        if not lpBuffer or nBufferLength <= len(tempdir):
+            return len(tempdir) + 1
         rv = len(tempdir)
-        if lpBuffer:
-            argv[1] = tempdir
-            self.mem_write(lpBuffer, new)
+        ctx.args[1].display = tempdir
+        self.mem_write(lpBuffer, new)
         return rv
 
+    @apihook("GetTempPath2", argc=2)
+    def GetTempPath2(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetTempPath2(
+            DWORD BufferLength,
+            LPTSTR Buffer
+        );
+        """
+        return self.GetTempPath(emu, argv, ctx)
+
+    @apihook("QueryInformationJobObject", argc=5)
+    def QueryInformationJobObject(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL QueryInformationJobObject(
+            HANDLE hJob,
+            JOBOBJECTINFOCLASS JobObjectInformationClass,
+            LPVOID lpJobObjectInformation,
+            DWORD cbJobObjectInformationLength,
+            LPDWORD lpReturnLength
+        );
+        """
+        hJob, JobObjectInformationClass, lpJobObjectInformation, cbJobObjectInformationLength, lpReturnLength = argv
+        x64 = self.get_ptr_size() == 8
+        sizes = {
+            JobObjectBasicAccountingInformation: 0x30,
+            JobObjectBasicLimitInformation: 0x40 if x64 else 0x30,
+            JobObjectExtendedLimitInformation: 0x90 if x64 else 0x70,
+        }
+        size = sizes.get(JobObjectInformationClass)
+        if size is None:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        if not lpJobObjectInformation or cbJobObjectInformationLength < size:
+            emu.set_last_error(windefs.ERROR_BAD_LENGTH)
+            return 0
+        # The job has no limits and no accounting data
+        self.mem_write(lpJobObjectInformation, b"\x00" * size)
+        if lpReturnLength:
+            self.write_dword(lpReturnLength, size)
+        return 1
+
     @apihook("SetPriorityClass", argc=2)
-    def SetPriorityClass(self, emu, argv, ctx: api.ApiContext = None):
+    def SetPriorityClass(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetPriorityClass(
-        HANDLE hProcess,
-        DWORD  dwPriorityClass
+            HANDLE hProcess,
+            DWORD dwPriorityClass
         );
         """
         return 1
 
     @apihook("SetProcessPriorityBoost", argc=2)
-    def SetProcessPriorityBoost(self, emu, argv, ctx: api.ApiContext = None):
+    def SetProcessPriorityBoost(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetProcessPriorityBoost(
-          HANDLE hProcess,
-          BOOL   bDisablePriorityBoost
+            HANDLE hProcess,
+            BOOL bDisablePriorityBoost
         );
         """
         emu.set_last_error(windefs.ERROR_SUCCESS)
         return 1
 
     @apihook("GetDriveType", argc=1)
-    def GetDriveType(self, emu, argv, ctx: api.ApiContext = None):
+    def GetDriveType(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT GetDriveType(
-          LPCSTR lpRootPathName
+            LPCTSTR lpRootPathName
         );
         """
-        ctx = ctx or {}
         (lpRootPathName,) = argv
 
-        cw = self.get_char_width(ctx)
-        name = self.read_mem_string(lpRootPathName, cw)
-        if name:
-            argv[0] = name
+        if not lpRootPathName:
+            # A NULL path means the root of the current directory.
+            name = ntpath.splitdrive(emu.get_cd())[0] + "\\"
+        else:
+            cw = _char_width(self, ctx)
+            name = self.read_mem_string(lpRootPathName, cw)
+            if name:
+                ctx.args["lpRootPathName"].display = name
 
         if name.startswith("\\\\?\\"):
             name = name.replace("\\\\?\\", "")
@@ -6394,11 +7678,11 @@ class Kernel32(api.ApiHandler):
         return dm.get_drive_type(name)
 
     @apihook("GetExitCodeProcess", argc=2)
-    def GetExitCodeProcess(self, emu, argv, ctx: api.ApiContext = None):
+    def GetExitCodeProcess(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetExitCodeProcess(
-        HANDLE  hProcess,
-        LPDWORD lpExitCode
+            HANDLE hProcess,
+            LPDWORD lpExitCode
         );
         """
         hProcess, lpExitCode = argv
@@ -6407,39 +7691,41 @@ class Kernel32(api.ApiHandler):
         return 1
 
     @apihook("SetThreadPriority", argc=2)
-    def SetThreadPriority(self, emu, argv, ctx: api.ApiContext = None):
+    def SetThreadPriority(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetThreadPriority(
-        HANDLE hThread,
-        int    nPriority
+            HANDLE hThread,
+            int nPriority
         );
         """
         return 1
 
     @apihook("ReleaseMutex", argc=1)
-    def ReleaseMutex(self, emu, argv, ctx: api.ApiContext = None):
+    def ReleaseMutex(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL ReleaseMutex(
             HANDLE hMutex
         );
+
+        Speakeasy does not model the owner or the count of a mutex.
         """
         return 1
 
     @apihook("GetShortPathName", argc=3)
-    def GetShortPathName(self, emu, argv, ctx: api.ApiContext = None):
+    def GetShortPathName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DWORD GetShortPathNameW(
-          LPCWSTR lpszLongPath,
-          LPWSTR  lpszShortPath,
-          DWORD   cchBuffer
+        DWORD GetShortPathName(
+            LPCTSTR lpszLongPath,
+            LPTSTR lpszShortPath,
+            DWORD cchBuffer
         );
+
         https://en.wikipedia.org/wiki/8.3_filename#VFAT_and_Computer-generated_8.3_filenames
         """
-        ctx = ctx or {}
         lpszLongPath, lpszShortPath, cchBuffer = argv
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         s = self.read_mem_string(lpszLongPath, cw)
-        argv[0] = s
+        ctx.args["lpszLongPath"].display = s
         files = s.split("\\")
         out = files[0] + "\\"
         for i, file in enumerate(files):
@@ -6470,163 +7756,218 @@ class Kernel32(api.ApiHandler):
                 out += "\\"
 
         if lpszShortPath and len(out) + 1 <= cchBuffer:
-            argv[1] = out
+            ctx.args["lpszShortPath"].display = out
             self.write_mem_string(out, lpszShortPath, cw)
+            return len(out)
 
         return len(out) + 1
 
     @apihook("GetLongPathName", argc=3)
-    def GetLongPathName(self, emu, argv, ctx: api.ApiContext = None):
+    def GetLongPathName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DWORD GetLongPathNameA(
-          LPCSTR lpszShortPath,
-          LPSTR  lpszLongPath,
-          DWORD  cchBuffer
+        DWORD GetLongPathName(
+            LPCTSTR lpszShortPath,
+            LPTSTR lpszLongPath,
+            DWORD cchBuffer
         );
         """
-        ctx = ctx or {}
         lpszShortPath, lpszLongPath, cchBuffer = argv
 
         # Not an accurate implementation, just a placeholder for now
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         s = self.read_mem_string(lpszShortPath, cw)
-        argv[0] = s
+        ctx.args["lpszShortPath"].display = s
+
+        if not lpszLongPath or cchBuffer <= len(s):
+            return len(s) + 1
 
         self.write_mem_string(s, lpszLongPath, cw)
-        argv[1] = s
+        ctx.args["lpszLongPath"].display = s
 
-        return len(s) * cw + 1
+        return len(s)
 
     @apihook("QueueUserAPC", argc=3)
-    def QueueUserAPC(self, emu, argv, ctx: api.ApiContext = None):
+    def QueueUserAPC(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD QueueUserAPC(
-        PAPCFUNC  pfnAPC,
-        HANDLE    hThread,
-        ULONG_PTR dwData
+            PAPCFUNC pfnAPC,
+            HANDLE hThread,
+            ULONG_PTR dwData
         );
         """
         pfnAPC, hThread, dwData = argv
-        thread_obj = self.get_object_from_handle(hThread)
+        thread_obj = emu.get_object_from_handle(hThread)
         if (
             thread_obj is not None
-            and thread_obj.process in emu.child_processes
+            and getattr(thread_obj, "process", None) in emu.child_processes
             and not emu.child_execution.allow_execution
         ):
             return 0
-        run_type = f"apc_thread_{hThread:x}"
-        self.create_thread(pfnAPC, dwData, 0, thread_type=run_type)
+        self.create_thread(pfnAPC, dwData, 0, name="apc")
+        return 1
 
     @apihook("DuplicateHandle", argc=7)
-    def DuplicateHandle(self, emu, argv, ctx: api.ApiContext = None):
+    def DuplicateHandle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL DuplicateHandle(
-          HANDLE   hSourceProcessHandle,
-          HANDLE   hSourceHandle,
-          HANDLE   hTargetProcessHandle,
-          LPHANDLE lpTargetHandle,
-          DWORD    dwDesiredAccess,
-          BOOL     bInheritHandle,
-          DWORD    dwOptions
-        )
+            HANDLE hSourceProcessHandle,
+            HANDLE hSourceHandle,
+            HANDLE hTargetProcessHandle,
+            LPHANDLE lpTargetHandle,
+            DWORD dwDesiredAccess,
+            BOOL bInheritHandle,
+            DWORD dwOptions
+        );
         """
+        (
+            hSourceProcessHandle,
+            hSourceHandle,
+            hTargetProcessHandle,
+            lpTargetHandle,
+            dwDesiredAccess,
+            bInheritHandle,
+            dwOptions,
+        ) = argv
+        source = self._get_process_handle_table(emu, hSourceProcessHandle)
+        target = self._get_process_handle_table(emu, hTargetProcessHandle)
+        if source is None or target is None:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        if self.is_std_handle(emu, hSourceHandle):
+            # A standard handle has no object, so its duplicate is the same value
+            hnd = hSourceHandle
+        else:
+            obj = source.get(hSourceHandle)
+            if obj is None:
+                emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+                return 0
+            hnd = target.new_handle(obj)
+            if dwOptions & DUPLICATE_CLOSE_SOURCE:
+                source.close(hSourceHandle)
+
+        if lpTargetHandle:
+            self.write_ptr(lpTargetHandle, hnd)
+        emu.set_last_error(windefs.ERROR_SUCCESS)
         return 1
 
     @apihook("GetBinaryType", argc=2)
-    def GetBinaryType(self, emu, argv, ctx: api.ApiContext = None):
+    def GetBinaryType(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL GetBinaryTypeA(
-          LPCSTR  lpApplicationName,
-          LPDWORD lpBinaryType
+        BOOL GetBinaryType(
+            LPCTSTR lpApplicationName,
+            LPDWORD lpBinaryType
         );
         """
         return 0
 
     @apihook("GetThreadUILanguage", argc=0)
-    def GetThreadUILanguage(self, emu, argv, ctx: api.ApiContext = None):
+    def GetThreadUILanguage(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LANGID GetThreadUILanguage();
         """
         return 0xFFFF
 
     @apihook("SetConsoleHistoryInfo", argc=1)
-    def SetConsoleHistoryInfo(self, emu, argv, ctx: api.ApiContext = None):
+    def SetConsoleHistoryInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL WINAPI SetConsoleHistoryInfo(
-          _In_ PCONSOLE_HISTORY_INFO lpConsoleHistoryInfo
+        BOOL SetConsoleHistoryInfo(
+            PCONSOLE_HISTORY_INFO lpConsoleHistoryInfo
         );
         """
         return 1
 
     @apihook("GetFileInformationByHandle", argc=2)
-    def GetFileInformationByHandle(self, emu, argv, ctx: api.ApiContext = None):
+    def GetFileInformationByHandle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetFileInformationByHandle(
-          HANDLE                       hFile,
-          LPBY_HANDLE_FILE_INFORMATION lpFileInformation
+            HANDLE hFile,
+            LPBY_HANDLE_FILE_INFORMATION lpFileInformation
         );
         """
-        return 0
+        hFile, lpFileInformation = argv
+
+        f = self.get_file(hFile)
+        if not f:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
+
+        info = k32defs.BY_HANDLE_FILE_INFORMATION(emu.get_ptr_size())
+        if f.is_dir or emu.get_file_manager().is_directory(f.path):
+            info.dwFileAttributes = windefs.FILE_ATTRIBUTE_DIRECTORY
+        else:
+            info.dwFileAttributes = windefs.FILE_ATTRIBUTE_ARCHIVE
+            size = f.get_size()
+            info.nFileSizeHigh = 0xFFFFFFFF & (size >> 32)
+            info.nFileSizeLow = 0xFFFFFFFF & size
+        timestamp = self.get_system_time()
+        for ft in (info.ftCreationTime, info.ftLastAccessTime, info.ftLastWriteTime):
+            ft.dwLowDateTime = 0xFFFFFFFF & timestamp
+            ft.dwHighDateTime = timestamp >> 32
+        info.dwVolumeSerialNumber = VOLUME_SERIAL_NUMBER
+        info.nNumberOfLinks = 1
+        info.nFileIndexLow = zlib.crc32(f.path.lower().encode("utf-8"))
+        self.mem_write(lpFileInformation, info.get_bytes())
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return 1
 
     @apihook("GetCommProperties", argc=2)
-    def GetCommProperties(self, emu, argv, ctx: api.ApiContext = None):
+    def GetCommProperties(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetCommProperties(
-          HANDLE     hFile,
-          LPCOMMPROP lpCommProp
+            HANDLE hFile,
+            LPCOMMPROP lpCommProp
         );
         """
         return 0
 
     @apihook("GetCommTimeouts", argc=2)
-    def GetCommTimeouts(self, emu, argv, ctx: api.ApiContext = None):
+    def GetCommTimeouts(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetCommTimeouts(
-          HANDLE         hFile,
-          LPCOMMTIMEOUTS lpCommTimeouts
+            HANDLE hFile,
+            LPCOMMTIMEOUTS lpCommTimeouts
         );
         """
         return 0
 
     @apihook("AddAtom", argc=1)
-    def AddAtom(self, emu, argv, ctx: api.ApiContext = None):
+    def AddAtom(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        ATOM AddAtomW(
-          LPCWSTR lpString
+        ATOM AddAtom(
+            LPCTSTR lpString
         );
         """
-        ctx = ctx or {}
         ATOM_RESERVED = 0xC000
         (lpString,) = argv
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         s = self.read_mem_string(lpString, cw)
         if len(s) == 0:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return 0
 
-        argv[0] = s
+        ctx.args["lpString"].display = s
         if s[0] == "#" and int(s[1:]) < ATOM_RESERVED:
             return int(s[1:])
 
         return self.add_local_atom(s)
 
     @apihook("FindAtom", argc=1)
-    def FindAtom(self, emu, argv, ctx: api.ApiContext = None):
+    def FindAtom(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        ATOM FindAtomA(
-          LPCSTR lpString
+        ATOM FindAtom(
+            LPCTSTR lpString
         );
         """
-        ctx = ctx or {}
         ATOM_RESERVED = 0xC000
         (lpString,) = argv
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         s = self.read_mem_string(lpString, cw)
         if len(s) == 0:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return 0
 
-        argv[0] = s
+        ctx.args["lpString"].display = s
         if s[0] == "#" and int(s[1:]) < ATOM_RESERVED:
             return int(s[1:])
 
@@ -6638,18 +7979,17 @@ class Kernel32(api.ApiHandler):
         return atom
 
     @apihook("GetAtomName", argc=3)
-    def GetAtomName(self, emu, argv, ctx: api.ApiContext = None):
+    def GetAtomName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        UINT GetAtomNameA(
-          ATOM  nAtom,
-          LPSTR lpBuffer,
-          int   nSize
+        UINT GetAtomName(
+            ATOM nAtom,
+            LPTSTR lpBuffer,
+            int nSize
         );
         """
-        ctx = ctx or {}
         ATOM_RESERVED = 0xC000
         nAtom, lpBuffer, nSize = argv
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         if nAtom < ATOM_RESERVED:
             s = f"#{nAtom}"
         elif nAtom not in self.local_atom_table:
@@ -6658,7 +7998,7 @@ class Kernel32(api.ApiHandler):
         else:
             s = self.get_local_atom_name(nAtom)
 
-        argv[1] = s
+        ctx.args["lpBuffer"].display = s
         s += "\0"
         if len(s) > nSize:
             s = s[: nSize - 1] + "\0"
@@ -6667,10 +8007,10 @@ class Kernel32(api.ApiHandler):
         return len(s) - 1
 
     @apihook("DeleteAtom", argc=1)
-    def DeleteAtom(self, emu, argv, ctx: api.ApiContext = None):
+    def DeleteAtom(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         ATOM DeleteAtom(
-          ATOM nAtom
+            ATOM nAtom
         );
         """
         ATOM_RESERVED = 0xC000
@@ -6686,196 +8026,193 @@ class Kernel32(api.ApiHandler):
         return nAtom
 
     @apihook("GetProcessHandleCount", argc=2)
-    def GetProcessHandleCount(self, emu, argv, ctx: api.ApiContext = None):
+    def GetProcessHandleCount(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetProcessHandleCount(
-          HANDLE hProcess,
-          PDWORD pdwHandleCount
+            HANDLE hProcess,
+            PDWORD pdwHandleCount
         );
         """
         return 0
 
     @apihook("GetMailslotInfo", argc=5)
-    def GetMailslotInfo(self, emu, argv, ctx: api.ApiContext = None):
+    def GetMailslotInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetMailslotInfo(
-          HANDLE  hMailslot,
-          LPDWORD lpMaxMessageSize,
-          LPDWORD lpNextSize,
-          LPDWORD lpMessageCount,
-          LPDWORD lpReadTimeout
+            HANDLE hMailslot,
+            LPDWORD lpMaxMessageSize,
+            LPDWORD lpNextSize,
+            LPDWORD lpMessageCount,
+            LPDWORD lpReadTimeout
         );
         """
         return 0
 
     @apihook("RtlZeroMemory", argc=2)
-    def RtlZeroMemory(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlZeroMemory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void RtlZeroMemory(
-            void*  Destination,
+            void *Destination,
             size_t Length
         );
         """
-        dest, length = argv
-        buf = b"\x00" * length
-        self.mem_write(dest, buf)
+        Destination, Length = argv
+        buf = b"\x00" * Length
+        self.mem_write(Destination, buf)
 
     @apihook("RtlMoveMemory", argc=3)
-    def RtlMoveMemory(self, emu, argv, ctx: api.ApiContext = None):
+    def RtlMoveMemory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void RtlMoveMemory(void* pvDest, const void *pSrc, size_t Length);
+        void RtlMoveMemory(
+            void *Destination,
+            const void *Source,
+            size_t Length
+        );
         """
-        dest, source, length = argv
-        buf = self.mem_read(source, length)
-        self.mem_write(dest, buf)
+        Destination, Source, Length = argv
+        buf = self.mem_read(Source, Length)
+        self.mem_write(Destination, buf)
 
     @apihook("QueryPerformanceFrequency", argc=1)
-    def QueryPerformanceFrequency(self, emu, argv, ctx: api.ApiContext = None):
+    def QueryPerformanceFrequency(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL QueryPerformanceFrequency(
             LARGE_INTEGER *lpFrequency
         );
         """
-        lpFrequency = argv[0]
-        self.mem_write(lpFrequency, (10000000).to_bytes(8, "little"))
+        (lpFrequency,) = argv
+        self.write_qword(lpFrequency, windefs.PERF_FREQUENCY)
         return 1
 
     @apihook("FindFirstVolume", argc=2)
-    def FindFirstVolume(self, emu, argv, ctx: api.ApiContext = None):
+    def FindFirstVolume(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HANDLE FindFirstVolumeW(
-          LPWSTR lpszVolumeName,
-          DWORD  cchBufferLength
+        HANDLE FindFirstVolume(
+            LPTSTR lpszVolumeName,
+            DWORD cchBufferLength
         );
         """
-        ctx = ctx or {}
-        lpszVolumeName, _ = argv
+        lpszVolumeName, cchBufferLength = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
         dm = emu.get_drive_manager()
-        dw = dm.walk_drives()
-        hnd = self.get_handle()
-        self.find_volumes.update({hnd: {"walker": dw}})
+        dw = (d.volume_guid_path for d in dm.walk_drives() if d.volume_guid_path)
 
         # Each drive contains a single volume
-        curr_drive = next(dw)
-        if curr_drive:
-            volume_guid_path = curr_drive.get("volume_guid_path")
-            argv[0] = volume_guid_path
+        volume_guid_path = next(dw, None)
+        if volume_guid_path is None:
+            emu.set_last_error(windefs.ERROR_NO_MORE_FILES)
+            return self.get_max_int()
 
-            self.write_mem_string(volume_guid_path + "\x00", lpszVolumeName, cw)
+        hnd = self.find_volumes.new_handle({"walker": dw})
+        ctx.args["lpszVolumeName"].display = volume_guid_path
+        self.write_mem_string(volume_guid_path + "\x00", lpszVolumeName, cw)
 
         return hnd
 
     @apihook("FindNextVolume", argc=3)
-    def FindNextVolume(self, emu, argv, ctx: api.ApiContext = None):
+    def FindNextVolume(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL FindNextVolumeW(
-          HANDLE hFindVolume,
-          LPWSTR lpszVolumeName,
-          DWORD  cchBufferLength
+        BOOL FindNextVolume(
+            HANDLE hFindVolume,
+            LPTSTR lpszVolumeName,
+            DWORD cchBufferLength
         );
         """
-        ctx = ctx or {}
         hFindVolume, lpszVolumeName, cchBufferLength = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
         dsearch = self.find_volumes.get(hFindVolume)
         if not hFindVolume or not dsearch:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
         # Get next drive; each drive contains one volume
-        walker = dsearch.get("walker")
+        walker = dsearch["walker"]
         try:
-            next_drive = next(walker)
+            volume_guid_path = next(walker)
         except StopIteration:
             emu.set_last_error(windefs.ERROR_NO_MORE_FILES)
             return 0
 
-        volume_guid_path = next_drive.get("volume_guid_path")
-        argv[1] = volume_guid_path
+        ctx.args["lpszVolumeName"].display = volume_guid_path
         self.write_mem_string(volume_guid_path + "\x00", lpszVolumeName, cw)
 
         return 1
 
     @apihook("FindVolumeClose", argc=1)
-    def FindVolumeClose(self, emu, argv, ctx: api.ApiContext = None):
+    def FindVolumeClose(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL FindVolumeClose(
-          HANDLE hFindVolume
+            HANDLE hFindVolume
         );
         """
         (hFindVolume,) = argv
-
-        try:
-            self.find_volumes.pop(hFindVolume)
-        except KeyError:
+        if not self.find_volumes.close(hFindVolume):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
         return 1
 
     @apihook("CreateIoCompletionPort", argc=4)
-    def CreateIoCompletionPort(self, emu, argv, ctx: api.ApiContext = None):
+    def CreateIoCompletionPort(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HANDLE WINAPI CreateIoCompletionPort(
-          _In_     HANDLE    FileHandle,
-          _In_opt_ HANDLE    ExistingCompletionPort,
-          _In_     ULONG_PTR CompletionKey,
-          _In_     DWORD     NumberOfConcurrentThreads
+        HANDLE CreateIoCompletionPort(
+            HANDLE FileHandle,
+            HANDLE ExistingCompletionPort,
+            ULONG_PTR CompletionKey,
+            DWORD NumberOfConcurrentThreads
         );
         """
         FileHandle, ExistingCompletionPort, CompletionKey, NumberOfConcurrentThreads = argv
 
         # TODO: Implement completion port creation
-        hnd = self.get_handle()
+        hnd = emu.get_handle_table().new_handle(IoCompletionPort())
 
         return hnd
 
     @apihook("GetVolumePathNamesForVolumeName", argc=4)
-    def GetVolumePathNamesForVolumeName(self, emu, argv, ctx: api.ApiContext = None):
+    def GetVolumePathNamesForVolumeName(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
-        BOOL GetVolumePathNamesForVolumeNameW(
-          LPCWSTR lpszVolumeName,
-          LPWCH   lpszVolumePathNames,
-          DWORD   cchBufferLength,
-          PDWORD  lpcchReturnLength
+        BOOL GetVolumePathNamesForVolumeName(
+            LPCTSTR lpszVolumeName,
+            LPTCH lpszVolumePathNames,
+            DWORD cchBufferLength,
+            PDWORD lpcchReturnLength
         );
         """
-        ctx = ctx or {}
         lpszVolumeName, lpszVolumePathNames, cchBufferLength, lpcchReturnLength = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
         volume_guid_path = self.read_mem_string(lpszVolumeName, cw)
         if volume_guid_path:
-            argv[0] = volume_guid_path
-
-        ERROR_MORE_DATA = 234
+            ctx.args["lpszVolumeName"].display = volume_guid_path
 
         rv = 1
         dm = emu.get_drive_manager()
         drive = dm.get_drive(volume_guid_path=volume_guid_path)
         if drive:
-            root_path = drive.get("root_path")
-            argv[1] = root_path
-            root_path += "\x00\x00"  # additional NULL to terminate list
+            root_path = drive.root_path
+            names = root_path + "\x00\x00"  # additional NULL to terminate list
 
-            root_path_len = len(root_path)
-            argv[3] = root_path_len
-
-            if lpszVolumePathNames and cchBufferLength >= root_path_len:
-                self.write_mem_string(root_path, lpszVolumePathNames, cw)
+            if lpszVolumePathNames and cchBufferLength >= len(names):
+                self.write_mem_string(names, lpszVolumePathNames, cw)
+                ctx.args["lpszVolumePathNames"].display = root_path
             else:
-                emu.set_last_error(ERROR_MORE_DATA)
+                emu.set_last_error(windefs.ERROR_MORE_DATA)
                 rv = 0
-            self.mem_write(lpcchReturnLength, root_path_len.to_bytes(4, "little"))
+            if lpcchReturnLength:
+                self.write_dword(lpcchReturnLength, len(names))
 
         return rv
 
     @apihook("GetLogicalDrives", argc=0)
-    def GetLogicalDrives(self, emu, argv, ctx: api.ApiContext = None):
+    def GetLogicalDrives(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetLogicalDrives();
         """
@@ -6887,20 +8224,57 @@ class Kernel32(api.ApiHandler):
 
         return rv
 
-    @apihook("GlobalMemoryStatus", argc=1)
-    def GlobalMemoryStatus(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("GetLogicalDriveStrings", argc=2)
+    def GetLogicalDriveStrings(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void GlobalMemoryStatus(
-        LPMEMORYSTATUS lpBuffer
+        DWORD GetLogicalDriveStrings(
+            DWORD nBufferLength,
+            LPTSTR lpBuffer
         );
         """
-        return
+        nBufferLength, lpBuffer = argv
+        cw = _char_width(self, ctx)
+        dm = emu.get_drive_manager()
+        roots = "".join(f"{dl}:\\\0" for dl in string.ascii_uppercase if dl in dm.drive_letters)
+        if nBufferLength <= len(roots) or not lpBuffer:
+            return len(roots) + 1
+        self.write_mem_string(roots + "\0", lpBuffer, cw)
+        return len(roots)
+
+    @apihook("GlobalMemoryStatus", argc=1)
+    def GlobalMemoryStatus(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        VOID GlobalMemoryStatus(
+            LPMEMORYSTATUS lpBuffer
+        );
+        """
+        (lpBuffer,) = argv
+        GB = 1024 * 1024 * 1024
+        total_virtual = 0x7FFE0000 if emu.get_ptr_size() == 4 else 0x7FFFFFFE0000
+        sizes = [8 * GB, 5 * GB, 8 * GB, 4 * GB, total_virtual, total_virtual - 0x10000000]
+        limits = [self.get_max_int()] * len(sizes)
+        if emu.get_ptr_size() == 4 and not self.is_large_address_aware(emu):
+            # Windows reports at most 2 GB of memory and address space to these images
+            limits[0:2] = limits[4:6] = [0x7FFFFFFF] * 2
+        fmt = "<II" + ("I" if emu.get_ptr_size() == 4 else "Q") * len(sizes)
+        buf = struct.pack(fmt, struct.calcsize(fmt), 80, *(min(n, lim) for n, lim in zip(sizes, limits)))
+        emu.mem_write(lpBuffer, buf)
+
+    def is_large_address_aware(self, emu):
+        proc = emu.get_current_process()
+        base = proc.base if proc else 0
+        if not base or not emu.is_address_valid(base + 0x3C):
+            return False
+        characteristics = base + self.read_dword(base + 0x3C) + 0x16
+        if not emu.is_address_valid(characteristics):
+            return False
+        return bool(int.from_bytes(emu.mem_read(characteristics, 2), "little") & IMAGE_FILE_LARGE_ADDRESS_AWARE)
 
     @apihook("GlobalMemoryStatusEx", argc=1)
-    def GlobalMemoryStatusEx(self, emu, argv, ctx: api.ApiContext = None):
+    def GlobalMemoryStatusEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void GlobalMemoryStatusEx(
-        LPMEMORYSTATUSEX lpBuffer
+        BOOL GlobalMemoryStatusEx(
+            LPMEMORYSTATUSEX lpBuffer
         );
 
         typedef struct _MEMORYSTATUSEX {
@@ -6915,6 +8289,10 @@ class Kernel32(api.ApiHandler):
             DWORDLONG ullAvailExtendedVirtual;
         } MEMORYSTATUSEX, *LPMEMORYSTATUSEX;
         """
+        (lpBuffer,) = argv
+        if self.mem_read(lpBuffer, 4) != struct.pack("<I", 64):
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
         GB = 1024 * 1024 * 1024
         buf = struct.pack(
             "<IIQQQQQQQ",
@@ -6926,173 +8304,244 @@ class Kernel32(api.ApiHandler):
             4 * GB,  # ullAvailPageFile
             8 * GB,  # ullTotalVirtual
             7 * GB,  # ullAvailVirtual
-            16 * GB,
-        )  # ullAvailExtendedVirtual
+            0,  # ullAvailExtendedVirtual
+        )
 
-        emu.mem_write(argv[0], buf)
-        return
+        emu.mem_write(lpBuffer, buf)
+        return 1
 
     @apihook("GetDiskFreeSpaceEx", argc=4)
-    def GetDiskFreeSpaceEx(self, emu, argv, ctx: api.ApiContext = None):
+    def GetDiskFreeSpaceEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetDiskFreeSpaceEx(
-        LPCSTR          lpDirectoryName,
-        PULARGE_INTEGER lpFreeBytesAvailableToCaller,
-        PULARGE_INTEGER lpTotalNumberOfBytes,
-        PULARGE_INTEGER lpTotalNumberOfFreeBytes
+            LPCTSTR lpDirectoryName,
+            PULARGE_INTEGER lpFreeBytesAvailableToCaller,
+            PULARGE_INTEGER lpTotalNumberOfBytes,
+            PULARGE_INTEGER lpTotalNumberOfFreeBytes
         );
         """
+        lpDirectoryName, lpFreeBytesAvailableToCaller, lpTotalNumberOfBytes, lpTotalNumberOfFreeBytes = argv
+        GB = 1024 * 1024 * 1024
+        for ptr, size in (
+            (lpFreeBytesAvailableToCaller, 40 * GB),
+            (lpTotalNumberOfBytes, 100 * GB),
+            (lpTotalNumberOfFreeBytes, 40 * GB),
+        ):
+            if ptr:
+                self.write_qword(ptr, size)
         return True
 
     @apihook("GetSystemDefaultLangID", argc=0)
-    def GetSystemDefaultLangID(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSystemDefaultLangID(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LANGID GetSystemDefaultLangID();
         """
         return True
 
     @apihook("ResetEvent", argc=1)
-    def ResetEvent(self, emu, argv, ctx: api.ApiContext = None):
+    def ResetEvent(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL ResetEvent(
-        HANDLE hEvent
+            HANDLE hEvent
         );
         """
+        (hEvent,) = argv
+
+        obj = emu.get_handle_table().get(hEvent, objman.Event)
+        if not obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
+        obj.signaled = False
         return True
 
     @apihook("WaitForMultipleObjects", argc=4)
-    def WaitForMultipleObjects(self, emu, argv, ctx: api.ApiContext = None):
+    def WaitForMultipleObjects(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD WaitForMultipleObjects(
-        DWORD        nCount,
-        const HANDLE *lpHandles,
-        BOOL         bWaitAll,
-        DWORD        dwMilliseconds
+            DWORD nCount,
+            const HANDLE *lpHandles,
+            BOOL bWaitAll,
+            DWORD dwMilliseconds
         );
         """
+        nCount, lpHandles, bWaitAll, dwMilliseconds = argv
+
+        ptr_size = emu.get_ptr_size()
+        table = emu.get_handle_table()
+        objs: list[Any] = []
+        if lpHandles:
+            for i in range(nCount):
+                hnd = self.read_ptr(lpHandles + i * ptr_size)
+                if self.is_std_handle(emu, hnd):
+                    objs.append(None)
+                    continue
+                obj = table.get(hnd)
+                if obj is None:
+                    emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+                    return windefs.WAIT_FAILED
+                objs.append(obj)
+
+        if objs and all(isinstance(obj, objman.Event) for obj in objs):
+            return self.wait_for_events(emu, objs, bool(bWaitAll), dwMilliseconds)
         return 0
 
-    @apihook("GetComputerNameEx", argc=3)
-    def GetComputerNameEx(self, emu, argv, ctx: api.ApiContext = None):
+    def wait_for_events(self, emu, events, wait_all, timeout):
         """
-        BOOL GetComputerNameExA(
-          COMPUTER_NAME_FORMAT NameType,
-          LPSTR                lpBuffer,
-          LPDWORD              nSize
+        Wait on event objects. Threads run one after another, so the wait times out only
+        when the timeout is finite and no queued run is left that could set an event.
+        """
+        if wait_all:
+            ready = events if all(evt.signaled for evt in events) else []
+            rv = windefs.WAIT_OBJECT_0
+        else:
+            index = next((i for i, evt in enumerate(events) if evt.signaled), None)
+            ready = [] if index is None else [events[index]]
+            rv = windefs.WAIT_OBJECT_0 + (index or 0)
+
+        if ready:
+            for evt in ready:
+                if not evt.manual_reset:
+                    evt.signaled = False
+            return rv
+
+        if timeout != 0xFFFFFFFF and not emu.run_queue:
+            self.advance_clock(timeout)
+            return windefs.WAIT_TIMEOUT
+        return windefs.WAIT_OBJECT_0
+
+    @apihook("GetComputerNameEx", argc=3)
+    def GetComputerNameEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL GetComputerNameEx(
+            COMPUTER_NAME_FORMAT NameType,
+            LPTSTR lpBuffer,
+            LPDWORD nSize
         );
         """
-        ctx = ctx or {}
         NameType, lpBuffer, nSize = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
-        name_type = k32types.get_define(NameType, prefix="ComputerName")
-        if name_type:
-            argv[0] = name_type
+        ctx.args["NameType"].display = decode(COMPUTER_NAME_FORMAT, NameType)
 
-        hostname = emu.config.hostname
-        argv[1] = hostname
-
-        hostname_len = len(hostname)
-        argv[2] = hostname_len
+        hostname = emu.config.system.hostname
+        size = self.read_dword(nSize)
+        if not lpBuffer or size <= len(hostname):
+            self.write_dword(nSize, len(hostname) + 1)
+            emu.set_last_error(windefs.ERROR_MORE_DATA)
+            return 0
 
         self.write_mem_string(hostname, lpBuffer, cw)
-        self.mem_write(nSize, hostname_len.to_bytes(4, "little"))
-
+        self.write_dword(nSize, len(hostname))
+        ctx.args["lpBuffer"].display = hostname
         return 1
 
     @apihook("GetDateFormat", argc=6)
-    def GetDateFormat(self, emu, argv, ctx: api.ApiContext = None):
+    def GetDateFormat(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int GetDateFormatA(
-          LCID             Locale,
-          DWORD            dwFlags,
-          const SYSTEMTIME *lpDate,
-          LPCSTR           lpFormat,
-          LPSTR            lpDateStr,
-          int              cchDate
+        int GetDateFormat(
+            LCID Locale,
+            DWORD dwFlags,
+            const SYSTEMTIME *lpDate,
+            LPCTSTR lpFormat,
+            LPTSTR lpDateStr,
+            int cchDate
         );
         """
-        ctx = ctx or {}
         Locale, dwFlags, lpDate, lpFormat, lpDateStr, cchDate = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
-        locale = k32types.get_define(Locale, prefix="LOCALE_")
-        if locale:
-            argv[0] = locale
+        ctx.args["Locale"].display = decode(LCID, Locale)
 
-        if lpDate == 0:
-            self.GetSystemTimeAsFileTime(emu, [lpDate], ctx)
-
-        sys_time = self.k32types.SYSTEMTIME(emu.get_ptr_size())
-        sys_time = self.mem_cast(sys_time, lpDate)
-
-        date_format = self.read_mem_string(lpFormat, cw)
-        if date_format:
-            argv[3] = date_format
+        if lpFormat:
+            date_format = self.read_mem_string(lpFormat, cw)
+            if date_format:
+                ctx.args["lpFormat"].display = date_format
+        else:
+            # Using this as default; TODO: use proper string based on locale
+            date_format = "MM/dd/yyyy"
 
         # Working from example "ddd, dd MMM yyyy "; TODO: expand this
-        date = datetime.date(sys_time.wYear, sys_time.wMonth, sys_time.wDay)
         date_format = date_format.replace("ddd", "%a")
         date_format = date_format.replace("dd", "%d")
         date_format = date_format.replace("MMM", "%b")
+        date_format = date_format.replace("MM", "%m")
         date_format = date_format.replace("yyyy", "%Y")
 
         try:
+            if lpDate:
+                sys_time = self.k32types.SYSTEMTIME(emu.get_ptr_size())
+                sys_time = self.mem_cast(sys_time, lpDate)
+                date = datetime.date(sys_time.wYear, sys_time.wMonth, sys_time.wDay)
+            else:
+                date = self.get_local_time().date()
             date_str = date.strftime(date_format)
         except Exception:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return 0
-        else:
-            if cchDate == 0:
-                return len(date_str) + 1
 
-            self.write_mem_string(date_str + "\x00" * cw, lpDateStr, cw)
-            argv[4] = date_str
+        if cchDate == 0:
+            return len(date_str) + 1
+        if cchDate <= len(date_str):
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            return 0
 
-        return 1
+        self.write_mem_string(date_str, lpDateStr, cw)
+        ctx.args["lpDateStr"].display = date_str
+
+        return len(date_str) + 1
 
     @apihook("DeviceIoControl", argc=8)
-    def DeviceIoControl(self, emu, argv, ctx: api.ApiContext = None):
+    def DeviceIoControl(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL DeviceIoControl(
-            HANDLE       hDevice,
-            DWORD        dwIoControlCode,
-            LPVOID       lpInBuffer,
-            DWORD        nInBufferSize,
-            LPVOID       lpOutBuffer,
-            DWORD        nOutBufferSize,
-            LPDWORD      lpBytesReturned,
+            HANDLE hDevice,
+            DWORD dwIoControlCode,
+            LPVOID lpInBuffer,
+            DWORD nInBufferSize,
+            LPVOID lpOutBuffer,
+            DWORD nOutBufferSize,
+            LPDWORD lpBytesReturned,
             LPOVERLAPPED lpOverlapped
         );
         """
-        hnd, ioctl, InputBuffer, in_len, out_buf, out_len, bytes_ret, overlap = argv  # noqa
+        (
+            hDevice,
+            dwIoControlCode,
+            lpInBuffer,
+            nInBufferSize,
+            lpOutBuffer,
+            nOutBufferSize,
+            lpBytesReturned,
+            lpOverlapped,
+        ) = argv
         nts = ddk.STATUS_SUCCESS
         out_written = 0
 
-        if bytes_ret:
-            self.mem_write(bytes_ret, (0).to_bytes(4, "little"))
+        if lpBytesReturned:
+            self.write_dword(lpBytesReturned, 0)
 
-        obj = self.get_object_from_handle(hnd)
+        obj = emu.get_handle_table().get(hDevice)
         if not obj:
             emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
             return 0
 
         in_buf = b""
-        if InputBuffer:
-            in_buf = self.mem_read(InputBuffer, in_len)
+        if lpInBuffer:
+            in_buf = self.mem_read(lpInBuffer, nInBufferSize)
 
-        nts, outbuf = emu.dev_ioctl(emu.get_ptr_size(), obj, ioctl, in_buf)
+        nts, outbuf = emu.dev_ioctl(emu.get_ptr_size(), obj, dwIoControlCode, in_buf)
 
-        if out_buf:
-            if out_len < len(outbuf):
+        if lpOutBuffer:
+            if nOutBufferSize < len(outbuf):
                 nts = ddk.STATUS_BUFFER_TOO_SMALL
             else:
-                self.mem_write(out_buf, outbuf)
+                self.mem_write(lpOutBuffer, outbuf)
                 out_written = len(outbuf)
 
-        if bytes_ret:
-            self.mem_write(bytes_ret, out_written.to_bytes(4, "little"))
+        if lpBytesReturned:
+            self.write_dword(lpBytesReturned, out_written)
 
         if nts == ddk.STATUS_SUCCESS:
             emu.set_last_error(windefs.ERROR_SUCCESS)
@@ -7107,66 +8556,67 @@ class Kernel32(api.ApiHandler):
         return 0
 
     @apihook("GetTimeFormat", argc=6)
-    def GetTimeFormat(self, emu, argv, ctx: api.ApiContext = None):
+    def GetTimeFormat(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        int GetTimeFormatA(
-          LCID             Locale,
-          DWORD            dwFlags,
-          const SYSTEMTIME *lpTime,
-          LPCSTR           lpFormat,
-          LPSTR            lpTimeStr,
-          int              cchTime
+        int GetTimeFormat(
+            LCID Locale,
+            DWORD dwFlags,
+            const SYSTEMTIME *lpTime,
+            LPCTSTR lpFormat,
+            LPTSTR lpTimeStr,
+            int cchTime
         );
         """
-        ctx = ctx or {}
         Locale, dwFlags, lpTime, lpFormat, lpTimeStr, cchTime = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
-        locale = k32types.get_define(Locale, prefix="LOCALE_")
-        if locale:
-            argv[0] = locale
-
-        if lpTime == 0:
-            self.GetSystemTimeAsFileTime(emu, [lpTime], ctx)
-
-        sys_time = self.k32types.SYSTEMTIME(emu.get_ptr_size())
-        sys_time = self.mem_cast(sys_time, lpTime)
+        ctx.args["Locale"].display = decode(LCID, Locale)
 
         if lpFormat:
             time_format = self.read_mem_string(lpFormat, cw)
             if time_format:
-                argv[3] = time_format
+                ctx.args["lpFormat"].display = time_format
         else:
             # Using this as default; TODO: use proper string based on locale
             time_format = "hh:mm:ss"
 
         # Working from "hh:mm:ss"; TODO: expand this
-        t = datetime.time(hour=sys_time.wHour, minute=sys_time.wMinute, second=sys_time.wSecond)
         time_format = time_format.replace("hh", "%I")
         time_format = time_format.replace("HH", "%H")
         time_format = time_format.replace("mm", "%M")
         time_format = time_format.replace("ss", "%S")
 
         try:
+            if lpTime:
+                sys_time = self.k32types.SYSTEMTIME(emu.get_ptr_size())
+                sys_time = self.mem_cast(sys_time, lpTime)
+                t = datetime.time(hour=sys_time.wHour, minute=sys_time.wMinute, second=sys_time.wSecond)
+            else:
+                t = self.get_local_time().time()
             time_str = t.strftime(time_format)
         except Exception:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
             return 0
-        else:
-            if cchTime == 0:
-                return len(time_str) + 1
 
-            self.write_mem_string(time_str + "\x00" * cw, lpTimeStr, cw)
-            argv[4] = time_str
+        if cchTime == 0:
+            return len(time_str) + 1
+        if cchTime <= len(time_str):
+            emu.set_last_error(windefs.ERROR_INSUFFICIENT_BUFFER)
+            return 0
 
-        return 1
+        self.write_mem_string(time_str, lpTimeStr, cw)
+        ctx.args["lpTimeStr"].display = time_str
+
+        return len(time_str) + 1
 
     @apihook("FlushFileBuffers", argc=1)
-    def FlushFileBuffers(self, emu, argv, ctx: api.ApiContext = None):
-        """BOOL FlushFileBuffers(
-        HANDLE hFile
-        );"""
-
+    def FlushFileBuffers(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL FlushFileBuffers(
+            HANDLE hFile
+        );
+        """
         (hFile,) = argv
         rv = 1
         emu.set_last_error(windefs.ERROR_SUCCESS)
@@ -7174,24 +8624,33 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("GetExitCodeThread", argc=2)
-    def GetExitCodeThread(self, emu, argv, ctx: api.ApiContext = None):
+    def GetExitCodeThread(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetExitCodeThread(
-        HANDLE  hThread,
-        LPDWORD lpExitCode
+            HANDLE hThread,
+            LPDWORD lpExitCode
         );
         """
-
         hThread, lpExitCode = argv
+        obj = emu.get_handle_table().get(hThread, objman.Thread)
+        if not obj:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return False
         if lpExitCode:
-            self.mem_write(lpExitCode, (0).to_bytes(4, "little"))
+            # Threads run one after another, so a thread that has not run yet has ended
+            # when another run asks, as for a wait on it.
+            if obj is emu.get_current_thread():
+                exit_code = windefs.STILL_ACTIVE
+            else:
+                exit_code = obj.exit_code or 0
+            self.write_dword(lpExitCode, exit_code)
         return True
 
     @apihook("InitializeConditionVariable", argc=1)
-    def InitializeConditionVariable(self, emu, argv, ctx: api.ApiContext = None):
+    def InitializeConditionVariable(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void InitializeConditionVariable(
-        PCONDITION_VARIABLE ConditionVariable
+        VOID InitializeConditionVariable(
+            PCONDITION_VARIABLE ConditionVariable
         );
         """
         (ConditionVariable,) = argv
@@ -7200,19 +8659,69 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("WakeAllConditionVariable", argc=1)
-    def WakeAllConditionVariable(self, emu, argv, ctx: api.ApiContext = None):
+    def WakeAllConditionVariable(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void WakeAllConditionVariable(
-          PCONDITION_VARIABLE ConditionVariable
+        VOID WakeAllConditionVariable(
+            PCONDITION_VARIABLE ConditionVariable
+        );
+        """
+        return
+
+    @apihook("WaitOnAddress", argc=4)
+    def WaitOnAddress(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL WaitOnAddress(
+            volatile VOID *Address,
+            PVOID CompareAddress,
+            SIZE_T AddressSize,
+            DWORD dwMilliseconds
+        );
+
+        Threads run one after another, so no other thread can change the value or wake
+        this thread during the wait. A finite wait times out at once. An INFINITE wait
+        ends the run of the thread, so that the queued runs can execute.
+        """
+        Address, CompareAddress, AddressSize, dwMilliseconds = argv
+        if AddressSize not in (1, 2, 4, 8):
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return False
+
+        if self.mem_read(Address, AddressSize) != self.mem_read(CompareAddress, AddressSize):
+            return True
+
+        if dwMilliseconds == 0xFFFFFFFF:
+            emu.exit_process()
+            return True
+
+        self.advance_clock(dwMilliseconds)
+        emu.set_last_error(windefs.ERROR_TIMEOUT)
+        return False
+
+    @apihook("WakeByAddressSingle", argc=1)
+    def WakeByAddressSingle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        VOID WakeByAddressSingle(
+            PVOID Address
+        );
+        """
+        return
+
+    @apihook("WakeByAddressAll", argc=1)
+    def WakeByAddressAll(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        VOID WakeByAddressAll(
+            PVOID Address
         );
         """
         return
 
     @apihook("Wow64DisableWow64FsRedirection", argc=1)
-    def Wow64DisableWow64FsRedirection(self, emu, argv, ctx: api.ApiContext = None):
+    def Wow64DisableWow64FsRedirection(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         BOOL Wow64DisableWow64FsRedirection(
-          PVOID *OldValue
+            PVOID *OldValue
         );
         """
         (OldValue,) = argv
@@ -7221,10 +8730,12 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("Wow64RevertWow64FsRedirection", argc=1)
-    def Wow64RevertWow64FsRedirection(self, emu, argv, ctx: api.ApiContext = None):
+    def Wow64RevertWow64FsRedirection(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         BOOL Wow64RevertWow64FsRedirection(
-          PVOID OlValue
+            PVOID OlValue
         );
         """
         (OlValue,) = argv
@@ -7233,12 +8744,12 @@ class Kernel32(api.ApiHandler):
         return rv
 
     @apihook("EnumProcesses", argc=3)
-    def EnumProcesses(self, emu, argv, ctx: api.ApiContext = None):
+    def EnumProcesses(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL EnumProcesses(
-          DWORD   *lpidProcess,
-          DWORD   cb,
-          LPDWORD lpcbNeeded
+            DWORD *lpidProcess,
+            DWORD cb,
+            LPDWORD lpcbNeeded
         );
         """
         lpidProcess, cb, lpcbNeeded = argv
@@ -7252,42 +8763,40 @@ class Kernel32(api.ApiHandler):
             self.mem_write(lpidProcess_cursor, pid)
             lpidProcess_cursor += 4
 
-        pcbNeeded = lim
-        self.mem_write(lpcbNeeded, pcbNeeded.to_bytes(4, "little"))
+        pcbNeeded = lim * 4
+        if lpcbNeeded:
+            self.write_dword(lpcbNeeded, pcbNeeded)
 
         return 1
 
     @apihook("GetModuleFileNameExA", argc=4)
-    def GetModuleFileNameExA(self, emu, argv, ctx: api.ApiContext = None):
+    def GetModuleFileNameExA(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD GetModuleFileNameExA(
-          HANDLE  hProcess,
-          HMODULE hModule,
-          LPSTR   lpFilename,
-          DWORD   nSize
+            HANDLE hProcess,
+            HMODULE hModule,
+            LPSTR lpFilename,
+            DWORD nSize
         );
         """
-        ctx = ctx or {}
         hProcess, hModule, lpFilename, nSize = argv
 
         if hModule:
-            return self.GetModuleFileName(hModule, lpFilename, nSize)
+            return self.GetModuleFileName(emu, [hModule, lpFilename, nSize], ctx)
 
         size = 0
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
 
-        proc = self.get_object_from_handle(hProcess)
+        proc = emu.get_handle_table().get(hProcess, objman.Process)
 
         if proc is None:
-            return
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return 0
 
         filename = proc.path
 
         if filename:
-            if cw == 2:
-                out = filename.encode("utf-16le")
-            elif cw == 1:
-                out = filename.encode("utf-8")
+            out = self.encode_string(filename, cw)
 
             size = len(out) // cw
             if nSize < size + 1 * cw:  # null terminator
@@ -7301,53 +8810,46 @@ class Kernel32(api.ApiHandler):
         return size
 
     @apihook("GetThreadPriority", argc=1)
-    def GetThreadPriority(self, emu, argv, ctx: api.ApiContext = None):
+    def GetThreadPriority(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HANDLE hThread;
-        """
-        return k32types.THREAD_PRIORITY_NORMAL
-
-    @apihook("RtlUnwind", argc=4)
-    def RtlUnwind(self, emu, argv, ctx: api.ApiContext = None):
-        """
-        VOID RtlUnwind(
-          PVOID TargetFrame,
-          PVOID TargetIp,
-          PEXCEPTION_RECORD ExceptionRecord,
-          PVOID ReturnValue
+        int GetThreadPriority(
+            HANDLE hThread
         );
         """
-        return
+        return k32defs.THREAD_PRIORITY_NORMAL
 
     @apihook("UnhandledExceptionFilter", argc=1)
-    def UnhandledExceptionFilter(self, emu, argv, ctx: api.ApiContext = None):
+    def UnhandledExceptionFilter(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        _EXCEPTION_POINTERS *ExceptionInfo;
+        LONG UnhandledExceptionFilter(
+            struct _EXCEPTION_POINTERS *ExceptionInfo
+        );
         """
-        return k32types.EXCEPTION_EXECUTE_HANDLER
+        return windefs.EXCEPTION_EXECUTE_HANDLER
 
     @apihook("GetSystemTimePreciseAsFileTime", argc=1)
-    def GetSystemTimePreciseAsFileTime(self, emu, argv, ctx: api.ApiContext = None):
-        """void GetSystemTimePreciseAsFileTime(
-          LPFILETIME lpSystemTimeAsFileTime
-        );"""
-
+    def GetSystemTimePreciseAsFileTime(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        VOID GetSystemTimePreciseAsFileTime(
+            LPFILETIME lpSystemTimeAsFileTime
+        );
+        """
         (lpSystemTimeAsFileTime,) = argv
         ft = self.k32types.FILETIME(emu.get_ptr_size())
 
-        timestamp = 116444736000000000 + int(time.time_ns())
+        timestamp = self.get_system_time()
         ft.dwLowDateTime = 0xFFFFFFFF & timestamp
         ft.dwHighDateTime = timestamp >> 32
 
         self.mem_write(lpSystemTimeAsFileTime, self.get_bytes(ft))
 
-        return
-
     @apihook("AddVectoredExceptionHandler", argc=2)
-    def AddVectoredExceptionHandler(self, emu, argv, ctx: api.ApiContext = None):
+    def AddVectoredExceptionHandler(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PVOID AddVectoredExceptionHandler(
-            ULONG                       First,
+            ULONG First,
             PVECTORED_EXCEPTION_HANDLER Handler
         );
         """
@@ -7358,10 +8860,10 @@ class Kernel32(api.ApiHandler):
         return Handler
 
     @apihook("AddVectoredContinueHandler", argc=2)
-    def AddVectoredContinueHandler(self, emu, argv, ctx={}):
+    def AddVectoredContinueHandler(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         PVOID AddVectoredContinueHandler(
-            ULONG                       First,
+            ULONG First,
             PVECTORED_EXCEPTION_HANDLER Handler
         );
         """
@@ -7369,59 +8871,63 @@ class Kernel32(api.ApiHandler):
         return Handler
 
     @apihook("RemoveVectoredExceptionHandler", argc=1)
-    def RemoveVectoredExceptionHandler(self, emu, argv, ctx: api.ApiContext = None):
+    def RemoveVectoredExceptionHandler(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         ULONG RemoveVectoredExceptionHandler(
-            PVOID Handle);
+            PVOID Handle
+        );
         """
-        Handler = argv
-        emu.remove_vectored_exception_handler(Handler)
+        (Handle,) = argv
+        if Handle not in emu.get_veh_handlers():
+            return 0
+        emu.remove_vectored_exception_handler(Handle)
         return 1
 
     @apihook("GetSystemDefaultUILanguage", argc=0)
-    def GetSystemDefaultUILanguage(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSystemDefaultUILanguage(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LANGID GetSystemDefaultUILanguage();
         """
         return LANG_EN_US
 
     @apihook("GetUserDefaultLangID", argc=0)
-    def GetUserDefaultLangID(self, emu, argv, ctx: api.ApiContext = None):
+    def GetUserDefaultLangID(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LANGID GetUserDefaultLangID();
         """
         return LANG_EN_US
 
     @apihook("GetUserDefaultLCID", argc=0)
-    def GetUserDefaultLCID(self, emu, argv, ctx: api.ApiContext = None):
+    def GetUserDefaultLCID(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LCID GetUserDefaultLCID();
         """
         # https://docs.microsoft.com/en-us/windows/win32/intl/locale-user-default
-        return LOCALE_USER_DEFAULT
+        return LCID.LOCALE_USER_DEFAULT
 
     @apihook("GetSystemDefaultLCID", argc=0)
-    def GetSystemDefaultLCID(self, emu, argv, ctx: api.ApiContext = None):
+    def GetSystemDefaultLCID(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        LCID GetUserDefaultLCID();
+        LCID GetSystemDefaultLCID();
         """
         # https://learn.microsoft.com/en-us/windows/win32/intl/locale-system-default
-        return LOCALE_SYSTEM_DEFAULT
+        return LCID.LOCALE_SYSTEM_DEFAULT
 
     @apihook("GetTempFileName", argc=4)
-    def GetTempFileName(self, emu, argv, ctx: api.ApiContext = None):
+    def GetTempFileName(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         UINT GetTempFileName(
-            [in]  LPCSTR lpPathName,
-            [in]  LPCSTR lpPrefixString,
-            [in]  UINT   uUnique,
-            [out] LPSTR  lpTempFileName
+            LPCTSTR lpPathName,
+            LPCTSTR lpPrefixString,
+            UINT uUnique,
+            LPTSTR lpTempFileName
         );
         """
-        ctx = ctx or {}
         lpPathName, lpPrefixString, uUnique, lpTempFileName = argv
 
-        cw = self.get_char_width(ctx)
+        cw = _char_width(self, ctx)
         if (
             not lpPathName
             or not emu.is_address_valid(lpPathName)
@@ -7435,185 +8941,179 @@ class Kernel32(api.ApiHandler):
         if lpPrefixString and emu.is_address_valid(lpPrefixString):
             prefix = self.read_mem_string(lpPrefixString, cw)
 
-        import time
-
-        if prefix:
-            out = path + f"\\{prefix}_{int(time.time_ns())}.tmp"
-        else:
-            out = path + f"{int(time.time_ns())}.tmp"
-        argv[1] = out
+        unique = uUnique & 0xFFFF
+        create = not unique
+        if create:
+            unique = self.get_tick_count() & 0xFFFF or 1
+        out = path.rstrip("\\") + f"\\{prefix[:3]}{unique:X}.TMP"
+        _set_arg_display(ctx, "lpTempFileName", out)
         self.write_mem_string(out, lpTempFileName, cw)
+        if create:
+            self.file_open(out, create=True)
 
-        return len(out) + 1
+        return unique
 
     @apihook("_llseek", argc=3)
-    def _llseek(self, emu, argv, ctx: api.ApiContext = None):
+    def _llseek(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         LONG _llseek(
             HFILE hFile,
-            LONG  lOffset,
-            int   iOrigin
+            LONG lOffset,
+            int iOrigin
         );
         """
         # _llseek is 16-bit variant of SetFilePointer
         # code replicates SetFilePointer()
         hFile, lOffset, iOrigin = argv
-        rv = 0
 
-        f = self.file_get(hFile)
-        if f:
-            f.seek(lOffset, 1)  # io.SEEK_CUR == 1
-            rv = f.tell()
-            emu.set_last_error(windefs.ERROR_SUCCESS)
+        f = self.get_file(hFile)
+        if not f:
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return windefs.HFILE_ERROR
 
-        return rv
+        offset = ct.c_int32(lOffset).value
+        if iOrigin == windefs.FILE_CURRENT:
+            offset += f.tell()
+        elif iOrigin == windefs.FILE_END:
+            offset += f.get_size()
+        if offset < 0:
+            emu.set_last_error(windefs.ERROR_NEGATIVE_SEEK)
+            return windefs.HFILE_ERROR
+
+        f.seek(offset, windefs.FILE_BEGIN)
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return f.tell() & 0xFFFFFFFF
 
     @apihook("_lopen", argc=2)
-    def _lopen(self, emu, argv, ctx: api.ApiContext = None):
+    def _lopen(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HFILE _lopen(
             LPCSTR lpPathName,
-            int    iReadWrite
+            int iReadWrite
         );
         """
-        ctx = ctx or {}
-        lpFileName, iRedWrite = argv
-        cw = self.get_char_width(ctx)
-        filename = self.read_mem_string(lpFileName, cw)
+        lpPathName, iReadWrite = argv
+        filename = self.read_mem_string(lpPathName, 1)
         fHandle = self.file_open(filename)
+        if not fHandle:
+            return windefs.HFILE_ERROR
         return fHandle
 
     @apihook("_lclose", argc=1)
-    def _lclose(self, emu, argv, ctx: api.ApiContext = None):
+    def _lclose(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HFILE _lclose(
             HFILE hFile
-            );
+        );
         """
-        (hObject,) = argv
-        obj = self.get_object_from_handle(hObject)
-        if obj:
-            emu.dec_ref(obj)
-            return True
-        return False
+        (hFile,) = argv
+        if not emu.get_handle_table().close(hFile):
+            emu.set_last_error(windefs.ERROR_INVALID_HANDLE)
+            return windefs.HFILE_ERROR
+        return 0
 
     @apihook("GetConsoleTitle", argc=2)
-    def GetConsoleTitle(self, emu, argv, ctx: api.ApiContext = None):
+    def GetConsoleTitle(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        DWORD WINAPI GetConsoleTitle(
-            _Out_ LPTSTR lpConsoleTitle,
-            _In_  DWORD nSize
+        DWORD GetConsoleTitle(
+            LPTSTR lpConsoleTitle,
+            DWORD nSize
         );
         """
-        ctx = ctx or {}
         lpConsoleTitle, nSize = argv
-        cw = self.get_char_width(ctx)
-        rv = False
+        cw = _char_width(self, ctx)
 
         # TODO: consider enumeration logic
-        temp_title = "explorer.exe"
+        title = "explorer.exe"
 
-        if cw == 2:
-            temp_title = temp_title.encode("utf-16le") + b"\x00\x00"
-        else:
-            temp_title = temp_title.encode("utf-8") + b"\x00"
+        if lpConsoleTitle and nSize:
+            out = title[: nSize - 1]
+            self.write_mem_string(out, lpConsoleTitle, cw)
+            ctx.args["lpConsoleTitle"].display = out
 
-        argv[0] = temp_title
-        argv[1] = len(temp_title)
-
-        if lpConsoleTitle and temp_title:
-            self.mem_write(lpConsoleTitle, temp_title)
-            rv = True
-        if nSize:
-            self.mem_write(nSize, (len(temp_title)).to_bytes(4, "little"))
-
-        return rv
+        return len(title)
 
     @apihook("InitializeSRWLock", argc=1)
-    def InitializeSRWLock(self, emu, argv, ctx: api.ApiContext = None):
+    def InitializeSRWLock(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void InitializeSRWLock(
-          [out] PSRWLOCK SRWLock
+        VOID InitializeSRWLock(
+            PSRWLOCK SRWLock
         );
         """
-
         return
 
     @apihook("AcquireSRWLockShared", argc=1)
-    def AcquireSRWLockShared(self, emu, argv, ctx: api.ApiContext = None):
+    def AcquireSRWLockShared(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void AcquireSRWLockShared(
-          [in, out] PSRWLOCK SRWLock
+        VOID AcquireSRWLockShared(
+            PSRWLOCK SRWLock
         );
         """
-
         return
 
     @apihook("ReleaseSRWLockShared", argc=1)
-    def ReleaseSRWLockShared(self, emu, argv, ctx: api.ApiContext = None):
+    def ReleaseSRWLockShared(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void ReleaseSRWLockShared(
-          [in, out] PSRWLOCK SRWLock
+        VOID ReleaseSRWLockShared(
+            PSRWLOCK SRWLock
         );
         """
-
         return
 
     @apihook("AcquireSRWLockExclusive", argc=1)
-    def AcquireSRWLockExclusive(self, emu, argv, ctx: api.ApiContext = None):
+    def AcquireSRWLockExclusive(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void AcquireSRWLockExclusive(
-          [in, out] PSRWLOCK SRWLock
+        VOID AcquireSRWLockExclusive(
+            PSRWLOCK SRWLock
         );
         """
-
         return
 
     @apihook("ReleaseSRWLockExclusive", argc=1)
-    def ReleaseSRWLockExclusive(self, emu, argv, ctx: api.ApiContext = None):
+    def ReleaseSRWLockExclusive(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void ReleaseSRWLockExclusive(
-          [in, out] PSRWLOCK SRWLock
+        VOID ReleaseSRWLockExclusive(
+            PSRWLOCK SRWLock
         );
         """
-
         return
 
     @apihook("GetPhysicallyInstalledSystemMemory", argc=1)
-    def GetPhysicallyInstalledSystemMemory(self, emu, argv, ctx: api.ApiContext = None):
+    def GetPhysicallyInstalledSystemMemory(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         BOOL GetPhysicallyInstalledSystemMemory(
-          [out] PULONGLONG TotalMemoryInKilobytes
+            PULONGLONG TotalMemoryInKilobytes
         );
         """
-
         (TotalMemoryInKilobytes,) = argv
 
         # 2GB
-        self.mem_write(TotalMemoryInKilobytes, (0x200000).to_bytes(8, "little"))
+        self.write_qword(TotalMemoryInKilobytes, 0x200000)
         return 1
 
     @apihook("CreateWaitableTimerExW", argc=4)
-    def CreateWaitableTimerExW(self, emu, argv, ctx={}):
+    def CreateWaitableTimerExW(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HANDLE CreateWaitableTimerExW(
             LPSECURITY_ATTRIBUTES lpTimerAttributes,
-            LPCWSTR               lpTimerName,
-            DWORD                 dwFlags,
-            DWORD                 dwDesiredAccess
+            LPCWSTR lpTimerName,
+            DWORD dwFlags,
+            DWORD dwDesiredAccess
         );
         """
-        _attrs, name, _flags, _access = argv
+        lpTimerAttributes, lpTimerName, dwFlags, dwDesiredAccess = argv
 
         timer_name = None
         obj = None
-        if name:
-            timer_name = self.read_mem_string(name, 2)
-            argv[1] = timer_name
+        if lpTimerName:
+            timer_name = self.read_mem_string(lpTimerName, 2)
+            ctx.args["lpTimerName"].display = timer_name
             obj = self.get_object_from_name(timer_name)
 
         if obj:
-            hnd = obj.get_handle()
+            hnd = emu.get_object_handle(obj)
             emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
         else:
             hnd, _evt = emu.create_event(timer_name)
@@ -7622,120 +9122,265 @@ class Kernel32(api.ApiHandler):
         return hnd
 
     @apihook("GetProcessAffinityMask", argc=3)
-    def GetProcessAffinityMask(self, emu, argv, ctx={}):
+    def GetProcessAffinityMask(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL GetProcessAffinityMask(
-            HANDLE     hProcess,
+            HANDLE hProcess,
             PDWORD_PTR lpProcessAffinityMask,
             PDWORD_PTR lpSystemAffinityMask
         );
         """
         hProcess, lpProcessAffinityMask, lpSystemAffinityMask = argv
-        ptr_size = emu.get_ptr_size()
-        mask = 0x1
+        mask = (1 << PROCESSOR_COUNT) - 1
         if lpProcessAffinityMask:
-            self.mem_write(lpProcessAffinityMask, mask.to_bytes(ptr_size, "little"))
+            self.write_ptr(lpProcessAffinityMask, mask)
         if lpSystemAffinityMask:
-            self.mem_write(lpSystemAffinityMask, mask.to_bytes(ptr_size, "little"))
+            self.write_ptr(lpSystemAffinityMask, mask)
         return 1
 
+    @apihook("GetActiveProcessorGroupCount", argc=0)
+    def GetActiveProcessorGroupCount(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        WORD GetActiveProcessorGroupCount();
+        """
+        return 1
+
+    @apihook("GetMaximumProcessorGroupCount", argc=0)
+    def GetMaximumProcessorGroupCount(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        WORD GetMaximumProcessorGroupCount();
+        """
+        return 1
+
+    @apihook("GetActiveProcessorCount", argc=1)
+    def GetActiveProcessorCount(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetActiveProcessorCount(
+            WORD GroupNumber
+        );
+        """
+        (GroupNumber,) = argv
+        if GroupNumber & 0xFFFF in (0, ALL_PROCESSOR_GROUPS):
+            return PROCESSOR_COUNT
+        emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+        return 0
+
+    @apihook("GetMaximumProcessorCount", argc=1)
+    def GetMaximumProcessorCount(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetMaximumProcessorCount(
+            WORD GroupNumber
+        );
+        """
+        return self.GetActiveProcessorCount(emu, argv, ctx)
+
     @apihook("SetConsoleCtrlHandler", argc=2)
-    def SetConsoleCtrlHandler(self, emu, argv, ctx={}):
+    def SetConsoleCtrlHandler(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetConsoleCtrlHandler(
             PHANDLER_ROUTINE HandlerRoutine,
-            BOOL             Add
+            BOOL Add
         );
         """
         return 1
 
     @apihook("WTSGetActiveConsoleSessionId", argc=0)
-    def WTSGetActiveConsoleSessionId(self, emu, argv, ctx: api.ApiContext = None):
+    def WTSGetActiveConsoleSessionId(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD WTSGetActiveConsoleSessionId();
+        """
         return emu.get_current_process().session
 
     @apihook("WaitForSingleObjectEx", argc=3)
-    def WaitForSingleObjectEx(self, emu, argv, ctx: api.ApiContext = None):
+    def WaitForSingleObjectEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD WaitForSingleObjectEx(
+            HANDLE hHandle,
+            DWORD dwMilliseconds,
+            BOOL bAlertable
+        );
+        """
         return 0  # = WAIT_OBJECT_0
 
     @apihook("GetProfileInt", argc=3)
-    def GetProfileInt(self, emu, argv, ctx: api.ApiContext = None):
-        _, _, nDefault = argv
-        return nDefault
-
-    @apihook("CreateSemaphoreW", argc=4)
-    def CreateSemaphoreW(self, emu, argv, ctx: api.ApiContext = None):
+    def GetProfileInt(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HANDLE CreateSemaphoreW(
-            [in, optional] LPSECURITY_ATTRIBUTES lpSemaphoreAttributes,
-            [in]           LONG                  lInitialCount,
-            [in]           LONG                  lMaximumCount,
-            [in, optional] LPCWSTR               lpName
+        UINT GetProfileInt(
+            LPCTSTR lpAppName,
+            LPCTSTR lpKeyName,
+            INT nDefault
         );
         """
-        return 0
+        lpAppName, lpKeyName, nDefault = argv
+        return nDefault
+
+    @apihook("CreateSemaphore", argc=4)
+    def CreateSemaphore(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HANDLE CreateSemaphore(
+            LPSECURITY_ATTRIBUTES lpSemaphoreAttributes,
+            LONG lInitialCount,
+            LONG lMaximumCount,
+            LPCTSTR lpName
+        );
+        """
+        lpSemaphoreAttributes, lInitialCount, lMaximumCount, lpName = argv
+        lInitialCount = ct.c_int32(lInitialCount).value
+        lMaximumCount = ct.c_int32(lMaximumCount).value
+
+        if lMaximumCount <= 0 or not 0 <= lInitialCount <= lMaximumCount:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        name = ""
+        if lpName:
+            name = self.read_mem_string(lpName, _char_width(self, ctx))
+            ctx.args["lpName"].display = name
+            obj = self.get_object_from_name(name)
+            if obj:
+                emu.set_last_error(windefs.ERROR_ALREADY_EXISTS)
+                return emu.get_object_handle(obj)
+
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        hnd, _ = emu.create_semaphore(name)
+        return hnd
+
+    @apihook("OpenSemaphore", argc=3)
+    def OpenSemaphore(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HANDLE OpenSemaphore(
+            DWORD dwDesiredAccess,
+            BOOL bInheritHandle,
+            LPCTSTR lpName
+        );
+        """
+        dwDesiredAccess, bInheritHandle, lpName = argv
+
+        if not lpName:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        obj_name = self.read_mem_string(lpName, _char_width(self, ctx))
+        ctx.args["lpName"].display = obj_name
+
+        obj = self.get_object_from_name(obj_name)
+        if not obj:
+            emu.set_last_error(windefs.ERROR_FILE_NOT_FOUND)
+            return 0
+
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return emu.get_object_handle(obj)
 
     @apihook("SetThreadStackGuarantee", argc=1)
-    def SetThreadStackGuarantee(self, emu, argv, ctx: api.ApiContext = None):
+    def SetThreadStackGuarantee(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL SetThreadStackGuarantee(
-            [in, out] PULONG StackSizeInBytes
+            PULONG StackSizeInBytes
         );
         """
         return 1
 
     @apihook("SetThreadDescription", argc=2)
-    def SetThreadDescription(self, emu, argv, ctx: api.ApiContext = None):
+    def SetThreadDescription(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT SetThreadDescription(
-            [in] HANDLE hThread,
-            [in] PCWSTR lpThreadDescription
+            HANDLE hThread,
+            PCWSTR lpThreadDescription
         );
         """
         return windefs.ERROR_SUCCESS
 
     @apihook("InitOnceBeginInitialize", argc=4)
-    def InitOnceBeginInitialize(self, emu, argv, ctx: api.ApiContext = None):
+    def InitOnceBeginInitialize(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL InitOnceBeginInitialize(
-            [in, out]       LPINIT_ONCE lpInitOnce,
-            [in]            DWORD       dwFlags,
-            [out]           PBOOL       fPending,
-            [out, optional] LPVOID      *lpContext
+            LPINIT_ONCE lpInitOnce,
+            DWORD dwFlags,
+            PBOOL fPending,
+            LPVOID *lpContext
         );
         """
+        lpInitOnce, dwFlags, fPending, lpContext = argv
+        state = self.read_ptr(lpInitOnce)
+        is_async = bool(dwFlags & k32defs.INIT_ONCE_ASYNC)
+        if state & 3 == 2:
+            if lpContext:
+                self.write_ptr(lpContext, state & ~3)
+            pending = 0
+        elif dwFlags & k32defs.INIT_ONCE_CHECK_ONLY:
+            emu.set_last_error(windefs.ERROR_GEN_FAILURE)
+            return 0
+        elif (state & 3 == 1 and is_async) or (state & 3 == 3 and not is_async):
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        else:
+            self.write_ptr(lpInitOnce, 3 if is_async else 1)
+            pending = 1
+        if fPending:
+            self.write_dword(fPending, pending)
+        return 1
+
+    @apihook("InitOnceComplete", argc=3)
+    def InitOnceComplete(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL InitOnceComplete(
+            LPINIT_ONCE lpInitOnce,
+            DWORD dwFlags,
+            LPVOID lpContext
+        );
+        """
+        lpInitOnce, dwFlags, lpContext = argv
+        state = self.read_ptr(lpInitOnce)
+        if lpContext & 3:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        if not state & 1:
+            emu.set_last_error(windefs.ERROR_GEN_FAILURE)
+            return 0
+        if dwFlags & k32defs.INIT_ONCE_INIT_FAILED:
+            state = 0
+        else:
+            state = lpContext | 2
+        self.write_ptr(lpInitOnce, state)
+        return 1
+
+    @apihook("InitOnceExecuteOnce", argc=4)
+    def InitOnceExecuteOnce(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL InitOnceExecuteOnce(
+            PINIT_ONCE InitOnce,
+            PINIT_ONCE_FN InitFn,
+            PVOID Parameter,
+            LPVOID *Context
+        );
+
+        The result of InitFn is not read back, so the initialization always succeeds.
+        """
+        InitOnce, InitFn, Parameter, Context = argv
+        state = self.read_ptr(InitOnce)
+        if state & 3 == 2:
+            return 1
+        self.write_ptr(InitOnce, 2)
+        self.setup_callback(InitFn, (InitOnce, Parameter, Context))
         return 1
 
     @apihook("FlsGetValue2", argc=1)
-    def FlsGetValue2(self, emu, argv, ctx: api.ApiContext = None):
-        fls_index = argv[0]
-        try:
-            val = emu.get_fls_value(fls_index)
-            return val if val else 0x1000
-        except Exception:
-            return 0x1000
-
-    @apihook("RtlCaptureContext", argc=1)
-    def RtlCaptureContext(self, emu, argv, ctx: api.ApiContext = None):
-        ptr = self.emu.reg_read("rcx")
-        if ptr:
-            try:
-                ctx_buf = b"\x00" * 0x500
-                try:
-                    self.emu.mem_write(ptr, ctx_buf)
-                except Exception:
-                    base_addr = ptr & ~0xFFF
-                    self.emu.mem_map(base_addr, 0x1000)
-                    self.emu.mem_write(ptr, ctx_buf)
-            except Exception:
-                pass
-        return True
-
-    @apihook("RtlLookupFunctionEntry", argc=3)
-    def RtlLookupFunctionEntry(self, emu, argv, ctx: api.ApiContext = None):
+    def FlsGetValue2(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        PVOID FlsGetValue2(
+            DWORD dwTlsIndex
+        );
+        """
+        (dwTlsIndex,) = argv
+        fls = emu.get_current_thread().fls
+        if dwTlsIndex < len(fls):
+            return fls[dwTlsIndex]
         return 0
 
     @apihook("MulDiv", argc=3)
-    def MulDiv(self, emu, argv, ctx: api.ApiContext = None):
+    def MulDiv(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         int MulDiv(
             int nNumber,
@@ -7752,7 +9397,7 @@ class Kernel32(api.ApiHandler):
             return 0
 
     @apihook("GlobalAddAtomA", argc=1)
-    def GlobalAddAtomA(self, emu, argv, ctx: api.ApiContext = None):
+    def GlobalAddAtomA(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         ATOM GlobalAddAtomA(
             LPCSTR lpString

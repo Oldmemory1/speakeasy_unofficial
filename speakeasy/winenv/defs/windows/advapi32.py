@@ -1,39 +1,78 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
-import ctypes as ct
+from typing import Annotated
 
 from speakeasy.struct import EmuStruct, Ptr
+from speakeasy.winenv.defs.enums import ENUM_SERVICE_TYPE, SERVICE_STATUS_CURRENT_STATE
 
+NTE_BAD_KEY = 0x80090003
+NTE_BAD_LEN = 0x80090004
+NTE_BAD_DATA = 0x80090005
 NTE_BAD_ALGID = 0x80090008
+NTE_BAD_FLAGS = 0x80090009
+NTE_BAD_TYPE = 0x8009000A
+NTE_BAD_KEY_STATE = 0x8009000B
+NTE_BAD_PUBLIC_KEY = 0x80090015
+NTE_INVALID_HANDLE = 0x80090026
 
-SERVICE_WIN32 = 0x30
+PROV_RSA_FULL = 1
+PROV_RSA_AES = 24
 
-SERVICE_ACTIVE = 0x1
-SERVICE_INACTIVE = 0x2
-SERVICE_STATE_ALL = 0x3
+CALG_RSA_SIGN = 0x2400
+CALG_AES_128 = 0x660E
+CALG_AES_192 = 0x660F
+CALG_AES_256 = 0x6610
+CALG_RC4 = 0x6801
+CALG_RSA_KEYX = 0xA400
+
+CRYPT_EXPORTABLE = 0x1
+CRYPT_NO_SALT = 0x10
+
+SIMPLEBLOB = 0x1
+PUBLICKEYBLOB = 0x6
+PLAINTEXTKEYBLOB = 0x8
+CUR_BLOB_VERSION = 2
+RSA1 = 0x31415352
+
+KP_IV = 1
+KP_PADDING = 3
+KP_MODE = 4
+
+CRYPT_MODE_CBC = 1
+CRYPT_MODE_ECB = 2
+CRYPT_MODE_CFB = 4
+
+PKCS5_PADDING = 1
+
+HP_HASHVAL = 2
+HP_HASHSIZE = 4
+
+
+SERVICE_ACCEPT_STOP = 0x1
+
+_SHARE_PROCESS = ENUM_SERVICE_TYPE.SERVICE_WIN32_SHARE_PROCESS
+_OWN_PROCESS = ENUM_SERVICE_TYPE.SERVICE_WIN32_OWN_PROCESS
+_RUNNING = SERVICE_STATUS_CURRENT_STATE.SERVICE_RUNNING
+_STOPPED = SERVICE_STATUS_CURRENT_STATE.SERVICE_STOPPED
+
+# Win32 services that EnumServicesStatus reports: (name, display name, type, state)
+EMULATED_SERVICES = (
+    ("Dhcp", "DHCP Client", _SHARE_PROCESS, _RUNNING),
+    ("Dnscache", "DNS Client", _SHARE_PROCESS, _RUNNING),
+    ("EventLog", "Windows Event Log", _SHARE_PROCESS, _RUNNING),
+    ("LanmanServer", "Server", _SHARE_PROCESS, _RUNNING),
+    ("LanmanWorkstation", "Workstation", _SHARE_PROCESS, _RUNNING),
+    ("Schedule", "Task Scheduler", _SHARE_PROCESS, _RUNNING),
+    ("Winmgmt", "Windows Management Instrumentation", _SHARE_PROCESS, _RUNNING),
+    ("Fax", "Fax", _OWN_PROCESS, _STOPPED),
+    ("RemoteRegistry", "Remote Registry", _SHARE_PROCESS, _STOPPED),
+    ("SNMPTRAP", "SNMP Trap", _OWN_PROCESS, _STOPPED),
+    ("TapiSrv", "Telephony", _SHARE_PROCESS, _STOPPED),
+    ("WebClient", "WebClient", _SHARE_PROCESS, _STOPPED),
+    ("seclogon", "Secondary Logon", _SHARE_PROCESS, _STOPPED),
+)
 
 
 class SERVICE_TABLE_ENTRY(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.lpServiceName = Ptr
-        self.lpServiceProc = Ptr
-
-
-class HCRYPTKEY(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.Algid = ct.c_uint32
-        self.keylen = ct.c_uint32
-        self.keyp = Ptr
-
-
-def get_define_int(define, prefix=""):
-    for k, v in globals().items():
-        if not isinstance(v, int) or v != define:
-            continue
-        if prefix:
-            if k.startswith(prefix):
-                return k
-        else:
-            return k
+    lpServiceName: Annotated[int, Ptr]
+    lpServiceProc: Annotated[int, Ptr]

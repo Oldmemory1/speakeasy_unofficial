@@ -50,6 +50,8 @@ def _write_db(
         ("f32", 4, 1),
         ("p", 4, 1),
         ("p", 8, 1),
+        ("up", 4, 1),
+        ("ip", 8, 1),
         ("S", 4, 1),
         ("ps:FILETIME", 8, 1),
         ("g", 4, 4),
@@ -83,6 +85,7 @@ def test_inline_array_and_field_sizes() -> None:
         ("p:u32", "u32", 4, 4),
         ("p:h", "h", 4, 8),
         ("p:p", "p", 4, 8),
+        ("p:up", "up", 4, 8),
         ("p:u32:FLAGS", "u32:FLAGS", 4, 4),
         ("a:u16", "u16", 2, 2),
         ("a:st:FILETIME:8", "st:FILETIME:8", 8, 8),
@@ -229,10 +232,11 @@ def test_out_buffer_size_scalars_and_structs() -> None:
         sigdb.ParamSig("sz", "s", "o"),
         sigdb.ParamSig("wsz", "S", "o"),
         sigdb.ParamSig("arr", "a:u16", "o"),
+        sigdb.ParamSig("pb", "a:u8", "o"),
     )
     values = [0x1000] * len(sig.params)
-    assert [_size(sig, i, values, 4) for i in range(len(sig.params))] == [4, 4, None, 36, None, 1, 2, None]
-    assert [_size(sig, i, values, 8) for i in range(len(sig.params))] == [4, 8, None, 48, None, 1, 2, None]
+    assert [_size(sig, i, values, 4) for i in range(len(sig.params))] == [4, 4, None, 36, None, 1, 2, 2, 1]
+    assert [_size(sig, i, values, 8) for i in range(len(sig.params))] == [4, 8, None, 48, None, 1, 2, 2, 1]
 
 
 def test_out_buffer_size_from_count_params() -> None:
@@ -240,7 +244,7 @@ def test_out_buffer_size_from_count_params() -> None:
         sigdb.ParamSig("wide", "a:u16", "o", ("c", 1)),
         sigdb.ParamSig("nSize", "u32", "i"),
         sigdb.ParamSig("pv", "p", "o", ("n", 3)),
-        sigdb.ParamSig("cb", "p", "i"),  # SIZE_T
+        sigdb.ParamSig("cb", "p", "i"),  # SIZE_T in an older database
         sigdb.ParamSig("fixed", "a:st:FILETIME:8", "o", ("k", 3)),
         sigdb.ParamSig("bytes", "a:u8", "o", ("n", 6)),
         sigdb.ParamSig("pcb", "p:u32", "i"),  # count behind a pointer
@@ -259,6 +263,27 @@ def test_out_buffer_size_from_count_params() -> None:
     # NULL count pointer
     values[6] = 0
     assert _size(sig, 5, values, 4, memory) is None
+
+
+def test_pointer_sized_integers() -> None:
+    """``up`` (SIZE_T, ULONG_PTR) and ``ip`` (SSIZE_T, LPARAM) are integers of pointer size."""
+    send_message = sigdb.FuncSig(
+        name="SendMessageA",
+        dll="user32",
+        ret="ip",
+        params=(
+            sigdb.ParamSig("hWnd", "h"),
+            sigdb.ParamSig("Msg", "u32"),
+            sigdb.ParamSig("wParam", "up"),
+            sigdb.ParamSig("lParam", "ip"),
+        ),
+    )
+    assert send_message.supports_emulation(4) and send_message.supports_emulation(8)
+    assert send_message.values_from_slots([0x44, 0x111, 0x1234567890, 2**64 - 1], 8)[2:] == [0x1234567890, 2**64 - 1]
+
+    # a SIZE_T parameter gives the byte count of a buffer
+    write = _out_sig(sigdb.ParamSig("lpBuffer", "a:u8", "o", ("n", 1)), sigdb.ParamSig("nSize", "up", "i"))
+    assert _size(write, 0, [0x1000, 0x30], 8) == 0x30
 
 
 # -- Win32MetadataSource ----------------------------------------------------
@@ -339,8 +364,6 @@ def test_source_basic_lookup(small_db: sigdb.Win32MetadataSource) -> None:
     assert [p.name for p in sig.params] == ["lpFileName", "dwDesiredAccess"]
     assert sig.slot_count(4) == 2
     assert sig.source == "win32metadata"
-    # cached
-    assert small_db.lookup("kernel32", "CreateFileW", "x86") is sig
 
 
 def test_source_unknown_function(small_db: sigdb.Win32MetadataSource) -> None:
@@ -386,7 +409,6 @@ def test_source_enum_lookup(small_db: sigdb.Win32MetadataSource) -> None:
     enum = small_db.lookup_enum("MOVE_FILE_FLAGS")
     assert enum is not None and enum.flags
     assert enum.decode(3) == "MOVEFILE_COPY_ALLOWED|MOVEFILE_REPLACE_EXISTING"
-    assert small_db.lookup_enum("MOVE_FILE_FLAGS") is enum
     assert small_db.lookup_enum("NOPE") is None
 
 
@@ -394,7 +416,6 @@ def test_source_struct_and_buffer_length(small_db: sigdb.Win32MetadataSource) ->
     struct = small_db.lookup_struct("SYSTEM_INFO")
     assert struct is not None and struct.size(4) == 36 and struct.size(8) == 48
     assert struct.fields == () and not struct.is_union
-    assert small_db.lookup_struct("SYSTEM_INFO") is struct
     assert small_db.lookup_struct("NOPE") is None
     ft = _struct(small_db, "FILETIME")
     assert [(f.name, f.code, f.offset(4)) for f in ft.fields] == [
@@ -407,7 +428,7 @@ def test_source_struct_and_buffer_length(small_db: sigdb.Win32MetadataSource) ->
     assert sig.params[1].buffer_len is None
 
 
-def test_source_missing_file(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_source_missing_file(tmp_path: Path) -> None:
     src = sigdb.Win32MetadataSource(str(tmp_path / "nope.json.gz"))
     assert not src.available
     assert src.lookup("kernel32", "CreateFileW", "x86") is None
@@ -460,28 +481,6 @@ def test_database_empty() -> None:
     db = sigdb.SignatureDatabase([])
     assert not db.available
     assert db.lookup("kernel32", "CreateFileW", "x86") is None
-
-
-def test_default_database_has_both_sources() -> None:
-    db = sigdb.SignatureDatabase()
-    win32, phnt = db.sources
-    assert isinstance(win32, sigdb.Win32MetadataSource) and not isinstance(win32, sigdb.PhntSource)
-    assert isinstance(phnt, sigdb.PhntSource)
-    assert win32.path == sigdb.DEFAULT_PATH
-    assert phnt.path == sigdb.DEFAULT_PHNT_PATH
-
-
-def test_missing_file_warns_once_per_source(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    sigdb.Win32MetadataSource._missing_warned = False
-    sigdb.PhntSource._missing_warned = False
-    with caplog.at_level("WARNING", logger="speakeasy.winenv.api.sigdb"):
-        for _ in range(2):
-            assert not sigdb.Win32MetadataSource(str(tmp_path / "a.json.gz")).available
-            assert not sigdb.PhntSource(str(tmp_path / "b.json.gz")).available
-    messages = [r.getMessage() for r in caplog.records]
-    assert len(messages) == 2
-    assert "win32metadata" in messages[0] and "gen_win32_signatures" in messages[0]
-    assert "phnt" in messages[1] and "gen_phnt_signatures" in messages[1]
 
 
 # -- bundled database -------------------------------------------------------

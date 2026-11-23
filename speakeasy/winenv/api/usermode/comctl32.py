@@ -1,7 +1,14 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 
+from typing import TYPE_CHECKING
+
 from .. import api
+from .shell32 import write_dll_version
+
+if TYPE_CHECKING:
+    from speakeasy.windows.netman import NetworkManager
+    from speakeasy.windows.win32 import Win32Emulator
 
 
 class Comctl32(api.ApiHandler):
@@ -14,11 +21,10 @@ class Comctl32(api.ApiHandler):
         self.funcs = {}
         self.data = {}
         super().__get_hook_attrs__(self)
-        self.netman = emu.get_network_manager()
-        self.names = {}
+        self.netman: NetworkManager = emu.get_network_manager()
 
     @apihook("InitCommonControlsEx", argc=1)
-    def InitCommonControlsEx(self, emu, argv, ctx: api.ApiContext = None):
+    def InitCommonControlsEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL InitCommonControlsEx(
             const INITCOMMONCONTROLSEX *picce
@@ -30,7 +36,7 @@ class Comctl32(api.ApiHandler):
         return rv
 
     @apihook("InitCommonControls", argc=0)
-    def InitCommonControls(self, emu, argv, ctx: api.ApiContext = None):
+    def InitCommonControls(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         void InitCommonControls();
 
@@ -38,3 +44,15 @@ class Comctl32(api.ApiHandler):
         Applications must explicitly register all common controls through InitCommonControlsEx.
         """
         return
+
+    @apihook("DllGetVersion", argc=1)
+    def DllGetVersion(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        HRESULT DllGetVersion(
+            DLLVERSIONINFO *pdvi
+        );
+
+        Common controls version 6 reports 6.10 with the build of the OS.
+        """
+        (pdvi,) = argv
+        return write_dll_version(self, pdvi, 6, 10, emu.config.system.os_ver.build or 0)

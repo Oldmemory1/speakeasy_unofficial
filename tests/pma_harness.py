@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from speakeasy import Speakeasy
+from speakeasy.config import RegistryConfig
 
 TESTS_DIR = Path(__file__).resolve().parent
 PMA_DIR = TESTS_DIR / "capa-testfiles"
@@ -38,6 +39,7 @@ class PmaCase:
     indicators: IndicatorExpectations = field(default_factory=IndicatorExpectations)
     config_patch: dict[str, Any] = field(default_factory=dict)
     allowed_entrypoint_errors: tuple[str, ...] = ()
+    allowed_errors: tuple[str, ...] = ()
     argv: tuple[str, ...] = ()
     profile: CaseProfile | None = None
 
@@ -59,8 +61,10 @@ def normalize_value(value: str) -> str:
 
 def build_case_config(base_config: dict[str, Any], case: PmaCase) -> dict[str, Any]:
     cfg = copy.deepcopy(base_config)
-    cfg["timeout"] = 4
-    cfg["max_api_count"] = 600
+    # The keys of tests/test.json replace the default keys, and the samples read default keys such as Svchost
+    cfg["registry"] = RegistryConfig().model_dump(mode="json")
+    cfg["limits"]["per_run_time"] = 4
+    cfg["limits"]["api_calls"] = 600
     merge_config_patch(cfg, case.config_patch)
     return cfg
 
@@ -96,14 +100,14 @@ def run_case(base_config: dict[str, Any], case: PmaCase, tmp_path: Path):
     se = Speakeasy(**kwargs)
     try:
         module = se.load_module(str(sample_path))
-        se.run_module(module, all_entrypoints=True)
+        se.run_module(module)
         return se.get_report()
     finally:
         se.shutdown()
 
 
 def collect_behavior(report) -> ObservedBehavior:
-    events = [evt for ep in report.entry_points for evt in (ep.events or [])]
+    events = [evt for ep in report.runs for evt in ep.events]
     api_events = [evt for evt in events if evt.event == "api"]
 
     api_names = {normalize_value(evt.api_name) for evt in api_events if evt.api_name}
@@ -114,8 +118,8 @@ def collect_behavior(report) -> ObservedBehavior:
     }
     files.update(
         normalize_value(dropped.path)
-        for ep in report.entry_points
-        for dropped in (ep.dropped_files or [])
+        for ep in report.runs
+        for dropped in ep.dropped_files or []
         if getattr(dropped, "path", None)
     )
 
@@ -131,16 +135,15 @@ def collect_behavior(report) -> ObservedBehavior:
         normalize_value(evt.server) for evt in events if evt.event == "net_http" and getattr(evt, "server", None)
     )
 
-    urls = set()
+    urls: set[str] = set()
     for evt in api_events:
         for arg in evt.args or []:
-            if isinstance(arg, str):
-                urls.update(normalize_value(match) for match in URL_PATTERN.findall(arg))
+            urls.update(normalize_value(match) for match in URL_PATTERN.findall(arg.display))
 
     unsupported_api_count = sum(1 for evt in events if evt.event == "unsupported_api")
     unsupported_api_count += sum(1 for evt in api_events if (evt.api_name or "").lower().startswith("unsupported"))
 
-    entrypoint_errors = {ep.error.type for ep in report.entry_points if ep.error and getattr(ep.error, "type", None)}
+    entrypoint_errors = {ep.error.type for ep in report.runs if ep.error and getattr(ep.error, "type", None)}
 
     return ObservedBehavior(
         api_names=api_names,
@@ -154,8 +157,8 @@ def collect_behavior(report) -> ObservedBehavior:
 
 
 def assert_case(case: PmaCase, report, observed: ObservedBehavior) -> None:
-    assert report.errors is None
-    assert report.entry_points
+    assert {error.type for error in report.errors}.issubset(set(case.allowed_errors))
+    assert report.runs
     assert observed.unsupported_api_count == 0
 
     for api_name in case.expected_apis:

@@ -1,9 +1,9 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
-# Unicorn specific wrappers and abstraction implemented here
+from __future__ import annotations
 
 import ctypes as ct
-import platform
+import functools
 
 import unicorn as uc
 import unicorn.x86_const as u
@@ -19,51 +19,107 @@ from unicorn.unicorn_py3.unicorn import (
 )
 from unicorn.unicorn_py3.unicorn import uclib as _uc
 
-import speakeasy.common as common
-import speakeasy.winenv.arch as arch
-from speakeasy.errors import EmuEngineError
+from speakeasy import common
+from speakeasy.engines.start_timer import StartTimer
+from speakeasy.errors import EngineError
+from speakeasy.winenv import arch
 
 uc_engine = ct.c_void_p
+# Unicorn ends emulation without an error when pc reaches the "until" address. No x86 code
+# reaches this one: it is above 32 bits and not canonical on x64.
+UNREACHABLE_ADDRESS = 0x8000000000000000
+
 UC_HOOK_INSN_IN_CB = ct.CFUNCTYPE(ct.c_uint32, uc_engine, ct.c_uint32, ct.c_int, ct.c_void_p)
+UC_HOOK_INSN_OUT_CB = ct.CFUNCTYPE(None, uc_engine, ct.c_uint32, ct.c_int, ct.c_uint32, ct.c_void_p)
 UC_HOOK_INSN_SYSCALL_CB = ct.CFUNCTYPE(None, uc_engine, ct.c_void_p)
+UC_HOOK_INSN_CPUID_CB = ct.CFUNCTYPE(ct.c_int, uc_engine, ct.c_void_p)
+CPUID_HYPERVISOR_PRESENT = 1 << 31
 hook_id = uc_hook_h()
 
 
-def is_platform_intel():
-    mach = platform.machine()
-    if mach in ("x86_64", "i386", "x86"):
-        return True
-    return False
-
-
-class ToggleableHook:
+@functools.cache
+def get_exception_state_offset(mode):
     """
-    Hook than can be toggled on/off at arbitrary times.
+    Get the offset, in a saved x86 context, of the vector of the CPU exception in flight.
+
+    Returns ``None`` when the offset cannot be found. The processor clears the vector once it
+    delivers the exception. Unicorn hands the exception to the interrupt hook instead and never
+    clears it.
     """
+    probe = uc.Uc(uc.UC_ARCH_X86, mode)
+    probe.mem_map(0x1000, 0x1000)
+    probe.mem_write(0x1000, b"\xf7\xf1")  # div ecx
+    probe.hook_add(uc.UC_HOOK_INTR, lambda emu, _intno, _data: emu.emu_stop())
+    before = bytes(probe.context_save())
+    probe.emu_start(0x1000, 0x1002)
+    after = bytes(probe.context_save())
+    offsets = [
+        offset
+        for offset in range(0, len(before), 4)
+        if before[offset : offset + 4] == b"\xff" * 4 and after[offset : offset + 4] == b"\0" * 4
+    ]
+    return offsets[0] if len(offsets) == 1 else None
 
-    def __init__(self, cb):
-        self.cb = cb
-        self.enabled = False
 
-    def enable(self):
-        if self.enabled:
-            return
-        self.enabled = True
+@functools.cache
+def get_tsc_offset_location(mode):
+    """
+    Get the offset, in a saved x86 context, of the value that ``rdtsc`` adds to the time stamp counter.
 
-    def disable(self):
-        self.enabled = False
+    Returns ``None`` when the offset cannot be found. QEMU keeps the value 16 bytes after the
+    exception in flight.
+    """
+    exception = get_exception_state_offset(mode)
+    if exception is None:
+        return None
+    probe = uc.Uc(uc.UC_ARCH_X86, mode)
+    probe.mem_map(0x1000, 0x1000)
+    probe.mem_write(0x1000, b"\x0f\x31")  # rdtsc
+    context = probe.context_save()
+    field = ct.c_uint64.from_address(context.context.value + exception + 16)
+    if field.value != 0:
+        return None
+    field.value = 1 << 62
+    probe.context_restore(context)
+    probe.emu_start(0x1000, 0x1002)
+    tsc = probe.reg_read(u.UC_X86_REG_EDX) << 32 | probe.reg_read(u.UC_X86_REG_EAX)
+    return exception + 16 if tsc >= 1 << 62 else None
+
+
+@functools.cache
+def get_cpuid_leaf_1(mode):
+    """
+    Get the EAX, EBX, ECX and EDX values that ``cpuid`` leaf 1 gives to the guest.
+
+    The values are Unicorn's, without the bit in ECX that tells that a hypervisor is present.
+    """
+    probe = uc.Uc(uc.UC_ARCH_X86, mode)
+    probe.mem_map(0x1000, 0x1000)
+    probe.mem_write(0x1000, b"\x0f\xa2")  # cpuid
+    probe.reg_write(u.UC_X86_REG_EAX, 1)
+    probe.emu_start(0x1000, 0x1002)
+    eax, ebx, ecx, edx = (
+        probe.reg_read(r) for r in (u.UC_X86_REG_EAX, u.UC_X86_REG_EBX, u.UC_X86_REG_ECX, u.UC_X86_REG_EDX)
+    )
+    return eax, ebx, ecx & ~CPUID_HYPERVISOR_PRESENT, edx
 
 
 class EmuEngine:
-    """Wrapper class for underlying cpu emulation engines"""
+    """Wrap a Unicorn instance for the emulator."""
 
     def __init__(self):
-        self.name = "unicorn"
-        self.emu = None
-        self.mmap = None
-        self._callbacks = {}
+        self.name: str = "unicorn"
+        self.emu: uc.Uc | None = None
+        self.mode: int | None = None
+        # The ctypes callbacks of the hooks that hook_add added through the C API, by hook ID. The
+        # references keep the callbacks alive while Unicorn can call them.
+        self._callbacks: dict[int, ct._CFunctionType] = {}
+        # Unicorn can call a removed hook until the current block ends, so keep the callbacks of the hooks that
+        # hook_remove removed until emu_start returns.
+        self._removed_callbacks: list[ct._CFunctionType] = []
+        self.timer: StartTimer = StartTimer(self.stop)
 
-        self.regs = {
+        self.regs: dict[int, int] = {
             arch.X86_REG_EAX: u.UC_X86_REG_EAX,
             arch.X86_REG_EBX: u.UC_X86_REG_EBX,
             arch.X86_REG_ESP: u.UC_X86_REG_ESP,
@@ -96,6 +152,10 @@ class EmuEngine:
             arch.X86_REG_XMM1: u.UC_X86_REG_XMM1,
             arch.X86_REG_XMM2: u.UC_X86_REG_XMM2,
             arch.X86_REG_XMM3: u.UC_X86_REG_XMM3,
+            arch.X86_REG_FPSW: u.UC_X86_REG_FPSW,
+            arch.X86_REG_FPTAG: u.UC_X86_REG_FPTAG,
+            arch.X86_REG_FPCW: u.UC_X86_REG_FPCW,
+            arch.X86_REG_MXCSR: u.UC_X86_REG_MXCSR,
             arch.X86_REG_GDTR: u.UC_X86_REG_GDTR,
             arch.X86_REG_CS: u.UC_X86_REG_CS,
             arch.X86_REG_ES: u.UC_X86_REG_ES,
@@ -105,9 +165,11 @@ class EmuEngine:
             arch.X86_REG_GS: u.UC_X86_REG_GS,
             arch.X86_REG_MSR: u.UC_X86_REG_MSR,
         }
+        for i in range(8):
+            self.regs[arch.X86_REG_FP0 + i] = u.UC_X86_REG_FP0 + i
 
-        self.mem_access = {
-            uc.UC_MEM_FETCH_UNMAPPED: common.INVALID_MEM_EXEC,  # noqa
+        self.mem_access: dict[int, int] = {
+            uc.UC_MEM_FETCH_UNMAPPED: common.INVALID_MEM_EXEC,
             uc.UC_MEM_READ_UNMAPPED: common.INVALID_MEM_READ,
             uc.UC_MEM_FETCH_PROT: common.INVAL_PERM_MEM_EXEC,
             uc.UC_MEM_WRITE_PROT: common.INVAL_PERM_MEM_WRITE,
@@ -115,18 +177,20 @@ class EmuEngine:
             uc.UC_MEM_WRITE_UNMAPPED: common.INVALID_MEM_WRITE,
         }
 
-        self.perms = {
+        self.perms: dict[int, int] = {
             common.PERM_MEM_NONE: uc.UC_PROT_NONE,
             common.PERM_MEM_EXEC: uc.UC_PROT_EXEC,
             common.PERM_MEM_READ: uc.UC_PROT_READ,
             common.PERM_MEM_WRITE: uc.UC_PROT_WRITE,
             common.PERM_MEM_RW: uc.UC_PROT_READ | uc.UC_PROT_WRITE,
             common.PERM_MEM_RX: uc.UC_PROT_READ | uc.UC_PROT_EXEC,
+            common.PERM_MEM_WRITE | common.PERM_MEM_EXEC: uc.UC_PROT_WRITE | uc.UC_PROT_EXEC,
             common.PERM_MEM_RWX: uc.UC_PROT_ALL,
         }
 
-        self.hook_types = {
+        self.hook_types: dict[int, int] = {
             common.HOOK_CODE: uc.UC_HOOK_CODE,
+            common.HOOK_BLOCK: uc.UC_HOOK_BLOCK,
             common.HOOK_MEM_ACCESS: uc.UC_HOOK_MEM_VALID,
             common.HOOK_MEM_INVALID: uc.UC_HOOK_MEM_INVALID,
             common.HOOK_MEM_PERM_EXEC: uc.UC_HOOK_MEM_FETCH_PROT,
@@ -138,109 +202,212 @@ class EmuEngine:
             common.HOOK_INSN_INVALID: uc.UC_HOOK_INSN_INVALID,
         }
 
-    def _sec_to_usec(self, sec):
-        """
-        Unicorn expects timeouts to be supplied in microsecond granularity
-        """
-        return int(sec * 1000000)
-
     def init_engine(self, eng_arch, mode):
-        """Initialize cpu engine"""
+        """
+        Create the Unicorn instance for an architecture and a bitness.
+
+        Raises:
+            EngineError: if ``eng_arch`` is not x86 or AMD64, or ``mode`` is not 32 or 64 bits.
+        """
         if eng_arch == arch.ARCH_X86 or eng_arch == arch.ARCH_AMD64:
             _arch = uc.UC_ARCH_X86
         else:
-            raise Exception("Invalid architecture")
+            raise EngineError("Invalid architecture")
 
         if mode == arch.BITS_32:
             _mode = uc.UC_MODE_32
         elif mode == arch.BITS_64:
             _mode = uc.UC_MODE_64
         else:
-            raise Exception("Invalid bitness")
+            raise EngineError("Invalid bitness")
 
         self.emu = uc.Uc(_arch, _mode)
+        self.mode = _mode
+        # A probe creates a Unicorn instance, and that can make a running start with a timeout
+        # stop as timed out. Probe now, while nothing runs.
+        get_tsc_offset_location(_mode)
+        get_cpuid_leaf_1(_mode)
+        # Unicorn tells that a hypervisor is present, but has no hypervisor leaves. No real
+        # machine does this, and malware that sees it stops, so tell that no hypervisor is present.
+        self.hook_add(htype=common.HOOK_INSN, cb=self._hook_cpuid, arg1=u.UC_X86_INS_CPUID)
+
+    def _hook_cpuid(self, uc_engine, user_data):
+        """Give the leaf 1 values of ``get_cpuid_leaf_1``, and let Unicorn run ``cpuid`` for the other leaves."""
+        assert self.emu is not None
+        if self.emu.reg_read(u.UC_X86_REG_EAX) != 1:
+            return 0
+        if self.mode == uc.UC_MODE_64:
+            regs = (u.UC_X86_REG_RAX, u.UC_X86_REG_RBX, u.UC_X86_REG_RCX, u.UC_X86_REG_RDX)
+        else:
+            regs = (u.UC_X86_REG_EAX, u.UC_X86_REG_EBX, u.UC_X86_REG_ECX, u.UC_X86_REG_EDX)
+        for reg, value in zip(regs, get_cpuid_leaf_1(self.mode), strict=True):
+            self.emu.reg_write(reg, value)
+        # Unicorn skips the instruction when the last CPUID hook returns 1, so the values stay.
+        return 1
 
     def mem_map(self, base, size, perms=common.PERM_MEM_RWX):
-        """Allocate memory in the cpu engine"""
+        """Map memory in the engine."""
+        assert self.emu is not None
         perm = self.perms.get(perms, uc.UC_PROT_ALL)
-        return self.emu.mem_map(base, size, perm)  # type: ignore[union-attr]
+        return self.emu.mem_map(base, size, perm)
 
     def mem_unmap(self, addr, size):
-        """Free memory in the cpu engine"""
-        return self.emu.mem_unmap(addr, size)  # type: ignore[union-attr]
+        """Unmap memory in the engine."""
+        assert self.emu is not None
+        return self.emu.mem_unmap(addr, size)
 
     def mem_regions(self):
-        """Get current memory allocations from the engine"""
-        return self.emu.mem_regions()  # type: ignore[union-attr]
+        """Get the mapped regions of the engine."""
+        assert self.emu is not None
+        return self.emu.mem_regions()
 
     def mem_write(self, addr, data):
-        """Write data into the address space of the engine"""
-        return self.emu.mem_write(addr, data)  # type: ignore[union-attr]
+        """Write data into the address space of the engine."""
+        assert self.emu is not None
+        result = self.emu.mem_write(addr, data)
+        if data:
+            # Drop the translated code of the range, so that the guest runs the new bytes.
+            self.emu.ctl_remove_cache(addr, addr + len(data))
+        return result
 
     def mem_read(self, addr, size):
-        """Read data from the address space of the engine"""
-        return self.emu.mem_read(addr, size)  # type: ignore[union-attr]
+        """Read data from the address space of the engine."""
+        assert self.emu is not None
+        return self.emu.mem_read(addr, size)
 
     def mem_protect(self, addr, size, perms):
-        """Change the memory protections for pages in the emu engine"""
+        """Change the protection of pages in the engine."""
+        assert self.emu is not None
         perm = self.perms.get(perms, uc.UC_PROT_ALL)
-        return self.emu.mem_protect(addr, size, perm)  # type: ignore[union-attr]
+        result = self.emu.mem_protect(addr, size, perm)
+        # Unicorn keeps translations and TLB entries made under the old protections,
+        # which would let code run or memory be read that the new ones deny.
+        self.invalidate_translations(addr, addr + size)
+        self.emu.ctl(uc.UC_CTL_TLB_FLUSH, uc.UC_CTL_IO_WRITE)
+        return result
+
+    def clear_exception_state(self):
+        """
+        Mark the CPU exception in flight as delivered.
+
+        Otherwise the next divide error or general protection fault becomes a double fault,
+        and the one after that becomes a triple fault that stops emulation without an error.
+        """
+        assert self.emu is not None
+        offset = get_exception_state_offset(self.mode)
+        if offset is None:
+            return
+        context = self.emu.context_save()
+        ct.memset(context.context.value + offset, 0xFF, 4)
+        self.emu.context_restore(context)
+
+    def advance_tsc(self, ticks):
+        """Move the time stamp counter that rdtsc and rdtscp read forward by ticks."""
+        assert self.emu is not None
+        location = get_tsc_offset_location(self.mode)
+        if location is None:
+            return
+        context = self.emu.context_save()
+        ct.c_uint64.from_address(context.context.value + location).value += ticks
+        self.emu.context_restore(context)
+
+    def invalidate_translations(self, begin, end):
+        """Drop the translated code of [begin, end), so that the next run of it uses the current hooks."""
+        assert self.emu is not None
+        # Unicorn rejects an empty range with UC_ERR_ARG, and an empty range has no translated code.
+        if begin < end:
+            self.emu.ctl_remove_cache(begin, end)
+
+    def flush_translations(self):
+        """Drop all translated code, so that the next run uses the current hooks."""
+        assert self.emu is not None
+        self.emu.ctl(uc.UC_CTL_TB_FLUSH, uc.UC_CTL_IO_WRITE)
 
     def reg_write(self, reg, val):
-        """Modify register values"""
+        """
+        Write a register.
+
+        Raises:
+            EngineError: if ``reg`` is not a known register.
+        """
+        assert self.emu is not None
         ereg = self.regs.get(reg)
         if not ereg:
-            raise EmuEngineError(f"Unknown register: {reg}")
-        return self.emu.reg_write(ereg, val)  # type: ignore[union-attr]
+            raise EngineError(f"Unknown register: {reg}")
+        return self.emu.reg_write(ereg, val)
 
     def reg_read(self, reg):
-        """Read register values"""
+        """
+        Read a register.
+
+        Raises:
+            EngineError: if ``reg`` is not a known register.
+        """
+        assert self.emu is not None
         ereg = self.regs.get(reg)
         if not ereg:
-            raise EmuEngineError(f"Unknown register: {reg}")
-        return self.emu.reg_read(ereg)  # type: ignore[union-attr]
+            raise EngineError(f"Unknown register: {reg}")
+        return self.emu.reg_read(ereg)
 
     def stop(self):
-        """Stop the emulation engine"""
-        return self.emu.emu_stop()  # type: ignore[union-attr]
+        """Stop the engine."""
+        assert self.emu is not None
+        return self.emu.emu_stop()
 
     def start(self, addr, timeout=0, count=0):
-        """Start the emulation engine"""
+        """Start the engine at ``addr``. A ``timeout`` of 0 seconds and a ``count`` of 0 or -1 set no limit."""
+        assert self.emu is not None
         if count == -1:
             count = 0
-
-        # Unicorn expects the timeout to be in microseconds, convert it here
-        timeout = self._sec_to_usec(timeout)
-        return self.emu.emu_start(addr, 0xFFFFFFFF, timeout=timeout, count=count)  # type: ignore[union-attr]
+        if timeout:
+            self.timer.arm(timeout)
+        try:
+            return self.emu.emu_start(addr, UNREACHABLE_ADDRESS, count=count)
+        finally:
+            self._removed_callbacks.clear()
+            if timeout:
+                self.timer.disarm()
 
     def hook_add(self, addr=None, cb=None, htype=None, begin=1, end=0, arg1=0):
         """
-        Add a callback function for a specific event type or address
+        Add a callback for a hook type and an address range, and return the hook handle.
+
+        Raises:
+            EngineError: if ``htype`` is not a known hook type.
+            ValueError: if ``htype`` is the instruction hook type and ``arg1`` is not IN, OUT, SYSCALL, SYSENTER, or
+                CPUID.
+            unicorn.UcError: if Unicorn rejects the hook.
         """
+        assert self.emu is not None
         hook_type = self.hook_types.get(htype)
         if not hook_type:
-            raise EmuEngineError("Invalid hook type")
+            raise EngineError("Invalid hook type")
 
-        handle = self.emu._uch  # type: ignore[union-attr]
+        handle = self.emu._uch
 
-        # The unicorn bindings have a default python wrapper. We want to use
-        # our own wrapper and don't need the extra overhead. Add callbacks directly
-        # to the unicorn library here.
+        # The Python wrapper of the Unicorn bindings adds a call to each hook. For the code, block, memory,
+        # invalid memory and instruction hooks, add the callback to the C library directly.
         if hook_type == uc.UC_HOOK_INSN:
-            if arg1 == u.UC_X86_INS_IN:  # IN instruction
+            if arg1 == u.UC_X86_INS_IN:
                 cb = ct.cast(UC_HOOK_INSN_IN_CB(cb), UC_HOOK_INSN_IN_CB)
-            elif arg1 in (u.UC_X86_INS_SYSCALL, u.UC_X86_INS_SYSENTER):  # SYSCALL/SYSENTER
+            elif arg1 == u.UC_X86_INS_OUT:
+                cb = ct.cast(UC_HOOK_INSN_OUT_CB(cb), UC_HOOK_INSN_OUT_CB)
+            elif arg1 in (u.UC_X86_INS_SYSCALL, u.UC_X86_INS_SYSENTER):
                 cb = ct.cast(UC_HOOK_INSN_SYSCALL_CB(cb), UC_HOOK_INSN_SYSCALL_CB)
-        elif hook_type == uc.UC_HOOK_CODE:
+            elif arg1 == u.UC_X86_INS_CPUID:
+                cb = ct.cast(UC_HOOK_INSN_CPUID_CB(cb), UC_HOOK_INSN_CPUID_CB)
+            else:
+                raise ValueError(f"unsupported instruction for an instruction hook: {arg1}")
+        elif hook_type in (uc.UC_HOOK_CODE, uc.UC_HOOK_BLOCK):
             cb = ct.cast(UC_HOOK_CODE_CB(cb), UC_HOOK_CODE_CB)
         elif hook_type in (uc.UC_HOOK_MEM_READ, uc.UC_HOOK_MEM_WRITE):
             cb = ct.cast(UC_HOOK_MEM_ACCESS_CB(cb), UC_HOOK_MEM_ACCESS_CB)
         elif hook_type == uc.UC_HOOK_MEM_INVALID:
             cb = ct.cast(UC_HOOK_MEM_INVALID_CB(cb), UC_HOOK_MEM_INVALID_CB)
         else:
-            return self.emu.hook_add(htype=hook_type, callback=cb, begin=begin, end=end)  # type: ignore[union-attr]
+            return self.emu.hook_add(htype=hook_type, callback=cb, begin=begin, end=end)
         ptr = ct.cast(cb, ct.c_void_p)
-        # uc_hook_add requires an additional paramter for the hook type UC_HOOK_INSN
+        # For UC_HOOK_INSN, uc_hook_add takes the instruction as an extra argument.
         if hook_type == uc.UC_HOOK_INSN:
             insn = ct.c_int(arg1)
             rv = _uc.uc_hook_add(handle, ct.byref(hook_id), hook_type, ptr.value, None, begin, end, insn)
@@ -249,35 +416,19 @@ class EmuEngine:
         if rv != uc.UC_ERR_OK:
             raise uc.UcError(rv)
 
-        th = ToggleableHook(cb)
-        self._callbacks.update({hook_id.value: th})
+        self._callbacks[hook_id.value] = cb
 
         return hook_id.value
 
-    def hook_enable(self, hook_handle):
-        """
-        Enable a previously disabled hook
-        """
-        hook = self._callbacks.get(hook_handle)
-        if hook:
-            return hook.enable()
-
-    def hook_disable(self, hook_handle):
-        """
-        Disable a previously enabled hook
-        """
-        hook = self._callbacks.get(hook_handle)
-        if hook:
-            return hook.disable()
-
     def hook_remove(self, hid):
+        assert self.emu is not None
         if hid not in self._callbacks:
-            return self.emu.hook_del(hid)  # type: ignore[union-attr]
+            return self.emu.hook_del(hid)
 
-        status = _uc.uc_hook_del(self.emu._uch, uc_hook_h(hid))  # type: ignore[union-attr]
+        status = _uc.uc_hook_del(self.emu._uch, uc_hook_h(hid))
         if status != uc.UC_ERR_OK:
             raise uc.UcError(status)
-        self._callbacks.pop(hid, None)
+        self._removed_callbacks.append(self._callbacks.pop(hid))
 
     def close(self):
         if self.emu is None:

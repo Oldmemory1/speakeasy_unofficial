@@ -1,43 +1,49 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import speakeasy.winenv.arch as e_arch
-import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.nt.ntoskrnl as ntos
 import speakeasy.winenv.defs.usb as usbdefs
-import speakeasy.winenv.defs.wdf as wdf
+from speakeasy.windows.handles import HandleTable
+from speakeasy.winenv.defs import wdf
+from speakeasy.winenv.defs.enums import REG_VALUE_TYPE
+from speakeasy.winenv.defs.nt import ddk
 
 from .. import api
 
+if TYPE_CHECKING:
+    from speakeasy.windows.kernel import WinKernelEmulator
+
+WDF_FUNCTION_TABLE_NUM_ENTRIES_V1_13 = 438
+
 
 class WdfDriver:
+    driver_object_addr: int
+    driver_object: ntos.DRIVER_OBJECT
+
     def __init__(self):
-        self.reg_path: int | None = None
-        self.typed_context_worker: int | None = None
+        self.reg_path: str | None = None
         self.queues: dict[int, int] = {}
-        self.driver_object_addr: int | None = None
-        self.driver_object: Any | None = None
 
 
 class WdfDevice:
-    def __init__(self):
-        self.device_object_addr: int | None = None
-        self.device_object: Any | None = None
+    device_object_addr: int
+    device_object: ntos.DEVICE_OBJECT
 
 
 class WdfUsbDevice:
     def __init__(self):
         self.num_interfaces: int = 0
-        self.config_desc: int | None = None
+        self.config_desc: bytes | None = None
 
 
 class WdfUsbInterface:
     def __init__(self):
-        self.config_desc = 0
-        self.iface_index = 0
-        self.setting_index = 0
+        self.config_desc: bytes | None = None
+        self.iface_index: int = 0
+        self.setting_index: int = 0
 
 
 class WdfUsbPipe:
@@ -58,131 +64,43 @@ class Wdfldr(api.ApiHandler):
     def __init__(self, emu):
         super().__init__(emu)
 
-        self.funcs: dict[str, Any] = {}
-        self.curr_handle: int = 4
-        self.pnp_device: Any | None = None
-        self.data: dict[str, Any] = {}
+        self.funcs = {}
+        self.pnp_device: int | None = None
+        self.data = {}
         self.emu = emu
         self.wdf_drivers: dict[int, WdfDriver] = {}
-        self.wdf_devices: dict[int, WdfDevice] = {}
-        self.usb_devices: dict[int, WdfUsbDevice] = {}
-        self.usb_pipes: dict[int, WdfUsbPipe] = {}
-        self.usb_interfaces: dict[int, WdfUsbInterface] = {}
-        self.handles: dict[int, Any] = {}
+        # WDF objects are not kernel objects, so their handles are in a table of the module
+        self.handles: HandleTable = HandleTable(emu.handle_allocator, release=lambda obj: None)
+        self.typed_contexts: dict[tuple[int, int], int] = {}
         self.types = wdf
-        self.func_table = self.types.WDFFUNCTIONS(emu.get_ptr_size())
+        self.func_table: wdf.WDFFUNCTIONS = self.types.WDFFUNCTIONS(emu.get_ptr_size())
         self.func_table_ptr: int | None = None
         self.component_globals: int | None = None
         super().__get_hook_attrs__(self)
 
-    def get_handle(self):
-        self.curr_handle += 4
-        return self.curr_handle
-
     def set_func_table(self, emu):
-        addr = emu.add_callback(Wdfldr.name, self.WdfDriverCreate.__apihook__[0])
-        self.func_table.pfnWdfDriverCreate = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfDeviceInitSetPnpPowerEventCallbacks.__apihook__[0])
-        self.func_table.pfnWdfDeviceInitSetPnpPowerEventCallbacks = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfDeviceInitSetRequestAttributes.__apihook__[0])
-        self.func_table.pfnWdfDeviceInitSetRequestAttributes = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfDeviceInitSetFileObjectConfig.__apihook__[0])
-        self.func_table.pfnWdfDeviceInitSetFileObjectConfig = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfDeviceInitSetIoType.__apihook__[0])
-        self.func_table.pfnWdfDeviceInitSetIoType = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfDeviceCreate.__apihook__[0])
-        self.func_table.pfnWdfDeviceCreate = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfObjectGetTypedContextWorker.__apihook__[0])
-        self.func_table.pfnWdfObjectGetTypedContextWorker = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfDriverOpenParametersRegistryKey.__apihook__[0])
-        self.func_table.pfnWdfDriverOpenParametersRegistryKey = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfRegistryQueryULong.__apihook__[0])
-        self.func_table.pfnWdfRegistryQueryULong = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfRegistryClose.__apihook__[0])
-        self.func_table.pfnWdfRegistryClose = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfDeviceSetPnpCapabilities.__apihook__[0])
-        self.func_table.pfnWdfDeviceSetPnpCapabilities = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfIoQueueCreate.__apihook__[0])
-        self.func_table.pfnWdfIoQueueCreate = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfIoQueueReadyNotify.__apihook__[0])
-        self.func_table.pfnWdfIoQueueReadyNotify = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfDeviceCreateDeviceInterface.__apihook__[0])
-        self.func_table.pfnWdfDeviceCreateDeviceInterface = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfDeviceWdmGetAttachedDevice.__apihook__[0])
-        self.func_table.pfnWdfDeviceWdmGetAttachedDevice = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfDeviceWdmGetDeviceObject.__apihook__[0])
-        self.func_table.pfnWdfDeviceWdmGetDeviceObject = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbTargetDeviceCreateWithParameters.__apihook__[0])
-        self.func_table.pfnWdfUsbTargetDeviceCreateWithParameters = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbTargetDeviceGetDeviceDescriptor.__apihook__[0])
-        self.func_table.pfnWdfUsbTargetDeviceGetDeviceDescriptor = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbTargetDeviceRetrieveConfigDescriptor.__apihook__[0])
-        self.func_table.pfnWdfUsbTargetDeviceRetrieveConfigDescriptor = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfMemoryCreate.__apihook__[0])
-        self.func_table.pfnWdfMemoryCreate = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbTargetDeviceSelectConfig.__apihook__[0])
-        self.func_table.pfnWdfUsbTargetDeviceSelectConfig = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbTargetDeviceGetNumInterfaces.__apihook__[0])
-        self.func_table.pfnWdfUsbTargetDeviceGetNumInterfaces = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbTargetDeviceRetrieveInformation.__apihook__[0])
-        self.func_table.pfnWdfUsbTargetDeviceRetrieveInformation = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbInterfaceGetNumSettings.__apihook__[0])
-        self.func_table.pfnWdfUsbInterfaceGetNumSettings = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbInterfaceSelectSetting.__apihook__[0])
-        self.func_table.pfnWdfUsbInterfaceSelectSetting = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbInterfaceGetNumConfiguredPipes.__apihook__[0])
-        self.func_table.pfnWdfUsbInterfaceGetNumConfiguredPipes = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbInterfaceGetConfiguredPipe.__apihook__[0])
-        self.func_table.pfnWdfUsbInterfaceGetConfiguredPipe = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbTargetPipeGetInformation.__apihook__[0])
-        self.func_table.pfnWdfUsbTargetPipeGetInformation = addr
-
-        addr = emu.add_callback(Wdfldr.name, self.WdfUsbInterfaceGetInterfaceNumber.__apihook__[0])
-        self.func_table.pfnWdfUsbInterfaceGetInterfaceNumber = addr
+        for field, _ in self.func_table.__fields__:
+            if field.startswith("pfn"):
+                setattr(self.func_table, field, emu.add_callback(Wdfldr.name, field.removeprefix("pfn")))
 
         self.mem_write(self.func_table_ptr, self.func_table.get_bytes())
 
     def parse_usb_config(self, data):
-        interfaces = []
+        interfaces: list[Any] = []
+        if not data:
+            return interfaces
 
         # Get the USB config descriptor
         cd = usbdefs.USB_CONFIGURATION_DESCRIPTOR().cast(data)
         ifaces = cd.bNumInterfaces
         data = data[cd.bLength :]
 
-        for i in range(ifaces):
+        for _ in range(ifaces):
             endpoints = []
             _id = usbdefs.USB_INTERFACE_DESCRIPTOR().cast(data)
 
             data = data[_id.bLength :]
-            for j in range(_id.bNumEndpoints):
+            for _ in range(_id.bNumEndpoints):
                 ep = usbdefs.USB_ENDPOINT_DESCRIPTOR().cast(data)
                 data = data[ep.bLength :]
                 endpoints.append(ep)
@@ -191,49 +109,64 @@ class Wdfldr(api.ApiHandler):
 
         return interfaces
 
+    def get_pipe_type(self, ep):
+        pipe_types = {
+            usbdefs.USB_ENDPOINT_TYPE_CONTROL: wdf.WDF_USB_PIPE_TYPE.WdfUsbPipeTypeControl,
+            usbdefs.USB_ENDPOINT_TYPE_ISOCHRONOUS: wdf.WDF_USB_PIPE_TYPE.WdfUsbPipeTypeIsochronous,
+            usbdefs.USB_ENDPOINT_TYPE_BULK: wdf.WDF_USB_PIPE_TYPE.WdfUsbPipeTypeBulk,
+            usbdefs.USB_ENDPOINT_TYPE_INTERRUPT: wdf.WDF_USB_PIPE_TYPE.WdfUsbPipeTypeInterrupt,
+        }
+        return pipe_types[ep.bmAttributes & usbdefs.USB_ENDPOINT_TYPE_MASK]
+
     @apihook("WdfVersionBind", argc=4)
-    def WdfVersionBind(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfVersionBind(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        NTSTATUS
-        WdfVersionBind(
-        __in PDRIVER_OBJECT DriverObject,
-        __in PUNICODE_STRING RegistryPath,
-        __inout PWDF_BIND_INFO BindInfo,
-        __out PWDF_COMPONENT_GLOBALS* ComponentGlobals
+        NTSTATUS WdfVersionBind(
+            PDRIVER_OBJECT DriverObject,
+            PUNICODE_STRING RegistryPath,
+            PWDF_BIND_INFO BindInfo,
+            PWDF_COMPONENT_GLOBALS *ComponentGlobals
         );
         """
         rv = ddk.STATUS_SUCCESS
-        drv, reg_path, BindInfo, comp_globals = argv
+        DriverObject, RegistryPath, BindInfo, ComponentGlobals = argv
 
-        wbi = self.types.WDF_BIND_INFO(emu.get_ptr_size())
+        ptr_size = emu.get_ptr_size()
+        wbi = self.types.WDF_BIND_INFO(ptr_size)
         wbi = self.mem_cast(wbi, BindInfo)
 
         if not self.func_table_ptr:
             size = self.func_table.sizeof()
             self.func_table_ptr = self.mem_alloc(size, tag="api.struct.WDFFUNCTIONS")
 
-            self.mem_write(wbi.FuncTable, (self.func_table_ptr).to_bytes(emu.get_ptr_size(), "little"))
-
         if not self.component_globals:
-            components = self.types.WDF_COMPONENT_GLOBALS(emu.get_ptr_size())
+            components = self.types.WDF_COMPONENT_GLOBALS(ptr_size)
             self.component_globals = self.mem_alloc(components.sizeof(), tag="api.struct.WDF_COMPONENT_GLOBALS")
-            self.mem_write(comp_globals, (self.component_globals).to_bytes(emu.get_ptr_size(), "little"))
+        self.write_ptr(ComponentGlobals, self.component_globals)
 
         self.set_func_table(emu)
+
+        # KMDF 1.13 and older drivers keep the function table as an array in their own image
+        if wbi.FuncCount <= WDF_FUNCTION_TABLE_NUM_ENTRIES_V1_13:
+            table_size = wbi.FuncCount * ptr_size
+            table = self.func_table.get_bytes()[:table_size]
+            self.mem_write(wbi.FuncTable, table.ljust(table_size, b"\x00"))
+        else:
+            self.write_ptr(wbi.FuncTable, self.func_table_ptr)
 
         # For now, just leave the handle open so we can reference it later
         return rv
 
     @apihook("WdfDriverCreate", argc=6)
-    def WdfDriverCreate(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDriverCreate(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS WdfDriverCreate(
-          PWDF_DRIVER_GLOBALS DriverGlobals,
-          PDRIVER_OBJECT         DriverObject,
-          PCUNICODE_STRING       RegistryPath,
-          PWDF_OBJECT_ATTRIBUTES DriverAttributes,
-          PWDF_DRIVER_CONFIG     DriverConfig,
-          WDFDRIVER              *Driver
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            PDRIVER_OBJECT DriverObject,
+            PCUNICODE_STRING RegistryPath,
+            PWDF_OBJECT_ATTRIBUTES DriverAttributes,
+            PWDF_DRIVER_CONFIG DriverConfig,
+            WDFDRIVER *Driver
         );
         """
         DriverGlobals, DriverObject, RegistryPath, DriverAttributes, DriverConfig, Driver = argv
@@ -245,81 +178,89 @@ class Wdfldr(api.ApiHandler):
 
         self.wdf_drivers.update({DriverGlobals: driver})
 
+        # WdfGetDriver reads the handle from WDF_DRIVER_GLOBALS.Driver
+        handle = self.handles.new_handle(driver)
+        for out in (DriverGlobals, Driver):
+            if out:
+                self.write_ptr(out, handle)
+
         if DriverConfig:
             self.mem_cast(
                 self.types.WDF_DRIVER_CONFIG(emu.get_ptr_size()),
                 DriverConfig,
             )
-        rv = 0
+        rv = ddk.STATUS_SUCCESS
 
         return rv
 
     @apihook("WdfDeviceInitSetPnpPowerEventCallbacks", argc=3)
-    def WdfDeviceInitSetPnpPowerEventCallbacks(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDeviceInitSetPnpPowerEventCallbacks(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
-        void WdfDeviceInitSetPnpPowerEventCallbacks(
-          PWDFDEVICE_INIT               DeviceInit,
-          PWDF_PNPPOWER_EVENT_CALLBACKS PnpPowerEventCallbacks
+        VOID WdfDeviceInitSetPnpPowerEventCallbacks(
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            PWDFDEVICE_INIT DeviceInit,
+            PWDF_PNPPOWER_EVENT_CALLBACKS PnpPowerEventCallbacks
         );
         """
         DriverGlobals, DeviceInit, PnpPowerEventCallbacks = argv
 
-        return
-
     @apihook("WdfDeviceInitSetRequestAttributes", argc=3)
-    def WdfDeviceInitSetRequestAttributes(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDeviceInitSetRequestAttributes(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
-        void WdfDeviceInitSetRequestAttributes(
-          PWDFDEVICE_INIT        DeviceInit,
-          PWDF_OBJECT_ATTRIBUTES RequestAttributes
+        VOID WdfDeviceInitSetRequestAttributes(
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            PWDFDEVICE_INIT DeviceInit,
+            PWDF_OBJECT_ATTRIBUTES RequestAttributes
         );
         """
         DriverGlobals, DeviceInit, RequestAttributes = argv
 
-        return
-
     @apihook("WdfDeviceInitSetFileObjectConfig", argc=4)
-    def WdfDeviceInitSetFileObjectConfig(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDeviceInitSetFileObjectConfig(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
-        void WdfDeviceInitSetFileObjectConfig(
-          PWDFDEVICE_INIT        DeviceInit,
-          PWDF_FILEOBJECT_CONFIG FileObjectConfig,
-          PWDF_OBJECT_ATTRIBUTES FileObjectAttributes
+        VOID WdfDeviceInitSetFileObjectConfig(
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            PWDFDEVICE_INIT DeviceInit,
+            PWDF_FILEOBJECT_CONFIG FileObjectConfig,
+            PWDF_OBJECT_ATTRIBUTES FileObjectAttributes
         );
         """
         DriverGlobals, DeviceInit, FileObjectConfig, FileObjectAttributes = argv
 
-        return
-
     @apihook("WdfDeviceInitSetIoType", argc=3)
-    def WdfDeviceInitSetIoType(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDeviceInitSetIoType(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void WdfDeviceInitSetIoType(
-          PWDFDEVICE_INIT    DeviceInit,
-          WDF_DEVICE_IO_TYPE IoType
+        VOID WdfDeviceInitSetIoType(
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            PWDFDEVICE_INIT DeviceInit,
+            WDF_DEVICE_IO_TYPE IoType
         );
         """
         DriverGlobals, DeviceInit, IoType = argv
 
-        return
-
     @apihook("WdfDeviceCreate", argc=4)
-    def WdfDeviceCreate(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDeviceCreate(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS WdfDeviceCreate(
-          PWDFDEVICE_INIT        *DeviceInit,
-          PWDF_OBJECT_ATTRIBUTES DeviceAttributes,
-          WDFDEVICE              *Device
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            PWDFDEVICE_INIT *DeviceInit,
+            PWDF_OBJECT_ATTRIBUTES DeviceAttributes,
+            WDFDEVICE *Device
         );
         """
         DriverGlobals, DeviceInit, DeviceAttributes, Device = argv
         rv = ddk.STATUS_SUCCESS
 
         if Device:
-            handle = self.get_handle()
             dev = WdfDevice()
-            self.wdf_devices.update({handle: dev})
-            self.mem_write(Device, (handle).to_bytes(emu.get_ptr_size(), "little"))
+            handle = self.handles.new_handle(dev)
+            self.write_ptr(Device, handle)
 
             do = ntos.DEVICE_OBJECT(emu.get_ptr_size())
             dev.device_object_addr = self.mem_alloc(do.sizeof(), tag="api.struct.DEVICE_OBJECT")
@@ -333,100 +274,117 @@ class Wdfldr(api.ApiHandler):
         return rv
 
     @apihook("WdfObjectGetTypedContextWorker", argc=3, conv=e_arch.CALL_CONV_FASTCALL)
-    def WdfObjectGetTypedContextWorker(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfObjectGetTypedContextWorker(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         PVOID WdfObjectGetTypedContextWorker(
-          WDFOBJECT                      Handle,
-          PCWDF_OBJECT_CONTEXT_TYPE_INFO TypeInfo
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFOBJECT Handle,
+            PCWDF_OBJECT_CONTEXT_TYPE_INFO TypeInfo
         );
         """
         DriverGlobals, Handle, TypeInfo = argv
+        if not TypeInfo:
+            return 0
 
-        driver = self.wdf_drivers.get(DriverGlobals)
-
-        if not driver.typed_context_worker:
-            size = self.types.WDF_COMPONENT_GLOBALS(emu.get_ptr_size()).sizeof()
-            driver.typed_context_worker = self.mem_alloc(size, tag="api.struct.WDF_TYPED_CONTEXT_WORKER")
-        rv = driver.typed_context_worker
-
-        return rv
+        ps = emu.get_ptr_size()
+        unique = self.read_ptr(TypeInfo + 3 * ps) or TypeInfo
+        key = (Handle, unique)
+        if key not in self.typed_contexts:
+            size = self.read_ptr(unique + 2 * ps) or ps
+            self.typed_contexts[key] = self.mem_alloc(size, tag="api.struct.WDF_OBJECT_CONTEXT")
+        return self.typed_contexts[key]
 
     @apihook("WdfDriverOpenParametersRegistryKey", argc=5)
-    def WdfDriverOpenParametersRegistryKey(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDriverOpenParametersRegistryKey(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         NTSTATUS WdfDriverOpenParametersRegistryKey(
-          WDFDRIVER              Driver,
-          ACCESS_MASK            DesiredAccess,
-          PWDF_OBJECT_ATTRIBUTES KeyAttributes,
-          WDFKEY                 *Key
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFDRIVER Driver,
+            ACCESS_MASK DesiredAccess,
+            PWDF_OBJECT_ATTRIBUTES KeyAttributes,
+            WDFKEY *Key
         );
         """
-        DriverGlobals, Driver, DesiredAccess, KeyAttributes, pKey = argv
+        DriverGlobals, Driver, DesiredAccess, KeyAttributes, Key = argv
 
         rv = ddk.STATUS_OBJECT_NAME_NOT_FOUND
+        hnd = 0
 
         driver = self.wdf_drivers.get(DriverGlobals)
-        hnd = emu.reg_open_key(driver.reg_path + "\\Parameters")
+        if driver and driver.reg_path:
+            hnd = emu.reg_open_key(driver.reg_path + "\\Parameters") or 0
         if hnd:
             rv = ddk.STATUS_SUCCESS
 
-        if pKey:
-            self.mem_write(pKey, (hnd).to_bytes(emu.get_ptr_size(), "little"))
+        if Key:
+            self.write_ptr(Key, hnd)
 
         return rv
 
     @apihook("WdfRegistryQueryULong", argc=4)
-    def WdfRegistryQueryULong(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfRegistryQueryULong(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS WdfRegistryQueryULong(
-          WDFKEY           Key,
-          PCUNICODE_STRING ValueName,
-          PULONG           Value
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFKEY Key,
+            PCUNICODE_STRING ValueName,
+            PULONG Value
         );
         """
         DriverGlobals, Key, ValueName, Value = argv
 
         rv = ddk.STATUS_OBJECT_NAME_NOT_FOUND
-        wkey = emu.reg_get_key(Key)
+        wkey = self.get_reg_key(Key)
         if wkey:
             val_name = self.read_unicode_string(ValueName)
-            argv[2] = val_name
+            ctx.args[2].display = val_name
             value = wkey.get_value(val_name)
             if value:
-                ulong = value.get_data()
-                self.mem_write(Value, (ulong).to_bytes(4, "little"))
-                rv = ddk.STATUS_SUCCESS
+                if value.get_type() != REG_VALUE_TYPE.REG_DWORD:
+                    rv = ddk.STATUS_OBJECT_TYPE_MISMATCH
+                else:
+                    self.mem_write(Value, value.get_bytes(2))
+                    rv = ddk.STATUS_SUCCESS
+        else:
+            rv = ddk.STATUS_INVALID_HANDLE
 
         return rv
 
     @apihook("WdfRegistryClose", argc=2)
-    def WdfRegistryClose(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfRegistryClose(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void WdfRegistryClose(
-          WDFKEY Key
+        VOID WdfRegistryClose(
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFKEY Key
         );
         """
         DriverGlobals, Key = argv
-        return
 
     @apihook("WdfDeviceSetPnpCapabilities", argc=3)
-    def WdfDeviceSetPnpCapabilities(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDeviceSetPnpCapabilities(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
-        void WdfDeviceSetPnpCapabilities(
-          WDFDEVICE                    Device,
-          PWDF_DEVICE_PNP_CAPABILITIES PnpCapabilities
+        VOID WdfDeviceSetPnpCapabilities(
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFDEVICE Device,
+            PWDF_DEVICE_PNP_CAPABILITIES PnpCapabilities
         );
         """
         DriverGlobals, Device, PnpCapabilities = argv
-        return
 
     @apihook("WdfIoQueueReadyNotify", argc=4)
-    def WdfIoQueueReadyNotify(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfIoQueueReadyNotify(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS WdfIoQueueReadyNotify(
-          WDFQUEUE               Queue,
-          PFN_WDF_IO_QUEUE_STATE QueueReady,
-          WDFCONTEXT             Context
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFQUEUE Queue,
+            PFN_WDF_IO_QUEUE_STATE QueueReady,
+            WDFCONTEXT Context
         );
         """
         DriverGlobals, Queue, QueueReady, Context = argv
@@ -435,12 +393,15 @@ class Wdfldr(api.ApiHandler):
         return rv
 
     @apihook("WdfDeviceCreateDeviceInterface", argc=4)
-    def WdfDeviceCreateDeviceInterface(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDeviceCreateDeviceInterface(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         NTSTATUS WdfDeviceCreateDeviceInterface(
-          WDFDEVICE        Device,
-          const GUID       *InterfaceClassGUID,
-          PCUNICODE_STRING ReferenceString
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFDEVICE Device,
+            const GUID *InterfaceClassGUID,
+            PCUNICODE_STRING ReferenceString
         );
         """
         DriverGlobals, Device, InterfaceClassGUID, ReferenceString = argv
@@ -449,22 +410,23 @@ class Wdfldr(api.ApiHandler):
         if InterfaceClassGUID:
             guid = self.mem_read(InterfaceClassGUID, 16)
             guid = uuid.UUID(bytes_le=guid)
-            argv[2] = str(guid)
+            ctx.args[2].display = str(guid)
 
         if ReferenceString:
             ref = self.read_unicode_string(ReferenceString)
-            argv[3] = ref
+            ctx.args[3].display = ref
 
         return rv
 
     @apihook("WdfIoQueueCreate", argc=5)
-    def WdfIoQueueCreate(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfIoQueueCreate(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS WdfIoQueueCreate(
-          WDFDEVICE              Device,
-          PWDF_IO_QUEUE_CONFIG   Config,
-          PWDF_OBJECT_ATTRIBUTES QueueAttributes,
-          WDFQUEUE               *Queue
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFDEVICE Device,
+            PWDF_IO_QUEUE_CONFIG Config,
+            PWDF_OBJECT_ATTRIBUTES QueueAttributes,
+            WDFQUEUE *Queue
         );
         """
         DriverGlobals, Device, Config, QueueAttributes, Queue = argv
@@ -473,20 +435,26 @@ class Wdfldr(api.ApiHandler):
         queue_config = self.types.WDF_IO_QUEUE_CONFIG(emu.get_ptr_size())
         queue_config = self.mem_cast(queue_config, Config)
 
-        hnd = self.get_handle()
         driver = self.wdf_drivers.get(DriverGlobals)
+        if driver is None:
+            return ddk.STATUS_INVALID_PARAMETER
+
+        hnd = self.handles.new_handle(queue_config)
         driver.queues.update({hnd: queue_config})
 
         if Queue:
-            self.mem_write(Queue, (hnd).to_bytes(emu.get_ptr_size(), "little"))
+            self.write_ptr(Queue, hnd)
 
         return rv
 
     @apihook("WdfDeviceWdmGetAttachedDevice", argc=2)
-    def WdfDeviceWdmGetAttachedDevice(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDeviceWdmGetAttachedDevice(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         PDEVICE_OBJECT WdfDeviceWdmGetAttachedDevice(
-          WDFDEVICE Device
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFDEVICE Device
         );
         """
         DriverGlobals, Device = argv
@@ -499,89 +467,100 @@ class Wdfldr(api.ApiHandler):
         return rv
 
     @apihook("WdfUsbTargetDeviceCreateWithParameters", argc=5)
-    def WdfUsbTargetDeviceCreateWithParameters(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbTargetDeviceCreateWithParameters(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         NTSTATUS WdfUsbTargetDeviceCreateWithParameters(
-          WDFDEVICE                     Device,
-          PWDF_USB_DEVICE_CREATE_CONFIG Config,
-          PWDF_OBJECT_ATTRIBUTES        Attributes,
-          WDFUSBDEVICE                  *UsbDevice
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFDEVICE Device,
+            PWDF_USB_DEVICE_CREATE_CONFIG Config,
+            PWDF_OBJECT_ATTRIBUTES Attributes,
+            WDFUSBDEVICE *UsbDevice
         );
         """
         DriverGlobals, Device, Config, Attributes, UsbDevice = argv
 
         rv = ddk.STATUS_SUCCESS
-        handle = self.get_handle()
         usb = WdfUsbDevice()
-        self.usb_devices.update({handle: usb})
+        handle = self.handles.new_handle(usb)
 
-        self.mem_write(UsbDevice, (handle).to_bytes(emu.get_ptr_size(), "little"))
+        self.write_ptr(UsbDevice, handle)
 
         return rv
 
     @apihook("WdfDeviceWdmGetDeviceObject", argc=2)
-    def WdfDeviceWdmGetDeviceObject(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfDeviceWdmGetDeviceObject(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         PDEVICE_OBJECT WdfDeviceWdmGetDeviceObject(
-          WDFDEVICE Device
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFDEVICE Device
         );
         """
         DriverGlobals, Device = argv
         rv = 0
 
-        dev = self.wdf_devices.get(Device)
+        dev = self.handles.get(Device, WdfDevice)
         if dev:
             rv = dev.device_object_addr
         return rv
 
     @apihook("WdfUsbTargetDeviceGetDeviceDescriptor", argc=3)
-    def WdfUsbTargetDeviceGetDeviceDescriptor(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbTargetDeviceGetDeviceDescriptor(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
-        void WdfUsbTargetDeviceGetDeviceDescriptor(
-          WDFUSBDEVICE           UsbDevice,
-          PUSB_DEVICE_DESCRIPTOR UsbDeviceDescriptor
+        VOID WdfUsbTargetDeviceGetDeviceDescriptor(
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBDEVICE UsbDevice,
+            PUSB_DEVICE_DESCRIPTOR UsbDeviceDescriptor
         );
         """
         DriverGlobals, UsbDevice, UsbDeviceDescriptor = argv
 
-        dev = self.usb_devices.get(UsbDevice)
+        dev = self.handles.get(UsbDevice, WdfUsbDevice)
         if dev:
             dd = usbdefs.USB_DEVICE_DESCRIPTOR()
             self.mem_write(UsbDeviceDescriptor, dd.get_bytes())
-        return
 
     @apihook("WdfMemoryCreate", argc=7)
-    def WdfMemoryCreate(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfMemoryCreate(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS WdfMemoryCreate(
-          PWDF_OBJECT_ATTRIBUTES Attributes,
-          POOL_TYPE              PoolType,
-          ULONG                  PoolTag,
-          size_t                 BufferSize,
-          WDFMEMORY              *Memory,
-          PVOID                  *Buffer
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            PWDF_OBJECT_ATTRIBUTES Attributes,
+            POOL_TYPE PoolType,
+            ULONG PoolTag,
+            size_t BufferSize,
+            WDFMEMORY *Memory,
+            PVOID *Buffer
         );
         """
-        DriverGlobals, Attributes, PoolType, PoolTag, BufferSize, Mem, Buf = argv
+        DriverGlobals, Attributes, PoolType, PoolTag, BufferSize, Memory, Buffer = argv
 
         rv = ddk.STATUS_SUCCESS
 
         ptr = self.mem_alloc(BufferSize, tag="api.struct.WDFMEMORY")
 
-        if Mem:
-            self.mem_write(Mem, (ptr).to_bytes(emu.get_ptr_size(), "little"))
-        if Buf:
-            self.mem_write(Buf, (ptr).to_bytes(emu.get_ptr_size(), "little"))
+        if Memory:
+            self.write_ptr(Memory, ptr)
+        if Buffer:
+            self.write_ptr(Buffer, ptr)
 
         return rv
 
     @apihook("WdfUsbTargetDeviceSelectConfig", argc=4)
-    def WdfUsbTargetDeviceSelectConfig(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbTargetDeviceSelectConfig(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         NTSTATUS WdfUsbTargetDeviceSelectConfig(
-          WDFUSBDEVICE                         UsbDevice,
-          PWDF_OBJECT_ATTRIBUTES               PipeAttributes,
-          PWDF_USB_DEVICE_SELECT_CONFIG_PARAMS Params
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBDEVICE UsbDevice,
+            PWDF_OBJECT_ATTRIBUTES PipeAttributes,
+            PWDF_USB_DEVICE_SELECT_CONFIG_PARAMS Params
         );
         """
         DriverGlobals, UsbDevice, PipeAttributes, Params = argv
@@ -590,16 +569,17 @@ class Wdfldr(api.ApiHandler):
         cfg_params = self.types.WDF_USB_DEVICE_SELECT_CONFIG_PARAMS(emu.get_ptr_size())
         cfg_params = self.mem_cast(cfg_params, Params)
 
-        dev = self.usb_devices.get(UsbDevice)
+        dev = self.handles.get(UsbDevice, WdfUsbDevice)
+        if not dev:
+            return ddk.STATUS_INVALID_HANDLE
 
         enum = self.types.WdfUsbTargetDeviceSelectConfigType
         if cfg_params.Type == enum.WdfUsbTargetDeviceSelectConfigTypeSingleInterface:
             dev.num_interfaces = 1
-            hnd = self.get_handle()
             uf = WdfUsbInterface()
             uf.config_desc = dev.config_desc
             uf.iface_index = 0
-            self.usb_interfaces.update({hnd: uf})
+            hnd = self.handles.new_handle(uf)
             cfg_params.Types.SingleInterface.ConfiguredUsbInterface = hnd
         elif cfg_params.Type == enum.WdfUsbTargetDeviceSelectConfigTypeMultiInterface:
             dev.num_interfaces = cfg_params.Types.MultiInterface.NumberInterfaces
@@ -611,12 +591,15 @@ class Wdfldr(api.ApiHandler):
         return rv
 
     @apihook("WdfUsbTargetDeviceRetrieveConfigDescriptor", argc=4)
-    def WdfUsbTargetDeviceRetrieveConfigDescriptor(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbTargetDeviceRetrieveConfigDescriptor(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         NTSTATUS WdfUsbTargetDeviceRetrieveConfigDescriptor(
-          WDFUSBDEVICE UsbDevice,
-          PVOID        ConfigDescriptor,
-          PUSHORT      ConfigDescriptorLength
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBDEVICE UsbDevice,
+            PVOID ConfigDescriptor,
+            PUSHORT ConfigDescriptorLength
         );
         """
         DriverGlobals, UsbDevice, ConfigDescriptor, ConfigDescriptorLength = argv
@@ -629,7 +612,7 @@ class Wdfldr(api.ApiHandler):
         cd = usbdefs.USB_CONFIGURATION_DESCRIPTOR()
         if ConfigDescriptor:
             cd = self.mem_cast(cd, ConfigDescriptor)
-            dev = self.usb_devices.get(UsbDevice)
+            dev = self.handles.get(UsbDevice, WdfUsbDevice)
             if dev:
                 if cd.bLength == 0:
                     self.mem_write(ConfigDescriptorLength, (cd.sizeof()).to_bytes(2, "little"))
@@ -640,22 +623,29 @@ class Wdfldr(api.ApiHandler):
                 rv = ddk.STATUS_SUCCESS
             else:
                 self.mem_write(ConfigDescriptorLength, (cd.sizeof()).to_bytes(2, "little"))
+        else:
+            dev = self.handles.get(UsbDevice, WdfUsbDevice)
+            size = len(dev.config_desc) if dev and dev.config_desc else cd.sizeof()
+            self.mem_write(ConfigDescriptorLength, size.to_bytes(2, "little"))
 
         return rv
 
     @apihook("WdfUsbInterfaceSelectSetting", argc=4)
-    def WdfUsbInterfaceSelectSetting(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbInterfaceSelectSetting(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         NTSTATUS WdfUsbInterfaceSelectSetting(
-          WDFUSBINTERFACE                          UsbInterface,
-          PWDF_OBJECT_ATTRIBUTES                   PipesAttributes,
-          PWDF_USB_INTERFACE_SELECT_SETTING_PARAMS Params
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBINTERFACE UsbInterface,
+            PWDF_OBJECT_ATTRIBUTES PipesAttributes,
+            PWDF_USB_INTERFACE_SELECT_SETTING_PARAMS Params
         );
         """
         DriverGlobals, UsbInterface, PipesAttributes, Params = argv
 
         rv = ddk.STATUS_INVALID_HANDLE
-        uif = self.usb_interfaces.get(UsbInterface)
+        uif = self.handles.get(UsbInterface, WdfUsbInterface)
         if uif:
             ifparams = self.types.WDF_USB_INTERFACE_SELECT_SETTING_PARAMS(emu.get_ptr_size())
             ifparams = self.mem_cast(ifparams, Params)
@@ -668,32 +658,38 @@ class Wdfldr(api.ApiHandler):
         return rv
 
     @apihook("WdfUsbTargetDeviceGetNumInterfaces", argc=2)
-    def WdfUsbTargetDeviceGetNumInterfaces(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbTargetDeviceGetNumInterfaces(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         UCHAR WdfUsbTargetDeviceGetNumInterfaces(
-          WDFUSBDEVICE UsbDevice
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBDEVICE UsbDevice
         );
         """
         DriverGlobals, UsbDevice = argv
 
         rv = 0
-        dev = self.usb_devices.get(UsbDevice)
+        dev = self.handles.get(UsbDevice, WdfUsbDevice)
         if dev:
             rv = dev.num_interfaces
 
         return rv
 
     @apihook("WdfUsbInterfaceGetNumConfiguredPipes", argc=2)
-    def WdfUsbInterfaceGetNumConfiguredPipes(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbInterfaceGetNumConfiguredPipes(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         BYTE WdfUsbInterfaceGetNumConfiguredPipes(
-          WDFUSBINTERFACE UsbInterface
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBINTERFACE UsbInterface
         );
         """
         DriverGlobals, UsbInterface = argv
 
         rv = 0
-        uif = self.usb_interfaces.get(UsbInterface)
+        uif = self.handles.get(UsbInterface, WdfUsbInterface)
 
         if uif:
             interfaces = self.parse_usb_config(uif.config_desc)
@@ -705,16 +701,21 @@ class Wdfldr(api.ApiHandler):
         return rv
 
     @apihook("WdfUsbInterfaceGetNumSettings", argc=2)
-    def WdfUsbInterfaceGetNumSettings(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbInterfaceGetNumSettings(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         BYTE WdfUsbInterfaceGetNumSettings(
-          WDFUSBINTERFACE UsbInterface
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBINTERFACE UsbInterface
         );
         """
         DriverGlobals, UsbInterface = argv
 
         rv = 0
-        uif = self.usb_interfaces.get(UsbInterface)
+        uif = self.handles.get(UsbInterface, WdfUsbInterface)
+        if not uif:
+            return rv
 
         interfaces = self.parse_usb_config(uif.config_desc)
 
@@ -725,17 +726,20 @@ class Wdfldr(api.ApiHandler):
         return rv
 
     @apihook("WdfUsbTargetDeviceRetrieveInformation", argc=3)
-    def WdfUsbTargetDeviceRetrieveInformation(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbTargetDeviceRetrieveInformation(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         NTSTATUS WdfUsbTargetDeviceRetrieveInformation(
-          WDFUSBDEVICE                UsbDevice,
-          PWDF_USB_DEVICE_INFORMATION Information
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBDEVICE UsbDevice,
+            PWDF_USB_DEVICE_INFORMATION Information
         );
         """
         DriverGlobals, UsbDevice, Information = argv
 
         rv = ddk.STATUS_INVALID_HANDLE
-        dev = self.usb_devices.get(UsbDevice)
+        dev = self.handles.get(UsbDevice, WdfUsbDevice)
         if dev:
             info = self.types.WDF_USB_DEVICE_INFORMATION(emu.get_ptr_size())
             info = self.mem_cast(info, Information)
@@ -747,25 +751,31 @@ class Wdfldr(api.ApiHandler):
         return rv
 
     @apihook("WdfUsbInterfaceGetConfiguredPipe", argc=4)
-    def WdfUsbInterfaceGetConfiguredPipe(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbInterfaceGetConfiguredPipe(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         WDFUSBPIPE WdfUsbInterfaceGetConfiguredPipe(
-          WDFUSBINTERFACE           UsbInterface,
-          UCHAR                     PipeIndex,
-          PWDF_USB_PIPE_INFORMATION PipeInfo
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBINTERFACE UsbInterface,
+            UCHAR PipeIndex,
+            PWDF_USB_PIPE_INFORMATION PipeInfo
         );
         """
         DriverGlobals, UsbInterface, PipeIndex, PipeInfo = argv
+        PipeIndex &= 0xFF
 
         rv = 0
-        uif = self.usb_interfaces.get(UsbInterface)
+        uif = self.handles.get(UsbInterface, WdfUsbInterface)
+        if not uif:
+            return rv
 
         interfaces = self.parse_usb_config(uif.config_desc)
-        if PipeInfo:
-            for i, eps in interfaces:
-                if uif.iface_index == i.bInterfaceNumber:
-                    if PipeIndex > len(eps):
-                        break
+        for i, eps in interfaces:
+            if uif.iface_index == i.bInterfaceNumber:
+                if PipeIndex >= len(eps):
+                    return rv
+                if PipeInfo:
                     ep = eps[PipeIndex]
                     info = self.types.WDF_USB_PIPE_INFORMATION(emu.get_ptr_size())
                     info = self.mem_cast(info, PipeInfo)
@@ -773,75 +783,65 @@ class Wdfldr(api.ApiHandler):
                     info.MaximumPacketSize = ep.wMaxPacketSize
                     info.EndpointAddress = ep.bEndpointAddress
                     info.Interval = ep.bInterval
-                    if ep.bmAttributes & usbdefs.USB_ENDPOINT_TYPE_ISOCHRONOUS:
-                        info.PipeType = wdf.WdfUsbPipeTypeIsochronous
-                    if ep.bmAttributes & usbdefs.USB_ENDPOINT_TYPE_BULK:
-                        info.PipeType = wdf.WdfUsbPipeTypeBulk
-                    if ep.bmAttributes & usbdefs.USB_ENDPOINT_TYPE_INTERRUPT:
-                        info.PipeType = wdf.WdfUsbPipeTypeInterrupt
-                    info.PipeType = ep.bmAttributes
+                    info.PipeType = self.get_pipe_type(ep)
                     self.mem_write(PipeInfo, info.get_bytes())
 
-        if uif:
-            hnd = self.get_handle()
-            up = WdfUsbPipe()
-            up.interface = uif
-            up.index = PipeIndex
-            self.usb_pipes.update({hnd: up})
-            rv = hnd
+        up = WdfUsbPipe()
+        up.interface = uif
+        up.index = PipeIndex
+        hnd = self.handles.new_handle(up)
+        rv = hnd
 
         return rv
 
     @apihook("WdfUsbTargetPipeGetInformation", argc=3)
-    def WdfUsbTargetPipeGetInformation(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbTargetPipeGetInformation(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
-        void WdfUsbTargetPipeGetInformation(
-          WDFUSBPIPE                Pipe,
-          PWDF_USB_PIPE_INFORMATION PipeInformation
+        VOID WdfUsbTargetPipeGetInformation(
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBPIPE Pipe,
+            PWDF_USB_PIPE_INFORMATION PipeInformation
         );
         """
-        DriverGlobals, Pipe, PipeInfo = argv
+        DriverGlobals, Pipe, PipeInformation = argv
 
-        _pipe = self.usb_pipes.get(Pipe)
-        if _pipe:
+        _pipe = self.handles.get(Pipe, WdfUsbPipe)
+        if _pipe and _pipe.interface:
             uif = _pipe.interface
 
             interfaces = self.parse_usb_config(uif.config_desc)
 
-            if PipeInfo:
+            if PipeInformation:
                 for i, eps in interfaces:
                     if uif.iface_index == i.bInterfaceNumber:
-                        if _pipe.index > len(eps):
+                        if _pipe.index >= len(eps):
                             break
                         ep = eps[_pipe.index]
                         info = self.types.WDF_USB_PIPE_INFORMATION(emu.get_ptr_size())
-                        info = self.mem_cast(info, PipeInfo)
+                        info = self.mem_cast(info, PipeInformation)
                         info.Size = info.sizeof()
                         info.MaximumPacketSize = ep.wMaxPacketSize
                         info.EndpointAddress = ep.bEndpointAddress
                         info.Interval = ep.bInterval
-                        if ep.bmAttributes & usbdefs.USB_ENDPOINT_TYPE_ISOCHRONOUS:
-                            info.PipeType = wdf.WDF_USB_PIPE_TYPE.WdfUsbPipeTypeIsochronous
-                        if ep.bmAttributes & usbdefs.USB_ENDPOINT_TYPE_BULK:
-                            info.PipeType = wdf.WDF_USB_PIPE_TYPE.WdfUsbPipeTypeBulk
-                        if ep.bmAttributes & usbdefs.USB_ENDPOINT_TYPE_INTERRUPT:
-                            info.PipeType = wdf.WDF_USB_PIPE_TYPE.WdfUsbPipeTypeInterrupt
-                        info.PipeType = ep.bmAttributes
-                        self.mem_write(PipeInfo, info.get_bytes())
-
-        return
+                        info.PipeType = self.get_pipe_type(ep)
+                        self.mem_write(PipeInformation, info.get_bytes())
 
     @apihook("WdfUsbInterfaceGetInterfaceNumber", argc=2)
-    def WdfUsbInterfaceGetInterfaceNumber(self, emu, argv, ctx: api.ApiContext = None):
+    def WdfUsbInterfaceGetInterfaceNumber(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         BYTE WdfUsbInterfaceGetInterfaceNumber(
-          WDFUSBINTERFACE UsbInterface
+            PWDF_DRIVER_GLOBALS DriverGlobals,
+            WDFUSBINTERFACE UsbInterface
         );
         """
         DriverGlobals, UsbInterface = argv
 
         rv = 0
-        uif = self.usb_interfaces.get(UsbInterface)
+        uif = self.handles.get(UsbInterface, WdfUsbInterface)
 
         if uif:
             rv = uif.iface_index

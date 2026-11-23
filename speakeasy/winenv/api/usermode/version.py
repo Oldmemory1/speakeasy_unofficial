@@ -1,20 +1,81 @@
-# Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
-"""version.dll —— 只实现语料里高频出现的版本查询函数（fixN）。
+# Copyright (C) 2026 Mandiant, Inc. All Rights Reserved.
+"""version.dll handlers.
 
-扫描 1204 语料的导入表：301 个样本导入 version.dll，887 次导入，Top：
-GetFileVersionInfoA 168 / GetFileVersionInfoSizeA 165 / VerQueryValueA 164 /
-VerQueryValueW 135 / GetFileVersionInfoW 125 / GetFileVersionInfoSizeW 124。
-
-旧行为（无 handler）：`GetFileVersionInfoSize*` 走签名模拟返回 u32=0 →
-样本认为"没有版本信息"，常直接跳过后续分支。这里给一个最小的、格式合法的
-VS_FIXEDFILEINFO（52 字节），让版本查询链路能走通。
+Combine the upstream v2.1.0 RT_VERSION resource lookup with the local fixN
+fallback: when the emulator knows the named file but cannot read an RT_VERSION
+resource from it, report a minimal, format-valid VS_VERSIONINFO block holding a
+VS_FIXEDFILEINFO for Windows 10.0.19041.0.  The local handler gave that block
+for every file so that the samples which query version information do not take
+their "no version resource" branch; the block here is a real VS_VERSIONINFO
+root node, so the upstream parser and VerQueryValue agree on its layout.
 """
 
+import ntpath
 import struct
+from typing import TYPE_CHECKING
+
+import pefile
+
+import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy.winenv.codepage import encode_ansi
 
 from .. import api
 
-# VS_FIXEDFILEINFO（52 bytes），版本 10.0.19041.0
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
+
+RT_VERSION = 16
+VS_VERSION_SIGNATURE = b"FE2X"
+
+
+def align4(offset: int) -> int:
+    return (offset + 3) & ~3
+
+
+def get_version_node(block: bytes, offset: int) -> tuple[int, str, int, int, bool]:
+    """
+    Decode the VS_VERSIONINFO node at ``offset``. Return its end, key, value
+    offset, wValueLength, and whether the value is text.
+
+    Raises:
+        struct.error: if the node header is outside the block.
+    """
+    length, value_length, value_type = struct.unpack_from("<HHH", block, offset)
+    end = min(offset + length, len(block))
+    key_end = offset + 6
+    while key_end + 2 <= end and block[key_end : key_end + 2] != b"\0\0":
+        key_end += 2
+    key = block[offset + 6 : key_end].decode("utf-16le", "replace")
+    return end, key, align4(key_end + 2), value_length, value_type == 1
+
+
+def get_version_value(block: bytes, sub_block: str) -> tuple[int, int, bool] | None:
+    """
+    Find a value in a VS_VERSIONINFO block by its backslash separated path.
+    Keys match without regard to case. Return the value offset, the
+    wValueLength field, and whether the value is text, or None when the path
+    does not exist.
+    """
+    try:
+        end, _, value_offset, value_length, is_text = get_version_node(block, 0)
+        for key in [part.lower() for part in sub_block.split("\\") if part]:
+            child = align4(value_offset + value_length * (2 if is_text else 1))
+            while child < end:
+                child_end, child_key, value_offset, value_length, is_text = get_version_node(block, child)
+                if child_end <= child:
+                    return None
+                if child_key.lower() == key:
+                    end = child_end
+                    break
+                child = align4(child_end)
+            else:
+                return None
+    except struct.error:
+        return None
+    return value_offset, value_length, is_text
+
+
+# Local fixN fallback: VS_FIXEDFILEINFO (52 bytes), version 10.0.19041.0.
 _FIXED_FILE_INFO = struct.pack(
     "<13I",
     0xFEEF04BD,  # dwSignature
@@ -23,18 +84,43 @@ _FIXED_FILE_INFO = struct.pack(
     0x00004A61,  # dwFileVersionLS (19041.0)
     0x000A0000,  # dwProductVersionMS
     0x00004A61,  # dwProductVersionLS
-    0x3F,        # dwFileFlagsMask
-    0x0,         # dwFileFlags
-    0x40004,     # dwFileOS (VOS_NT_WINDOWS32)
-    0x1,         # dwFileType (VFT_APP)
-    0x0,         # dwFileSubtype
-    0x0,         # dwFileDateMS
-    0x0,         # dwFileDateLS
+    0x3F,  # dwFileFlagsMask
+    0x0,  # dwFileFlags
+    0x40004,  # dwFileOS (VOS_NT_WINDOWS32)
+    0x1,  # dwFileType (VFT_APP)
+    0x0,  # dwFileSubtype
+    0x0,  # dwFileDateMS
+    0x0,  # dwFileDateLS
 )
 
 
+def _build_fixed_version_info() -> bytes:
+    """Wrap the local VS_FIXEDFILEINFO in a format-valid VS_VERSIONINFO root node."""
+    key = "VS_VERSION_INFO".encode("utf-16le") + b"\0\0"
+    value_offset = align4(6 + len(key))
+    length = align4(value_offset + len(_FIXED_FILE_INFO))
+    return (
+        struct.pack("<HHH", length, len(_FIXED_FILE_INFO), 0)
+        + key
+        + b"\0" * (value_offset - 6 - len(key))
+        + _FIXED_FILE_INFO
+        + b"\0" * (length - value_offset - len(_FIXED_FILE_INFO))
+    )
+
+
+_FIXED_VERSION_INFO = _build_fixed_version_info()
+
+
 class Version(api.ApiHandler):
-    """version.dll"""
+    """
+    Implements exported functions from version.dll
+
+    The version resource of a file is the RT_VERSION resource of the loaded
+    module with that path or file name, or else of the emulated PE file with
+    that path. A file that the emulator knows but that gives no readable
+    RT_VERSION resource reports the local minimal VS_FIXEDFILEINFO block.
+    Other files report that they have no version resource.
+    """
 
     name = "version"
     apihook = api.ApiHandler.apihook
@@ -42,67 +128,183 @@ class Version(api.ApiHandler):
 
     def __init__(self, emu):
         super().__init__(emu)
+        self.funcs = {}
+        self.data = {}
         super().__get_hook_attrs__(self)
 
-    @apihook("GetFileVersionInfoSizeA", argc=2)
-    def GetFileVersionInfoSizeA(self, emu, argv, ctx: api.ApiContext = None):
-        """DWORD GetFileVersionInfoSizeA(LPCSTR, LPDWORD);"""
-        handle_ptr = argv[1]
-        if handle_ptr:
-            self.mem_write(handle_ptr, b"\x00\x00\x00\x00")
-        return len(_FIXED_FILE_INFO)
+    def find_module(self, emu, path):
+        """Return the loaded module that ``path`` names, or None."""
+        lowered = path.lower()
+        for mod in emu.modules:
+            emu_path = (mod.emu_path or "").lower()
+            if lowered in (emu_path, ntpath.basename(emu_path), (mod.name or "").lower()):
+                return mod
+        return None
 
-    @apihook("GetFileVersionInfoSizeW", argc=2)
-    def GetFileVersionInfoSizeW(self, emu, argv, ctx: api.ApiContext = None):
-        """DWORD GetFileVersionInfoSizeW(LPCWSTR, LPDWORD);"""
-        handle_ptr = argv[1]
-        if handle_ptr:
-            self.mem_write(handle_ptr, b"\x00\x00\x00\x00")
-        return len(_FIXED_FILE_INFO)
+    def find_file(self, emu, path):
+        """Return the emulated file that ``path`` names, or None."""
+        return emu.get_file_manager().get_file_from_path(path)
 
-    @apihook("GetFileVersionInfoA", argc=4)
-    def GetFileVersionInfoA(self, emu, argv, ctx: api.ApiContext = None):
-        """BOOL GetFileVersionInfoA(LPCSTR, DWORD, DWORD, LPVOID);"""
-        data = argv[3]
-        if data:
-            self.mem_write(data, _FIXED_FILE_INFO)
-        return 1
+    def get_module_resource(self, mod):
+        """Return the RT_VERSION resource of a loaded module, or None."""
+        metadata = mod.get_pe_metadata()
+        for res in metadata.resources if metadata else []:
+            if res.type_id == RT_VERSION:
+                return self.mem_read(mod.base + res.data_rva, res.size)
+        return None
 
-    @apihook("GetFileVersionInfoW", argc=4)
-    def GetFileVersionInfoW(self, emu, argv, ctx: api.ApiContext = None):
-        """BOOL GetFileVersionInfoW(LPCWSTR, DWORD, DWORD, LPVOID);"""
-        data = argv[3]
-        if data:
-            self.mem_write(data, _FIXED_FILE_INFO)
-        return 1
+    def get_file_resource(self, f):
+        """Return the RT_VERSION resource of an emulated PE file, or None."""
+        if not f:
+            return None
+        try:
+            pe = pefile.PE(data=f.get_contents(), fast_load=True)
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
+        except pefile.PEFormatError:
+            return None
+        if not hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
+            return None
+        for res_type in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+            if res_type.id != RT_VERSION or not hasattr(res_type, "directory"):
+                continue
+            for res_id in res_type.directory.entries:
+                if hasattr(res_id, "directory") and res_id.directory.entries:
+                    data = res_id.directory.entries[0].data.struct
+                    return pe.get_data(data.OffsetToData, data.Size)
+        return None
 
-    def _query_value(self, argv, wide: bool):
-        """VerQueryValue(A/W)(hBlock, lpSubBlock, lplpBuffer, puLen)
-
-        只支持根查询 "\\\\"（VS_FIXEDFILEINFO）：分配 52 字节并回填指针与长度；
-        其它子块返回 FALSE（与"查不到"一致）。
+    def get_version_resource(self, emu, filename, arg, ctx):
         """
-        sub_block, pp_buffer, p_len = argv[1], argv[2], argv[3]
-        sub = ""
-        if sub_block:
-            try:
-                sub = self.read_mem_string(sub_block, 2 if wide else 1)
-            except Exception:
-                sub = ""
-        if sub.strip("\\").strip("\x00") != "":
+        Return the RT_VERSION resource of the named file, or None and set the
+        last error.
+
+        The local fixN fallback applies only when the emulator knows the file
+        (a loaded module or an emulated file), so a path that names no file
+        still reports that it has no version resource.
+        """
+        resource = None
+        known = False
+        if filename:
+            path = self.read_mem_string(filename, self.get_char_width(ctx))
+            ctx.args[arg].display = path
+            mod = self.find_module(emu, path)
+            if mod is not None:
+                known = True
+                resource = self.get_module_resource(mod)
+            if not resource:
+                f = self.find_file(emu, path)
+                if f is not None:
+                    known = True
+                    resource = self.get_file_resource(f)
+            if not resource and known:
+                # Local fixN fallback: a known file without a readable
+                # RT_VERSION resource still reports a fixed version.
+                resource = _FIXED_VERSION_INFO
+        if not resource:
+            emu.set_last_error(windefs.ERROR_RESOURCE_TYPE_NOT_FOUND)
+        return resource
+
+    def get_size(self, emu, filename, arg, lpdwHandle, ctx):
+        if lpdwHandle:
+            self.write_dword(lpdwHandle, 0)
+        resource = self.get_version_resource(emu, filename, arg, ctx)
+        if not resource:
             return 0
-        if pp_buffer:
-            ptr = self.mem_alloc(len(_FIXED_FILE_INFO), tag="api.version.fixedfileinfo")
-            self.mem_write(ptr, _FIXED_FILE_INFO)
-            self.mem_write(pp_buffer, ptr.to_bytes(self.get_ptr_size(), "little"))
-        if p_len:
-            self.mem_write(p_len, len(_FIXED_FILE_INFO).to_bytes(4, "little"))
+        # The A functions convert text values into the space after the block.
+        return len(resource) * 2 + len(VS_VERSION_SIGNATURE)
+
+    def get_info(self, emu, filename, arg, dwLen, lpData, ctx):
+        if not lpData:
+            emu.set_last_error(windefs.ERROR_INVALID_DATA)
+            return 0
+        resource = self.get_version_resource(emu, filename, arg, ctx)
+        if not resource:
+            return 0
+        self.mem_write(lpData, resource[:dwLen])
+        length = struct.unpack_from("<H", resource)[0] if len(resource) >= 2 else 0
+        if dwLen >= length + len(VS_VERSION_SIGNATURE):
+            self.mem_write(lpData + length, VS_VERSION_SIGNATURE)
         return 1
 
-    @apihook("VerQueryValueA", argc=4)
-    def VerQueryValueA(self, emu, argv, ctx: api.ApiContext = None):
-        return self._query_value(argv, wide=False)
+    @apihook("GetFileVersionInfoSize", argc=2)
+    def GetFileVersionInfoSize(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetFileVersionInfoSize(
+            LPCTSTR lptstrFilename,
+            LPDWORD lpdwHandle
+        );
+        """
+        lptstrFilename, lpdwHandle = argv
+        return self.get_size(emu, lptstrFilename, 0, lpdwHandle, ctx)
 
-    @apihook("VerQueryValueW", argc=4)
-    def VerQueryValueW(self, emu, argv, ctx: api.ApiContext = None):
-        return self._query_value(argv, wide=True)
+    @apihook("GetFileVersionInfoSizeEx", argc=3)
+    def GetFileVersionInfoSizeEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        DWORD GetFileVersionInfoSizeEx(
+            DWORD dwFlags,
+            LPCTSTR lpwstrFilename,
+            LPDWORD lpdwHandle
+        );
+        """
+        dwFlags, lpwstrFilename, lpdwHandle = argv
+        return self.get_size(emu, lpwstrFilename, 1, lpdwHandle, ctx)
+
+    @apihook("GetFileVersionInfo", argc=4)
+    def GetFileVersionInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL GetFileVersionInfo(
+            LPCTSTR lptstrFilename,
+            DWORD dwHandle,
+            DWORD dwLen,
+            LPVOID lpData
+        );
+        """
+        lptstrFilename, dwHandle, dwLen, lpData = argv
+        return self.get_info(emu, lptstrFilename, 0, dwLen, lpData, ctx)
+
+    @apihook("GetFileVersionInfoEx", argc=5)
+    def GetFileVersionInfoEx(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL GetFileVersionInfoEx(
+            DWORD dwFlags,
+            LPCTSTR lpwstrFilename,
+            DWORD dwHandle,
+            DWORD dwLen,
+            LPVOID lpData
+        );
+        """
+        dwFlags, lpwstrFilename, dwHandle, dwLen, lpData = argv
+        return self.get_info(emu, lpwstrFilename, 1, dwLen, lpData, ctx)
+
+    @apihook("VerQueryValue", argc=4)
+    def VerQueryValue(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL VerQueryValue(
+            LPCVOID pBlock,
+            LPCTSTR lpSubBlock,
+            LPVOID *lplpBuffer,
+            PUINT puLen
+        );
+        """
+        pBlock, lpSubBlock, lplpBuffer, puLen = argv
+        if not pBlock or not lpSubBlock:
+            return 0
+        cw = self.get_char_width(ctx)
+        sub_block = self.read_mem_string(lpSubBlock, cw)
+        ctx.args[1].display = sub_block
+        length = struct.unpack("<H", self.mem_read(pBlock, 2))[0]
+        found = get_version_value(self.mem_read(pBlock, length), sub_block)
+        if not found:
+            emu.set_last_error(windefs.ERROR_RESOURCE_TYPE_NOT_FOUND)
+            return 0
+        offset, value_length, is_text = found
+        value = pBlock + offset
+        if is_text and cw == 1:
+            text = self.mem_read(value, value_length * 2).decode("utf-16le", "replace")
+            value = pBlock + length + len(VS_VERSION_SIGNATURE) + offset
+            self.mem_write(value, encode_ansi(text))
+        if lplpBuffer:
+            self.write_ptr(lplpBuffer, value)
+        if puLen:
+            self.write_dword(puLen, value_length)
+        return 1

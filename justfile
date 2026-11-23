@@ -1,24 +1,30 @@
 set quiet
 
+# keep in sync with the ruff version in pyproject.toml and .github/workflows/test.yml
+ruff := "uvx --quiet ruff@0.17.3"
+
+# lint only tracked files, so that local files that are not in the repo stay as they are
 format:
-    uvx --quiet ruff format --quiet
+    git ls-files -z '*.py' | xargs -0 {{ruff}} format --quiet --force-exclude
 
 ruff:
-    uvx --quiet ruff check --quiet --fix
-    uvx --quiet ruff check --quiet --select I --fix
+    git ls-files -z '*.py' | xargs -0 {{ruff}} check --quiet --fix --force-exclude
+    git ls-files -z '*.py' | xargs -0 {{ruff}} check --quiet --select I --fix --force-exclude
 
-# lots of errors due to dynamic access to C structures
-# address this later
-# mypy:
-#     uvx mypy --check-untyped-defs speakeasy tests examples
+mypy:
+    ./.venv/bin/mypy speakeasy tests/check_public_types.py
 
-lint: format ruff
+lint: format ruff mypy
 
 # regenerate the API signature databases from the deps/win32json and deps/phnt submodules
 gen-signatures:
     git submodule update --init deps/win32json deps/phnt
     ./.venv/bin/python scripts/gen_win32_signatures.py --stats
     ./.venv/bin/python scripts/gen_phnt_signatures.py --stats
+
+# regenerate speakeasy/resources/report.schema.json from the report models
+gen-report-schema:
+    ./.venv/bin/python scripts/gen_report_schema.py
 
 test:
     ./.venv/bin/pytest -x -q --no-header tests/

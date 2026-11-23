@@ -4,7 +4,7 @@ import pytest
 
 
 def get_api_calls(ep, api_name):
-    return [evt for evt in ep.events or [] if evt.event == "api" and evt.api_name == api_name]
+    return [evt for evt in ep.events if evt.event == "api" and evt.api_name == api_name]
 
 
 @pytest.mark.parametrize(
@@ -17,7 +17,7 @@ def get_api_calls(ep, api_name):
 def test_dll_emu(config, load_test_bin, run_test, bin_file):
     data = load_test_bin(bin_file)
     report = run_test(config, data)
-    eps = report.entry_points
+    eps = report.runs
     assert len(eps) == 3
 
     dll_entry = eps[0]
@@ -25,22 +25,22 @@ def test_dll_emu(config, load_test_bin, run_test, bin_file):
     msgbox = get_api_calls(dll_entry, "user32.MessageBoxA")
     assert len(msgbox) == 1
     msgbox = msgbox[0]
-    assert msgbox.args[1] == "Inside process attach"
-    assert msgbox.args[2] == "My caption"
-    assert dll_entry.ret_val == 1
+    assert msgbox.args[1].display == "Inside process attach"
+    assert msgbox.args[2].display == "My caption"
+    assert dll_entry.return_value == 1
 
     ep = eps[1]
     msgbox = get_api_calls(ep, "user32.MessageBoxA")
     assert len(msgbox) == 1
     msgbox = msgbox[0]
-    assert msgbox.args[1] == "Inside emu_test_one"
-    assert msgbox.args[2] == "First export"
-    assert ep.ret_val == 0x41414141
+    assert msgbox.args[1].display == "Inside emu_test_one"
+    assert msgbox.args[2].display == "First export"
+    assert ep.return_value == 0x41414141
 
     ep = eps[2]
     msgbox = get_api_calls(ep, "user32.MessageBoxW")
     assert len(msgbox) == 1
     msgbox = msgbox[0]
-    assert msgbox.args[1] == "Inside emu_test_two"
-    assert msgbox.args[2] == "Second export"
-    assert ep.ret_val == 0x42424242
+    assert msgbox.args[1].display == "Inside emu_test_two"
+    assert msgbox.args[2].display == "Second export"
+    assert ep.return_value == 0x42424242

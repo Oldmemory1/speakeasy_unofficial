@@ -1,21 +1,21 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import uuid
+from typing import TYPE_CHECKING, Any
 
-import speakeasy.winenv.defs.nt.ddk as ddk
 import speakeasy.winenv.defs.wfp.fwpmtypes as fwp
+from speakeasy.winenv.defs.nt import ddk
 
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.kernel import WinKernelEmulator
 
 FWP_E_NOT_FOUND = 0x80320008
 FWP_E_CALLOUT_NOT_FOUND = 0x80320001
 FWP_E_FILTER_NOT_FOUND = 0x80320003
 FWP_E_LAYER_NOT_FOUND = 0x80320004
 FWP_E_SUBLAYER_NOT_FOUND = 0x80320007
-
-
-class NetIoEmuError(Exception):
-    pass
 
 
 class Fwpkclnt(api.ApiHandler):
@@ -33,12 +33,11 @@ class Fwpkclnt(api.ApiHandler):
 
         self.funcs = {}
         self.data = {}
-        self.handle = 4
-        self.sessions = {}
-        self.injections = {}
-        self.sublayers = {}
-        self.callouts = {}
-        self.filters = {}
+        self.sessions: dict[int, str] = {}
+        self.injections: dict[int, str] = {}
+        self.sublayers: dict[str, dict[str, Any]] = {}
+        self.callouts: dict[int, dict[str, Any]] = {}
+        self.filters: dict[int, dict[str, Any]] = {}
 
         self.emu = emu
 
@@ -46,78 +45,74 @@ class Fwpkclnt(api.ApiHandler):
 
         super().__get_hook_attrs__(self)
 
-    def new_id(self):
-        tmp = self.handle
-        self.handle += 4
-        return tmp
-
     def new_session(self):
         # stub
-        ret = self.new_id()
+        ret = self.emu.handle_allocator.allocate_handle()
         self.sessions.update({ret: "sess"})
 
         return ret
 
     def new_injection(self):
-        ret = self.new_id()
+        ret = self.emu.handle_allocator.allocate_handle()
         # TODO
         self.injections.update({ret: "inj"})
         return ret
 
     def new_filter(self, name, desc, key):
-        ret = self.new_id()
+        ret = self.emu.handle_allocator.allocate_handle()
         flt = {ret: {"name": name, "desc": desc, "key": key}}
         self.filters.update(flt)
         return ret
 
     @apihook("FwpmEngineOpen0", argc=5)
-    def FwpmEngineOpen0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmEngineOpen0(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmEngineOpen0(
-        const wchar_t             *serverName,
-        UINT32                    authnService,
-        SEC_WINNT_AUTH_IDENTITY_W *authIdentity,
-        const FWPM_SESSION0       *session,
-        HANDLE                    *engineHandle
+            const wchar_t *serverName,
+            UINT32 authnService,
+            SEC_WINNT_AUTH_IDENTITY_W *authIdentity,
+            const FWPM_SESSION0 *session,
+            HANDLE *engineHandle
         );
         """
-
-        sname, asvc, authid, sess, eng = argv
+        serverName, authnService, authIdentity, session, engineHandle = argv
 
         rv = ddk.STATUS_SUCCESS
 
         hnd = self.new_session()
 
-        self.mem_write(eng, hnd.to_bytes(self.get_ptr_size(), "little"))
+        self.write_ptr(engineHandle, hnd)
 
         return rv
 
     @apihook("FwpsInjectionHandleCreate0", argc=3)
-    def FwpsInjectionHandleCreate0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpsInjectionHandleCreate0(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         NTSTATUS FwpsInjectionHandleCreate0(
-        ADDRESS_FAMILY addressFamily,
-        UINT32         flags,
-        HANDLE         *injectionHandle
+            ADDRESS_FAMILY addressFamily,
+            UINT32 flags,
+            HANDLE *injectionHandle
         );
         """
-        family, flags, inj_handle = argv
+        addressFamily, flags, injectionHandle = argv
 
         rv = ddk.STATUS_SUCCESS
 
         hnd = self.new_injection()
 
-        self.mem_write(inj_handle, hnd.to_bytes(self.get_ptr_size(), "little"))
+        self.write_ptr(injectionHandle, hnd)
 
         return rv
 
     @apihook("FwpmSubLayerAdd0", argc=3)
-    def FwpmSubLayerAdd0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmSubLayerAdd0(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmSubLayerAdd0(
-        HANDLE               engineHandle,
-        const FWPM_SUBLAYER0 *subLayer,
-        PSECURITY_DESCRIPTOR sd
+            HANDLE engineHandle,
+            const FWPM_SUBLAYER0 *subLayer,
+            PSECURITY_DESCRIPTOR sd
         );
         """
         engineHandle, subLayer, sd = argv
@@ -137,13 +132,13 @@ class Fwpkclnt(api.ApiHandler):
 
         subkey = self.get_bytes(layer.subLayerKey)
         if all(x == 0 for x in subkey):
-            subkey = uuid.uuid4().bytes
+            subkey = uuid.UUID(bytes=emu.rng.randbytes(16), version=4).bytes_le
         subkey = uuid.UUID(bytes_le=subkey)
         subkey = str(subkey)
 
-        provkey = self.get_bytes(layer.providerKey)
+        provkey = self.mem_read(layer.providerKey, 16) if layer.providerKey else bytes(16)
         if all(x == 0 for x in provkey):
-            provkey = uuid.uuid4().bytes
+            provkey = uuid.UUID(bytes=emu.rng.randbytes(16), version=4).bytes_le
         provkey = uuid.UUID(bytes_le=provkey)
         provkey = str(provkey)
 
@@ -154,35 +149,35 @@ class Fwpkclnt(api.ApiHandler):
         return rv
 
     @apihook("FwpsCalloutRegister1", argc=3)
-    def FwpsCalloutRegister1(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpsCalloutRegister1(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         NTSTATUS FwpsCalloutRegister1(
-          void                *deviceObject,
-          const FWPS_CALLOUT1 *callout,
-          UINT32              *calloutId
+            void *deviceObject,
+            const FWPS_CALLOUT1 *callout,
+            UINT32 *calloutId
         );
         """
-        deviceObject, pCallout, calloutId = argv
+        deviceObject, callout, calloutId = argv
 
         rv = ddk.STATUS_SUCCESS
-        cid = self.new_id()
+        cid = emu.handle_allocator.allocate_handle()
 
         _co = self.fwp.FWPS_CALLOUT1(emu.get_ptr_size())
-        callout = self.mem_cast(_co, pCallout)
-        classify_fn = callout.classifyFn
-        notify_fn = callout.notifyFn
-        delete_fn = callout.flowDeleteFn
+        fwps_callout = self.mem_cast(_co, callout)
+        classify_fn = fwps_callout.classifyFn
+        notify_fn = fwps_callout.notifyFn
+        delete_fn = fwps_callout.flowDeleteFn
 
-        co_key = self.get_bytes(callout.calloutKey)
+        co_key = self.get_bytes(fwps_callout.calloutKey)
         if all(x == 0 for x in co_key):
-            co_key = uuid.uuid4().bytes
+            co_key = uuid.UUID(bytes=emu.rng.randbytes(16), version=4).bytes_le
         co_key = uuid.UUID(bytes_le=co_key)
         co_key = str(co_key)
 
         co = {
             cid: {
                 "key": co_key,
-                "flags": callout.flags,
+                "flags": fwps_callout.flags,
                 "classify_fn": classify_fn,
                 "notify_fn": notify_fn,
                 "delete_fn": delete_fn,
@@ -192,37 +187,37 @@ class Fwpkclnt(api.ApiHandler):
         self.callouts.update(co)
 
         if calloutId:
-            self.mem_write(calloutId, cid.to_bytes(4, "little"))
+            self.write_dword(calloutId, cid)
 
         return rv
 
     @apihook("FwpmCalloutAdd0", argc=4)
-    def FwpmCalloutAdd0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmCalloutAdd0(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmCalloutAdd0(
-          HANDLE               engineHandle,
-          const FWPM_CALLOUT0  *callout,
-          PSECURITY_DESCRIPTOR sd,
-          UINT32               *id
+            HANDLE engineHandle,
+            const FWPM_CALLOUT0 *callout,
+            PSECURITY_DESCRIPTOR sd,
+            UINT32 *id
         );
         """
-        eng, pCallout, sd, pCid = argv
+        engineHandle, callout, sd, id = argv
 
         name = ""
         desc = ""
         rv = ddk.STATUS_SUCCESS
 
         _co = self.fwp.FWPM_CALLOUT0(emu.get_ptr_size())
-        callout = self.mem_cast(_co, pCallout)
-        if callout.displayData.name:
-            name = self.read_wide_string(callout.displayData.name)
-        if callout.displayData.description:
-            desc = self.read_wide_string(callout.displayData.description)
+        fwpm_callout = self.mem_cast(_co, callout)
+        if fwpm_callout.displayData.name:
+            name = self.read_wide_string(fwpm_callout.displayData.name)
+        if fwpm_callout.displayData.description:
+            desc = self.read_wide_string(fwpm_callout.displayData.description)
 
-        co_key = self.get_bytes(callout.calloutKey)
+        co_key = self.get_bytes(fwpm_callout.calloutKey)
         # was the guid set to 0?
         if all(x == 0 for x in co_key):
-            co_key = uuid.uuid4().bytes
+            co_key = uuid.UUID(bytes=emu.rng.randbytes(16), version=4).bytes_le
         co_key = uuid.UUID(bytes_le=co_key)
         co_key = str(co_key)
 
@@ -232,24 +227,22 @@ class Fwpkclnt(api.ApiHandler):
                 cid = k
                 self.callouts[k].update({"name": name, "desc": desc})
 
-        if pCid:
-            cid = self.mem_write(pCid, cid.to_bytes(4, "little"))
+        if id:
+            self.write_dword(id, cid)
 
         return rv
 
     @apihook("FwpmFilterAdd0", argc=4)
-    def FwpmFilterAdd0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmFilterAdd0(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmFilterAdd0(
-          HANDLE               engineHandle,
-          const FWPM_FILTER0   *filter,
-          PSECURITY_DESCRIPTOR sd,
-          UINT64               *id
+            HANDLE engineHandle,
+            const FWPM_FILTER0 *filter,
+            PSECURITY_DESCRIPTOR sd,
+            UINT64 *id
         );
         """
-        eng, pFilter, sd, pId = argv
-
-        self.mem_write(pId, b"\x41\x41")
+        engineHandle, filter, sd, id = argv
 
         rv = ddk.STATUS_SUCCESS
 
@@ -257,7 +250,7 @@ class Fwpkclnt(api.ApiHandler):
         desc = ""
 
         _filt = self.fwp.FWPM_FILTER0(emu.get_ptr_size())
-        filt = self.mem_cast(_filt, pFilter)
+        filt = self.mem_cast(_filt, filter)
         if filt.displayData.name:
             name = self.read_wide_string(filt.displayData.name)
         if filt.displayData.description:
@@ -267,104 +260,114 @@ class Fwpkclnt(api.ApiHandler):
 
         # was the guid set to 0?
         if all(x == 0 for x in flt_key):
-            flt_key = uuid.uuid4().bytes
+            flt_key = uuid.UUID(bytes=emu.rng.randbytes(16), version=4).bytes_le
 
         flt_key = uuid.UUID(bytes_le=flt_key)
         flt_key = str(flt_key)
 
         fid = self.new_filter(name, desc, flt_key)
-        self.mem_write(pId, fid.to_bytes(8, "little"))
+        if id:
+            self.write_qword(id, fid)
 
         return rv
 
-    @apihook("FwpmFilterDeleteById0", argc=2)
-    def FwpmFilterDeleteById0(self, emu, argv, ctx: api.ApiContext = None):
+    @apihook("FwpmFilterDeleteById0", argc=3)
+    def FwpmFilterDeleteById0(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmFilterDeleteById0(
-        HANDLE engineHandle,
-        UINT64 id
+            HANDLE engineHandle,
+            UINT64 id
         );
+
+        id is passed by value: two stack slots on x86, one register on x64.
         """
-        eng, fid = argv
+        if emu.get_ptr_size() == 4:
+            eng, fid = argv[0], (argv[2] << 32) | argv[1]
+        else:
+            eng, fid = argv[:2]
 
         rv = ddk.STATUS_SUCCESS
 
         return rv
 
     @apihook("FwpmCalloutDeleteById0", argc=2)
-    def FwpmCalloutDeleteById0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmCalloutDeleteById0(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmCalloutDeleteById0(
-        HANDLE engineHandle,
-        UINT32 id
+            HANDLE engineHandle,
+            UINT32 id
         );
         """
-        eng, cid = argv
+        engineHandle, id = argv
         rv = FWP_E_CALLOUT_NOT_FOUND
 
-        co = self.callouts.get(cid)
+        co = self.callouts.get(id)
         if co:
             rv = ddk.STATUS_SUCCESS
         return rv
 
     @apihook("FwpsCalloutUnregisterById0", argc=1)
-    def FwpsCalloutUnregisterById0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpsCalloutUnregisterById0(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         NTSTATUS FwpsCalloutUnregisterById0(
-        const UINT32 calloutId
+            const UINT32 calloutId
         );
         """
-        (cid,) = argv
+        (calloutId,) = argv
         rv = FWP_E_CALLOUT_NOT_FOUND
 
-        co = self.callouts.get(cid)
+        co = self.callouts.get(calloutId)
         if co:
             rv = ddk.STATUS_SUCCESS
         return rv
 
     @apihook("FwpmSubLayerDeleteByKey0", argc=2)
-    def FwpmSubLayerDeleteByKey0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmSubLayerDeleteByKey0(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmSubLayerDeleteByKey0(
-        HANDLE     engineHandle,
-        const GUID *key
+            HANDLE engineHandle,
+            const GUID *key
         );
         """
-        eng, key = argv
+        engineHandle, key = argv
 
         rv = FWP_E_SUBLAYER_NOT_FOUND
 
         guid = self.mem_read(key, 16)
         guid = uuid.UUID(bytes_le=guid)
 
-        if self.sublayers.get(guid):
+        if self.sublayers.pop(str(guid), None):
             rv = ddk.STATUS_SUCCESS
 
         return rv
 
     @apihook("FwpmEngineClose0", argc=1)
-    def FwpmEngineClose0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpmEngineClose0(self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         DWORD FwpmEngineClose0(
-        HANDLE engineHandle
+            HANDLE engineHandle
         );
         """
-        (eng,) = argv
+        (engineHandle,) = argv
 
         rv = ddk.STATUS_SUCCESS
         return rv
 
     @apihook("FwpsInjectionHandleDestroy0", argc=1)
-    def FwpsInjectionHandleDestroy0(self, emu, argv, ctx: api.ApiContext = None):
+    def FwpsInjectionHandleDestroy0(
+        self, emu: "WinKernelEmulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
         """
         NTSTATUS FwpsInjectionHandleDestroy0(
-        HANDLE injectionHandle
+            HANDLE injectionHandle
         );
         """
-        (handle,) = argv
+        (injectionHandle,) = argv
 
         rv = ddk.STATUS_SUCCESS
-        if not self.injections.get(handle):
+        if not self.injections.get(injectionHandle):
             rv = FWP_E_NOT_FOUND
 
         return rv

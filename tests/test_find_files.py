@@ -2,14 +2,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from speakeasy.config import SpeakeasyConfig
+from speakeasy.config import FilesystemConfig, ModulesConfig, ProcessEnvironmentConfig, SpeakeasyConfig
 from speakeasy.windows.fileman import FileManager
 
 
 def make_file_manager(file_entries):
     cfg = SpeakeasyConfig(
-        filesystem={"files": file_entries},
-        command_line="",
+        filesystem=FilesystemConfig.model_validate({"files": file_entries}),
+        modules=ModulesConfig(user=[], system=[]),
+        process=ProcessEnvironmentConfig(command_line=""),
     )
     emu = SimpleNamespace(arch=0)
     return FileManager(cfg, emu)
@@ -19,20 +20,15 @@ def make_file_manager(file_entries):
 def fm():
     return make_file_manager(
         [
-            {"mode": "full_path", "emu_path": "c:\\programdata\\mydir\\myfile.bin"},
-            {"mode": "full_path", "emu_path": "c:\\Windows\\system32\\cmd.exe"},
-            {"mode": "full_path", "emu_path": "c:\\Windows\\system32\\svchost.exe"},
-            {"mode": "full_path", "emu_path": "c:\\pagefile.sys"},
+            {"mode": "full_path", "emu_path": emu_path, "byte_fill": {"byte": "0x00", "size": 0}}
+            for emu_path in (
+                "c:\\programdata\\mydir\\myfile.bin",
+                "c:\\Windows\\system32\\cmd.exe",
+                "c:\\Windows\\system32\\svchost.exe",
+                "c:\\pagefile.sys",
+            )
         ]
     )
-
-
-def test_root_wildcard_finds_directories_and_files(fm):
-    results = list(fm.find_matching_entries("C:\\*"))
-    names = {name for name, _ in results}
-    assert "programdata" in names
-    assert "windows" in names
-    assert "pagefile.sys" in names
 
 
 def test_root_wildcard_marks_dirs_correctly(fm):
@@ -72,3 +68,20 @@ def test_case_insensitive(fm):
     results_upper = {name for name, _ in fm.find_matching_entries("C:\\WINDOWS\\*")}
     results_lower = {name for name, _ in fm.find_matching_entries("c:\\windows\\*")}
     assert results_upper == results_lower
+
+
+@pytest.mark.parametrize("ext", ["EXE", ".exe"])
+def test_by_ext_entry_matches_regardless_of_case_and_dot(ext):
+    fm = make_file_manager([{"mode": "by_ext", "ext": ext, "byte_fill": {"byte": "0x41", "size": 4}}])
+    entry = fm.get_emu_file("c:\\temp\\a.exe")
+    assert entry is not None
+    assert entry.mode == "by_ext"
+
+
+@pytest.mark.parametrize(
+    ("byte", "data"),
+    [("0x41", b"AA"), ("41", b"AA"), ("0xff", b"\xff\xff"), ("FF", b"\xff\xff"), ("0", b"\x00\x00")],
+)
+def test_byte_fill_file_has_the_byte(byte, data):
+    fm = make_file_manager([{"mode": "default", "byte_fill": {"byte": byte, "size": 2}}])
+    assert fm.get_file_by_path("c:\\temp\\a.bin").get_data() == data

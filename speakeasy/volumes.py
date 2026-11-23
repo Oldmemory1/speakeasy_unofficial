@@ -1,4 +1,4 @@
-"""Docker-style --volume support for mounting host files into the emulated filesystem."""
+"""The ``--volume`` option: add host files to the emulated file system, as Docker volumes do."""
 
 from __future__ import annotations
 
@@ -6,20 +6,20 @@ from pathlib import Path, PureWindowsPath
 
 
 def parse_volume_spec(spec: str) -> tuple[Path, PureWindowsPath]:
-    """Parse a ``host_path:guest_path`` volume specification.
+    r"""
+    Parse a ``host_path:guest_path`` volume specification.
 
-    Handles Windows drive-letter colons on both sides (e.g.
-    ``C:\\samples:C:\\guest``).  The real separator is the first ``:``
-    that is NOT the second character of a drive-letter prefix.
+    Each path can start with a Windows drive letter, for example ``C:\samples:C:\guest``. The
+    separator is the first ``:`` after the drive letter of the host path.
+
+    Raises:
+        ValueError: if the specification is empty or malformed.
     """
     if not spec:
         raise ValueError("Empty volume specification")
 
-    # Find the separator colon.  Skip a leading drive letter (X:) on the
-    # host side, then look for the next colon.
     start = 0
     if len(spec) >= 2 and spec[1] == ":":
-        # Host path starts with a drive letter — skip past it.
         start = 2
 
     idx = spec.find(":", start)
@@ -38,11 +38,15 @@ def parse_volume_spec(spec: str) -> tuple[Path, PureWindowsPath]:
 
 
 def expand_volume_to_entries(host_path: Path, guest_path: PureWindowsPath) -> list[dict]:
-    """Expand a volume mapping into ``FileEntryFullPath``-compatible dicts.
+    """
+    Expand a volume mapping into ``FileEntryFullPath``-compatible dicts.
 
-    If *host_path* is a file, one entry is returned.  If it is a
+    If ``host_path`` is a file, this returns one entry. If it is a
     directory, every file underneath it (recursively) becomes an entry
-    with the relative path appended to *guest_path*.
+    with the relative path appended to ``guest_path``.
+
+    Raises:
+        FileNotFoundError: if ``host_path`` does not exist.
     """
     host_path = host_path.resolve()
 
@@ -77,10 +81,15 @@ def expand_volume_to_entries(host_path: Path, guest_path: PureWindowsPath) -> li
 
 
 def apply_volumes(config: dict, volume_specs: list[str]) -> dict:
-    """Parse *volume_specs* and prepend the resulting file entries to *config*.
+    """
+    Parse ``volume_specs`` and put the file entries before the file entries of ``config``.
 
-    Entries are prepended so they win first-match resolution in
-    ``get_emu_file()``.
+    ``FileManager.get_emu_file`` uses the first ``full_path`` entry that matches, so the volume
+    entries come first.
+
+    Raises:
+        ValueError: if a specification is empty or malformed.
+        FileNotFoundError: if a host path does not exist.
     """
     if not volume_specs:
         return config

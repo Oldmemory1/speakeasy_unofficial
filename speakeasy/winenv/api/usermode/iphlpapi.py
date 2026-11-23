@@ -1,11 +1,16 @@
 # Copyright (C) 2022 Mandiant, Inc. All Rights Reserved.
 
 import binascii
+from typing import TYPE_CHECKING
 
 import speakeasy.winenv.defs.windows.iphlpapi as iphlpapi_types
 import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy.winenv.codepage import encode_ansi
 
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
 
 
 class Iphlpapi(api.ApiHandler):
@@ -22,47 +27,41 @@ class Iphlpapi(api.ApiHandler):
 
         self.iphlpapi_types = iphlpapi_types
 
-    @staticmethod
-    def _adapter_value(adapter, name, default=None):
-        if isinstance(adapter, dict):
-            return adapter.get(name, default)
-        return getattr(adapter, name, default)
-
     @apihook("GetAdaptersInfo", argc=2)
-    def GetAdaptersInfo(self, emu, argv, ctx: api.ApiContext = None):
-        ptr_adapter_info, size_ptr = argv
+    def GetAdaptersInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        ULONG GetAdaptersInfo(
+            PIP_ADAPTER_INFO AdapterInfo,
+            PULONG SizePointer
+        );
+        """
+        AdapterInfo, SizePointer = argv
         rv = 0
 
         adapters = emu.config.network.adapters
         adapter_count = len(adapters)
 
-        if not ptr_adapter_info:
-            adapter_info = self.iphlpapi_types.IP_ADAPTER_INFO(emu.get_ptr_size())
-            size = adapter_info.sizeof()
-            self.mem_write(size_ptr, size.to_bytes(4, "little"))
+        size = self.iphlpapi_types.IP_ADAPTER_INFO(emu.get_ptr_size()).sizeof()
+        if not AdapterInfo or self.read_dword(SizePointer) < size:
+            self.write_dword(SizePointer, size)
             return windefs.ERROR_BUFFER_OVERFLOW
 
         for index, adapter in enumerate(adapters):
             adapter_info = self.iphlpapi_types.IP_ADAPTER_INFO(emu.get_ptr_size())
 
-            name = self._adapter_value(adapter, "name") or ""
-            description = self._adapter_value(adapter, "description") or ""
-            mac_address = self._adapter_value(adapter, "mac_address") or ""
-            adapter_type = self._adapter_value(adapter, "type") or ""
-            ip_address = self._adapter_value(adapter, "ip_address") or ""
-            subnet_mask = self._adapter_value(adapter, "subnet_mask") or ""
+            mac_address = (adapter.mac_address or "00-00-00-00-00-00").replace("-", "").replace(":", "")
 
-            adapter_info.AdapterName = name.encode("utf-8")
-            adapter_info.Description = description.encode("utf-8")
+            adapter_info.AdapterName = encode_ansi(adapter.name or "")
+            adapter_info.Description = encode_ansi(adapter.description or "")
             adapter_info.AddressLength = 6
             try:
-                adapter_info.Address = binascii.unhexlify(mac_address.replace("-", "").replace(":", ""))
+                adapter_info.Address = binascii.unhexlify(mac_address)
             except (binascii.Error, ValueError):
                 adapter_info.Address = b"\x00" * 6
-            adapter_info.Type = iphlpapi_types.get_adapter_type(adapter_type)
-            adapter_info.IpAddressList.IpAddress = ip_address.encode("utf-8")
-            adapter_info.IpAddressList.IpMask = subnet_mask.encode("utf-8")
-            adapter_info.DhcpEnabled = bool(self._adapter_value(adapter, "dhcp_enabled", False))
+            adapter_info.Type = iphlpapi_types.get_adapter_type(adapter.type)
+            adapter_info.IpAddressList.IpAddress = (adapter.ip_address or "").encode("utf-8")
+            adapter_info.IpAddressList.IpMask = (adapter.subnet_mask or "").encode("utf-8")
+            adapter_info.DhcpEnabled = int(bool(adapter.dhcp_enabled))
 
             if index < adapter_count - 1:
                 ptr_next = self.mem_alloc(adapter_info.sizeof(), tag="api.struct.IP_ADAPTER_INFO")
@@ -70,7 +69,7 @@ class Iphlpapi(api.ApiHandler):
                 ptr_next = 0
 
             adapter_info.Next = ptr_next
-            self.mem_write(ptr_adapter_info, self.get_bytes(adapter_info))
-            ptr_adapter_info = ptr_next
+            self.mem_write(AdapterInfo, self.get_bytes(adapter_info))
+            AdapterInfo = ptr_next
 
         return rv

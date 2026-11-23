@@ -1,8 +1,11 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+
 from speakeasy.struct import Enum
 
 WINDOWS_CONSOLE = 3
+
+THREAD_CREATE_FLAGS_CREATE_SUSPENDED = 0x00000001
 
 # IRQL Levels
 PASSIVE_LEVEL = 0  # Passive release level
@@ -18,6 +21,7 @@ POWER_LEVEL = 30  # Power failure level
 HIGH_LEVEL = 31  # Highest interrupt level
 
 STATUS_SUCCESS = 0
+STATUS_PENDING = 0x103
 STATUS_BREAKPOINT = 0x80000003
 STATUS_SINGLE_STEP = 0x80000004
 STATUS_UNSUCCESSFUL = 0xC0000001
@@ -27,19 +31,25 @@ STATUS_ACCESS_VIOLATION = 0xC0000005
 STATUS_INTEGER_DIVIDE_BY_ZERO = 0xC0000094
 STATUS_INTEGER_OVERFLOW = 0xC0000095
 STATUS_INVALID_HANDLE = 0xC0000008
+STATUS_CONFLICTING_ADDRESSES = 0xC0000018
+STATUS_NOT_MAPPED_VIEW = 0xC0000019
 STATUS_ILLEGAL_INSTRUCTION = 0xC000001D
 STATUS_PRIVILEGED_INSTRUCTION = 0xC0000096
 STATUS_BUFFER_TOO_SMALL = 0xC0000023
 STATUS_INVALID_CID = 0xC000000B
 STATUS_INVALID_PARAMETER = 0xC000000D
+STATUS_INVALID_PARAMETER_MIX = 0xC0000030
 STATUS_PROCEDURE_NOT_FOUND = 0xC000007A
 STATUS_NOT_SUPPORTED = 0xC00000BB
 STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
+STATUS_ACCESS_DENIED = 0xC0000022
 STATUS_RESOURCE_DATA_NOT_FOUND = 0xC0000089
+STATUS_NOT_FOUND = 0xC0000225
 STATUS_DEBUGGER_INACTIVE = 0xC0000354
 STATUS_BAD_COMPRESSION_BUFFER = 0xC0000242
 STATUS_UNSUPPORTED_COMPRESSION = 0xC000025F
 STATUS_INVALID_DEVICE_REQUEST = 0xC0000010
+STATUS_END_OF_FILE = 0xC0000011
 STATUS_OBJECT_TYPE_MISMATCH = 0xC0000024
 STATUS_NOINTERFACE = 0xC00002B9
 STATUS_PORT_NOT_SET = 0xC0000353
@@ -81,37 +91,21 @@ IRP_MJ_PNP = 0x1B
 IRP_MJ_PNP_POWER = IRP_MJ_PNP
 IRP_MJ_MAXIMUM_FUNCTION = 0x1B
 
+IRP_BUFFERED_IO = 0x10
+IRP_DEALLOCATE_BUFFER = 0x20
+IRP_INPUT_OPERATION = 0x40
+
+METHOD_BUFFERED = 0
+METHOD_IN_DIRECT = 1
+METHOD_OUT_DIRECT = 2
+METHOD_NEITHER = 3
+
+COMPRESSION_FORMAT_NONE = 0x0
+COMPRESSION_FORMAT_DEFAULT = 0x1
 COMPRESSION_FORMAT_LZNT1 = 0x2
 COMPRESSION_FORMAT_XPRESS = 0x3
-
-DELETE = 0x00010000
-READ_CONTROL = 0x00020000
-WRITE_DAC = 0x00040000
-WRITE_OWNER = 0x00080000
-SYNCHRONIZE = 0x00100000
-GENERIC_READ = 0x80000000
-GENERIC_WRITE = 0x40000000
-GENERIC_EXECUTE = 0x20000000
-GENERIC_ALL = 0x10000000
-
-# Create Dispositions
-FILE_SUPERSEDE = 0x00000000
-FILE_OPEN = 0x00000001
-FILE_CREATE = 0x00000002
-FILE_OPEN_IF = 0x00000003
-FILE_OVERWRITE = 0x00000004
-FILE_OVERWRITE_IF = 0x00000005
-
-# File specific access mask
-FILE_READ_DATA = 0x0001  # file & pipe
-FILE_WRITE_DATA = 0x0002  # file & pipe
-FILE_APPEND_DATA = 0x0004  # file
-FILE_READ_EA = 0x0008  # file & directory
-FILE_WRITE_EA = 0x0010  # file & directory
-FILE_EXECUTE = 0x0020  # file
-FILE_DELETE_CHILD = 0x0040  # directory
-FILE_READ_ATTRIBUTES = 0x0080  # all
-FILE_WRITE_ATTRIBUTES = 0x0100  # all
+COMPRESSION_ENGINE_STANDARD = 0x0
+COMPRESSION_ENGINE_MAXIMUM = 0x100
 
 
 PROCESSINFOCLASS = Enum()
@@ -121,7 +115,12 @@ PROCESSINFOCLASS.ProcessWow64Information = 0x1A
 PROCESSINFOCLASS.ProcessImageFileName = 0x1B
 PROCESSINFOCLASS.ProcessBreakOnTermination = 0x1D
 PROCESSINFOCLASS.ProcessDebugObjectHandle = 0x1E
+PROCESSINFOCLASS.ProcessDebugFlags = 0x1F
 PROCESSINFOCLASS.ProcessProtectionInformation = 0x3D
+
+
+THREADINFOCLASS = Enum()
+THREADINFOCLASS.ThreadHideFromDebugger = 0x11
 
 
 SYSTEM_INFORMATION_CLASS = Enum()
@@ -180,68 +179,3 @@ MODE.MaximumMode = 2
 IMAGE_DOS_SIGNATURE = b"MZ"
 PE32_BIT = 0x0100
 PE32_PLUS_BIT = 0x0200
-
-
-def get_flag_defines(flags, prefix=""):
-    defs = []
-    for k, v in globals().items():
-        if isinstance(v, int):
-            if v & flags:
-                if prefix:
-                    if k.startswith(prefix):
-                        defs.append(k)
-                else:
-                    defs.append(k)
-    return defs
-
-
-def get_const_defines(const, prefix=""):
-    defs = []
-    for k, v in globals().items():
-        if isinstance(v, int):
-            if v == const:
-                if prefix:
-                    if k.startswith(prefix):
-                        defs.append(k)
-                else:
-                    defs.append(k)
-    return defs
-
-
-def get_access_defines(flags):
-    defs = []
-    accesses = (
-        "DELETE",
-        "READ_CONTROL",
-        "WRITE_DAC",
-        "WRITE_OWNER",
-        "SYNCHRONIZE",
-        "GENERIC_READ",
-        "GENERIC_WRITE",
-        "GENERIC_EXECUTE",
-        "GENERIC_ALL",
-    )
-
-    for k, v in [(k, v) for k, v in globals().items() if k in accesses]:
-        if isinstance(v, int):
-            if v & flags:
-                defs.append(k)
-
-    return defs
-
-
-def get_file_access_defines(flags):
-    defs = get_flag_defines(flags, "FILE_")
-    defs = [d for d in defs if d.startswith(("FILE_READ", "FILE_WRITE", "FILE_DELETE", "FILE_APPEND", "FILE_EXECUTE"))]
-
-    return defs
-
-
-def get_create_disposition(disp):
-    defs = get_const_defines(disp, "FILE_")
-    defs = [d for d in defs if not d.startswith("FILE_SHARE")]
-
-    ret = 0
-    if len(defs):
-        ret = defs[0]
-    return ret

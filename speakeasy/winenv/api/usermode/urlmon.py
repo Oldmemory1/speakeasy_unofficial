@@ -1,11 +1,15 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import speakeasy.winenv.defs.windows.windows as windefs
-from speakeasy.profiler_events import FILE_CREATE, FILE_WRITE
 
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.netman import NetworkManager
+    from speakeasy.windows.win32 import Win32Emulator
 
 
 class Urlmon(api.ApiHandler):
@@ -18,78 +22,71 @@ class Urlmon(api.ApiHandler):
         self.funcs = {}
         self.data = {}
         super().__get_hook_attrs__(self)
-        self.netman = emu.get_network_manager()
-        self.names = {}
+        self.netman: NetworkManager = emu.get_network_manager()
 
     @apihook("URLDownloadToFile", argc=5)
-    def URLDownloadToFile(self, emu, argv, ctx: api.ApiContext = None):
+    def URLDownloadToFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         HRESULT URLDownloadToFile(
-                    LPUNKNOWN            pCaller,
-                    LPCTSTR              szURL,
-                    LPCTSTR              szFileName,
-                    DWORD                dwReserved,
-                    LPBINDSTATUSCALLBACK lpfnCB
+            LPUNKNOWN pCaller,
+            LPCTSTR szURL,
+            LPCTSTR szFileName,
+            DWORD dwReserved,
+            LPBINDSTATUSCALLBACK lpfnCB
         );
         """
-        ctx = ctx or {}
-
         pCaller, szURL, szFileName, dwReserved, lpfnCB = argv
         rv = windefs.ERROR_SUCCESS
 
         cw = self.get_char_width(ctx)
         if szURL:
             url = self.read_mem_string(szURL, cw)
-            argv[1] = url
+            ctx.args["szURL"].display = url
             parsed = urlparse(url)
-            if parsed.netloc:
-                self.record_dns_event(parsed.netloc)
+            if parsed.hostname:
+                emu.get_network_manager().name_lookup(parsed.hostname)
 
         if szFileName:
             name = self.read_mem_string(szFileName, cw)
-            argv[2] = name
-            self.record_file_access_event(name, FILE_CREATE)
-            self.record_file_access_event(name, FILE_WRITE)
+            ctx.args["szFileName"].display = name
+            emu.get_file_manager().record_download(name)
 
         return rv
 
     @apihook("URLDownloadToCacheFile", argc=6)
-    def URLDownloadToCacheFile(self, emu, argv, ctx: api.ApiContext = None):
+    def URLDownloadToCacheFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        HRESULT URLDownloadToCacheFileA(
-          LPUNKNOWN            pCaller,
-          LPCSTR               szURL,
-          LPSTR                szFileName,
-          DWORD                cchFileName,
-          DWORD                dwReserved,
-          LPBINDSTATUSCALLBACK lpfnCB
+        HRESULT URLDownloadToCacheFile(
+            LPUNKNOWN lpUnkcaller,
+            LPCTSTR szURL,
+            LPTSTR szFileName,
+            DWORD cchFileName,
+            DWORD dwReserved,
+            LPBINDSTATUSCALLBACK pBSC
         );
         """
-        ctx = ctx or {}
-        pCaller, szURL, szFileName, cchFileName, dwReserved, lpfnCB = argv
+        lpUnkcaller, szURL, szFileName, cchFileName, dwReserved, pBSC = argv
         rv = windefs.ERROR_SUCCESS
         cw = self.get_char_width(ctx)
         cache_name = "C:\\Windows\\Temp\\urlcache.bin"
 
         if szURL:
             url = self.read_mem_string(szURL, cw)
-            argv[1] = url
+            ctx.args["szURL"].display = url
             parsed = urlparse(url)
-            if parsed.netloc:
-                self.record_dns_event(parsed.netloc)
+            if parsed.hostname:
+                emu.get_network_manager().name_lookup(parsed.hostname)
             tail = parsed.path.rsplit("/", 1)[-1]
             if tail:
                 cache_name = f"C:\\Windows\\Temp\\{tail}"
 
         if szFileName:
             required = len(cache_name) + 1
-            argv[2] = cache_name
-            argv[3] = cchFileName
+            ctx.args["szFileName"].display = cache_name
             if cchFileName >= required:
                 self.write_mem_string(cache_name, szFileName, cw)
-                self.record_file_access_event(cache_name, FILE_CREATE)
-                self.record_file_access_event(cache_name, FILE_WRITE)
+                emu.get_file_manager().record_download(cache_name)
             else:
-                rv = windefs.ERROR_INSUFFICIENT_BUFFER
+                rv = windefs.E_OUTOFMEMORY
 
         return rv

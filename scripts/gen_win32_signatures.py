@@ -9,7 +9,7 @@ contains into a compact table keyed by function name, resolving every
 parameter and return type down to a handful of type codes that the emulator
 can act on without walking the metadata type graph at runtime.
 
-The output (``speakeasy/resources/win32/signatures.json.gz``) is a build
+The output (``speakeasy/resources/win32/win32json_signatures.json.gz``) is a build
 artifact: it is regenerated on every build and is not committed.
 
 Usage::
@@ -62,13 +62,15 @@ Type codes (``kind`` or ``kind:qualifier``):
 
     v                 void (return only)
     i8 u8 i16 u16 i32 u32 i64 u64   sized integers
+    ip up             pointer-sized integers: IntPtr (LONG_PTR, SSIZE_T, LPARAM,
+                      LRESULT) and UIntPtr (SIZE_T, ULONG_PTR, WPARAM)
     u32:NAME          (any integer kind) value drawn from enum NAME in ``enums``
     f32 f64           floating point
-    p                 pointer-sized opaque value (IntPtr, void*, COM, callbacks)
+    p                 pointer-sized opaque pointer (void*, COM, callbacks)
     p:CODE            pointer to a value of type CODE (p:u32, p:h, p:p, p:S)
     ps:NAME           pointer to struct/union NAME (see ``structs``)
     a:CODE            array/buffer of CODE elements; its length, if declared, is in
-                      the parameter's 4th element (see below)
+                      the parameter's 4th element (see below). BYTE* is a:u8
     arr:N:CODE        inline array of N CODE elements (struct fields only)
     s                 pointer to NUL-terminated narrow string (PSTR)
     S                 pointer to NUL-terminated wide string (PWSTR)
@@ -94,13 +96,14 @@ import glob
 import gzip
 import json
 import os
+import re
 import subprocess
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_WIN32JSON = os.path.join(REPO_ROOT, "deps", "win32json")
 DEFAULT_OVERRIDES = os.path.join(REPO_ROOT, "scripts", "win32_overrides.json")
-DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "speakeasy", "resources", "win32", "signatures.json.gz")
+DEFAULT_OUTPUT = os.path.join(REPO_ROOT, "speakeasy", "resources", "win32", "win32json_signatures.json.gz")
 
 FORMAT_VERSION = 2
 
@@ -120,10 +123,25 @@ NATIVE_TYPES = {
     "Int64": ("i64", 8),
     "Single": ("f32", 4),
     "Double": ("f64", 8),
-    "IntPtr": ("p", None),
-    "UIntPtr": ("p", None),
+    "IntPtr": ("ip", None),
+    "UIntPtr": ("up", None),
     "Guid": ("g", 16),
 }
+
+# NativeTypedefs of IntPtr and UIntPtr that are integers. The other typedefs of
+# IntPtr and UIntPtr are handles or opaque pointers, such as alljoyn_busattachment.
+INTEGER_TYPEDEFS = {"LPARAM", "WPARAM", "LRESULT"}
+
+# win32metadata gives some handles as a bare IntPtr or UIntPtr, with no typedef:
+# HCRYPTPROV, HCRYPTKEY, HCRYPTHASH, HMACHINE, SCARDCONTEXT, HTHEME, HGLOBAL in
+# GlobalReAlloc. win32json keeps no C type name for them, so the generator uses the
+# parameter name: an IntPtr or UIntPtr parameter with a handle name (hProv, phHash)
+# gets the code h, and a pointer to one or an array of them gets p:h or a:h.
+HANDLE_PARAM_NAME = re.compile(r"p?h[A-Z]")
+
+# Parameters with a handle name that are not handles: the hUser of DdeSetUserHandle
+# is a DWORD_PTR value that the caller chooses.
+NOT_HANDLE_PARAMS = {("DdeSetUserHandle", "hUser")}
 
 # NativeTypedefs that carry meaning beyond their underlying integer.
 SPECIAL_TYPEDEFS = {
@@ -132,6 +150,11 @@ SPECIAL_TYPEDEFS = {
     "BOOL": "b",
     "BOOLEAN": "B",
 }
+
+# win32metadata gives RPC_CSTR and RPC_WSTR as PointerTo Byte and PointerTo UInt16.
+# The Ndr* functions use the same types for marshalling buffers.
+RPC_STRING_DLLS = ("rpcrt4", "rpcns4")
+RPC_STRING_CODES = {"Byte": "s", "UInt16": "S"}
 
 # Parameter attribute -> flag character.
 ATTR_FLAGS = {
@@ -169,9 +192,10 @@ class TypeResolver:
 
     def struct_size(self, api: str, name: str, ptr_size: int) -> int:
         """
-        Compute sizeof() for a struct or union using C layout rules and the
-        metadata's PackingSize. Only needed for the rare by-value struct
-        parameters; raises UnsupportedType for anything it cannot lay out.
+        Compute sizeof() for a struct or union using C layout rules and the metadata's PackingSize.
+
+        Only needed for the rare by-value struct parameters; raises UnsupportedType for anything it
+        cannot lay out.
         """
         td = self.lookup(api, name)
         if td is None or td["Kind"] not in ("Struct", "Union"):
@@ -271,7 +295,8 @@ class TypeResolver:
             child = t["Child"]
             if child["Kind"] == "Native":
                 if child["Name"] == "Byte":
-                    return "s"
+                    # BYTE* and char* are both PointerTo Byte. PSTR names the strings.
+                    return "a:u8"
                 if child["Name"] == "Char":
                     return "S"
                 if child["Name"] == "Void":
@@ -303,8 +328,10 @@ class TypeResolver:
                 raise UnsupportedType(f"unknown type {t['Api']}.{t['Name']}")
             if td["Kind"] == "NativeTypedef":
                 base = self.resolve(td["Def"])
-                if base == "p" and _is_handle_typedef(td):
+                if base in ("p", "ip", "up") and _is_handle_typedef(td):
                     return "h"
+                if base in ("ip", "up") and td["Name"] not in INTEGER_TYPEDEFS:
+                    return "p"
                 return base
             if td["Kind"] == "Enum":
                 return self._enum_code(td)
@@ -323,10 +350,10 @@ class TypeResolver:
 
     def resolve_field(self, t: dict, api: str, nested: dict, scope: str, wanted: list) -> str:
         """
-        Resolve a struct field type to a type code. Anonymous nested types are
-        keyed as ``OUTER.INNER`` in the struct table; ``wanted`` collects
-        (key, api, definition) of every struct the field refers to so callers
-        can emit those too.
+        Resolve a struct field type to a type code.
+
+        Anonymous nested types are keyed as ``OUTER.INNER`` in the struct table; ``wanted`` collects
+        (key, api, definition) of every struct the field refers to so callers can emit those too.
         """
         kind = t["Kind"]
         if kind == "Array":
@@ -365,9 +392,11 @@ class TypeResolver:
 
     def struct_entry(self, key: str, api: str, td: dict, wanted: list) -> dict:
         """
-        Build the struct table entry for ``td``: sizes for both pointer sizes
-        and, when every field resolves, ``[name, code, offset32, offset64]``
-        per field. Raises UnsupportedType when the struct cannot be laid out.
+        Build the struct table entry for ``td``.
+
+        The entry holds the sizes for both pointer sizes and, when every field resolves,
+        ``[name, code, offset32, offset64]`` per field. Raises UnsupportedType when the struct cannot be laid
+        out.
         """
         size32, _ = self._layout_struct(td, api, 4, ())
         size64, _ = self._layout_struct(td, api, 8, ())
@@ -461,6 +490,7 @@ def load_overrides(path: str) -> dict:
     doc.setdefault("dll_aliases", {})
     doc.setdefault("name_prefixes", {})
     doc.setdefault("enum_extra", {})
+    doc.setdefault("param_names", {})
     return doc
 
 
@@ -482,6 +512,26 @@ def _buffer_length(pm: dict, nparams: int) -> dict | None:
     return None
 
 
+def _rpc_string_code(t: dict) -> str | None:
+    """Get the string code of an RPC_CSTR or RPC_WSTR parameter, else None."""
+    child = t.get("Child", {})
+    if t["Kind"] != "PointerTo" or child.get("Kind") != "Native":
+        return None
+    return RPC_STRING_CODES.get(child["Name"])
+
+
+def _handle_param_code(fn_name: str, param_name: str, t: dict) -> str | None:
+    """Get the code of a parameter with a handle name that win32metadata gives as IntPtr or UIntPtr, else None."""
+    if not HANDLE_PARAM_NAME.match(param_name) or (fn_name, param_name) in NOT_HANDLE_PARAMS:
+        return None
+    prefix = {"PointerTo": "p:", "LPArray": "a:"}.get(t["Kind"], "")
+    if prefix:
+        t = t["Child"]
+    if t["Kind"] == "Native" and t["Name"] in ("IntPtr", "UIntPtr"):
+        return f"{prefix}h"
+    return None
+
+
 def build_entry(fn: dict, resolver: TypeResolver, overrides: dict) -> dict:
     dll = normalize_dll(fn["DllImport"])
     entry: dict = {"dll": dll}
@@ -493,22 +543,29 @@ def build_entry(fn: dict, resolver: TypeResolver, overrides: dict) -> dict:
         entry["ret"] = "p"
         skip_reason = f"return type: {e}"
 
+    name = fn["Name"]
+    names = overrides["param_names"].get(name, [pm["Name"] for pm in fn["Params"]])
+    if len(names) != len(fn["Params"]):
+        raise SystemExit(f"param_names: {name} has {len(fn['Params'])} parameters, not {len(names)}")
+
     params = []
-    for pm in fn["Params"]:
+    for pm, param_name in zip(fn["Params"], names):
         flags = "".join(ATTR_FLAGS[a] for a in pm["Attrs"] if isinstance(a, str) and a in ATTR_FLAGS)
         try:
             code = resolver.resolve(pm["Type"])
         except UnsupportedType as e:
             code = "p"
             skip_reason = skip_reason or f"param {pm['Name']}: {e}"
-        param = [pm["Name"], code, flags]
+        code = _handle_param_code(name, param_name, pm["Type"]) or code
+        if dll in RPC_STRING_DLLS and not name.startswith("Ndr"):
+            code = _rpc_string_code(pm["Type"]) or code
+        param = [param_name, code, flags]
         length = _buffer_length(pm, len(fn["Params"]))
         if length:
             param.append(length)
         params.append(param)
     entry["params"] = params
 
-    name = fn["Name"]
     if name in overrides["variadic"]:
         entry["variadic"] = True
         entry["conv"] = "cdecl"
@@ -526,26 +583,32 @@ def build_entry(fn: dict, resolver: TypeResolver, overrides: dict) -> dict:
     return entry
 
 
+def get_enum_values(td: dict, constants: dict[str, int], overrides: dict) -> list[list]:
+    """
+    Get the ``[name, value]`` members of one enum, in the order of win32json.
+
+    Values are masked to the enum's integer size so negative members compare equal to the unsigned
+    argument slots the emulator reads. ``overrides["enum_extra"]`` appends named constants that
+    win32metadata keeps outside the enum (e.g. ``GENERIC_READ`` for ``FILE_ACCESS_FLAGS``).
+    """
+    name = td["Name"]
+    mask = (1 << (_enum_size(td) * 8)) - 1
+    values = [[v["Name"], v["Value"] & mask] for v in td["Values"]]
+    seen = {v[0] for v in values}
+    for extra in overrides["enum_extra"].get(name, ()):
+        if extra in seen:
+            continue
+        if extra not in constants:
+            raise SystemExit(f"enum_extra: constant {extra!r} for enum {name} not found in win32json")
+        values.append([extra, constants[extra] & mask])
+    return values
+
+
 def build_enum_table(resolver: TypeResolver, constants: dict[str, int], overrides: dict) -> dict[str, dict]:
-    """
-    Flatten every enum some resolved type referenced. Values are masked to the
-    enum's integer size so negative members compare equal to the unsigned
-    argument slots the emulator reads. ``overrides["enum_extra"]`` appends
-    named constants that win32metadata keeps outside the enum (e.g.
-    ``GENERIC_READ`` for ``FILE_ACCESS_FLAGS``).
-    """
+    """Flatten every enum some resolved type referenced."""
     enums: dict[str, dict] = {}
     for name, td in sorted(resolver.used_enums.items()):
-        mask = (1 << (_enum_size(td) * 8)) - 1
-        values = [[v["Name"], v["Value"] & mask] for v in td["Values"]]
-        seen = {v[0] for v in values}
-        for extra in overrides["enum_extra"].get(name, ()):
-            if extra in seen:
-                continue
-            if extra not in constants:
-                raise SystemExit(f"enum_extra: constant {extra!r} for enum {name} not found in win32json")
-            values.append([extra, constants[extra] & mask])
-        entry: dict = {"v": values}
+        entry: dict = {"v": get_enum_values(td, constants, overrides)}
         if td.get("Flags"):
             entry["f"] = True
         enums[name] = entry
@@ -554,8 +617,9 @@ def build_enum_table(resolver: TypeResolver, constants: dict[str, int], override
 
 def build_struct_table(resolver: TypeResolver, stats: collections.Counter) -> dict[str, dict]:
     """
-    Layout of every struct some parameter points at, plus (transitively) every
-    struct their fields embed or point at, for both pointer sizes.
+    Lay out every struct some parameter points at, for both pointer sizes.
+
+    The table also holds (transitively) every struct their fields embed or point at.
     """
     structs: dict[str, dict] = {}
     worklist = [(name, api, td) for name, (api, td) in sorted(resolver.used_structs.items())]
@@ -603,7 +667,10 @@ def generate(win32json_root: str, overrides_path: str) -> tuple[dict, collection
         for param in entry["params"]:
             code = param[1]
             stats[f"param:{code.split(':', 1)[0]}"] += 1
-            if code.split(":", 1)[0] in ("i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64") and ":" in code:
+            if (
+                code.split(":", 1)[0] in ("i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "ip", "up")
+                and ":" in code
+            ):
                 stats["param:enum"] += 1
             if len(param) > 3:
                 stats["param:sized-buffer"] += 1
@@ -647,9 +714,8 @@ def write_output(doc: dict, output: str) -> int:
     os.makedirs(os.path.dirname(output), exist_ok=True)
     raw = json.dumps(doc, separators=(",", ":"), sort_keys=False).encode("utf-8")
     # A fixed mtime and no embedded filename keep the archive byte-for-byte reproducible.
-    with open(output, "wb") as f:
-        with gzip.GzipFile(filename="", fileobj=f, mode="wb", mtime=0) as gz:
-            gz.write(raw)
+    with open(output, "wb") as f, gzip.GzipFile(filename="", fileobj=f, mode="wb", mtime=0) as gz:
+        gz.write(raw)
     return len(raw)
 
 

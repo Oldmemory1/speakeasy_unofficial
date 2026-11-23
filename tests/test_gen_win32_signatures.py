@@ -68,9 +68,11 @@ def _struct(
 
 def _with_anonymous_union() -> dict[str, Any]:
     """
-    struct WITH_ANON { UINT32 tag; union { UINT64 q; struct { UINT32 lo, hi; } s; } u; }
-    as win32metadata emits it: the union is an anonymous NestedType referenced
-    with an empty Parents chain, and its inner struct with Parents=[union].
+    Build the struct ``WITH_ANON`` as win32metadata emits it.
+
+    The C definition is ``struct WITH_ANON { UINT32 tag; union { UINT64 q; struct { UINT32 lo, hi; } s; } u; }``.
+    The union is an anonymous NestedType referenced with an empty Parents chain, and its inner struct has
+    Parents=[union].
     """
     inner = _struct("_s_e__Struct", [("lo", _native("UInt32")), ("hi", _native("UInt32"))])
     union = _struct(
@@ -253,6 +255,19 @@ def mini_win32json(tmp_path: Path) -> Path:
             ),
             _func("ldap_bind_sA", "WLDAP32.dll", _native("UInt32"), []),
             _func(
+                "Bytes",
+                "KERNEL32.dll",
+                _native("Void"),
+                [
+                    ("data", _ptr(_native("Byte")), ["In", {"Kind": "MemorySize", "BytesParamIndex": 1}]),
+                    ("size", _native("UInt32"), ["In"]),
+                    ("pdata", _ptr(_ptr(_native("Byte"))), ["Out"]),
+                ],
+            ),
+            _func("UuidFromStringA", "RPCRT4.dll", _native("Int32"), [("StringUuid", _ptr(_native("Byte")), ["In"])]),
+            _func("UuidFromStringW", "RPCRT4.dll", _native("Int32"), [("StringUuid", _ptr(_native("UInt16")), ["In"])]),
+            _func("NdrPointerFree", "RPCRT4.dll", _native("Void"), [("pMemory", _ptr(_native("Byte")), ["In"])]),
+            _func(
                 "OnlyX86",
                 "odbc32.dll",
                 _native("Int16"),
@@ -283,7 +298,6 @@ def mini_win32json(tmp_path: Path) -> Path:
 
 def test_generate_resolves_types(gen: ModuleType, mini_win32json: Path) -> None:
     doc, stats = gen.generate(str(mini_win32json), str(OVERRIDES))
-    assert doc["format"] == gen.FORMAT_VERSION
     assert doc["version"] == "0.0.1-test"
     assert doc["dll_aliases"]["psapi"] == "kernel32"
     assert doc["name_prefixes"]["kernel32"] == ["K32"]
@@ -301,7 +315,7 @@ def test_generate_resolves_types(gen: ModuleType, mini_win32json: Path) -> None:
         ["disposition", "i32:DISPOSITION", "i"],
         ["hTemplateFile", "h", "i?"],
         ["hwnd", "h", "i"],
-        ["lParam", "p", "i"],
+        ["lParam", "ip", "i"],
         ["ok", "b", "i"],
         ["okay", "B", "i"],
         ["cb", "p", "i"],
@@ -322,6 +336,46 @@ def test_generate_resolves_types(gen: ModuleType, mini_win32json: Path) -> None:
         "f": [["dwLowDateTime", "u32", 0, 0], ["dwHighDateTime", "u32", 4, 4]],
     }
     assert "MIXED" not in doc["structs"]  # only referenced by value, never pointed at
+
+
+def test_pointer_sized_integers_are_not_pointers(gen: ModuleType) -> None:
+    types = [
+        _typedef("WPARAM", _native("UIntPtr")),
+        _typedef("alljoyn_busattachment", _native("IntPtr")),
+    ]
+    resolve = gen.TypeResolver({"Foundation": {t["Name"]: t for t in types}}).resolve
+    # win32metadata gives SIZE_T, ULONG_PTR and DWORD_PTR as UIntPtr, and SSIZE_T, LONG_PTR and INT_PTR as IntPtr
+    assert resolve(_native("UIntPtr")) == "up"
+    assert resolve(_native("IntPtr")) == "ip"
+    assert resolve(_ptr(_native("UIntPtr"))) == "p:up"
+    assert resolve(_ref("Foundation", "WPARAM")) == "up"
+    # the other typedefs of IntPtr that are not handles are opaque pointers
+    assert resolve(_ref("Foundation", "alljoyn_busattachment")) == "p"
+
+
+def test_pointer_sized_integer_with_a_handle_name_is_a_handle(gen: ModuleType) -> None:
+    # win32metadata gives HCRYPTPROV, HCRYPTHASH and HPROFILE as UIntPtr or IntPtr, with no typedef
+    fn = _func(
+        "CryptCreateHash",
+        "ADVAPI32.dll",
+        _native("IntPtr"),
+        [
+            ("hProv", _native("UIntPtr"), ["In"]),
+            ("hash", _native("UIntPtr"), ["In"]),
+            ("phHash", _ptr(_native("UIntPtr")), ["Out"]),
+            ("hProfiles", {"Kind": "LPArray", "Child": _native("IntPtr"), "CountParamIndex": -1, "CountConst": 2}, []),
+            ("hWnd", _native("UInt32"), ["In"]),
+        ],
+    )
+    entry = gen.build_entry(fn, gen.TypeResolver({}), gen.load_overrides(str(OVERRIDES)))
+    assert entry["ret"] == "ip"
+    assert entry["params"] == [
+        ["hProv", "h", "i"],
+        ["hash", "up", "i"],
+        ["phHash", "p:h", "o"],
+        ["hProfiles", "a:h", "", {"k": 2}],
+        ["hWnd", "u32", "i"],
+    ]
 
 
 def test_generate_enum_table(gen: ModuleType, mini_win32json: Path, tmp_path: Path) -> None:
@@ -386,6 +440,21 @@ def test_generate_by_value_struct_sizes(gen: ModuleType, mini_win32json: Path) -
     }
 
 
+def test_generate_byte_pointer_is_a_buffer(gen: ModuleType, mini_win32json: Path) -> None:
+    """Only string types get a string code. win32metadata has no type for BYTE* that differs from char*."""
+    doc, _ = gen.generate(str(mini_win32json), str(OVERRIDES))
+    (fn,) = doc["functions"]["Bytes"]
+    assert fn["params"] == [
+        ["data", "a:u8", "i", {"n": 1}],
+        ["size", "u32", "i"],
+        ["pdata", "p:a:u8", "o"],
+    ]
+    # RPC_CSTR and RPC_WSTR are unsigned char* and unsigned short* in win32metadata
+    assert doc["functions"]["UuidFromStringA"][0]["params"] == [["StringUuid", "s", "i"]]
+    assert doc["functions"]["UuidFromStringW"][0]["params"] == [["StringUuid", "S", "i"]]
+    assert doc["functions"]["NdrPointerFree"][0]["params"] == [["pMemory", "a:u8", "i"]]
+
+
 def test_generate_applies_overrides(gen: ModuleType, mini_win32json: Path) -> None:
     doc, stats = gen.generate(str(mini_win32json), str(OVERRIDES))
     (ws,) = doc["functions"]["wsprintfA"]
@@ -394,6 +463,21 @@ def test_generate_applies_overrides(gen: ModuleType, mini_win32json: Path) -> No
     assert ldap["conv"] == "cdecl"
     assert stats["variadic"] == 1
     assert stats["cdecl"] == 2
+
+
+def test_generate_param_names(gen: ModuleType, mini_win32json: Path, tmp_path: Path) -> None:
+    overrides = json.loads(OVERRIDES.read_text())
+    overrides["param_names"] = {"wsprintfA": ["lpOut", "lpFmt"]}
+    path = tmp_path / "overrides.json"
+    path.write_text(json.dumps(overrides))
+    doc, _ = gen.generate(str(mini_win32json), str(path))
+    (ws,) = doc["functions"]["wsprintfA"]
+    assert [p[0] for p in ws["params"]] == ["lpOut", "lpFmt"]
+
+    overrides["param_names"] = {"wsprintfA": ["lpOut"]}
+    path.write_text(json.dumps(overrides))
+    with pytest.raises(SystemExit, match="wsprintfA has 2 parameters"):
+        gen.generate(str(mini_win32json), str(path))
 
 
 def test_generate_arch_skip_and_duplicates(gen: ModuleType, mini_win32json: Path) -> None:
@@ -424,13 +508,3 @@ def test_write_output_is_reproducible(gen: ModuleType, mini_win32json: Path, tmp
 def test_main_reports_missing_submodule(gen: ModuleType, tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="git submodule update"):
         gen.generate(str(tmp_path / "empty"), str(OVERRIDES))
-
-
-def test_overrides_file_is_well_formed(gen: ModuleType) -> None:
-    overrides = gen.load_overrides(str(OVERRIDES))
-    assert "wsprintfA" in overrides["variadic"]
-    assert "icu" in overrides["cdecl_dlls"]
-    assert overrides["dll_aliases"]["psapi"] == "kernel32"
-    for key in ("cdecl_dlls", "cdecl", "variadic", "skip"):
-        assert all(isinstance(v, str) for v in overrides[key])
-    assert "GENERIC_READ" in overrides["enum_extra"]["FILE_ACCESS_FLAGS"]

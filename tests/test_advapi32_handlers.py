@@ -1,0 +1,1247 @@
+"""advapi32, secur32, crypt32, bcrypt and ncrypt handlers give callers the results and out-params that Windows gives."""
+
+import hashlib
+import struct
+from collections.abc import Callable, Iterator
+from typing import Any
+
+import pytest
+from Crypto.Cipher import AES, ARC4, PKCS1_v1_5
+from Crypto.PublicKey import RSA
+from Crypto.Util.Padding import pad
+
+from speakeasy import Speakeasy
+from speakeasy.profiler_events import RegCreateKeyEvent, RegOpenKeyEvent
+from speakeasy.windows.cryptman import CryptContext
+from speakeasy.windows.handles import HandleTable
+from speakeasy.windows.objman import HandleAllocator
+from speakeasy.windows.regman import RegistryManager
+from speakeasy.winenv.defs.enums import ENUM_SERVICE_STATE, ENUM_SERVICE_TYPE
+from speakeasy.winenv.defs.nt import ddk
+from speakeasy.winenv.defs.windows import advapi32 as adv32defs
+from speakeasy.winenv.defs.windows import windows as windefs
+from tests.handler_harness import alloc, call, load_emu, start_process
+
+HKEY_CURRENT_USER = 0x80000001
+REG_SZ = 1
+REG_DWORD = 4
+
+
+def _dword(se: Speakeasy, addr: int) -> int:
+    return int.from_bytes(se.mem_read(addr, 4), "little")
+
+
+def _create_key(se: Speakeasy, hkey: int, subkey: bytes) -> int:
+    phk = alloc(se, b"\x00" * 4)
+    rv, _ = call(se, "advapi32", "RegCreateKeyExA", [hkey, alloc(se, subkey + b"\x00"), 0, 0, 0, 0xF003F, 0, phk, 0])
+    assert rv == windefs.ERROR_SUCCESS
+    return _dword(se, phk)
+
+
+@pytest.mark.parametrize("api, encoding", [("RegEnumKeyExA", "utf-8"), ("RegEnumKeyExW", "utf-16le")])
+def test_reg_enum_key_ex_returns_the_subkey_name(dll_emu: Speakeasy, api: str, encoding: str) -> None:
+    _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo\\Bar")
+    hfoo = _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+    buf = alloc(dll_emu, b"\xcc" * 64)
+    cch = alloc(dll_emu, struct.pack("<I", 32))
+    rv, _ = call(dll_emu, "advapi32", api, [hfoo, 0, buf, cch, 0, 0, 0, 0])
+    expected = "Bar\x00".encode(encoding)
+    assert (rv, _dword(dll_emu, cch)) == (windefs.ERROR_SUCCESS, 3)
+    assert dll_emu.mem_read(buf, len(expected)) == expected
+    rv, _ = call(dll_emu, "advapi32", api, [hfoo, 1, buf, cch, 0, 0, 0, 0])
+    assert rv == windefs.ERROR_NO_MORE_ITEMS
+
+
+def test_reg_enum_key_ex_small_buffer(dll_emu: Speakeasy) -> None:
+    _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo\\Bar")
+    hfoo = _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+    buf = alloc(dll_emu, b"\xcc" * 8)
+    cch = alloc(dll_emu, struct.pack("<I", 3))
+    rv, _ = call(dll_emu, "advapi32", "RegEnumKeyExA", [hfoo, 0, buf, cch, 0, 0, 0, 0])
+    assert rv == windefs.ERROR_MORE_DATA
+    assert dll_emu.mem_read(buf, 8) == b"\xcc" * 8
+
+
+def test_reg_enum_key_uses_the_buffer_size(dll_emu: Speakeasy) -> None:
+    _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo\\Bar")
+    hfoo = _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+    buf = alloc(dll_emu, b"\xcc" * 8)
+    rv, _ = call(dll_emu, "advapi32", "RegEnumKeyA", [hfoo, 0, buf, 8])
+    assert (rv, dll_emu.mem_read(buf, 4)) == (windefs.ERROR_SUCCESS, b"Bar\x00")
+    rv, _ = call(dll_emu, "advapi32", "RegEnumKeyA", [hfoo, 0, buf, 3])
+    assert rv == windefs.ERROR_MORE_DATA
+
+
+def test_get_subkeys_lists_each_child_once() -> None:
+    table = HandleTable(HandleAllocator(), release=lambda obj: None)
+    regman = RegistryManager(lambda: table)
+    for path in ("HKEY_LOCAL_MACHINE\\T\\A\\x", "HKEY_LOCAL_MACHINE\\T\\A\\y", "HKEY_LOCAL_MACHINE\\TT"):
+        regman.create_key(path)
+    parent = regman.create_key("HKEY_LOCAL_MACHINE\\T")
+    assert regman.get_subkeys(parent) == ["A"]
+
+
+def test_reg_create_key_returns_a_handle_to_the_subkey(dll_emu: Speakeasy) -> None:
+    phk = alloc(dll_emu, b"\x00" * 4)
+    rv, _ = call(dll_emu, "advapi32", "RegCreateKeyA", [HKEY_CURRENT_USER, alloc(dll_emu, b"Software\\Evil\x00"), phk])
+    assert rv == windefs.ERROR_SUCCESS
+    key = dll_emu.emu.regman.get_key_from_handle(_dword(dll_emu, phk))
+    assert key is not None and key.get_path() == "HKEY_CURRENT_USER\\Software\\Evil"
+
+
+def test_reg_create_key_without_a_subkey_returns_the_key(dll_emu: Speakeasy) -> None:
+    phk = alloc(dll_emu, b"\x00" * 4)
+    rv, _ = call(dll_emu, "advapi32", "RegCreateKeyA", [HKEY_CURRENT_USER, 0, phk])
+    assert (rv, _dword(dll_emu, phk)) == (windefs.ERROR_SUCCESS, HKEY_CURRENT_USER)
+
+
+@pytest.mark.parametrize(("api", "encoding"), [("RegSetValueExA", "utf-8"), ("RegSetValueExW", "utf-16le")])
+def test_reg_set_value_shows_string_data(dll_emu: Speakeasy, api: str, encoding: str) -> None:
+    hkey = _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Evil")
+    data = "wlogon.dll\x00".encode(encoding)
+    rv, displays = call(dll_emu, "advapi32", api, [hkey, 0, 0, 1, alloc(dll_emu, data), len(data)])
+    assert rv == windefs.ERROR_SUCCESS
+    assert displays["lpData"] == "wlogon.dll"
+
+
+def test_reg_set_value_x64_reads_only_the_low_dword_of_dword_args(dll64_emu: Speakeasy) -> None:
+    hkey = _create_key(dll64_emu, HKEY_CURRENT_USER, b"Software\\Evil")
+    data = struct.pack("<Q", 0x1122334455667788)
+    garbage = 0x00010001 << 32
+    argv = [hkey, alloc(dll64_emu, b"Stamp\x00"), garbage, garbage | 0xB, alloc(dll64_emu, data), garbage | 8]
+    rv, _ = call(dll64_emu, "advapi32", "RegSetValueExA", argv)
+    assert rv == windefs.ERROR_SUCCESS
+    vtype = alloc(dll64_emu, b"\x00" * 4)
+    buf = alloc(dll64_emu, b"\x00" * 0x10)
+    size = alloc(dll64_emu, struct.pack("<I", 0x10))
+    rv, _ = call(dll64_emu, "advapi32", "RegQueryValueExA", [hkey, alloc(dll64_emu, b"Stamp\x00"), 0, vtype, buf, size])
+    assert rv == windefs.ERROR_SUCCESS
+    assert (_dword(dll64_emu, vtype), dll64_emu.mem_read(buf, _dword(dll64_emu, size))) == (0xB, data)
+
+
+@pytest.mark.parametrize("api", ["RegEnumKeyA", "RegEnumKeyExA"])
+def test_reg_enum_key_x64_reads_only_the_low_dword_of_the_index(dll64_emu: Speakeasy, api: str) -> None:
+    _create_key(dll64_emu, HKEY_CURRENT_USER, b"Software\\Foo\\Bar")
+    hfoo = _create_key(dll64_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+    buf = alloc(dll64_emu, b"\xcc" * 8)
+    garbage = 0x00010001 << 32
+    if api == "RegEnumKeyA":
+        argv = [hfoo, garbage, buf, garbage | 8]
+    else:
+        argv = [hfoo, garbage, buf, alloc(dll64_emu, struct.pack("<I", 8)), 0, 0, 0, 0]
+    rv, _ = call(dll64_emu, "advapi32", api, argv)
+    assert (rv, dll64_emu.mem_read(buf, 4)) == (windefs.ERROR_SUCCESS, b"Bar\x00")
+
+
+@pytest.mark.parametrize("api", ["RegQueryValueExA", "RegGetValueA"])
+def test_reg_query_without_a_value_name_reads_the_default_value(dll_emu: Speakeasy, api: str) -> None:
+    hkey = _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Evil")
+    data = b"payload\x00"
+    rv, _ = call(dll_emu, "advapi32", "RegSetValueExA", [hkey, 0, 0, 1, alloc(dll_emu, data), len(data)])
+    assert rv == windefs.ERROR_SUCCESS
+
+    buf = alloc(dll_emu, b"\x00" * 0x20)
+    size = alloc(dll_emu, struct.pack("<I", 0x20))
+    if api == "RegQueryValueExA":
+        argv = [hkey, 0, 0, 0, buf, size]
+    else:
+        argv = [hkey, 0, 0, 0xFFFF, 0, buf, size]
+    rv, _ = call(dll_emu, "advapi32", api, argv)
+
+    assert rv == windefs.ERROR_SUCCESS
+    assert dll_emu.mem_read(buf, len(data)) == data
+
+
+def _query_value(se: Speakeasy, hkey: int, name: bytes) -> tuple[int, bytes]:
+    vtype = alloc(se, b"\x00" * 4)
+    buf = alloc(se, b"\x00" * 0x80)
+    size = alloc(se, struct.pack("<I", 0x80))
+    rv, _ = call(se, "advapi32", "RegQueryValueExA", [hkey, alloc(se, name + b"\x00"), 0, vtype, buf, size])
+    assert rv == windefs.ERROR_SUCCESS
+    return _dword(se, vtype), se.mem_read(buf, _dword(se, size))
+
+
+def _open_current_version(se: Speakeasy) -> int:
+    phk = alloc(se, b"\x00" * 4)
+    subkey = alloc(se, b"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\x00")
+    rv, _ = call(se, "advapi32", "RegOpenKeyExA", [HKEY_LOCAL_MACHINE, subkey, 0, 0x20019, phk])
+    assert rv == windefs.ERROR_SUCCESS
+    return _dword(se, phk)
+
+
+@pytest.fixture
+def win10_emu(config: dict[str, Any], load_test_bin: Callable[[str], bytes]) -> Iterator[Speakeasy]:
+    config["system"]["os_ver"] = {"major": 10, "minor": 0, "build": 19045}
+    yield from load_emu(config, load_test_bin("dll_test_x86.dll.xz"))
+
+
+def test_current_version_values_follow_a_windows_10_os_version(win10_emu: Speakeasy) -> None:
+    hkey = _open_current_version(win10_emu)
+    assert _query_value(win10_emu, hkey, b"ProductName") == (REG_SZ, b"Windows 10 Pro\x00")
+    assert _query_value(win10_emu, hkey, b"CurrentVersion") == (REG_SZ, b"6.3\x00")
+    assert _query_value(win10_emu, hkey, b"CurrentBuild") == (REG_SZ, b"19045\x00")
+    assert _query_value(win10_emu, hkey, b"CurrentMajorVersionNumber") == (REG_DWORD, struct.pack("<I", 10))
+    assert _query_value(win10_emu, hkey, b"CurrentMinorVersionNumber") == (REG_DWORD, struct.pack("<I", 0))
+
+
+@pytest.fixture
+def product_name_emu(config: dict[str, Any], load_test_bin: Callable[[str], bytes]) -> Iterator[Speakeasy]:
+    config["registry"]["keys"].append(
+        {
+            "path": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+            "values": [{"name": "ProductName", "type": "REG_SZ", "data": "Windows 7 Ultimate"}],
+        }
+    )
+    yield from load_emu(config, load_test_bin("dll_test_x86.dll.xz"))
+
+
+def test_configured_current_version_values_win(product_name_emu: Speakeasy) -> None:
+    hkey = _open_current_version(product_name_emu)
+    assert _query_value(product_name_emu, hkey, b"ProductName") == (REG_SZ, b"Windows 7 Ultimate\x00")
+    assert _query_value(product_name_emu, hkey, b"CurrentBuildNumber") == (REG_SZ, b"7601\x00")
+
+
+def _open_key(se: Speakeasy, api: str, hkey: int, subkey: int) -> tuple[int, str | None]:
+    """Open ``subkey`` below ``hkey`` and return the status and the path of the new handle."""
+    phk = alloc(se, b"\x00" * 4)
+    argv = [hkey, subkey, phk] if api == "RegOpenKeyA" else [hkey, subkey, 0, 0xF003F, phk]
+    rv, _ = call(se, "advapi32", api, argv)
+    key = se.emu.regman.get_key_from_handle(_dword(se, phk))
+    return rv, key.get_path() if key else None
+
+
+@pytest.mark.parametrize("api", ["RegOpenKeyA", "RegOpenKeyExA"])
+def test_reg_open_key_below_an_open_key(dll_emu: Speakeasy, api: str) -> None:
+    _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo\\Bar")
+    hfoo = _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+    rv, path = _open_key(dll_emu, api, hfoo, alloc(dll_emu, b"Bar\x00"))
+    assert (rv, path) == (windefs.ERROR_SUCCESS, "HKEY_CURRENT_USER\\Software\\Foo\\Bar")
+
+
+@pytest.mark.parametrize("api", ["RegOpenKeyA", "RegOpenKeyExA"])
+def test_reg_open_missing_key_is_file_not_found(dll_emu: Speakeasy, api: str) -> None:
+    rv, path = _open_key(dll_emu, api, HKEY_CURRENT_USER, alloc(dll_emu, b"Software\\NoSuchKey\x00"))
+    assert (rv, path) == (windefs.ERROR_FILE_NOT_FOUND, None)
+
+
+@pytest.mark.parametrize("api", ["RegOpenKeyA", "RegOpenKeyExA"])
+def test_reg_open_unknown_handle_is_invalid(dll_emu: Speakeasy, api: str) -> None:
+    rv, _ = _open_key(dll_emu, api, 0x1234, alloc(dll_emu, b"Bar\x00"))
+    assert rv == windefs.ERROR_INVALID_HANDLE
+
+
+@pytest.mark.parametrize("subkey", [None, b"\x00"])
+def test_reg_open_key_ex_without_a_subkey_opens_a_new_handle(dll_emu: Speakeasy, subkey: bytes | None) -> None:
+    hfoo = _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+    phk = alloc(dll_emu, b"\x00" * 4)
+    lp = alloc(dll_emu, subkey) if subkey else 0
+    rv, _ = call(dll_emu, "advapi32", "RegOpenKeyExA", [hfoo, lp, 0, 0x20006, phk])
+    h2 = _dword(dll_emu, phk)
+    assert rv == windefs.ERROR_SUCCESS and h2 != hfoo
+    key = dll_emu.emu.regman.get_key_from_handle(h2)
+    assert key is not None and key.get_path() == "HKEY_CURRENT_USER\\Software\\Foo"
+    assert call(dll_emu, "advapi32", "RegCloseKey", [h2])[0] == windefs.ERROR_SUCCESS
+    rv, _ = call(dll_emu, "advapi32", "RegQueryInfoKeyA", [hfoo, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    assert rv == windefs.ERROR_SUCCESS
+
+
+@pytest.mark.parametrize("subkey", [None, b"\x00"])
+def test_reg_open_key_without_a_subkey_returns_the_same_handle(dll_emu: Speakeasy, subkey: bytes | None) -> None:
+    hfoo = _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+    phk = alloc(dll_emu, b"\x00" * 4)
+    rv, _ = call(dll_emu, "advapi32", "RegOpenKeyA", [hfoo, alloc(dll_emu, subkey) if subkey else 0, phk])
+    assert (rv, _dword(dll_emu, phk)) == (windefs.ERROR_SUCCESS, hfoo)
+
+
+def test_reg_query_info_key_counts_subkeys_and_values(dll_emu: Speakeasy) -> None:
+    _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo\\Bar")
+    _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo\\Bazzz")
+    hfoo = _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+    value = alloc(dll_emu, b"abc\x00")
+    rv, _ = call(dll_emu, "advapi32", "RegSetValueExA", [hfoo, alloc(dll_emu, b"Name\x00"), 0, 1, value, 4])
+    assert rv == windefs.ERROR_SUCCESS
+    outs = [alloc(dll_emu, b"\xcc" * 4) for _ in range(8)]
+    ft = alloc(dll_emu, b"\xcc" * 8)
+    rv, _ = call(dll_emu, "advapi32", "RegQueryInfoKeyA", [hfoo, 0, outs[0], 0, *outs[1:], ft])
+    assert rv == windefs.ERROR_SUCCESS
+    cch_class, subkeys, max_subkey, max_class, values, max_name, max_value, sec = (_dword(dll_emu, a) for a in outs)
+    assert (subkeys, max_subkey, values, max_name, max_value) == (2, 5, 1, 4, 4)
+    assert (cch_class, max_class, sec) == (0, 0, 0)
+    assert dll_emu.mem_read(ft, 8) == b"\x00" * 8
+
+
+@pytest.mark.parametrize("name", ["SystemFunction036", "CryptGenRandom"])
+def test_gen_random_gives_a_nonzero_byte_in_a_few_calls(dll_emu: Speakeasy, name: str) -> None:
+    buf = alloc(dll_emu, b"\x00" * 16)
+    argv = [buf, 1] if name == "SystemFunction036" else [0x1234, 1, buf]
+    calls = 1
+    while call(dll_emu, "advapi32", name, argv)[0] and dll_emu.mem_read(buf, 1) == b"\x00":
+        calls += 1
+        assert calls < 10
+    assert dll_emu.mem_read(buf, 1) != b"\x00"
+
+    argv = [buf, 16] if name == "SystemFunction036" else [0x1234, 16, buf]
+    assert call(dll_emu, "advapi32", name, argv)[0]
+    first = dll_emu.mem_read(buf, 16)
+    assert call(dll_emu, "advapi32", name, argv)[0]
+    assert len(set(first)) > 1
+    assert dll_emu.mem_read(buf, 16) != first
+
+
+def _last_error(se: Speakeasy) -> int:
+    error: int = se.emu.get_last_error()
+    return error
+
+
+def test_lookup_account_sid_reports_the_sizes(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    sid = alloc(dll_emu, bytes([1, 1, 0, 0, 0, 0, 0, 5]) + struct.pack("<I", 18))
+    cch_name = alloc(dll_emu, struct.pack("<I", 0))
+    cch_dom = alloc(dll_emu, struct.pack("<I", 0))
+    use = alloc(dll_emu, b"\xcc" * 4)
+    rv, _ = call(dll_emu, "advapi32", "LookupAccountSidA", [0, sid, 0, cch_name, 0, cch_dom, use])
+    assert not rv
+    assert _last_error(dll_emu) == windefs.ERROR_INSUFFICIENT_BUFFER
+    name_size, dom_size = _dword(dll_emu, cch_name), _dword(dll_emu, cch_dom)
+
+    name = alloc(dll_emu, b"\xcc" * name_size)
+    dom = alloc(dll_emu, b"\xcc" * dom_size)
+    rv, _ = call(dll_emu, "advapi32", "LookupAccountSidA", [0, sid, name, cch_name, dom, cch_dom, use])
+    assert rv
+    assert dll_emu.mem_read(name, name_size)[-1:] == b"\x00"
+    assert dll_emu.mem_read(dom, dom_size)[-1:] == b"\x00"
+    assert (_dword(dll_emu, cch_name), _dword(dll_emu, cch_dom)) == (name_size - 1, dom_size - 1)
+    assert _dword(dll_emu, use) == 1
+
+
+def test_get_user_name_ex_reports_the_size(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    user = dll_emu.emu.config.user.name
+    size = alloc(dll_emu, struct.pack("<I", 0))
+    rv, _ = call(dll_emu, "secur32", "GetUserNameExA", [2, 0, size])
+    assert (rv, _last_error(dll_emu), _dword(dll_emu, size)) == (0, windefs.ERROR_MORE_DATA, len(user) + 1)
+
+    buf = alloc(dll_emu, b"\xcc" * (len(user) + 1))
+    rv, _ = call(dll_emu, "secur32", "GetUserNameExA", [2, buf, size])
+    assert (rv, _dword(dll_emu, size)) == (1, len(user))
+    assert dll_emu.mem_read(buf, len(user) + 1) == user.encode() + b"\x00"
+
+
+@pytest.mark.parametrize("api, encoding", [("GetUserNameA", "cp1252"), ("GetUserNameW", "utf-16le")])
+def test_get_user_name_reports_the_size(dll_emu: Speakeasy, api: str, encoding: str) -> None:
+    start_process(dll_emu)
+    expected = (dll_emu.emu.config.user.name + "\x00").encode(encoding)
+    need = len(dll_emu.emu.config.user.name) + 1
+    size = alloc(dll_emu, struct.pack("<I", 0))
+    rv, _ = call(dll_emu, "advapi32", api, [0, size])
+    assert (rv, _last_error(dll_emu), _dword(dll_emu, size)) == (0, windefs.ERROR_INSUFFICIENT_BUFFER, need)
+
+    buf = alloc(dll_emu, b"\xcc" * 64)
+    rv, _ = call(dll_emu, "advapi32", api, [buf, size])
+    assert (rv, _dword(dll_emu, size)) == (1, need)
+    assert dll_emu.mem_read(buf, len(expected)) == expected
+
+
+def test_get_user_name_a_writes_the_name_in_code_page_1252(
+    config: dict[str, Any], load_test_bin: Callable[[str], bytes]
+) -> None:
+    config["user"]["name"] = "José"
+    for se in load_emu(config, load_test_bin("dll_test_x86.dll.xz")):
+        start_process(se)
+        size = alloc(se, struct.pack("<I", 5))
+        buf = alloc(se, b"\xcc" * 7)
+        rv, _ = call(se, "advapi32", "GetUserNameA", [buf, size])
+        assert (rv, _dword(se, size)) == (1, 5)
+        assert se.mem_read(buf, 7) == b"Jos\xe9\x00\xcc\xcc"
+
+
+def test_crypt_release_context_rejects_an_unknown_handle(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    phprov = alloc(dll_emu, b"\x00" * 4)
+    rv, _ = call(dll_emu, "advapi32", "CryptAcquireContextA", [phprov, 0, 0, 1, 0xF0000000])
+    assert rv
+    hprov = _dword(dll_emu, phprov)
+    assert call(dll_emu, "advapi32", "CryptReleaseContext", [hprov, 0])[0]
+    rv, _ = call(dll_emu, "advapi32", "CryptReleaseContext", [hprov, 0])
+    assert (rv, _last_error(dll_emu)) == (0, windefs.ERROR_INVALID_HANDLE)
+    rv, _ = call(dll_emu, "advapi32", "CryptReleaseContext", [0, 0])
+    assert not rv
+
+
+def test_bcrypt_close_algorithm_provider_twice(dll_emu: Speakeasy) -> None:
+    ph = alloc(dll_emu, b"\x00" * 4)
+    rv, _ = call(
+        dll_emu, "bcrypt", "BCryptOpenAlgorithmProvider", [ph, alloc(dll_emu, "RSA\x00".encode("utf-16le")), 0, 0]
+    )
+    assert rv == 0
+    halg = _dword(dll_emu, ph)
+    assert call(dll_emu, "bcrypt", "BCryptCloseAlgorithmProvider", [halg, 0])[0] == 0
+    assert call(dll_emu, "bcrypt", "BCryptCloseAlgorithmProvider", [halg, 0])[0] == ddk.STATUS_INVALID_HANDLE
+
+
+STATUS_INVALID_BUFFER_SIZE = 0xC0000206
+
+
+def _wstr(se: Speakeasy, text: str) -> int:
+    return alloc(se, (text + "\x00").encode("utf-16le"))
+
+
+def _ptr(se: Speakeasy, addr: int) -> int:
+    size = se.emu.get_ptr_size()
+    return int.from_bytes(se.mem_read(addr, size), "little")
+
+
+def _aes_key(se: Speakeasy, mode: str, secret: bytes) -> int:
+    ph = alloc(se, b"\x00" * 8)
+    assert call(se, "bcrypt", "BCryptOpenAlgorithmProvider", [ph, _wstr(se, "AES"), 0, 0])[0] == 0
+    halg = _ptr(se, ph)
+    value = (mode + "\x00").encode("utf-16le")
+    assert (
+        call(se, "bcrypt", "BCryptSetProperty", [halg, _wstr(se, "ChainingMode"), alloc(se, value), len(value), 0])[0]
+        == 0
+    )
+    phkey = alloc(se, b"\x00" * 8)
+    rv, _ = call(se, "bcrypt", "BCryptGenerateSymmetricKey", [halg, phkey, 0, 0, alloc(se, secret), len(secret), 0])
+    assert rv == 0
+    return _ptr(se, phkey)
+
+
+# Bits of the return value of bcrypt_cases.c, one per case
+BCRYPT_GCM_CASES = {
+    0x01: "AuthTagLength of a GCM key is 12 to 16 in steps of 1",
+    0x02: "BlockLength of an AES key is 16",
+    0x04: "BCryptEncrypt without an output buffer gives the output size",
+    0x08: "BCryptEncrypt encrypts and writes the tag",
+    0x10: "BCryptDecrypt decrypts and checks the tag",
+    0x20: "BCryptDecrypt of a bad tag fails with STATUS_AUTH_TAG_MISMATCH",
+    0x40: "BCryptDestroyKey destroys the key",
+}
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_bcrypt_aes_gcm_round_trip_matches_pycryptodome(config: dict, load_test_bin, arch: str) -> None:
+    r"""bcrypt_cases.c encrypts with AES-GCM and writes the cipher text and the tag to c:\gcm.bin."""
+    with Speakeasy(config=config) as se:
+        se.run_module(se.load_module(data=load_test_bin(f"bcrypt_cases_{arch}.exe.xz")))
+        run = se.get_report().runs[0]
+        dropped = [f.get_contents() for f in se.get_dropped_files()]
+
+    assert run.error is None
+    assert not [case for bit, case in BCRYPT_GCM_CASES.items() if not run.return_value & bit]
+    secret, nonce, aad, plain = bytes(range(32)), b"\x07" * 12, b"UK01", bytes(range(0x40, 0x80))
+    expected, expected_tag = AES.new(secret, AES.MODE_GCM, nonce=nonce).update(aad).encrypt_and_digest(plain)
+    assert dropped == [expected + expected_tag]
+
+
+@pytest.mark.parametrize("mode, cipher", [("ChainingModeCBC", AES.MODE_CBC), ("ChainingModeECB", AES.MODE_ECB)])
+def test_bcrypt_aes_block_padding_round_trip_matches_pycryptodome(dll_emu: Speakeasy, mode: str, cipher: int) -> None:
+    se = dll_emu
+    secret, iv, plain = b"k" * 16, bytes(range(16)), b"twenty bytes of text"
+    hkey = _aes_key(se, mode, secret)
+    piv = alloc(se, iv) if cipher == AES.MODE_CBC else 0
+    civ = 16 if piv else 0
+    src, enc, dec, pcb = (alloc(se, data) for data in (plain, b"\x00" * 32, b"\x00" * 32, b"\x00" * 4))
+    padding = 1
+
+    assert (
+        call(se, "bcrypt", "BCryptEncrypt", [hkey, src, 20, 0, piv, civ, 0, 0, pcb, 0])[0] == STATUS_INVALID_BUFFER_SIZE
+    )
+    assert call(se, "bcrypt", "BCryptEncrypt", [hkey, src, 20, 0, piv, civ, 0, 0, pcb, padding])[0] == 0
+    assert _dword(se, pcb) == 32
+    assert (
+        call(se, "bcrypt", "BCryptEncrypt", [hkey, src, 20, 0, piv, civ, enc, 16, pcb, padding])[0]
+        == ddk.STATUS_BUFFER_TOO_SMALL
+    )
+    assert call(se, "bcrypt", "BCryptEncrypt", [hkey, src, 20, 0, piv, civ, enc, 32, pcb, padding])[0] == 0
+
+    aes = AES.new(secret, cipher, iv=iv) if piv else AES.new(secret, cipher)  # type: ignore[call-overload]
+    expected = aes.encrypt(pad(plain, 16))
+    assert se.mem_read(enc, 32) == expected
+    if piv:
+        assert se.mem_read(piv, 16) == expected[16:]
+        se.mem_write(piv, iv)
+    assert call(se, "bcrypt", "BCryptDecrypt", [hkey, enc, 32, 0, piv, civ, dec, 32, pcb, padding])[0] == 0
+    assert (_dword(se, pcb), se.mem_read(dec, 20)) == (20, plain)
+
+
+def _acquire_context(se: Speakeasy, prov_type: int) -> int:
+    ph = alloc(se, b"\x00" * 8)
+    assert call(se, "advapi32", "CryptAcquireContextA", [ph, 0, 0, prov_type, 0xF0000000])[0]
+    return _ptr(se, ph)
+
+
+def _plaintext_key_blob(algid: int, key: bytes) -> bytes:
+    header = struct.pack("<BBHII", adv32defs.PLAINTEXTKEYBLOB, adv32defs.CUR_BLOB_VERSION, 0, algid, len(key))
+    return header + key
+
+
+def _import_key(se: Speakeasy, hprov: int, blob: bytes, flags: int = 0) -> int:
+    ph = alloc(se, b"\x00" * 8)
+    assert call(se, "advapi32", "CryptImportKey", [hprov, alloc(se, blob), len(blob), 0, flags, ph])[0]
+    return _ptr(se, ph)
+
+
+def _gen_key(se: Speakeasy, hprov: int, algid: int, flags: int) -> int:
+    ph = alloc(se, b"\x00" * 8)
+    assert call(se, "advapi32", "CryptGenKey", [hprov, algid, flags, ph])[0]
+    return _ptr(se, ph)
+
+
+def _derive_rc4_key(se: Speakeasy, hprov: int, password: bytes) -> int:
+    ph = alloc(se, b"\x00" * 8)
+    assert call(se, "advapi32", "CryptCreateHash", [hprov, 0x8003, 0, 0, ph])[0]
+    hhash = _ptr(se, ph)
+    assert call(se, "advapi32", "CryptHashData", [hhash, alloc(se, password), len(password), 0])[0]
+    assert call(se, "advapi32", "CryptDeriveKey", [hprov, adv32defs.CALG_RC4, hhash, 0, ph])[0]
+    return _ptr(se, ph)
+
+
+def _crypt(se: Speakeasy, api: str, hkey: int, data: bytes, final: bool) -> bytes:
+    """Run CryptEncrypt or CryptDecrypt on data in a 256-byte buffer and return the output."""
+    buf = alloc(se, data.ljust(0x100, b"\x00"))
+    pcb = alloc(se, struct.pack("<I", len(data)))
+    argv = [hkey, 0, int(final), 0, buf, pcb] + ([0x100] if api == "CryptEncrypt" else [])
+    assert call(se, "advapi32", api, argv)[0]
+    return se.mem_read(buf, _dword(se, pcb))
+
+
+def _export_key(se: Speakeasy, hkey: int) -> bytes:
+    pcb = alloc(se, b"\x00" * 4)
+    argv = [hkey, 0, adv32defs.PLAINTEXTKEYBLOB, 0, 0, pcb]
+    assert call(se, "advapi32", "CryptExportKey", argv)[0]
+    size = _dword(se, pcb)
+    buf = alloc(se, b"\xcc" * size)
+    se.mem_write(pcb, struct.pack("<I", size - 1))
+    rv, _ = call(se, "advapi32", "CryptExportKey", [hkey, 0, adv32defs.PLAINTEXTKEYBLOB, 0, buf, pcb])
+    assert (rv, _last_error(se), _dword(se, pcb)) == (0, windefs.ERROR_MORE_DATA, size)
+    assert call(se, "advapi32", "CryptExportKey", [hkey, 0, adv32defs.PLAINTEXTKEYBLOB, 0, buf, pcb])[0]
+    return se.mem_read(buf, _dword(se, pcb))
+
+
+@pytest.mark.parametrize(
+    "algid, size",
+    [(adv32defs.CALG_AES_128, 16), (adv32defs.CALG_AES_192, 24), (adv32defs.CALG_AES_256, 32)],
+    ids=["aes-128", "aes-192", "aes-256"],
+)
+def test_crypt_aes_key_blob_round_trip_matches_pycryptodome(dll_emu: Speakeasy, algid: int, size: int) -> None:
+    start_process(dll_emu)
+    se = dll_emu
+    key, iv, plain = bytes(range(size)), bytes(range(0x10, 0x20)), b"twenty bytes of text"
+    blob = _plaintext_key_blob(algid, key)
+    hkey = _import_key(se, _acquire_context(se, adv32defs.PROV_RSA_AES), blob, adv32defs.CRYPT_EXPORTABLE)
+    assert call(se, "advapi32", "CryptSetKeyParam", [hkey, adv32defs.KP_IV, alloc(se, iv), 0])[0]
+    expected = AES.new(key, AES.MODE_CBC, iv=iv).encrypt(pad(plain, 16))
+
+    pcb = alloc(se, struct.pack("<I", len(plain)))
+    assert call(se, "advapi32", "CryptEncrypt", [hkey, 0, 1, 0, 0, pcb, 0])[0]
+    assert _dword(se, pcb) == len(expected)
+    se.mem_write(pcb, struct.pack("<I", len(plain)))
+    rv, _ = call(se, "advapi32", "CryptEncrypt", [hkey, 0, 1, 0, alloc(se, plain), pcb, len(plain)])
+    assert (rv, _last_error(se), _dword(se, pcb)) == (0, windefs.ERROR_MORE_DATA, len(expected))
+
+    assert _crypt(se, "CryptEncrypt", hkey, plain, final=True) == expected
+    assert _crypt(se, "CryptDecrypt", hkey, expected, final=True) == plain
+    assert _export_key(se, hkey) == blob
+    assert call(se, "advapi32", "CryptDestroyKey", [hkey])[0]
+    rv, _ = call(se, "advapi32", "CryptDecrypt", [hkey, 0, 1, 0, alloc(se, expected), pcb])
+    assert (rv, _last_error(se)) == (0, windefs.ERROR_INVALID_HANDLE)
+
+
+def test_crypt_gen_key_exports_the_key_that_it_encrypts_with(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    se = dll_emu
+    flags = 256 << 16 | adv32defs.CRYPT_EXPORTABLE
+    hkey = _gen_key(se, _acquire_context(se, adv32defs.PROV_RSA_AES), adv32defs.CALG_AES_256, flags)
+    blob = _export_key(se, hkey)
+    header = struct.pack(
+        "<BBHII", adv32defs.PLAINTEXTKEYBLOB, adv32defs.CUR_BLOB_VERSION, 0, adv32defs.CALG_AES_256, 32
+    )
+    assert (blob[:12], len(blob)) == (header, 44)
+    assert blob[12:] != bytes(32)
+
+    mode = alloc(se, struct.pack("<I", adv32defs.CRYPT_MODE_ECB))
+    assert call(se, "advapi32", "CryptSetKeyParam", [hkey, adv32defs.KP_MODE, mode, 0])[0]
+    plain = bytes(range(32))
+    assert _crypt(se, "CryptEncrypt", hkey, plain, final=False) == AES.new(blob[12:], AES.MODE_ECB).encrypt(plain)
+
+
+def test_crypt_export_key_needs_an_exportable_key(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    hkey = _gen_key(dll_emu, _acquire_context(dll_emu, adv32defs.PROV_RSA_AES), adv32defs.CALG_AES_128, 0)
+    pcb = alloc(dll_emu, b"\x00" * 4)
+    rv, _ = call(dll_emu, "advapi32", "CryptExportKey", [hkey, 0, adv32defs.PLAINTEXTKEYBLOB, 0, 0, pcb])
+    assert (rv, _last_error(dll_emu)) == (0, adv32defs.NTE_BAD_KEY_STATE)
+
+
+@pytest.mark.parametrize(
+    "prov_type, get_key",
+    [(adv32defs.PROV_RSA_FULL, lambda digest: digest[:5] + bytes(11)), (adv32defs.PROV_RSA_AES, lambda digest: digest)],
+    ids=["40-bit", "128-bit"],
+)
+def test_crypt_derived_rc4_keys_keep_their_own_state(
+    dll_emu: Speakeasy, prov_type: int, get_key: Callable[[bytes], bytes]
+) -> None:
+    start_process(dll_emu)
+    se = dll_emu
+    hprov = _acquire_context(se, prov_type)
+    passwords = (b"first", b"second")
+    hkeys = [_derive_rc4_key(se, hprov, password) for password in passwords]
+    data = bytes(range(32))
+
+    out: dict[int, bytes] = {hkey: b"" for hkey in hkeys}
+    for chunk, final in ((data[:16], False), (data[16:], True)):
+        for hkey in hkeys:
+            out[hkey] += _crypt(se, "CryptDecrypt", hkey, chunk, final)
+    for hkey, password in zip(hkeys, passwords, strict=True):
+        key = get_key(hashlib.md5(password).digest())
+        assert out[hkey] == ARC4.new(key).decrypt(data)
+        assert _crypt(se, "CryptDecrypt", hkey, data, final=True) == ARC4.new(key).decrypt(data)
+
+
+def test_crypt_encrypt_with_an_rsa_public_key_blob(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    se = dll_emu
+    rsa = RSA.generate(1024)
+    header = struct.pack("<BBHI", adv32defs.PUBLICKEYBLOB, adv32defs.CUR_BLOB_VERSION, 0, adv32defs.CALG_RSA_KEYX)
+    blob = header + struct.pack("<III", adv32defs.RSA1, 1024, rsa.e) + rsa.n.to_bytes(128, "little")
+    hkey = _import_key(se, _acquire_context(se, adv32defs.PROV_RSA_FULL), blob)
+    plain = bytes(range(44))
+
+    pcb = alloc(se, struct.pack("<I", len(plain)))
+    assert call(se, "advapi32", "CryptEncrypt", [hkey, 0, 0, 0, 0, pcb, 0])[0]
+    assert _dword(se, pcb) == 128
+    out = _crypt(se, "CryptEncrypt", hkey, plain, final=False)
+    assert len(out) == 128
+    assert PKCS1_v1_5.new(rsa).decrypt(out[::-1], None) == plain
+
+
+def test_crypt_import_key_fails_a_simple_blob(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    header = struct.pack(
+        "<BBHII", adv32defs.SIMPLEBLOB, adv32defs.CUR_BLOB_VERSION, 0, adv32defs.CALG_RC4, adv32defs.CALG_RSA_KEYX
+    )
+    blob = alloc(dll_emu, header + bytes(128))
+    ph = alloc(dll_emu, b"\x00" * 4)
+    hprov = _acquire_context(dll_emu, adv32defs.PROV_RSA_FULL)
+    rv, _ = call(dll_emu, "advapi32", "CryptImportKey", [hprov, blob, 140, 0, 0, ph])
+    assert (rv, _last_error(dll_emu)) == (0, adv32defs.NTE_BAD_PUBLIC_KEY)
+
+
+def test_crypt_import_key_fails_an_rc4_key_longer_than_256_bytes(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    blob = _plaintext_key_blob(adv32defs.CALG_RC4, bytes(257))
+    ph = alloc(dll_emu, b"\x00" * 4)
+    hprov = _acquire_context(dll_emu, adv32defs.PROV_RSA_AES)
+    rv, _ = call(dll_emu, "advapi32", "CryptImportKey", [hprov, alloc(dll_emu, blob), len(blob), 0, 0, ph])
+    assert (rv, _last_error(dll_emu)) == (0, adv32defs.NTE_BAD_DATA)
+
+
+def test_crypt_set_key_param_padding_keeps_the_rc4_key_stream(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    se = dll_emu
+    key, data = bytes(range(16)), bytes(range(32))
+    hkey = _import_key(se, _acquire_context(se, adv32defs.PROV_RSA_AES), _plaintext_key_blob(adv32defs.CALG_RC4, key))
+    first = _crypt(se, "CryptEncrypt", hkey, data[:16], final=False)
+    padding = alloc(se, struct.pack("<I", adv32defs.PKCS5_PADDING))
+    assert call(se, "advapi32", "CryptSetKeyParam", [hkey, adv32defs.KP_PADDING, padding, 0])[0]
+    assert first + _crypt(se, "CryptEncrypt", hkey, data[16:], final=True) == ARC4.new(key).encrypt(data)
+
+
+def _open_storage_provider(se: Speakeasy, name: str | None) -> int:
+    ph = alloc(se, b"\xcc" * 8)
+    pname = alloc(se, (name + "\x00").encode("utf-16le")) if name is not None else 0
+    rv, _ = call(se, "ncrypt", "NCryptOpenStorageProvider", [ph, pname, 0])
+    assert rv == 0
+    return int.from_bytes(se.mem_read(ph, se.emu.get_ptr_size()), "little")
+
+
+@pytest.mark.parametrize("name", [None, "Microsoft Software Key Storage Provider"])
+def test_ncrypt_open_storage_provider_returns_a_handle(dll_emu: Speakeasy, name: str | None) -> None:
+    hprov = _open_storage_provider(dll_emu, name)
+    assert isinstance(dll_emu.emu.get_crypt_manager().get_context(hprov), CryptContext)
+
+
+def test_ncrypt_import_key_ignores_the_high_bits_of_the_size(dll64_emu: Speakeasy) -> None:
+    hprov = _open_storage_provider(dll64_emu, None)
+    phkey = alloc(dll64_emu, b"\x00" * 8)
+    blob_type = alloc(dll64_emu, "RSAPUBLICBLOB\x00".encode("utf-16le"))
+    data = alloc(dll64_emu, b"\x01" * 16)
+    argv = [hprov, 0, blob_type, 0, phkey, data, 0xDEADBEEF00000010, 0]
+    rv, _ = call(dll64_emu, "ncrypt", "NCryptImportKey", argv)
+    assert rv == 0
+    assert int.from_bytes(dll64_emu.mem_read(phkey, 8), "little") != 0
+
+
+def test_import_key_rejects_an_unknown_provider(dll_emu: Speakeasy) -> None:
+    blob_type = alloc(dll_emu, "RSAPUBLICBLOB\x00".encode("utf-16le"))
+    data = alloc(dll_emu, b"\x01" * 16)
+    phkey = alloc(dll_emu, b"\x00" * 4)
+    rv, _ = call(dll_emu, "ncrypt", "NCryptImportKey", [0x1234, 0, blob_type, 0, phkey, data, 16, 0])
+    assert rv == adv32defs.NTE_INVALID_HANDLE
+    rv, _ = call(dll_emu, "bcrypt", "BCryptImportKeyPair", [0x1234, 0, blob_type, phkey, data, 16, 0])
+    assert rv == ddk.STATUS_INVALID_HANDLE
+
+
+def _sid(*subauthorities: int) -> bytes:
+    return bytes([1, len(subauthorities), 0, 0, 0, 0, 0, 5]) + struct.pack(f"<{len(subauthorities)}I", *subauthorities)
+
+
+@pytest.mark.parametrize(
+    "a, b, equal",
+    [
+        (_sid(32, 544), _sid(32, 544), True),
+        (_sid(32, 544), _sid(32, 545), False),
+        (_sid(32, 0x10220), _sid(32, 0x20220), False),
+        (_sid(32), _sid(32, 544), False),
+    ],
+    ids=["same", "last", "high-bytes", "count"],
+)
+def test_equal_sid_compares_every_subauthority(dll_emu: Speakeasy, a: bytes, b: bytes, equal: bool) -> None:
+    rv, _ = call(dll_emu, "advapi32", "EqualSid", [alloc(dll_emu, a), alloc(dll_emu, b)])
+    assert bool(rv) == equal
+
+
+NT_AUTHORITY = bytes([0, 0, 0, 0, 0, 5])
+
+
+def test_allocate_and_initialize_sid_writes_the_sid(dll_emu: Speakeasy) -> None:
+    psid = alloc(dll_emu, b"\x00" * 4)
+    argv = [alloc(dll_emu, NT_AUTHORITY), 2, 32, 544, 0, 0, 0, 0, 0, 0, psid]
+    assert call(dll_emu, "advapi32", "AllocateAndInitializeSid", argv)[0]
+    sid = _dword(dll_emu, psid)
+    assert call(dll_emu, "advapi32", "GetLengthSid", [sid])[0] == 16
+    assert call(dll_emu, "advapi32", "EqualSid", [sid, alloc(dll_emu, _sid(32, 544))])[0]
+    assert call(dll_emu, "advapi32", "IsValidSid", [sid])[0]
+
+
+def test_initialize_sid_and_copy_sid(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    assert call(dll_emu, "advapi32", "GetSidLengthRequired", [2])[0] == 16
+    sid = alloc(dll_emu, b"\xcc" * 16)
+    assert call(dll_emu, "advapi32", "InitializeSid", [sid, alloc(dll_emu, NT_AUTHORITY), 2])[0]
+    assert dll_emu.mem_read(sid, 8) == bytes([1, 2]) + NT_AUTHORITY
+    dll_emu.mem_write(sid + 8, struct.pack("<2I", 32, 544))
+
+    dst = alloc(dll_emu, b"\xcc" * 20)
+    assert call(dll_emu, "advapi32", "CopySid", [15, dst, sid])[0] == 0
+    assert _last_error(dll_emu) == windefs.ERROR_INSUFFICIENT_BUFFER
+    assert call(dll_emu, "advapi32", "CopySid", [20, dst, sid])[0]
+    assert dll_emu.mem_read(dst, 20) == _sid(32, 544) + b"\xcc" * 4
+
+
+@pytest.mark.parametrize("sid, valid", [(_sid(32, 544), True), (bytes([2, 0, 0, 0, 0, 0, 0, 5]), False)])
+def test_is_valid_sid_checks_the_revision(dll_emu: Speakeasy, sid: bytes, valid: bool) -> None:
+    assert bool(call(dll_emu, "advapi32", "IsValidSid", [alloc(dll_emu, sid)])[0]) == valid
+
+
+def _derive_and_decrypt(se: Speakeasy, algid: int, flags: int, ciphertext: bytes) -> bytes:
+    """Hash "secret", derive an RC4 key from the hash, and decrypt ``ciphertext`` with it."""
+    phprov = alloc(se, b"\x00" * 4)
+    assert call(se, "advapi32", "CryptAcquireContextA", [phprov, 0, 0, 1, 0xF0000000])[0]
+    hprov = _dword(se, phprov)
+    phhash = alloc(se, b"\x00" * 4)
+    assert call(se, "advapi32", "CryptCreateHash", [hprov, algid, 0, 0, phhash])[0]
+    hhash = _dword(se, phhash)
+    assert call(se, "advapi32", "CryptHashData", [hhash, alloc(se, b"secret"), 6, 0])[0]
+    phkey = alloc(se, b"\x00" * 4)
+    assert call(se, "advapi32", "CryptDeriveKey", [hprov, 0x6801, hhash, flags, phkey])[0]
+    buf = alloc(se, ciphertext)
+    size = alloc(se, struct.pack("<I", len(ciphertext)))
+    assert call(se, "advapi32", "CryptDecrypt", [_dword(se, phkey), 0, 1, 0, buf, size])[0]
+    return se.mem_read(buf, len(ciphertext))
+
+
+def _rc4(key: bytes, data: bytes) -> bytes:
+    s = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + s[i] + key[i % len(key)]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    out = bytearray()
+    i = j = 0
+    for b in data:
+        i = (i + 1) & 0xFF
+        j = (j + s[i]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+        out.append(b ^ s[(s[i] + s[j]) & 0xFF])
+    return bytes(out)
+
+
+@pytest.mark.parametrize(
+    "algid, hasher, flags, key",
+    [
+        (0x8003, hashlib.md5, 0, lambda d: d[:5] + b"\x00" * 11),
+        (0x8004, hashlib.sha1, 0, lambda d: d[:5] + b"\x00" * 11),
+        (0x8004, hashlib.sha1, 0x00280010, lambda d: d[:5]),
+        (0x8004, hashlib.sha1, 0x00800000, lambda d: d[:16]),
+        (0x8003, hashlib.md5, 0x00800000, lambda d: d[:16]),
+    ],
+    ids=["md5", "sha1", "sha1-40-no-salt", "sha1-128", "md5-128"],
+)
+def test_crypt_derive_key_rc4(
+    dll_emu: Speakeasy, algid: int, hasher: Callable[[bytes], Any], flags: int, key: Callable[[bytes], bytes]
+) -> None:
+    plaintext = b"hello world!"
+    ciphertext = _rc4(key(hasher(b"secret").digest()), plaintext)
+    assert _derive_and_decrypt(dll_emu, algid, flags, ciphertext) == plaintext
+
+
+def _hash(se: Speakeasy, algid: int, data: bytes) -> int:
+    phprov = alloc(se, b"\x00" * 4)
+    assert call(se, "advapi32", "CryptAcquireContextA", [phprov, 0, 0, 1, 0xF0000000])[0]
+    phhash = alloc(se, b"\x00" * 4)
+    assert call(se, "advapi32", "CryptCreateHash", [_dword(se, phprov), algid, 0, 0, phhash])[0]
+    hhash = _dword(se, phhash)
+    assert call(se, "advapi32", "CryptHashData", [hhash, alloc(se, data or b"\x00"), len(data), 0])[0]
+    return hhash
+
+
+@pytest.mark.parametrize("algid, hasher", [(0x8003, hashlib.md5), (0x8004, hashlib.sha1)])
+def test_crypt_get_hash_param_returns_the_hash(dll_emu: Speakeasy, algid: int, hasher: Callable[[bytes], Any]) -> None:
+    start_process(dll_emu)
+    digest = hasher(b"abc").digest()
+    hhash = _hash(dll_emu, algid, b"abc")
+    size = alloc(dll_emu, struct.pack("<I", 0))
+    assert call(dll_emu, "advapi32", "CryptGetHashParam", [hhash, 2, 0, size, 0])[0]
+    assert _dword(dll_emu, size) == len(digest)
+
+    buf = alloc(dll_emu, b"\xcc" * 4)
+    rv, _ = call(dll_emu, "advapi32", "CryptGetHashParam", [hhash, 4, buf, size, 0])
+    assert (rv, _dword(dll_emu, buf), _dword(dll_emu, size)) == (1, len(digest), 4)
+
+    buf = alloc(dll_emu, b"\xcc" * len(digest))
+    size = alloc(dll_emu, struct.pack("<I", len(digest) - 1))
+    rv, _ = call(dll_emu, "advapi32", "CryptGetHashParam", [hhash, 2, buf, size, 0])
+    assert (rv, _last_error(dll_emu), _dword(dll_emu, size)) == (0, windefs.ERROR_MORE_DATA, len(digest))
+    size = alloc(dll_emu, struct.pack("<I", len(digest)))
+    assert call(dll_emu, "advapi32", "CryptGetHashParam", [hhash, 2, buf, size, 0])[0]
+    assert dll_emu.mem_read(buf, len(digest)) == digest
+
+
+def test_crypt_hash_data_accepts_empty_data(dll_emu: Speakeasy) -> None:
+    hhash = _hash(dll_emu, 0x8003, b"")
+    buf = alloc(dll_emu, b"\xcc" * 16)
+    size = alloc(dll_emu, struct.pack("<I", 16))
+    assert call(dll_emu, "advapi32", "CryptGetHashParam", [hhash, 2, buf, size, 0])[0]
+    assert dll_emu.mem_read(buf, 16) == hashlib.md5(b"").digest()
+
+
+def test_md5_final_writes_the_digest_of_all_updates(dll_emu: Speakeasy) -> None:
+    data = bytes(range(80))
+    first = alloc(dll_emu, b"\xcc" * 104)
+    second = alloc(dll_emu, b"\xcc" * 104)
+    call(dll_emu, "advapi32", "MD5Init", [first])
+    call(dll_emu, "advapi32", "MD5Init", [second])
+
+    call(dll_emu, "advapi32", "MD5Update", [first, alloc(dll_emu, data[:70]), 70])
+    call(dll_emu, "advapi32", "MD5Update", [second, alloc(dll_emu, b"abc"), 3])
+    call(dll_emu, "advapi32", "MD5Update", [first, alloc(dll_emu, data[70:]), 10])
+    call(dll_emu, "advapi32", "MD5Update", [first, 0, 0])
+    assert struct.unpack("<Q", dll_emu.mem_read(first, 8))[0] == 80 * 8
+    assert dll_emu.mem_read(first + 24, 16) == data[64:]
+
+    call(dll_emu, "advapi32", "MD5Final", [first])
+    call(dll_emu, "advapi32", "MD5Final", [second])
+    assert dll_emu.mem_read(first + 88, 16) == hashlib.md5(data).digest()
+    assert dll_emu.mem_read(second + 88, 16) == hashlib.md5(b"abc").digest()
+
+
+@pytest.fixture
+def sid_emu(config: dict[str, Any], load_test_bin: Callable[[str], bytes]) -> Iterator[Speakeasy]:
+    config["user"]["sid"] = "S-1-5-21-1-2-3-1001"
+    yield from load_emu(config, load_test_bin("dll_test_x86.dll.xz"))
+
+
+def test_lookup_account_name_reports_both_sizes(sid_emu: Speakeasy) -> None:
+    start_process(sid_emu)
+    domain = sid_emu.emu.config.system.domain
+    assert domain
+    account = alloc(sid_emu, sid_emu.emu.config.user.name.encode() + b"\x00")
+    cb_sid = alloc(sid_emu, struct.pack("<I", 0))
+    cch_dom = alloc(sid_emu, struct.pack("<I", 0))
+    use = alloc(sid_emu, b"\xcc" * 4)
+    rv, _ = call(sid_emu, "advapi32", "LookupAccountNameA", [0, account, 0, cb_sid, 0, cch_dom, use])
+    assert (rv, _last_error(sid_emu)) == (0, windefs.ERROR_INSUFFICIENT_BUFFER)
+    assert (_dword(sid_emu, cb_sid), _dword(sid_emu, cch_dom)) == (28, len(domain) + 1)
+
+    sid = alloc(sid_emu, b"\xcc" * 28)
+    dom = alloc(sid_emu, b"\xcc" * (len(domain) + 1))
+    rv, _ = call(sid_emu, "advapi32", "LookupAccountNameA", [0, account, sid, cb_sid, dom, cch_dom, use])
+    assert rv == 1
+    assert sid_emu.mem_read(sid, 28) == _sid(21, 1, 2, 3, 1001)
+    assert sid_emu.mem_read(dom, len(domain) + 1) == domain.encode() + b"\x00"
+    assert (_dword(sid_emu, cch_dom), _dword(sid_emu, use)) == (len(domain), 1)
+
+
+def test_lookup_account_name_small_domain_buffer(sid_emu: Speakeasy) -> None:
+    start_process(sid_emu)
+    domain = sid_emu.emu.config.system.domain
+    assert domain
+    account = alloc(sid_emu, sid_emu.emu.config.user.name.encode() + b"\x00")
+    sid = alloc(sid_emu, b"\xcc" * 28)
+    cb_sid = alloc(sid_emu, struct.pack("<I", 28))
+    dom = alloc(sid_emu, b"\xcc" * 4)
+    cch_dom = alloc(sid_emu, struct.pack("<I", 2))
+    use = alloc(sid_emu, b"\xcc" * 4)
+    rv, _ = call(sid_emu, "advapi32", "LookupAccountNameA", [0, account, sid, cb_sid, dom, cch_dom, use])
+    assert (rv, _last_error(sid_emu), _dword(sid_emu, cch_dom)) == (
+        0,
+        windefs.ERROR_INSUFFICIENT_BUFFER,
+        len(domain) + 1,
+    )
+    assert sid_emu.mem_read(dom, 4) == b"\xcc" * 4
+
+
+@pytest.fixture(params=[False, True], ids=["user", "admin"])
+def admin_emu(
+    request: pytest.FixtureRequest, config: dict[str, Any], load_test_bin: Callable[[str], bytes]
+) -> Iterator[Speakeasy]:
+    config["user"]["admin"] = request.param
+    yield from load_emu(config, load_test_bin("dll_test_x86.dll.xz"))
+
+
+def test_get_token_information_writes_the_elevation(admin_emu: Speakeasy) -> None:
+    info = alloc(admin_emu, b"\xcc" * 4)
+    ret_len = alloc(admin_emu, b"\xcc" * 4)
+    rv, _ = call(admin_emu, "advapi32", "GetTokenInformation", [0x1234, 20, info, 4, ret_len])
+    assert (rv, _dword(admin_emu, info), _dword(admin_emu, ret_len)) == (1, int(admin_emu.emu.config.user.admin), 4)
+
+
+def test_get_token_information_returns_the_integrity_level(admin_emu: Speakeasy) -> None:
+    start_process(admin_emu)
+    ret_len = alloc(admin_emu, b"\xcc" * 4)
+    rv, _ = call(admin_emu, "advapi32", "GetTokenInformation", [0x1234, 25, 0, 0, ret_len])
+    assert (rv, _last_error(admin_emu), _dword(admin_emu, ret_len)) == (0, windefs.ERROR_INSUFFICIENT_BUFFER, 20)
+
+    info = alloc(admin_emu, b"\xcc" * 20)
+    rv, _ = call(admin_emu, "advapi32", "GetTokenInformation", [0x1234, 25, info, 20, ret_len])
+    sid, attributes = struct.unpack("<2I", admin_emu.mem_read(info, 8))
+    level = 0x3000 if admin_emu.emu.config.user.admin else 0x2000
+    assert (rv, sid, attributes) == (1, info + 8, 0x20)
+    assert admin_emu.mem_read(sid, 12) == bytes([1, 1]) + (16).to_bytes(6, "big") + struct.pack("<I", level)
+
+
+@pytest.mark.parametrize(
+    "api, data",
+    [
+        ("CryptStringToBinaryA", bytes([0x90, 0x4D, 0x5A, 0xFF, 0x00, 0x01]) * 16),
+        ("CryptStringToBinaryW", "QUJD*REVG".encode("utf-16le")),
+    ],
+)
+def test_crypt_string_to_binary_rejects_invalid_input(dll_emu: Speakeasy, api: str, data: bytes) -> None:
+    start_process(dll_emu)
+    cch = len(data) // (2 if api.endswith("W") else 1)
+    out = alloc(dll_emu, b"\x00" * 128)
+    size = alloc(dll_emu, struct.pack("<I", 128))
+    rv, _ = call(dll_emu, "crypt32", api, [alloc(dll_emu, data), cch, 1, out, size, 0, 0])
+    assert (rv, _last_error(dll_emu)) == (0, windefs.ERROR_INVALID_DATA)
+
+
+@pytest.mark.parametrize("api, encoding", [("CryptStringToBinaryA", "latin-1"), ("CryptStringToBinaryW", "utf-16le")])
+def test_crypt_string_to_binary_skips_line_breaks(dll_emu: Speakeasy, api: str, encoding: str) -> None:
+    text = "QUJDREVG\r\nR0hJSktM\r\nTU5P\r\n"
+    out = alloc(dll_emu, b"\x00" * 32)
+    size = alloc(dll_emu, struct.pack("<I", 32))
+    rv, _ = call(dll_emu, "crypt32", api, [alloc(dll_emu, text.encode(encoding)), len(text), 1, out, size, 0, 0])
+    assert (rv, dll_emu.mem_read(out, _dword(dll_emu, size))) == (1, b"ABCDEFGHIJKLMNO")
+
+    size = alloc(dll_emu, struct.pack("<I", 0))
+    rv, _ = call(dll_emu, "crypt32", api, [alloc(dll_emu, (text + "\x00").encode(encoding)), 0, 1, 0, size, 0, 0])
+    assert (rv, _dword(dll_emu, size)) == (1, 15)
+
+
+DPAPI_HEADER = bytes.fromhex("01000000d08c9ddf0115d1118c7a00c04fc297eb")
+
+
+def _data_blob(se: Speakeasy, data: bytes) -> int:
+    ptr_size = se.emu.get_ptr_size()
+    blob = struct.pack("<I", len(data)).ljust(ptr_size, b"\x00") + alloc(se, data).to_bytes(ptr_size, "little")
+    return alloc(se, blob)
+
+
+def _read_data_blob(se: Speakeasy, addr: int) -> bytes:
+    ptr_size = se.emu.get_ptr_size()
+    data = int.from_bytes(se.mem_read(addr + ptr_size, ptr_size), "little")
+    return se.mem_read(data, _dword(se, addr))
+
+
+@pytest.mark.parametrize("emu_fixture", ["dll_emu", "dll64_emu"])
+def test_crypt_protect_data_round_trips_with_the_description(emu_fixture: str, request: pytest.FixtureRequest) -> None:
+    se: Speakeasy = request.getfixturevalue(emu_fixture)
+    ptr_size = se.emu.get_ptr_size()
+    secret = bytes(range(32))
+    protected = alloc(se, b"\x00" * 16)
+    entropy = _data_blob(se, b"salt")
+    rv, _ = call(
+        se,
+        "crypt32",
+        "CryptProtectData",
+        [_data_blob(se, secret), alloc(se, "Upkeep\x00".encode("utf-16le")), entropy, 0, 0, 4, protected],
+    )
+    blob = _read_data_blob(se, protected)
+    assert rv == 1
+    assert len(blob) > 32 and blob.startswith(DPAPI_HEADER) and secret not in blob
+    plain = alloc(se, b"\x00" * 16)
+    descr = alloc(se, b"\x00" * 8)
+    rv, _ = call(se, "crypt32", "CryptUnprotectData", [_data_blob(se, blob), descr, entropy, 0, 0, 0, plain])
+    assert rv == 1
+    assert _read_data_blob(se, plain) == secret
+    descr_addr = int.from_bytes(se.mem_read(descr, ptr_size), "little")
+    assert se.emu.read_mem_string(descr_addr, 2) == "Upkeep"
+    for addr in (protected + ptr_size, plain + ptr_size, descr):
+        assert call(se, "kernel32", "LocalFree", [int.from_bytes(se.mem_read(addr, ptr_size), "little")])[0] == 0
+
+
+HKEY_LOCAL_MACHINE = 0x80000002
+USBSAMP = b"System\\CurrentControlSet\\Services\\usbsamp\x00"
+
+
+def test_reg_config_key_keeps_values_across_opens(dll_emu: Speakeasy) -> None:
+    phk = alloc(dll_emu, b"\x00" * 4)
+    call(dll_emu, "advapi32", "RegOpenKeyExA", [HKEY_LOCAL_MACHINE, alloc(dll_emu, USBSAMP), 0, 0xF003F, phk])
+    value = alloc(dll_emu, b"abc\x00")
+    name = alloc(dll_emu, b"Extra\x00")
+    assert call(dll_emu, "advapi32", "RegSetValueExA", [_dword(dll_emu, phk), name, 0, 1, value, 4])[0] == 0
+
+    call(dll_emu, "advapi32", "RegOpenKeyExA", [HKEY_LOCAL_MACHINE, alloc(dll_emu, USBSAMP), 0, 0xF003F, phk])
+    size = alloc(dll_emu, struct.pack("<I", 0))
+    rv, _ = call(dll_emu, "advapi32", "RegQueryValueExA", [_dword(dll_emu, phk), name, 0, 0, 0, size])
+    assert (rv, _dword(dll_emu, size)) == (windefs.ERROR_SUCCESS, 4)
+
+
+def test_reg_parent_of_a_config_key_lists_it(dll_emu: Speakeasy) -> None:
+    phk = alloc(dll_emu, b"\x00" * 4)
+    services = alloc(dll_emu, b"System\\CurrentControlSet\\Services\x00")
+    rv, _ = call(dll_emu, "advapi32", "RegOpenKeyExA", [HKEY_LOCAL_MACHINE, services, 0, 0xF003F, phk])
+    assert rv == windefs.ERROR_SUCCESS
+    buf = alloc(dll_emu, b"\xcc" * 32)
+    cch = alloc(dll_emu, struct.pack("<I", 32))
+    rv, _ = call(dll_emu, "advapi32", "RegEnumKeyExA", [_dword(dll_emu, phk), 0, buf, cch, 0, 0, 0, 0])
+    assert (rv, dll_emu.mem_read(buf, 8)) == (windefs.ERROR_SUCCESS, b"usbsamp\x00")
+
+
+def test_reg_open_key_needs_a_whole_path_component(dll_emu: Speakeasy) -> None:
+    _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+    rv, path = _open_key(dll_emu, "RegOpenKeyExA", HKEY_CURRENT_USER, alloc(dll_emu, b"Soft\x00"))
+    assert (rv, path) == (windefs.ERROR_FILE_NOT_FOUND, None)
+
+
+def test_create_process_as_user_without_program_name_fails(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    cmd = alloc(dll_emu, b'"" arg\x00')
+    si = alloc(dll_emu, b"\x00" * 0x44)
+    pi = alloc(dll_emu, b"\x00" * 0x10)
+    ok, _ = call(dll_emu, "advapi32", "CreateProcessAsUserA", [0, 0, cmd, 0, 0, 0, 0, 0, 0, si, pi])
+    assert ok == 0
+    assert dll_emu.emu.get_last_error() == windefs.ERROR_FILE_NOT_FOUND
+
+
+def _enum_services(se: Speakeasy, api: str, state: int, size: int) -> tuple[int, int, int, int]:
+    buf = alloc(se, b"\x00" * max(size, 1))
+    needed, returned, resume = (alloc(se, b"\x00" * 4) for _ in range(3))
+    rv, _ = call(
+        se, "advapi32", api, [0x7D20, ENUM_SERVICE_TYPE.SERVICE_WIN32, state, buf, size, needed, returned, resume]
+    )
+    return rv, buf, _dword(se, needed), _dword(se, returned)
+
+
+@pytest.mark.parametrize("emu_name", ["dll_emu", "dll64_emu"])
+@pytest.mark.parametrize("api, encoding", [("EnumServicesStatusA", "utf-8"), ("EnumServicesStatusW", "utf-16le")])
+@pytest.mark.parametrize(
+    "state, status", [(ENUM_SERVICE_STATE.SERVICE_ACTIVE, 4), (ENUM_SERVICE_STATE.SERVICE_INACTIVE, 1)]
+)
+def test_enum_services_status_lists_services_in_the_state(
+    request: pytest.FixtureRequest, emu_name: str, api: str, encoding: str, state: int, status: int
+) -> None:
+    se = request.getfixturevalue(emu_name)
+    ptr = se.get_ptr_size()
+    entry_size = 2 * ptr + 28 + (4 if ptr == 8 else 0)
+
+    rv, buf, needed, returned = _enum_services(se, api, state, 0x4800)
+
+    assert (rv, needed) == (1, 0)
+    assert returned > 0
+    for index in range(returned):
+        entry = buf + index * entry_size
+        name = int.from_bytes(se.mem_read(entry, ptr), "little")
+        display = int.from_bytes(se.mem_read(entry + ptr, ptr), "little")
+        service_type, current_state = struct.unpack("<II", se.mem_read(entry + 2 * ptr, 8))
+        assert se.read_mem_string(name, 2 if encoding == "utf-16le" else 1)
+        assert se.read_mem_string(display, 2 if encoding == "utf-16le" else 1)
+        assert service_type & ENUM_SERVICE_TYPE.SERVICE_WIN32
+        assert current_state == status
+
+
+def test_enum_services_status_reports_the_size_for_a_small_buffer(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    rv, _, needed, returned = _enum_services(dll_emu, "EnumServicesStatusA", ENUM_SERVICE_STATE.SERVICE_STATE_ALL, 0)
+
+    assert (rv, returned) == (0, 0)
+    assert needed > 0
+    assert _last_error(dll_emu) == windefs.ERROR_MORE_DATA
+
+    rv, _, _, returned = _enum_services(dll_emu, "EnumServicesStatusA", ENUM_SERVICE_STATE.SERVICE_STATE_ALL, needed)
+    assert rv == 1 and returned > 0
+
+
+def test_sid_functions_reject_an_unmapped_sid(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    sid = 0xA530
+    assert not dll_emu.emu.is_address_valid(sid)
+
+    assert call(dll_emu, "advapi32", "GetLengthSid", [sid])[0] == 0
+    assert not call(dll_emu, "advapi32", "IsValidSid", [sid])[0]
+    assert not call(dll_emu, "advapi32", "EqualSid", [sid, alloc(dll_emu, _sid(32, 544))])[0]
+    assert not call(dll_emu, "advapi32", "CopySid", [20, alloc(dll_emu, b"\x00" * 20), sid])[0]
+    assert _last_error(dll_emu) == windefs.ERROR_INVALID_SID
+
+
+@pytest.mark.parametrize("fixture", ["dll_emu", "dll64_emu"])
+def test_get_token_information_returns_the_user_sid(request: pytest.FixtureRequest, fixture: str) -> None:
+    se: Speakeasy = request.getfixturevalue(fixture)
+    start_process(se)
+    ptr_size = se.emu.get_ptr_size()
+    ret_len = alloc(se, b"\xcc" * 4)
+
+    rv, _ = call(se, "advapi32", "GetTokenInformation", [0x1234, 1, 0, 0, ret_len])
+    assert (rv, _last_error(se), _dword(se, ret_len)) == (0, windefs.ERROR_INSUFFICIENT_BUFFER, 2 * ptr_size + 28)
+
+    info = alloc(se, b"\xcc" * _dword(se, ret_len))
+    rv, _ = call(se, "advapi32", "GetTokenInformation", [0x1234, 1, info, _dword(se, ret_len), ret_len])
+    sid = int.from_bytes(se.mem_read(info, ptr_size), "little")
+    assert (rv, sid) == (1, info + 2 * ptr_size)
+    authority = bytes([1, 5]) + (5).to_bytes(6, "big")
+    assert se.mem_read(sid, 28) == authority + struct.pack("<5I", 21, 1111111111, 2222222222, 3333333333, 1001)
+
+
+@pytest.mark.parametrize("api, encoding", [("ConvertSidToStringSidA", "utf-8"), ("ConvertSidToStringSidW", "utf-16le")])
+def test_convert_sid_to_string_sid_allocates_the_string(dll_emu: Speakeasy, api: str, encoding: str) -> None:
+    start_process(dll_emu)
+    out = alloc(dll_emu, b"\x00" * 4)
+    assert call(dll_emu, "advapi32", api, [alloc(dll_emu, _sid(32, 544)), out])[0]
+    text = "S-1-5-32-544\0".encode(encoding)
+    assert dll_emu.mem_read(_dword(dll_emu, out), len(text)) == text
+
+    assert not call(dll_emu, "advapi32", api, [0xA530, out])[0]
+    assert _last_error(dll_emu) == windefs.ERROR_INVALID_SID
+
+
+@pytest.mark.parametrize(
+    "second_entry",
+    [
+        (0x00380031, 0x00330032),  # a name that cannot be read
+        (0, 0x00330032),  # a NULL name ends the table
+    ],
+)
+def test_start_service_ctrl_dispatcher_ends_the_table_at_a_bad_entry(
+    dll_emu: Speakeasy, second_entry: tuple[int, int]
+) -> None:
+    se = dll_emu
+    start_process(se)
+    name = alloc(se, "svc\x00".encode("utf-16le"))
+    service_main = alloc(se, b"\xc3")
+    entries = []
+    for service_name, proc in ((name, service_main), second_entry, (0, 0)):
+        entry = adv32defs.SERVICE_TABLE_ENTRY(se.get_ptr_size())
+        entry.lpServiceName = service_name
+        entry.lpServiceProc = proc
+        entries.append(entry.get_bytes())
+    table = alloc(se, b"".join(entries))
+    se.emu.run_queue.clear()
+
+    rv, _ = call(se, "advapi32", "StartServiceCtrlDispatcherW", [table])
+
+    assert rv
+    assert [(r.type, r.name, r.start_addr) for r in se.emu.run_queue] == [("service_main", "svc", service_main)]
+
+
+@pytest.mark.parametrize(
+    ("hkey", "subkey", "expected"),
+    [
+        (0xFFFFFFFF80000002, b"System\\CurrentControlSet\\Services\\usbsamp\x00", (0, "HKEY_LOCAL_MACHINE")),
+        (0xFFFFFFFF80000001, b"Software\\NoSuchKey\x00", (2, "HKEY_CURRENT_USER")),
+    ],
+)
+def test_reg_open_key_accepts_sign_extended_root_keys(
+    dll64_emu: Speakeasy, hkey: int, subkey: bytes, expected: tuple[int, str]
+) -> None:
+    phk = alloc(dll64_emu, b"\x00" * 8)
+    rv, displays = call(dll64_emu, "advapi32", "RegOpenKeyExA", [hkey, alloc(dll64_emu, subkey), 0, 0x20019, phk])
+    assert (rv, displays["hKey"]) == expected
+
+
+def test_reg_close_key_makes_the_handle_invalid(dll_emu: Speakeasy) -> None:
+    hkey = _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+    data = alloc(dll_emu, b"\x01\x00\x00\x00")
+    name = alloc(dll_emu, b"x\x00")
+
+    assert call(dll_emu, "advapi32", "RegCloseKey", [hkey])[0] == windefs.ERROR_SUCCESS
+
+    assert call(dll_emu, "advapi32", "RegCloseKey", [hkey])[0] == windefs.ERROR_INVALID_HANDLE
+    assert call(dll_emu, "advapi32", "RegSetValueExA", [hkey, name, 0, 4, data, 4])[0] == windefs.ERROR_INVALID_HANDLE
+    assert call(dll_emu, "advapi32", "RegCloseKey", [HKEY_CURRENT_USER])[0] == windefs.ERROR_SUCCESS
+    assert _create_key(dll_emu, HKEY_CURRENT_USER, b"Software\\Foo")
+
+
+@pytest.mark.parametrize("control_set", [b"CurrentControlSet", b"ControlSet001"])
+def test_create_service_creates_the_service_key(dll_emu: Speakeasy, control_set: bytes) -> None:
+    scm = call(dll_emu, "advapi32", "OpenSCManagerA", [0, 0, 0xF003F])[0]
+    name = alloc(dll_emu, b"Irmon\x00")
+    path = alloc(dll_emu, b"C:\\svc.exe\x00")
+    assert call(dll_emu, "advapi32", "CreateServiceA", [scm, name, name, 0xF01FF, 0x20, 2, 1, path, 0, 0, 0, 0, 0])[0]
+
+    phk = alloc(dll_emu, b"\x00" * 4)
+    subkey = alloc(dll_emu, b"SYSTEM\\" + control_set + b"\\Services\\Irmon\x00")
+    rv, _ = call(dll_emu, "advapi32", "RegOpenKeyExA", [0x80000002, subkey, 0, 0xF003F, phk])
+
+    assert rv == windefs.ERROR_SUCCESS
+    key = dll_emu.emu.regman.get_key_from_handle(_dword(dll_emu, phk))
+    assert key.get_value("ImagePath").get_data() == "C:\\svc.exe"
+    assert key.get_value("Start").get_data() == 2
+
+
+@pytest.mark.parametrize("api", ["RegOpenKeyA", "RegOpenKeyExA"])
+@pytest.mark.parametrize("hkey", [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE])
+def test_reg_open_key_ignores_a_trailing_backslash(dll_emu: Speakeasy, api: str, hkey: int) -> None:
+    _create_key(dll_emu, hkey, b"Software\\Foo\\Bar")
+    expected = _open_key(dll_emu, api, hkey, alloc(dll_emu, b"Software\\Foo\\Bar\x00"))
+    assert expected[0] == windefs.ERROR_SUCCESS
+    assert _open_key(dll_emu, api, hkey, alloc(dll_emu, b"Software\\Foo\\Bar\\\x00")) == expected
+
+
+def test_reg_create_key_ex_and_reg_open_key_ex_record_the_disposition_and_access(dll_emu: Speakeasy) -> None:
+    se = dll_emu
+    run = se.emu.curr_run
+    assert run is not None
+    subkey = alloc(se, b"Software\\Contoso\x00")
+
+    def create(sam: int) -> int:
+        phk = alloc(se, b"\x00" * 4)
+        disp = alloc(se, b"\x00" * 4)
+        rv, _ = call(se, "advapi32", "RegCreateKeyExA", [HKEY_CURRENT_USER, subkey, 0, 0, 0, sam, 0, phk, disp])
+        assert rv == windefs.ERROR_SUCCESS
+        return _dword(se, disp)
+
+    assert create(0xF003F) == 1
+    assert create(0x20019) == 2
+    phk = alloc(se, b"\x00" * 4)
+    rv, _ = call(se, "advapi32", "RegOpenKeyExA", [HKEY_CURRENT_USER, subkey, 0, 0x2, phk])
+    assert rv == windefs.ERROR_SUCCESS
+
+    creates = [e for e in run.events if isinstance(e, RegCreateKeyEvent)]
+    assert [(e.open_flags, e.access_flags) for e in creates] == [
+        (["REG_CREATED_NEW_KEY"], ["KEY_ALL_ACCESS"]),
+        (["REG_OPENED_EXISTING_KEY"], ["KEY_READ"]),
+    ]
+    opens = [e for e in run.events if isinstance(e, RegOpenKeyEvent)]
+    assert [e.access_flags for e in opens] == [["KEY_SET_VALUE"]]
+
+
+def test_close_service_handle_does_not_free_guest_memory(dll_emu: Speakeasy) -> None:
+    data = alloc(dll_emu, b"keep this data")
+    mm = dll_emu.emu.get_address_map(data)
+
+    rv, _ = call(dll_emu, "advapi32", "CloseServiceHandle", [data + 4])
+
+    assert rv == 1
+    assert not mm.free

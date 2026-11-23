@@ -1,46 +1,14 @@
 # Mounting host files with --volume
 
-The `-V` / `--volume` flag maps host files or directories into the emulated Windows filesystem.
+The `-V` / `--volume` flag maps host files or directories into the emulated Windows file system. The `volumes` parameter of `Speakeasy` does the same in Python. The functions in `speakeasy.volumes` are internal, and a minor release can change them (see [Public interface](library.md#public-interface)).
 
-Format:
-
-- `host_path:guest_path`
-- repeat `-V` to provide multiple mappings
-
-## Mount a single file
-
-```python
-from speakeasy.volumes import parse_volume_spec
-
-host, guest = parse_volume_spec("/data/payload.dll:c:\\windows\\system32\\payload.dll")
-print(f"Host:  {host}")
-print(f"Guest: {guest}")
-
-host, guest = parse_volume_spec("C:\\samples\\mal.exe:D:\\staging\\mal.exe")
-print(f"Host:  {host}")
-print(f"Guest: {guest}")
-```
-
-```output
-Host:  /data/payload.dll
-Guest: c:\windows\system32\payload.dll
-Host:  C:\samples\mal.exe
-Guest: D:\staging\mal.exe
-```
+A volume has the format `host_path:guest_path`. Repeat `-V` for more than one volume. Both paths can start with a drive letter, for example `C:\samples\mal.exe:D:\staging\mal.exe`. The separator is the first `:` that is not part of a drive letter.
 
 ## Mount a directory recursively
 
-```python
-from pathlib import Path, PureWindowsPath
+A directory mount maps each file below the host directory, at any depth, to the same relative path below the guest path. With `-V /tmp/vol_demo:c:\appdata`, the emulated file system has these files:
 
-from speakeasy.volumes import expand_volume_to_entries
-
-entries = expand_volume_to_entries(Path("/tmp/vol_demo"), PureWindowsPath("c:\\appdata"))
-for entry in entries:
-    print(f"{entry['emu_path']}  <-  {entry['path']}")
-```
-
-```output
+```text
 c:\appdata\configs\settings.ini  <-  /tmp/vol_demo/configs/settings.ini
 c:\appdata\sample.bin  <-  /tmp/vol_demo/sample.bin
 ```
@@ -59,7 +27,7 @@ Mount one directory:
 speakeasy -t malware.exe -V /data/samples:c:\windows\temp
 ```
 
-Mount multiple paths:
+Mount more than one path:
 
 ```console
 speakeasy -t malware.exe \
@@ -67,7 +35,7 @@ speakeasy -t malware.exe \
   -V /data/payload.dll:c:\windows\system32\payload.dll
 ```
 
-## Programmatic usage
+## Python example
 
 ```python
 import speakeasy
@@ -82,10 +50,15 @@ module = se.load_module("malware.exe")
 se.run_module(module)
 ```
 
-## Notes
+## How Speakeasy applies volumes
 
-- Volume entries are injected as filesystem `full_path` rules.
-- When loading from a host file path, Speakeasy can also auto-mount immediate sibling files from the target directory into the emulated current directory.
+Speakeasy adds a `full_path` file entry to the config for each mounted file. It puts these entries before the file entries of the config, so a volume file wins over a config entry for the same path.
+
+## Automatic mount of the target directory
+
+When `load_module` loads the input from a host path, Speakeasy also maps each file in the directory of the input into the emulated current directory (`process.current_dir`, default `C:\Windows\system32`). It does not map the subdirectories. Speakeasy puts these entries before the volume entries, so a file next to the input wins over a volume for the same guest path. The log shows an `Auto-mounted N file(s) from target directory ...` line, and with `-v` one line for each file. Speakeasy does not mount a directory for shellcode (`--raw` or `load_shellcode`) or for a PE that `load_module` loads from bytes.
+
+The guest can read every file in the directory of the input, for example all of `~/Downloads`. To turn off the automatic mount, give `--no-auto-mount` on the CLI or `auto_mount=False` to `Speakeasy`. You can also put the sample in a directory of its own.
 
 ## Related docs
 
@@ -93,5 +66,5 @@ se.run_module(module)
 - [Documentation index](index.md)
 - [CLI reference](cli-reference.md)
 - [Configuration walkthrough](configuration.md)
-- [Speakeasy 2 walkthrough outline](speakeasy2-walkthrough.md)
+- [What's new in 2.0](speakeasy2-walkthrough.md)
 - [Help and troubleshooting](help.md)

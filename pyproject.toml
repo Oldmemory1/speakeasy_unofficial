@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,25 +7,35 @@ name = "speakeasy-emulator"
 dynamic = ["version"]
 description = "Speakeasy malware emulation framework"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "Andrew Davis"}
 ]
 requires-python = ">=3.10"
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Topic :: Security",
+    "Typing :: Typed",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Operating System :: OS Independent",
 ]
 keywords = ["emulator", "malware", "windows", "reverse-engineering", "security"]
 dependencies = [
-    "pefile",
-    "capstone",
-    "lznt1",
-    "unicorn>=2.1.4",
-    "pycryptodome",
-    "pydantic>=2.0",
-    "rich",
+    "pefile>=2024.8.26",
+    "capstone>=5.0.3",
+    "lznt1>=0.2",
+    "unicorn>=2.1.4,<3",
+    "pycryptodome>=3.15.0",
+    "pydantic>=2.10",
+    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +47,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/mandiant/speakeasy"
+Documentation = "https://github.com/mandiant/speakeasy/blob/master/doc/index.md"
 Repository = "https://github.com/mandiant/speakeasy"
 Issues = "https://github.com/mandiant/speakeasy/issues"
 
@@ -63,7 +74,42 @@ target-version = "py310"
 exclude = ["deps/", "tests/capa-testfiles/"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "D",
+    "D213",
+    "B",
+    "T20",
+    "PLR0402",
+    "PLR1711",
+    "PLR5501",
+    "RET501",
+    "RET502",
+    "RET504",
+    "RET505",
+    "RET508",
+    "PIE790",
+    "SIM300",
+    "SIM114",
+    "SIM117",
+    "RUF100",
+]
+# B905 asks for zip(strict=), which adds nothing for most calls here
+ignore = ["D1", "D212", "B905"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["speakeasy.gdb.ResumeAction"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# RET504: handlers assign the return value to rv before they return it
+"speakeasy/winenv/api/**/*.py" = ["D200", "D205", "D402", "D403", "D415", "RET504"]
+"{examples,scripts,tests}/**/*.py" = ["T20"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -71,6 +117,7 @@ warn_return_any = true
 warn_unused_ignores = true
 ignore_missing_imports = true
 check_untyped_defs = true
+warn_unreachable = true
 
 # Windows struct definitions using ctypes - extremely dynamic, not worth typing
 [[tool.mypy.overrides]]

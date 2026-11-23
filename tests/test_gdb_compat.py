@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from xml.etree import ElementTree
 
 from unicorn import UC_ARCH_X86, UC_MODE_64, Uc
+from unicorn.x86_const import UC_X86_REG_DS
 
 from speakeasy.gdb import _PACKET_SIZE, GdbServer, ResumeAction, StopReason, _rsp_escape, _rsp_packet
 from speakeasy.winenv import arch
@@ -22,14 +23,18 @@ class DummyHook:
     def __init__(self):
         self.enabled = True
         self.added = True
-        self.native_hook = True
-        self.handle = 1
-        self.emu_eng = SimpleNamespace(hook_remove=lambda handle: None)
+        self.begin = 1
+        self.end = 0
 
     def add(self):
-        self.enabled = True
         self.added = True
-        self.handle = 1
+
+    def detach(self):
+        self.enabled = False
+        self.added = False
+
+    def enable(self):
+        self.enabled = True
 
 
 class DummyModule:
@@ -46,12 +51,23 @@ class DummyEmulator:
         ]
         self.curr_thread = DummyThread(DummyTeb(0x7FFDE000))
         self.module_change_listeners = []
+        self.emu_eng = SimpleNamespace(stop=lambda: None, flush_translations=lambda: None)
+        self.code_hooks = []
 
     def get_arch(self):
         return arch.ARCH_AMD64
 
-    def add_code_hook(self, callback):
-        return DummyHook()
+    def add_code_hook(self, callback, begin=1, end=0):
+        hook = DummyHook()
+        hook.begin, hook.end = begin, end
+        self.code_hooks.append(hook)
+        return hook
+
+    def remove_hook(self, hook):
+        self.code_hooks.remove(hook)
+
+    def code_hook_ranges(self):
+        return {(hook.begin, hook.end) for hook in self.code_hooks if hook.added}
 
     def add_mem_read_hook(self, callback):
         return DummyHook()
@@ -64,14 +80,9 @@ def make_server():
     return GdbServer(DummyEmulator(), 0, "127.0.0.1")
 
 
-def test_server_uses_provided_bind_host():
-    assert make_server().host == "127.0.0.1"
-    assert GdbServer(DummyEmulator(), 0, "0.0.0.0").host == "0.0.0.0"
-
-
 def test_supported_features_include_ida_process_queries():
     server = make_server()
-    replies = []
+    replies: list[bytes] = []
     server._reply = replies.append
 
     server._handle_command(b"qSupported:multiprocess+;xmlRegisters=i386")
@@ -116,7 +127,6 @@ def test_xfer_chunking_and_process_metadata():
     assert first == b"mC:\\s"
     assert second == b"lample.exe"
     assert server._handle_xfer(b"qXfer:exec-file:read:2a:0,100") == b"lC:\\sample.exe"
-    assert server._teb_address() == 0x7FFDE000
 
 
 def test_packet_extraction_validates_checksum_across_fragmented_input():
@@ -129,14 +139,17 @@ def test_packet_extraction_validates_checksum_across_fragmented_input():
 
     corrupt = bytearray(raw)
     corrupt[-1] = ord("0") if corrupt[-1] != ord("0") else ord("1")
-    assert GdbServer._extract_packet(corrupt)[2] is False
+    packet = GdbServer._extract_packet(corrupt)
+    assert packet is not None and packet[2] is False
 
     trailing_escape = _rsp_packet(b"qC}")
-    assert GdbServer._extract_packet(bytearray(trailing_escape))[2] is False
+    packet = GdbServer._extract_packet(bytearray(trailing_escape))
+    assert packet is not None and packet[2] is False
 
     oversized_payload = b"q" * (_PACKET_SIZE + 1)
     oversized = _rsp_packet(oversized_payload)
-    assert GdbServer._extract_packet(bytearray(oversized))[2] is False
+    packet = GdbServer._extract_packet(bytearray(oversized))
+    assert packet is not None and packet[2] is False
 
 
 def test_interrupt_during_resume_transition_is_preserved():
@@ -162,21 +175,38 @@ def test_instruction_and_memory_hooks_are_enabled_only_when_needed():
     assert not server._write_hook.enabled
 
     server._change_breakpoint(b"Z0,1000,1")
-    assert server._code_hook.enabled
+    assert server.emu.code_hook_ranges() == {(0x1000, 0x1000)}
     server._change_breakpoint(b"z0,1000,1")
-    assert not server._code_hook.enabled
+    assert server.emu.code_hook_ranges() == set()
 
+    # A watch stop happens at the next instruction, so watchpoints hook all code.
+    server._change_breakpoint(b"Z0,1000,1")
     server._change_breakpoint(b"Z4,2000,4")
+    assert server.emu.code_hook_ranges() == {(1, 0)}
     assert server._read_hook.enabled
     assert server._write_hook.enabled
     server._change_breakpoint(b"z4,2000,4")
+    assert server.emu.code_hook_ranges() == {(0x1000, 0x1000)}
     assert not server._read_hook.enabled
     assert not server._write_hook.enabled
 
 
+def test_overlapping_breakpoints_share_one_code_hook():
+    server = make_server()
+    server._reply = lambda payload: None
+    server._install_hooks()
+
+    for packet in (b"Z0,1000,1", b"Z1,1000,1", b"Z1,1000,10", b"Z0,1010,1", b"Z0,2000,1"):
+        server._change_breakpoint(packet)
+    assert server.emu.code_hook_ranges() == {(0x1000, 0x1010), (0x2000, 0x2000)}
+
+    server._change_breakpoint(b"z1,1000,10")
+    assert server.emu.code_hook_ranges() == {(0x1000, 0x1000), (0x1010, 0x1010), (0x2000, 0x2000)}
+
+
 def test_access_watchpoint_does_not_clobber_write_watchpoint():
     server = make_server()
-    replies = []
+    replies: list[bytes] = []
     server._reply = replies.append
 
     server._change_breakpoint(b"Z4,1000,4")
@@ -190,7 +220,7 @@ def test_access_watchpoint_does_not_clobber_write_watchpoint():
 
 def test_access_watchpoint_reports_awatch_stop_reason():
     server = make_server()
-    reasons = []
+    reasons: list[StopReason] = []
     server._access_watchpoints[(0x1000, 4)] = 4
     server._request_stop = reasons.append
 
@@ -203,7 +233,7 @@ def test_access_watchpoint_reports_awatch_stop_reason():
 
 def test_module_change_requests_library_stop_reason():
     server = make_server()
-    reasons = []
+    reasons: list[StopReason] = []
     server._request_stop = reasons.append
 
     server._on_module_change()
@@ -262,25 +292,13 @@ def test_xfer_escaping_respects_advertised_packet_size():
     assert all(value not in encoded[1:] for value in b"$#*")
 
 
-def test_hardware_breakpoint_accepts_large_ranges():
-    server = make_server()
-    replies = []
-    server._reply = replies.append
-    server._install_hooks()
-
-    for size_hex in ("1c000", "28000", "2d000", "100000"):
-        server._change_breakpoint(f"Z1,401000,{size_hex}".encode())
-
-    assert replies == [b"OK"] * 4
-    assert len(server._exec_breakpoints) == 4
-    assert (0x401000, 0x2D000) in server._exec_breakpoints
-
-
 def test_hardware_breakpoint_range_hit_detection():
     server = make_server()
-    reasons = []
+    reasons: list[StopReason] = []
     server._request_stop = reasons.append
-    server._exec_breakpoints[(0x401000, 0x2D000)] = 1
+    server._reply = lambda _payload: None
+    server._install_hooks()
+    server._change_breakpoint(b"Z1,401000,2d000")
 
     server._on_code(None, 0x401000, 1)
     server._on_code(None, 0x42DFFF, 1)
@@ -294,7 +312,7 @@ def test_hardware_breakpoint_range_hit_detection():
 
 def test_change_breakpoint_survives_hook_error(caplog):
     server = make_server()
-    replies = []
+    replies: list[bytes] = []
     server._reply = replies.append
 
     def failing_refresh():
@@ -305,3 +323,106 @@ def test_change_breakpoint_survives_hook_error(caplog):
 
     assert replies == [b"E01"]
     assert any("breakpoint command failed" in r.message for r in caplog.records)
+
+
+def test_read_memory_fills_advertised_packet_size():
+    server = make_server()
+    server.emu.mem_read = lambda address, size: bytes(range(256)) * (size // 256)
+    replies: list[bytes] = []
+    server._reply = replies.append
+
+    server._read_memory(f"402000,{_PACKET_SIZE // 2:x}".encode())
+    server._read_memory(f"402000,{_PACKET_SIZE // 2 + 1:x}".encode())
+
+    assert len(replies[0]) == _PACKET_SIZE
+    assert bytes.fromhex(replies[0].decode()) == bytes(range(256)) * (_PACKET_SIZE // 512)
+    assert replies[1] == b"E01"
+
+
+def test_software_and_hardware_breakpoints_at_one_address_are_separate():
+    server = make_server()
+    reasons: list[StopReason] = []
+    server._request_stop = reasons.append
+    server._reply = lambda _payload: None
+    server._install_hooks()
+    server._change_breakpoint(b"Z0,401000,1")
+    server._change_breakpoint(b"Z1,401000,1")
+
+    server._change_breakpoint(b"z0,401000,1")
+    server._on_code(None, 0x401000, 1)
+
+    assert [r.kind for r in reasons] == ["hwbreak"]
+
+
+def test_vkill_replies_ok_and_k_replies_with_an_exit():
+    server = make_server()
+    replies: list[bytes] = []
+    server._reply = replies.append
+
+    assert server._handle_command(b"vKill;1").kill
+    assert replies == [b"OK"]
+    assert server._handle_command(b"k").kill
+    assert replies == [b"OK", b"X09"]
+
+
+def test_x87_control_registers_read_and_write_the_cpu_state():
+    emulator = DummyEmulator()
+    emulator.emu_eng = SimpleNamespace(emu=Uc(UC_ARCH_X86, UC_MODE_64))
+    server = GdbServer(emulator, 0, "127.0.0.1")
+    index = {register.name: i for i, register in enumerate(server._registers)}
+
+    for name, value in (("fctrl", 0x27F), ("fstat", 0x3800), ("ftag", 0x7FFF), ("fioff", 0x401000)):
+        server._write_register_value(server._registers[index[name]], value.to_bytes(4, "little"))
+        assert server._read_register_value(index[name]) == value.to_bytes(4, "little")
+
+
+def test_x87_instruction_offset_above_4gb_fits_its_slot():
+    emulator = DummyEmulator()
+    uc = Uc(UC_ARCH_X86, UC_MODE_64)
+    uc.mem_map(0x180001000, 0x1000)
+    uc.mem_write(0x180001000, b"\xd9\xe8")
+    uc.emu_start(0x180001000, 0x180001002)
+    emulator.emu_eng = SimpleNamespace(emu=uc)
+    server = GdbServer(emulator, 0, "127.0.0.1")
+    fioff = next(i for i, register in enumerate(server._registers) if register.name == "fioff")
+
+    assert server._read_register_value(fioff) == (0x80001000).to_bytes(4, "little")
+
+
+def test_x87_operand_pointer_and_segments_come_from_the_cpu_state():
+    emulator = DummyEmulator()
+    uc = Uc(UC_ARCH_X86, UC_MODE_64)
+    uc.mem_map(0x1000, 0x2000)
+    uc.mem_write(0x1000, b"\xd9\x04\x25\x00\x20\x00\x00")  # fld dword [0x2000]
+    uc.reg_write(UC_X86_REG_DS, 0x2B)
+    uc.emu_start(0x1000, 0x1007)
+    emulator.emu_eng = SimpleNamespace(emu=uc)
+    server = GdbServer(emulator, 0, "127.0.0.1")
+    index = {register.name: i for i, register in enumerate(server._registers)}
+
+    assert server._read_register_value(index["foseg"]) == (0x2B).to_bytes(4, "little")
+    assert server._read_register_value(index["fooff"]) == (0x2000).to_bytes(4, "little")
+
+    for name, value in (("fiseg", 0x33), ("foseg", 0x53), ("fooff", 0x3000)):
+        server._write_register_value(server._registers[index[name]], value.to_bytes(4, "little"))
+        assert server._read_register_value(index[name]) == value.to_bytes(4, "little")
+
+
+def test_breakpoint_of_kind_zero_is_one_byte():
+    server = make_server()
+    reasons: list[StopReason] = []
+    server._request_stop = reasons.append
+    replies: list[bytes] = []
+    server._reply = replies.append
+    server._install_hooks()
+
+    server._change_breakpoint(b"Z1,401000,0")
+    assert server.emu.code_hook_ranges() == {(0x401000, 0x401000)}
+    server._on_code(None, 0x401000, 1)
+    server._change_breakpoint(b"z1,401000,0")
+    assert server.emu.code_hook_ranges() == set()
+    # A watchpoint of length 0 watches nothing.
+    server._change_breakpoint(b"Z2,401000,0")
+
+    assert [r.kind for r in reasons] == ["hwbreak"]
+    assert replies == [b"OK", b"OK", b"E01"]

@@ -1,16 +1,37 @@
-"""Minimal stateful emulation for GDI+ lifecycle APIs."""
+"""GDI+ handler: deterministic lifecycle tokens, heap memory, and image stubs.
+
+The module merges the local GDI+ lifecycle emulation with the upstream v2.1.0
+flat API handler set. Image decoding is not implemented because the emulator
+has no image codecs.
+"""
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
 
 GDI_PLUS_OK = 0
 GDI_PLUS_GENERIC_ERROR = 1
 GDI_PLUS_INVALID_PARAMETER = 2
 
+# Upstream v2.1.0 names for the same GpStatus values, kept for the upstream handler tests.
+OK = GDI_PLUS_OK
+GENERIC_ERROR = GDI_PLUS_GENERIC_ERROR
+INVALID_PARAMETER = GDI_PLUS_INVALID_PARAMETER
+
 
 class Gdiplus(api.ApiHandler):
-    """Emulate the deterministic lifecycle subset used during process startup."""
+    """
+    Implements the GDI+ flat API from gdiplus.dll.
+
+    Startup returns a deterministic non-zero token and shutdown is idempotent.
+    GdipAlloc/GdipFree work against the emulator heap. Image decoding fails,
+    because the emulator has no image codecs.
+    """
 
     name = "gdiplus"
     apihook = api.ApiHandler.apihook
@@ -26,9 +47,18 @@ class Gdiplus(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("GdiplusStartup", argc=3)
-    def GdiplusStartup(self, emu, argv, ctx: api.ApiContext = None):
-        """GdiplusStartup(ULONG_PTR *token, const GdiplusStartupInput *input, ...)."""
-        token_address, input_address, _output_address = argv
+    def GdiplusStartup(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        Status GdiplusStartup(
+            ULONG_PTR *token,
+            const GdiplusStartupInput *input,
+            GdiplusStartupOutput *output
+        );
+
+        Write a unique non-zero token. A non-NULL output buffer is cleared,
+        since no notification hooks are set.
+        """
+        token_address, input_address, output_address = argv
         if not token_address or not input_address:
             return GDI_PLUS_INVALID_PARAMETER
 
@@ -40,18 +70,142 @@ class Gdiplus(api.ApiHandler):
                 token_address,
                 token.to_bytes(emu.get_ptr_size(), "little"),
             )
+            if output_address:
+                emu.mem_write(output_address, b"\x00" * 2 * emu.get_ptr_size())
         except Exception:
             self._tokens.discard(token)
             return GDI_PLUS_GENERIC_ERROR
         return GDI_PLUS_OK
 
     @apihook("GdiplusShutdown", argc=1)
-    def GdiplusShutdown(self, emu, argv, ctx: api.ApiContext = None):
-        """GdiplusShutdown(ULONG_PTR token); this function has no return value."""
+    def GdiplusShutdown(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        VOID GdiplusShutdown(
+            ULONG_PTR token
+        );
+
+        This function has no return value. A stale token cannot be made into a
+        useful status code, so lifecycle cleanup stays idempotent.
+        """
         token = int(argv[0])
         if token not in self._tokens:
-            # GdiplusShutdown is void. A stale token cannot be made into a
-            # useful status code, so leave lifecycle cleanup idempotent.
             return None
         self._tokens.remove(token)
         return None
+
+    @apihook("GdipAlloc", argc=1)
+    def GdipAlloc(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void *GdipAlloc(
+            size_t size
+        );
+        """
+        (size,) = argv
+        return self.heap_alloc(size, heap="HeapAlloc")
+
+    @apihook("GdipFree", argc=1)
+    def GdipFree(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        void GdipFree(
+            void *ptr
+        );
+        """
+        (ptr,) = argv
+        if ptr:
+            self.mem_free(ptr)
+
+    def fail_image(self, emu, out):
+        if out:
+            self.mem_write(out, b"\x00" * emu.get_ptr_size())
+        return GDI_PLUS_GENERIC_ERROR
+
+    @apihook("GdipCreateBitmapFromStream", argc=2)
+    def GdipCreateBitmapFromStream(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        GpStatus GdipCreateBitmapFromStream(
+            IStream *stream,
+            GpBitmap **bitmap
+        );
+        """
+        return self.fail_image(emu, argv[1])
+
+    @apihook("GdipCreateBitmapFromFile", argc=2)
+    def GdipCreateBitmapFromFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        GpStatus GdipCreateBitmapFromFile(
+            const WCHAR *filename,
+            GpBitmap **bitmap
+        );
+        """
+        return self.fail_image(emu, argv[1])
+
+    @apihook("GdipLoadImageFromStream", argc=2)
+    def GdipLoadImageFromStream(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        GpStatus GdipLoadImageFromStream(
+            IStream *stream,
+            GpImage **image
+        );
+        """
+        return self.fail_image(emu, argv[1])
+
+    @apihook("GdipLoadImageFromFile", argc=2)
+    def GdipLoadImageFromFile(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        GpStatus GdipLoadImageFromFile(
+            const WCHAR *filename,
+            GpImage **image
+        );
+        """
+        return self.fail_image(emu, argv[1])
+
+    @apihook("GdipCreateBitmapFromStreamICM", argc=2)
+    def GdipCreateBitmapFromStreamICM(
+        self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT
+    ):
+        """
+        GpStatus GdipCreateBitmapFromStreamICM(
+            IStream *stream,
+            GpBitmap **bitmap
+        );
+        """
+        return self.fail_image(emu, argv[1])
+
+    @apihook("GdipCreateBitmapFromFileICM", argc=2)
+    def GdipCreateBitmapFromFileICM(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        GpStatus GdipCreateBitmapFromFileICM(
+            const WCHAR *filename,
+            GpBitmap **bitmap
+        );
+        """
+        return self.fail_image(emu, argv[1])
+
+    @apihook("GdipLoadImageFromStreamICM", argc=2)
+    def GdipLoadImageFromStreamICM(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        GpStatus GdipLoadImageFromStreamICM(
+            IStream *stream,
+            GpImage **image
+        );
+        """
+        return self.fail_image(emu, argv[1])
+
+    @apihook("GdipLoadImageFromFileICM", argc=2)
+    def GdipLoadImageFromFileICM(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        GpStatus GdipLoadImageFromFileICM(
+            const WCHAR *filename,
+            GpImage **image
+        );
+        """
+        return self.fail_image(emu, argv[1])
+
+    @apihook("GdipDisposeImage", argc=1)
+    def GdipDisposeImage(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        GpStatus GdipDisposeImage(
+            GpImage *image
+        );
+        """
+        return GDI_PLUS_OK if argv[0] else GDI_PLUS_INVALID_PARAMETER

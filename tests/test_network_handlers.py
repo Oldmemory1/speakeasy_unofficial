@@ -1,0 +1,727 @@
+import copy
+import struct
+import uuid
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+import speakeasy
+from speakeasy import NetHttpProtocol, Speakeasy
+from speakeasy.winenv.defs.enums import INTERNET_FLAGS, WINHTTP_OPEN_REQUEST_FLAGS
+from tests.handler_harness import alloc, call, load_emu, start_process
+
+IID_IFOO = uuid.UUID("11223344-5566-7788-99aa-bbccddeeff00")
+CLSID_PS = uuid.UUID("aabbccdd-0011-2233-4455-66778899aabb")
+
+
+@pytest.fixture
+def adapter_emu(config: dict[str, Any], load_test_bin: Callable[[str], bytes]) -> Iterator[Speakeasy]:
+    config["network"]["adapters"] = [
+        {
+            "name": "{00000000-1111-2222-3333-444444444444}",
+            "description": "Intel(R) Ethernet",
+            "mac_address": "00-11-22-33-44-55",
+            "type": "ethernet",
+            "ip_address": "192.168.1.5",
+            "subnet_mask": "255.255.255.0",
+            "dhcp_enabled": True,
+        }
+    ]
+    yield from load_emu(config, load_test_bin("dll_test_x86.dll.xz"))
+
+
+def test_get_adapters_info_fills_the_adapter(adapter_emu: Speakeasy) -> None:
+    buf = alloc(adapter_emu, b"\xcc" * 0x400)
+    size = alloc(adapter_emu, struct.pack("<I", 0x400))
+    rv, _ = call(adapter_emu, "iphlpapi", "GetAdaptersInfo", [buf, size])
+    assert rv == 0
+    info = adapter_emu.mem_read(buf, 0x1D0)
+    assert info[8:47] == b"{00000000-1111-2222-3333-444444444444}\x00"
+    assert info[268:286] == b"Intel(R) Ethernet\x00"
+    assert struct.unpack_from("<I", info, 400)[0] == 6
+    assert info[404:410] == bytes.fromhex("001122334455")
+    assert struct.unpack_from("<I", info, 416)[0] == 6
+    assert info[432:444] == b"192.168.1.5\x00"
+    assert info[448:462] == b"255.255.255.0\x00"
+
+
+def test_get_adapters_info_small_buffer_gives_size(adapter_emu: Speakeasy) -> None:
+    buf = alloc(adapter_emu, b"\xcc" * 0x400)
+    size = alloc(adapter_emu, struct.pack("<I", 16))
+    rv, _ = call(adapter_emu, "iphlpapi", "GetAdaptersInfo", [buf, size])
+    assert rv == 111
+    assert struct.unpack("<I", adapter_emu.mem_read(size, 4))[0] == 0x288
+    assert adapter_emu.mem_read(buf, 0x400) == b"\xcc" * 0x400
+
+
+def test_get_adapters_info_accepts_a_partial_adapter(
+    config: dict[str, Any], load_test_bin: Callable[[str], bytes]
+) -> None:
+    config["network"]["adapters"] = [{"name": "eth0", "type": "wireless"}]
+    for se in load_emu(config, load_test_bin("dll_test_x86.dll.xz")):
+        buf = alloc(se, b"\xcc" * 0x400)
+        size = alloc(se, struct.pack("<I", 0x400))
+        rv, _ = call(se, "iphlpapi", "GetAdaptersInfo", [buf, size])
+        assert rv == 0
+        info = se.mem_read(buf, 0x1D0)
+        assert info[8:13] == b"eth0\x00"
+        assert struct.unpack_from("<I", info, 416)[0] == 1
+
+
+def test_uuid_to_string_a_returns_a_string_pointer(dll_emu: Speakeasy) -> None:
+    guid = alloc(dll_emu, bytes(range(16)))
+    out = alloc(dll_emu, b"\xcc" * 64)
+    rv, _ = call(dll_emu, "rpcrt4", "UuidToStringA", [guid, out])
+    assert rv == 0
+    ptr = struct.unpack("<I", dll_emu.mem_read(out, 4))[0]
+    assert dll_emu.mem_read(out + 4, 60) == b"\xcc" * 60
+    assert dll_emu.mem_read(ptr, 37) == b"03020100-0504-0706-0809-0a0b0c0d0e0f\x00"
+
+
+def _proxy_file_list(se: Speakeasy) -> int:
+    iid = alloc(se, IID_IFOO.bytes_le)
+    stub = alloc(se, struct.pack("<IIII", iid, 0, 7, 0))
+    stubs = alloc(se, struct.pack("<I", stub))
+    names = alloc(se, struct.pack("<I", alloc(se, b"IFoo\x00")))
+    info = alloc(se, struct.pack("<IIIIIHHIIII", 0, stubs, names, 0, 0, 1, 2, 0, 0, 0, 0))
+    return alloc(se, struct.pack("<II", info, 0))
+
+
+def _default_value(se: Speakeasy, path: str) -> Any:
+    key = se.emu.regman.get_key_from_path(path)
+    assert key is not None
+    return key.get_value("").get_data()
+
+
+def test_ndr_dll_register_proxy_registers_the_interfaces(dll_emu: Speakeasy) -> None:
+    module = dll_emu.emu.modules[0]
+    clsid = alloc(dll_emu, CLSID_PS.bytes_le)
+
+    rv, _ = call(dll_emu, "rpcrt4", "NdrDllRegisterProxy", [module.base, _proxy_file_list(dll_emu), clsid])
+
+    assert rv == 0
+    iface = f"HKEY_CLASSES_ROOT\\Interface\\{{{str(IID_IFOO).upper()}}}"
+    clsid_str = f"{{{str(CLSID_PS).upper()}}}"
+    assert _default_value(dll_emu, iface) == "IFoo"
+    assert _default_value(dll_emu, iface + "\\NumMethods") == "7"
+    assert _default_value(dll_emu, iface + "\\ProxyStubClsid32") == clsid_str
+    clsid_key = "HKEY_CLASSES_ROOT\\CLSID\\" + clsid_str
+    assert _default_value(dll_emu, clsid_key) == "PSFactoryBuffer"
+    assert _default_value(dll_emu, clsid_key + "\\InprocServer32") == module.emu_path
+
+
+def test_inet_ntoa_reuses_the_buffer_for_an_address(dll_emu: Speakeasy) -> None:
+    addr = struct.unpack("<I", bytes([10, 1, 2, 3]))[0]
+    first, _ = call(dll_emu, "ws2_32", "inet_ntoa", [addr])
+    second, _ = call(dll_emu, "ws2_32", "inet_ntoa", [addr])
+    assert first == second
+    assert dll_emu.mem_read(first, 9) == b"10.1.2.3\x00"
+
+
+@pytest.mark.parametrize(
+    "emu_fixture, max_sockets_offset, description_offset, size",
+    [("dll_emu", 390, 4, 400), ("dll64_emu", 4, 16, 408)],
+)
+@pytest.mark.parametrize("requested, version", [(0x0202, 0x0202), (0x0101, 0x0101), (0x0303, 0x0202)])
+def test_wsa_startup_fills_wsadata(
+    request: pytest.FixtureRequest,
+    emu_fixture: str,
+    max_sockets_offset: int,
+    description_offset: int,
+    size: int,
+    requested: int,
+    version: int,
+) -> None:
+    se: Speakeasy = request.getfixturevalue(emu_fixture)
+    data = alloc(se, b"\xcc" * 0x200)
+    rv, _ = call(se, "ws2_32", "WSAStartup", [requested, data])
+    assert rv == 0
+    wsadata = se.mem_read(data, 0x200)
+    assert struct.unpack_from("<HH", wsadata, 0) == (version, 0x0202)
+    assert struct.unpack_from("<H", wsadata, max_sockets_offset)[0] != 0xCCCC
+    assert wsadata[description_offset : description_offset + 12] == b"WinSock 2.0\x00"
+    assert wsadata[size:] == b"\xcc" * (0x200 - size)
+
+
+def _read_ptr(se: Speakeasy, addr: int) -> int:
+    size = se.emu.get_ptr_size()
+    return int.from_bytes(se.mem_read(addr, size), "little")
+
+
+@pytest.mark.parametrize("emu_fixture, addr_offset", [("dll_emu", 24), ("dll64_emu", 32)])
+@pytest.mark.parametrize("service, port", [(None, 0), (b"443", 443), (b"http", 80)])
+def test_getaddrinfo_without_hints(
+    request: pytest.FixtureRequest, emu_fixture: str, addr_offset: int, service: bytes | None, port: int
+) -> None:
+    se: Speakeasy = request.getfixturevalue(emu_fixture)
+    node = alloc(se, b"example.com\x00")
+    service_ptr = alloc(se, service + b"\x00") if service else 0
+    result = alloc(se, b"\x00" * 8)
+    rv, _ = call(se, "ws2_32", "getaddrinfo", [node, service_ptr, 0, result])
+    assert rv == 0
+    for last in range(4):
+        call(se, "ws2_32", "inet_ntoa", [last << 24])
+    info = _read_ptr(se, result)
+    assert struct.unpack("<II", se.mem_read(info + 4, 8)) == (2, 0)
+    assert _read_ptr(se, info + addr_offset - se.emu.get_ptr_size()) == 0
+    sockaddr = se.mem_read(_read_ptr(se, info + addr_offset), 8)
+    assert struct.unpack("<H", sockaddr[:2])[0] == 2
+    assert struct.unpack(">H", sockaddr[2:4])[0] == port
+    assert sockaddr[4:8] == bytes([10, 1, 2, 3])
+
+
+def test_getaddrinfo_unknown_service(dll_emu: Speakeasy) -> None:
+    node = alloc(dll_emu, b"example.com\x00")
+    service = alloc(dll_emu, b"nosuchservice\x00")
+    result = alloc(dll_emu, b"\xcc" * 4)
+    rv, _ = call(dll_emu, "ws2_32", "getaddrinfo", [node, service, 0, result])
+    assert rv == 10109
+
+
+@pytest.mark.parametrize("ordinal, other", [(177, "freeaddrinfo"), (178, "getaddrinfo"), (180, "inet_ntop")])
+def test_x86_ordinal_call_does_not_reach_another_handler(config: dict[str, Any], ordinal: int, other: str) -> None:
+    # x86 ws2_32 exports getaddrinfo as #177, getnameinfo as #178 and inet_pton as #180.
+    code = b"\xb9\x00\x00\x00\x00" + b"\x51" * 4 + b"\xb8\x00\x00\x00\x00\xff\xd0\xc3"
+    se = Speakeasy(config=config)
+    try:
+        sc_addr = se.load_shellcode(data=code, arch="x86")
+        se.mem_write(sc_addr + 1, se.mem_alloc(0x100).to_bytes(4, "little"))
+        se.mem_write(sc_addr + 10, se.emu.get_proc("ws2_32", f"ordinal_{ordinal}").to_bytes(4, "little"))
+        se.run_shellcode(sc_addr)
+        events = se.get_report().runs[0].events
+    finally:
+        se.shutdown()
+    assert f"ws2_32.{other}" not in [e.api_name for e in events if e.event == "api"]
+
+
+def _wininet_request(se: Speakeasy, verb: bytes, objname: bytes, flags: int = 0) -> int:
+    inet, _ = call(se, "wininet", "InternetOpenA", [0, 0, 0, 0, 0])
+    server = alloc(se, b"example.com\x00")
+    conn, _ = call(se, "wininet", "InternetConnectA", [inet, server, 80, 0, 0, 3, 0, 0])
+    verb_ptr = alloc(se, verb + b"\x00")
+    obj = alloc(se, objname + b"\x00")
+    req, _ = call(se, "wininet", "HttpOpenRequestA", [conn, verb_ptr, obj, 0, 0, 0, flags, 0])
+    assert req
+    return req
+
+
+def _winhttp_request(se: Speakeasy, verb: str, objname: str, flags: int = 0) -> int:
+    session, _ = call(se, "winhttp", "WinHttpOpen", [0, 0, 0, 0, 0])
+    server = alloc(se, "example.com\x00".encode("utf-16le"))
+    conn, _ = call(se, "winhttp", "WinHttpConnect", [session, server, 80, 0])
+    verb_ptr = alloc(se, (verb + "\x00").encode("utf-16le"))
+    obj = alloc(se, (objname + "\x00").encode("utf-16le"))
+    req, _ = call(se, "winhttp", "WinHttpOpenRequest", [conn, verb_ptr, obj, 0, 0, 0, flags])
+    assert req
+    return req
+
+
+def _http_events(se: Speakeasy) -> list[Any]:
+    return [e for e in se.emu.get_current_run().events if e.event == "net_http"]
+
+
+@pytest.mark.parametrize(
+    "flags, proto, connection",
+    [
+        (0, "http", "Connection: Close"),
+        (
+            INTERNET_FLAGS.INTERNET_FLAG_SECURE | INTERNET_FLAGS.INTERNET_FLAG_KEEP_CONNECTION,
+            "https",
+            "Connection: Keep-Alive",
+        ),
+    ],
+)
+def test_http_send_request_follows_the_request_flags(
+    dll_emu: Speakeasy, flags: int, proto: str, connection: str
+) -> None:
+    req = _wininet_request(dll_emu, b"GET", b"/a", flags)
+    assert call(dll_emu, "wininet", "HttpSendRequestA", [req, 0, 0, 0, 0])[0] == 1
+    (event,) = _http_events(dll_emu)
+    assert event.proto == proto
+    assert connection in event.headers
+
+
+def test_win_http_send_request_is_secure_with_the_secure_flag(dll_emu: Speakeasy) -> None:
+    req = _winhttp_request(dll_emu, "GET", "/a", WINHTTP_OPEN_REQUEST_FLAGS.WINHTTP_FLAG_SECURE)
+    assert call(dll_emu, "winhttp", "WinHttpSendRequest", [req, 0, 0, 0, 0, 0, 0])[0] == 1
+    assert [e.proto for e in _http_events(dll_emu)] == ["https"]
+
+
+def test_internet_read_file_without_a_configured_response(dll_emu: Speakeasy) -> None:
+    req = _wininet_request(dll_emu, b"POST", b"/gate.php")
+    avail = alloc(dll_emu, b"\xcc" * 4)
+    rv, _ = call(dll_emu, "wininet", "InternetQueryDataAvailable", [req, avail, 0, 0])
+    assert rv == 1
+    assert dll_emu.mem_read(avail, 4) == b"\x00" * 4
+    buf = alloc(dll_emu, b"\xcc" * 16)
+    read = alloc(dll_emu, b"\xcc" * 4)
+    rv, _ = call(dll_emu, "wininet", "InternetReadFile", [req, buf, 16, read])
+    assert rv == 1
+    assert dll_emu.mem_read(read, 4) == b"\x00" * 4
+
+
+def test_each_emulator_reads_its_own_http_response(
+    config: dict[str, Any], load_test_bin: Callable[[str], bytes], tmp_path: Path
+) -> None:
+    data = load_test_bin("dll_test_x86.dll.xz")
+    with ExitStack() as stack:
+        emus = []
+        for name in ("A", "B"):
+            path = tmp_path / f"{name}.bin"
+            path.write_bytes(f"response for {name}".encode())
+            cfg = copy.deepcopy(config)
+            cfg["network"]["http"] = {"responses": [{"verb": "GET", "files": [{"mode": "default", "path": str(path)}]}]}
+            emus.append(stack.enter_context(contextmanager(load_emu)(cfg, data)))
+        reqs = [_wininet_request(se, b"GET", b"/x") for se in emus]
+        for se, req, name in zip(emus, reqs, ("A", "B"), strict=True):
+            assert call(se, "wininet", "HttpSendRequestA", [req, 0, 0, 0, 0])[0] == 1
+            buf = alloc(se, b"\x00" * 32)
+            read = alloc(se, b"\x00" * 4)
+            assert call(se, "wininet", "InternetReadFile", [req, buf, 32, read])[0] == 1
+            size = struct.unpack("<I", se.mem_read(read, 4))[0]
+            assert se.mem_read(buf, size) == f"response for {name}".encode()
+
+
+def test_win_http_read_data_without_a_configured_response(dll_emu: Speakeasy) -> None:
+    req = _winhttp_request(dll_emu, "POST", "/gate.php")
+    buf = alloc(dll_emu, b"\xcc" * 16)
+    read = alloc(dll_emu, b"\xcc" * 4)
+    rv, _ = call(dll_emu, "winhttp", "WinHttpReadData", [req, buf, 16, read])
+    assert rv == 1
+    assert dll_emu.mem_read(read, 4) == b"\x00" * 4
+
+
+def test_win_http_query_data_available_reports_the_unread_body(dll_emu: Speakeasy) -> None:
+    req = _winhttp_request(dll_emu, "GET", "/index")
+    assert call(dll_emu, "winhttp", "WinHttpSendRequest", [req, 0, 0, 0, 0, 0, 0])[0] == 1
+    assert call(dll_emu, "winhttp", "WinHttpReceiveResponse", [req, 0])[0] == 1
+    avail = alloc(dll_emu, b"\xcc" * 4)
+    assert call(dll_emu, "winhttp", "WinHttpQueryDataAvailable", [req, avail])[0] == 1
+    assert dll_emu.mem_read(avail, 4) == struct.pack("<I", 4096)
+    buf = alloc(dll_emu, b"\xcc" * 4096)
+    read = alloc(dll_emu, b"\xcc" * 4)
+    assert call(dll_emu, "winhttp", "WinHttpReadData", [req, buf, 4096, read])[0] == 1
+    assert dll_emu.mem_read(read, 4) == struct.pack("<I", 4096)
+    assert call(dll_emu, "winhttp", "WinHttpQueryDataAvailable", [req, avail])[0] == 1
+    assert dll_emu.mem_read(avail, 4) == b"\x00" * 4
+
+
+def _query_headers(se: Speakeasy, req: int, level: int, size: int | None) -> tuple[int, bytes, int]:
+    """
+    Call WinHttpQueryHeaders with a buffer of ``size`` bytes, or with a NULL buffer for None.
+
+    Return the result, the buffer and the length.
+    """
+    buf = 0 if size is None else alloc(se, b"\xcc" * size)
+    buf_len = alloc(se, struct.pack("<I", size or 0))
+    rv, _ = call(se, "winhttp", "WinHttpQueryHeaders", [req, level, 0, buf, buf_len, 0])
+    length = struct.unpack("<I", se.mem_read(buf_len, 4))[0]
+    return rv, se.mem_read(buf, size) if size is not None else b"", length
+
+
+@pytest.mark.parametrize(
+    "level, text",
+    [
+        (22, "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n"),
+        (21, "HTTP/1.1 200 OK\0Content-Length: 4096\0\0"),
+        (5, "4096"),
+    ],
+)
+def test_win_http_query_headers_gives_the_response_headers(dll_emu: Speakeasy, level: int, text: str) -> None:
+    start_process(dll_emu)
+    req = _winhttp_request(dll_emu, "GET", "/index")
+    assert call(dll_emu, "winhttp", "WinHttpSendRequest", [req, 0, 0, 0, 0, 0, 0])[0] == 1
+    assert call(dll_emu, "winhttp", "WinHttpReceiveResponse", [req, 0])[0] == 1
+    out = (text + "\0").encode("utf-16le")
+
+    rv, _, length = _query_headers(dll_emu, req, level, None)
+    assert rv == 0
+    assert dll_emu.emu.get_last_error() == 122
+    assert length == len(out)
+
+    rv, buf, length = _query_headers(dll_emu, req, level, len(out) - 2)
+    assert rv == 0
+    assert dll_emu.emu.get_last_error() == 122
+    assert buf == b"\xcc" * (len(out) - 2)
+    assert length == len(out)
+
+    rv, buf, length = _query_headers(dll_emu, req, level, len(out))
+    assert rv == 1
+    assert buf == out
+    assert length == len(out) - 2
+
+
+def test_win_http_query_headers_gives_the_content_length_as_a_number(dll_emu: Speakeasy) -> None:
+    req = _winhttp_request(dll_emu, "GET", "/index")
+    rv, buf, length = _query_headers(dll_emu, req, 5 | 0x20000000, 4)
+    assert (rv, buf, length) == (1, struct.pack("<I", 4096), 4)
+
+
+def test_internet_open_url_with_headers(dll_emu: Speakeasy) -> None:
+    inet, _ = call(dll_emu, "wininet", "InternetOpenA", [0, 0, 0, 0, 0])
+    url = alloc(dll_emu, b"http://example.com/a.bin\x00")
+    headers = alloc(dll_emu, b"Accept: */*\r\n\x00")
+    req, _ = call(dll_emu, "wininet", "InternetOpenUrlA", [inet, url, headers, 0xFFFFFFFF, 0, 0])
+    assert req
+    buf = alloc(dll_emu, b"\xcc" * 16)
+    read = alloc(dll_emu, b"\xcc" * 4)
+    rv, _ = call(dll_emu, "wininet", "InternetReadFile", [req, buf, 16, read])
+    assert rv == 1
+    assert dll_emu.mem_read(read, 4) == struct.pack("<I", 16)
+
+
+def test_internet_open_url_without_a_url(dll_emu: Speakeasy) -> None:
+    inet, _ = call(dll_emu, "wininet", "InternetOpenA", [0, 0, 0, 0, 0])
+    rv, _ = call(dll_emu, "wininet", "InternetOpenUrlA", [inet, 0, 0, 0, 0, 0])
+    assert rv == 0
+
+
+def _url_components(host_buf: int = 0, host_len: int = 1) -> bytes:
+    fields = [60, 0, 1, 0, host_buf, host_len, 0, 0, 0, 0, 0, 0, 1, 0, 1]
+    return struct.pack("<15I", *fields)
+
+
+@pytest.mark.parametrize("dll, name, width", [("wininet", "InternetCrackUrlA", 1), ("winhttp", "WinHttpCrackUrl", 2)])
+@pytest.mark.parametrize(
+    "url, host, port, path, extra",
+    [
+        ("http://user@1.2.3.4:8080/x/y.php?a=1", "1.2.3.4", 8080, "/x/y.php", "?a=1"),
+        ("https://Example.com/index.html", "Example.com", 443, "/index.html", ""),
+        ("http://example.com", "example.com", 80, "", ""),
+    ],
+)
+def test_crack_url_points_into_the_url(
+    dll_emu: Speakeasy, dll: str, name: str, width: int, url: str, host: str, port: int, path: str, extra: str
+) -> None:
+    enc = "utf-8" if width == 1 else "utf-16le"
+    url_ptr = alloc(dll_emu, (url + "\x00").encode(enc))
+    comp = alloc(dll_emu, _url_components())
+    rv, _ = call(dll_emu, dll, name, [url_ptr, 0, 0, comp])
+    assert rv == 1
+    fields = struct.unpack("<15I", dll_emu.mem_read(comp, 60))
+    assert fields[6] & 0xFFFF == port
+    for ptr, length, text in [
+        (fields[1], fields[2], url.split(":")[0]),
+        (fields[4], fields[5], host),
+        (fields[11], fields[12], path),
+        (fields[13], fields[14], extra),
+    ]:
+        assert length == len(text)
+        assert dll_emu.mem_read(ptr, length * width).decode(enc) == text
+
+
+@pytest.mark.parametrize("dll, name, width", [("wininet", "InternetCrackUrlA", 1), ("winhttp", "WinHttpCrackUrl", 2)])
+def test_crack_url_copies_the_host(dll_emu: Speakeasy, dll: str, name: str, width: int) -> None:
+    enc = "utf-8" if width == 1 else "utf-16le"
+    url_ptr = alloc(dll_emu, "http://example.com:81/a\x00".encode(enc))
+    host_buf = alloc(dll_emu, b"\xcc" * 64)
+    comp = alloc(dll_emu, _url_components(host_buf, 32))
+    rv, _ = call(dll_emu, dll, name, [url_ptr, 0, 0, comp])
+    assert rv == 1
+    fields = struct.unpack("<15I", dll_emu.mem_read(comp, 60))
+    assert (fields[4], fields[5]) == (host_buf, 11)
+    assert dll_emu.mem_read(host_buf, 12 * width) == "example.com\x00".encode(enc)
+
+
+@pytest.mark.parametrize(
+    "dll, name, width, path",
+    [("wininet", "InternetCrackUrlA", 1, "/gate.php?id=42#top"), ("winhttp", "WinHttpCrackUrl", 2, "/gate.php")],
+)
+def test_crack_url_without_extra_info(dll_emu: Speakeasy, dll: str, name: str, width: int, path: str) -> None:
+    enc = "utf-8" if width == 1 else "utf-16le"
+    url_ptr = alloc(dll_emu, "http://c2.example.com/gate.php?id=42#top\x00".encode(enc))
+    comp = alloc(dll_emu, _url_components()[:-4] + b"\x00" * 4)
+    rv, _ = call(dll_emu, dll, name, [url_ptr, 0, 0, comp])
+    assert rv == 1
+    fields = struct.unpack("<15I", dll_emu.mem_read(comp, 60))
+    assert fields[12] == len(path)
+    assert dll_emu.mem_read(fields[11], len(path) * width).decode(enc) == path
+
+
+def test_recv_peek_keeps_the_read_position(dll_emu: Speakeasy) -> None:
+    stager = (Path(speakeasy.__file__).parent / "resources" / "web" / "stager.bin").read_bytes()
+    s, _ = call(dll_emu, "ws2_32", "socket", [2, 1, 6])
+    buf = alloc(dll_emu, b"\x00" * 0x100)
+    assert call(dll_emu, "ws2_32", "recv", [s, buf, 4, 0])[0] == 4
+    peeked, _ = call(dll_emu, "ws2_32", "recv", [s, buf, 0x100, 2])
+    assert dll_emu.mem_read(buf, peeked) == stager[4:]
+    assert call(dll_emu, "ws2_32", "recv", [s, buf, 4, 0])[0] == 4
+    assert dll_emu.mem_read(buf, 4) == stager[4:8]
+
+
+@pytest.mark.parametrize("level", [101, 102])
+def test_net_wksta_get_info_keeps_the_lanroot(dll_emu: Speakeasy, level: int) -> None:
+    out = alloc(dll_emu, b"\x00" * 4)
+    rv, _ = call(dll_emu, "netapi32", "NetWkstaGetInfo", [0, level, out])
+    assert rv == 0
+    info = dll_emu.mem_read(struct.unpack("<I", dll_emu.mem_read(out, 4))[0], 28 if level == 102 else 24)
+    assert struct.unpack_from("<I", info, 0)[0] == 500
+    lanroot = struct.unpack_from("<I", info, 20)[0]
+    assert lanroot != 0
+    assert dll_emu.mem_read(lanroot, 2) == b"\x00\x00"
+    if level == 102:
+        assert struct.unpack_from("<I", info, 24)[0] == 2
+
+
+def test_url_download_to_cache_file_small_buffer_fails(dll_emu: Speakeasy) -> None:
+    url = alloc(dll_emu, b"http://example.com/a.bin\x00")
+    out = alloc(dll_emu, b"\xcc" * 8)
+    rv, _ = call(dll_emu, "urlmon", "URLDownloadToCacheFileA", [0, url, out, 8, 0, 0])
+    assert rv == 0x8007000E
+    assert dll_emu.mem_read(out, 8) == b"\xcc" * 8
+
+
+@pytest.mark.parametrize("emu_fixture, ptr_size", [("dll_emu", 4), ("dll64_emu", 8)])
+def test_win_http_get_ie_proxy_config_clears_the_strings(
+    request: pytest.FixtureRequest, emu_fixture: str, ptr_size: int
+) -> None:
+    se: Speakeasy = request.getfixturevalue(emu_fixture)
+    config = alloc(se, b"\xcc" * 40)
+    rv, _ = call(se, "winhttp", "WinHttpGetIEProxyConfigForCurrentUser", [config])
+    assert rv == 1
+    size = 4 * ptr_size
+    data = se.mem_read(config, 40)
+    assert struct.unpack_from("<I", data, 0)[0] == 1
+    assert data[ptr_size:size] == b"\x00" * (size - ptr_size)
+    assert data[size:] == b"\xcc" * (40 - size)
+
+
+@pytest.mark.parametrize("emu_fixture, ptr_size", [("dll_emu", 4), ("dll64_emu", 8)])
+def test_win_http_get_proxy_for_url_reports_no_proxy(
+    request: pytest.FixtureRequest, emu_fixture: str, ptr_size: int
+) -> None:
+    se: Speakeasy = request.getfixturevalue(emu_fixture)
+    url = alloc(se, "http://example.com/\x00".encode("utf-16le"))
+    info = alloc(se, b"\xcc" * 32)
+    rv, _ = call(se, "winhttp", "WinHttpGetProxyForUrl", [0, url, 0, info])
+    assert rv == 1
+    size = 3 * ptr_size
+    data = se.mem_read(info, 32)
+    assert struct.unpack_from("<I", data, 0)[0] == 1
+    assert data[ptr_size:size] == b"\x00" * (size - ptr_size)
+    assert data[size:] == b"\xcc" * (32 - size)
+
+
+@pytest.mark.parametrize(
+    "name, level, size, rv, out, length",
+    [
+        ("HttpQueryInfoA", 19, 16, 1, b"200\x00", 3),
+        ("HttpQueryInfoW", 19, 16, 1, "200\x00".encode("utf-16le"), 6),
+        ("HttpQueryInfoA", 19 | 0x20000000, 16, 1, struct.pack("<I", 200), 4),
+        ("HttpQueryInfoA", 19, 2, 0, b"\xcc" * 4, 4),
+        ("HttpQueryInfoW", 19, 4, 0, b"\xcc" * 4, 8),
+    ],
+)
+def test_http_query_info_status_code(
+    dll_emu: Speakeasy, name: str, level: int, size: int, rv: int, out: bytes, length: int
+) -> None:
+    req = _wininet_request(dll_emu, b"GET", b"/a")
+    buf = alloc(dll_emu, b"\xcc" * 16)
+    buf_len = alloc(dll_emu, struct.pack("<I", size))
+    assert call(dll_emu, "wininet", name, [req, level, buf, buf_len, 0])[0] == rv
+    assert dll_emu.mem_read(buf, len(out)) == out
+    assert struct.unpack("<I", dll_emu.mem_read(buf_len, 4))[0] == length
+
+
+@pytest.mark.parametrize("name, encoding", [("HttpQueryInfoA", "utf-8"), ("HttpQueryInfoW", "utf-16le")])
+@pytest.mark.parametrize(
+    "level, text",
+    [
+        (22, "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n"),
+        (21, "HTTP/1.1 200 OK\0Content-Length: 4096\0\0"),
+        (5, "4096"),
+    ],
+)
+def test_http_query_info_gives_the_response_headers(
+    dll_emu: Speakeasy, name: str, encoding: str, level: int, text: str
+) -> None:
+    start_process(dll_emu)
+    req = _wininet_request(dll_emu, b"GET", b"/index")
+    out = (text + "\0").encode(encoding)
+    width = len("\0".encode(encoding))
+
+    buf_len = alloc(dll_emu, struct.pack("<I", 0))
+    assert call(dll_emu, "wininet", name, [req, level, 0, buf_len, 0])[0] == 0
+    assert dll_emu.emu.get_last_error() == 122
+    assert struct.unpack("<I", dll_emu.mem_read(buf_len, 4))[0] == len(out)
+
+    buf = alloc(dll_emu, b"\xcc" * len(out))
+    assert call(dll_emu, "wininet", name, [req, level, buf, buf_len, 0])[0] == 1
+    assert dll_emu.mem_read(buf, len(out)) == out
+    assert struct.unpack("<I", dll_emu.mem_read(buf_len, 4))[0] == len(out) - width
+
+
+def test_gethostbyname_ignores_case(dll_emu: Speakeasy) -> None:
+    name = alloc(dll_emu, b"Google.COM\x00")
+    hostent, _ = call(dll_emu, "ws2_32", "gethostbyname", [name])
+    assert hostent
+    addr_list = struct.unpack("<I", dll_emu.mem_read(hostent + 12, 4))[0]
+    addr = struct.unpack("<I", dll_emu.mem_read(addr_list, 4))[0]
+    assert dll_emu.mem_read(addr, 4) == bytes([8, 8, 8, 8])
+
+
+def test_inet_addr_null(dll_emu: Speakeasy) -> None:
+    assert call(dll_emu, "ws2_32", "inet_addr", [0])[0] == 0xFFFFFFFF
+
+
+def test_accept_fills_the_peer_address(dll_emu: Speakeasy) -> None:
+    s, _ = call(dll_emu, "ws2_32", "socket", [2, 1, 6])
+    local = alloc(dll_emu, struct.pack("<H", 2) + struct.pack(">H", 4444) + b"\x00" * 12)
+    assert call(dll_emu, "ws2_32", "bind", [s, local, 16])[0] == 0
+    peer = alloc(dll_emu, b"\xcc" * 16)
+    peer_len = alloc(dll_emu, struct.pack("<I", 16))
+    client, _ = call(dll_emu, "ws2_32", "accept", [s, peer, peer_len])
+    assert client
+    data = dll_emu.mem_read(peer, 8)
+    assert struct.unpack("<H", data[:2])[0] == 2
+    assert struct.unpack(">H", data[2:4])[0] == 4444
+    assert data[4:8] == bytes([10, 1, 2, 3])
+
+
+@pytest.mark.parametrize("emu_fixture, ptr_size", [("dll_emu", 4), ("dll64_emu", 8)])
+def test_dns_query_a_record(request: pytest.FixtureRequest, emu_fixture: str, ptr_size: int) -> None:
+    se: Speakeasy = request.getfixturevalue(emu_fixture)
+    name = alloc(se, b"google.com\x00")
+    results = alloc(se, b"\x00" * 8)
+    rv, _ = call(se, "dnsapi", "DnsQuery_A", [name, 1, 0, 0, results, 0])
+    assert rv == 0
+    rec = _read_ptr(se, results)
+    assert _read_ptr(se, rec) == 0
+    assert struct.unpack("<HH", se.mem_read(rec + 2 * ptr_size, 4)) == (1, 4)
+    assert se.mem_read(rec + 2 * ptr_size + 16, 4) == bytes([8, 8, 8, 8])
+
+
+@pytest.mark.parametrize(
+    "name, args, rv",
+    [
+        ("bind", [0, 16], 0xFFFFFFFF),
+        ("connect", [0, 16], 0xFFFFFFFF),
+        ("accept", [0, 0], 0xFFFFFFFF),
+        ("recv", [0, 4, 0], 0xFFFFFFFF),
+        ("send", [0, 4, 0], 0xFFFFFFFF),
+        ("closesocket", [], 0xFFFFFFFF),
+        ("ioctlsocket", [0x4004667F, 0], 0xFFFFFFFF),
+    ],
+)
+def test_socket_calls_reject_an_unknown_socket(dll_emu: Speakeasy, name: str, args: list[int], rv: int) -> None:
+    start_process(dll_emu)
+    buf = alloc(dll_emu, b"\x00" * 16)
+    argv = [0x999] + [buf if a == 0 and i == 0 else a for i, a in enumerate(args)]
+    assert call(dll_emu, "ws2_32", name, argv)[0] == rv
+    assert dll_emu.emu.get_last_error() == 10038
+
+
+def test_gethostname_fills_an_exact_buffer(dll_emu: Speakeasy) -> None:
+    host = dll_emu.emu.config.system.hostname.encode()
+    buf = alloc(dll_emu, b"\xcc" * 64)
+    assert call(dll_emu, "ws2_32", "gethostname", [buf, len(host) + 1])[0] == 0
+    assert dll_emu.mem_read(buf, len(host) + 2) == host + b"\x00\xcc"
+
+
+def test_wsa_get_last_error_returns_the_socket_error(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    name = alloc(dll_emu, struct.pack("<HH4s8x", 2, 0x5000, bytes([127, 0, 0, 1])))
+    assert call(dll_emu, "ws2_32", "connect", [0x1234, name, 16])[0] == 0xFFFFFFFF
+    assert call(dll_emu, "ws2_32", "WSAGetLastError", [])[0] == 10038
+    call(dll_emu, "ws2_32", "WSASetLastError", [10060])
+    assert call(dll_emu, "ws2_32", "WSAGetLastError", [])[0] == 10060
+
+
+def fd_set(se: Speakeasy, *socks: int) -> int:
+    return alloc(se, struct.pack(f"<I{len(socks)}I", len(socks), *socks))
+
+
+def test_wsa_fd_is_set_checks_the_set(dll_emu: Speakeasy) -> None:
+    fds = fd_set(dll_emu, 0x40, 0x44)
+    assert call(dll_emu, "ws2_32", "__WSAFDIsSet", [0x44, fds])[0] == 1
+    assert call(dll_emu, "ws2_32", "__WSAFDIsSet", [0x48, fds])[0] == 0
+    assert call(dll_emu, "ws2_32", "__WSAFDIsSet", [0x44, fd_set(dll_emu)])[0] == 0
+
+
+def test_select_reports_readable_and_writable_sockets_without_errors(dll_emu: Speakeasy) -> None:
+    readfds, writefds, exceptfds = fd_set(dll_emu, 0x44), fd_set(dll_emu, 0x44), fd_set(dll_emu, 0x44)
+    rv, _ = call(dll_emu, "ws2_32", "select", [0, readfds, writefds, exceptfds, 0])
+    assert rv == 2
+    assert call(dll_emu, "ws2_32", "__WSAFDIsSet", [0x44, writefds])[0] == 1
+    assert call(dll_emu, "ws2_32", "__WSAFDIsSet", [0x44, exceptfds])[0] == 0
+
+
+def test_getpeername_returns_the_connected_address(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    s, _ = call(dll_emu, "ws2_32", "socket", [2, 1, 6])
+    name = alloc(dll_emu, b"\xcc" * 16)
+    name_len = alloc(dll_emu, struct.pack("<I", 16))
+    assert call(dll_emu, "ws2_32", "getpeername", [s, name, name_len])[0] == 0xFFFFFFFF
+    assert call(dll_emu, "ws2_32", "WSAGetLastError", [])[0] == 10057
+
+    peer = alloc(dll_emu, struct.pack("<H", 2) + struct.pack(">H", 8080) + bytes([10, 1, 2, 3]) + b"\x00" * 8)
+    assert call(dll_emu, "ws2_32", "connect", [s, peer, 16])[0] == 0
+    assert call(dll_emu, "ws2_32", "getpeername", [s, name, name_len])[0] == 0
+    assert dll_emu.mem_read(name, 8) == dll_emu.mem_read(peer, 8)
+
+
+def test_getsockname_returns_the_adapter_address(dll_emu: Speakeasy) -> None:
+    start_process(dll_emu)
+    s, _ = call(dll_emu, "ws2_32", "socket", [2, 1, 6])
+    name = alloc(dll_emu, b"\xcc" * 16)
+    name_len = alloc(dll_emu, struct.pack("<I", 8))
+    assert call(dll_emu, "ws2_32", "getsockname", [s, name, name_len])[0] == 0xFFFFFFFF
+    assert call(dll_emu, "ws2_32", "WSAGetLastError", [])[0] == 10014
+
+    dll_emu.mem_write(name_len, struct.pack("<I", 16))
+    assert call(dll_emu, "ws2_32", "getsockname", [s, name, name_len])[0] == 0
+    family, port, addr = struct.unpack("<H2s4s", dll_emu.mem_read(name, 8))
+    assert (family, addr) == (2, bytes([127, 0, 0, 1]))
+    assert struct.unpack(">H", port)[0] >= 49152
+    assert struct.unpack("<I", dll_emu.mem_read(name_len, 4))[0] == 16
+
+
+ERROR_INTERNET_UNRECOGNIZED_SCHEME = 12006
+
+
+@pytest.mark.parametrize("url", [b"manda.php?id=1", b"file:///c:/a.txt", b"/gate.php"])
+def test_internet_open_url_rejects_a_url_without_a_known_scheme(dll_emu: Speakeasy, url: bytes) -> None:
+    start_process(dll_emu)
+    inet, _ = call(dll_emu, "wininet", "InternetOpenA", [0, 0, 0, 0, 0])
+    rv, _ = call(dll_emu, "wininet", "InternetOpenUrlA", [inet, alloc(dll_emu, url + b"\x00"), 0, 0, 0, 0])
+    assert rv == 0
+    assert dll_emu.emu.get_last_error() == ERROR_INTERNET_UNRECOGNIZED_SCHEME
+    assert not [e for e in dll_emu.emu.get_current_run().events if e.event == "net_http"]
+
+
+@pytest.mark.parametrize(
+    "url, server, port, proto",
+    [
+        (b"http://example.com/a", "example.com", 80, NetHttpProtocol.HTTP),
+        (b"https://example.com/a", "example.com", 443, NetHttpProtocol.HTTPS),
+        (b"HTTPS://example.com/a", "example.com", 443, NetHttpProtocol.HTTPS),
+        (b"http://example.com:8080/a", "example.com", 8080, NetHttpProtocol.HTTP),
+        (b"https://user:pw@example.com:8443/a", "example.com", 8443, NetHttpProtocol.HTTPS),
+    ],
+)
+def test_internet_open_url_records_the_host_port_and_protocol(
+    dll_emu: Speakeasy, url: bytes, server: str, port: int, proto: NetHttpProtocol
+) -> None:
+    inet, _ = call(dll_emu, "wininet", "InternetOpenA", [0, 0, 0, 0, 0])
+    assert call(dll_emu, "wininet", "InternetOpenUrlA", [inet, alloc(dll_emu, url + b"\x00"), 0, 0, 0, 0])[0]
+    events = [e for e in dll_emu.emu.get_current_run().events if e.event == "net_http"]
+    assert [(e.server, e.port, e.proto) for e in events] == [(server, port, proto)]
+
+
+@pytest.mark.parametrize(
+    "emu_fixture, name, arg, rv",
+    [
+        ("dll_emu", "htons", 0xDEAD0050, 0x5000),
+        ("dll_emu", "ntohs", 0xDEAD5000, 0x0050),
+        ("dll64_emu", "htonl", 0xFFFFFFFF12345678, 0x78563412),
+        ("dll64_emu", "ntohl", 0xFFFFFFFF78563412, 0x12345678),
+    ],
+)
+def test_byte_order_ignores_the_bits_above_the_parameter(
+    request: pytest.FixtureRequest, emu_fixture: str, name: str, arg: int, rv: int
+) -> None:
+    se: Speakeasy = request.getfixturevalue(emu_fixture)
+    assert call(se, "ws2_32", name, [arg])[0] == rv

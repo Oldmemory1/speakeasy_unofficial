@@ -1,12 +1,42 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import base64
+import hashlib
+import hmac
+import struct
+from typing import TYPE_CHECKING
+
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+
+import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy.winenv.codepage import decode_ansi
 
 from .. import api
 
-ERROR_MORE_DATA = 234
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
+
 
 CRYPT_STRING_BASE64 = 1
+BASE64_ALPHABET = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+DPAPI_VERSION = 1
+DPAPI_PROVIDER = bytes.fromhex("d08c9ddf0115d1118c7a00c04fc297eb")
+DPAPI_MASTER_KEY = bytes.fromhex("5c7b0e3a9d6f4e21b3a8c4d2e1f09a77")
+DPAPI_KEY = hashlib.sha256(b"speakeasy dpapi master key").digest()
+DPAPI_HEADER = struct.Struct("<I16sI16sII")
+
+
+def decode_base64(s):
+    """
+    Decode base64 like crypt32: whitespace is skipped and any other character outside the alphabet is an error.
+    """
+    chars = "".join(c for c in s if c not in " \t\r\n")
+    data = chars.rstrip("=")
+    if len(chars) - len(data) > 2 or len(data) % 4 == 1 or not BASE64_ALPHABET.issuperset(data):
+        raise ValueError("invalid base64 string")
+    return base64.b64decode(data + "=" * (-len(data) % 4))
 
 
 class Crypt32(api.ApiHandler):
@@ -27,58 +57,153 @@ class Crypt32(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("CryptStringToBinary", argc=7)
-    def CryptStringToBinary(self, emu, argv, ctx: api.ApiContext = None):
+    def CryptStringToBinary(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        BOOL CryptStringToBinaryA(
-        LPCSTR pszString,
-        DWORD  cchString,
-        DWORD  dwFlags,
-        BYTE   *pbBinary,
-        DWORD  *pcbBinary,
-        DWORD  *pdwSkip,
-        DWORD  *pdwFlags
+        BOOL CryptStringToBinary(
+            LPCTSTR pszString,
+            DWORD cchString,
+            DWORD dwFlags,
+            BYTE *pbBinary,
+            DWORD *pcbBinary,
+            DWORD *pdwSkip,
+            DWORD *pdwFlags
         );
         """
-        ctx = ctx or {}
-
         cw = self.get_char_width(ctx)
 
         pszString, cchString, dwFlags, pbBinary, pcbBinary, pdwSkip, pdwFlags = argv
 
-        if cchString:
-            s = self.mem_read(pszString, cchString * cw)
-        else:
-            s = self.read_mem_string(pszString, cw)
+        if not cchString:
+            cchString = self.mem_string_len(pszString, cw)
+        raw = self.mem_read(pszString, cchString * cw)
+        s = raw.decode("utf-16le", "surrogatepass") if cw == 2 else decode_ansi(raw)
+        s = s.partition("\x00")[0]
 
         if dwFlags != CRYPT_STRING_BASE64:
             # self.logger.info("%s: currently unsupported flags (%08X)" % (api_name, dwFlags))
             return 1
 
-        if not isinstance(s, str):
-            s = s.decode("utf8")
-
-        argv[0] = s
+        ctx.args["pszString"].display = s
 
         try:
-            decoded = base64.b64decode(s)
-        except Exception:
+            decoded = decode_base64(s)
+        except ValueError:
+            emu.set_last_error(windefs.ERROR_INVALID_DATA)
             return 0
 
-        cbBinary = int.from_bytes(self.mem_read(pcbBinary, 4), "little")
+        cbBinary = self.read_dword(pcbBinary)
         out_len = len(decoded)
 
         if pbBinary == 0:
-            self.mem_write(pcbBinary, out_len.to_bytes(4, "little"))
-            return out_len
+            self.write_dword(pcbBinary, out_len)
+            return 1
 
         if out_len > cbBinary:
-            emu.set_last_error(ERROR_MORE_DATA)
+            emu.set_last_error(windefs.ERROR_MORE_DATA)
             return 0
 
         self.mem_write(pbBinary, decoded)
-        self.mem_write(pcbBinary, out_len.to_bytes(4, "little"))
+        self.write_dword(pcbBinary, out_len)
 
         if pdwSkip:
             self.mem_write(pdwSkip, b"\x00" * 4)
 
+        return 1
+
+    def read_data_blob(self, addr):
+        ptr_size = self.get_ptr_size()
+        size = self.read_dword(addr)
+        data = self.read_ptr(addr + ptr_size)
+        return self.mem_read(data, size) if size else b""
+
+    def write_data_blob(self, addr, data):
+        ptr_size = self.get_ptr_size()
+        buf = self.heap_alloc(max(len(data), 1), heap="LocalAlloc")
+        self.mem_write(buf, data)
+        self.write_dword(addr, len(data))
+        self.write_ptr(addr + ptr_size, buf)
+
+    def get_dpapi_keys(self, pOptionalEntropy):
+        entropy = self.read_data_blob(pOptionalEntropy) if pOptionalEntropy else b""
+        key = hashlib.sha256(DPAPI_KEY + entropy).digest()
+        return key[:16], key[16:]
+
+    @apihook("CryptProtectData", argc=7)
+    def CryptProtectData(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CryptProtectData(
+            DATA_BLOB *pDataIn,
+            LPCWSTR szDataDescr,
+            DATA_BLOB *pOptionalEntropy,
+            PVOID pvReserved,
+            CRYPTPROTECT_PROMPTSTRUCT *pPromptStruct,
+            DWORD dwFlags,
+            DATA_BLOB *pDataOut
+        );
+        """
+        pDataIn, szDataDescr, pOptionalEntropy, pvReserved, pPromptStruct, dwFlags, pDataOut = argv
+
+        if not pDataIn or not pDataOut:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        data = self.read_data_blob(pDataIn)
+        descr = self.read_mem_string(szDataDescr, 2) if szDataDescr else ""
+        descr_bytes = (descr + "\x00").encode("utf-16le")
+        enc_key, mac_key = self.get_dpapi_keys(pOptionalEntropy)
+        cipher = AES.new(enc_key, AES.MODE_CBC, iv=b"\x00" * 16).encrypt(pad(data, 16))
+        blob = DPAPI_HEADER.pack(
+            DPAPI_VERSION, DPAPI_PROVIDER, 1, DPAPI_MASTER_KEY, dwFlags & 0xFFFFFFFF, len(descr_bytes)
+        )
+        blob += descr_bytes + struct.pack("<I", len(cipher)) + cipher
+        sign = hmac.new(mac_key, blob, hashlib.sha256).digest()
+        self.write_data_blob(pDataOut, blob + struct.pack("<I", len(sign)) + sign)
+        emu.set_last_error(windefs.ERROR_SUCCESS)
+        return 1
+
+    @apihook("CryptUnprotectData", argc=7)
+    def CryptUnprotectData(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL CryptUnprotectData(
+            DATA_BLOB *pDataIn,
+            LPWSTR *ppszDataDescr,
+            DATA_BLOB *pOptionalEntropy,
+            PVOID pvReserved,
+            CRYPTPROTECT_PROMPTSTRUCT *pPromptStruct,
+            DWORD dwFlags,
+            DATA_BLOB *pDataOut
+        );
+        """
+        pDataIn, ppszDataDescr, pOptionalEntropy, pvReserved, pPromptStruct, dwFlags, pDataOut = argv
+
+        if not pDataIn or not pDataOut:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        blob = self.read_data_blob(pDataIn)
+        enc_key, mac_key = self.get_dpapi_keys(pOptionalEntropy)
+        try:
+            version, provider, _, _, _, descr_len = DPAPI_HEADER.unpack_from(blob)
+            if (version, provider) != (DPAPI_VERSION, DPAPI_PROVIDER):
+                raise ValueError("not a DPAPI blob")
+            off = DPAPI_HEADER.size + descr_len
+            (cipher_len,) = struct.unpack_from("<I", blob, off)
+            off += 4 + cipher_len
+            (sign_len,) = struct.unpack_from("<I", blob, off)
+            sign = hmac.new(mac_key, blob[:off], hashlib.sha256).digest()
+            if blob[off + 4 :] != sign or sign_len != len(sign):
+                raise ValueError("bad DPAPI signature")
+            cipher = blob[off - cipher_len : off]
+            data = unpad(AES.new(enc_key, AES.MODE_CBC, iv=b"\x00" * 16).decrypt(cipher), 16)
+        except (ValueError, struct.error):
+            emu.set_last_error(windefs.ERROR_INVALID_DATA)
+            return 0
+
+        self.write_data_blob(pDataOut, data)
+        if ppszDataDescr:
+            descr = blob[DPAPI_HEADER.size : DPAPI_HEADER.size + descr_len]
+            buf = self.heap_alloc(max(len(descr), 2), heap="LocalAlloc")
+            self.mem_write(buf, descr)
+            self.write_ptr(ppszDataDescr, buf)
+        emu.set_last_error(windefs.ERROR_SUCCESS)
         return 1

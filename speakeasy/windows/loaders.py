@@ -1,14 +1,64 @@
+"""Load guest PE and shellcode images and describe their addresses.
+
+The module follows the upstream v2.1.0 loader model: a loader returns an image
+at its preferred base with RVA addresses, and :func:`relocate_image` produces a
+copy at a chosen base with absolute addresses.  The local FX-001/FX-013
+extensions are layered on top of that model:
+
+* ``LoadedImage.dep_policy`` / ``RuntimeModule.get_dep_policy`` expose the
+  parsed NXCOMPAT policy while :func:`is_dep_enabled` keeps the upstream OptIn
+  model for the general DEP state.
+* ``LoadedImage.tls_directory`` keeps the parsed ``IMAGE_TLS_DIRECTORY`` used by
+  the local TLS manager; ``tls_directory_rva``/``tls_directory_va`` carry the
+  upstream RVA and the local absolute preferred-base address.
+* ``LoadedImage.loader`` / ``default_export_mode`` and
+  ``ExportEntry.execution_mode`` keep the local module/decoy construction
+  contracts (``system_modules`` and ``child_execution``).
+"""
+
 from __future__ import annotations
 
+import logging
 import ntpath
 import os
-from dataclasses import dataclass, field
+import struct
+from bisect import bisect_right
+from dataclasses import dataclass, field, replace
+from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Protocol
 
-import speakeasy.common as common
+import pefile
+
 import speakeasy.winenv.arch as _arch
+from speakeasy import common
+from speakeasy.windows.common import ImageSectionCharacteristics, _PeParser
 from speakeasy.windows.dep_policy import ImageDepPolicy, policy_from_dll_characteristics
 from speakeasy.windows.tls import TlsDirectory
+
+logger = logging.getLogger(__name__)
+
+
+def validate_forwarder(value: str) -> None:
+    """
+    Check that ``value`` is a forwarder string in ``DLL.name`` or ``DLL.#ordinal`` form. Do not resolve the target.
+
+    Raises:
+        ValueError: if ``value`` is not a valid forwarder string.
+    """
+    if not value or "\0" in value:
+        raise ValueError("Invalid forwarder")
+    if not value.isascii():
+        raise ValueError("Non-ASCII forwarder")
+    dll, separator, symbol = value.rpartition(".")
+    if not separator or not dll or not symbol or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError("Invalid forwarder target")
+    if any(c in dll for c in "\\/:") or dll.startswith(".") or dll.endswith("."):
+        raise ValueError("Invalid forwarder module")
+    if symbol.startswith("#"):
+        digits = symbol[1:]
+        if not digits.isascii() or not digits.isdecimal() or not 0 < int(digits) <= 0xFFFF:
+            raise ValueError("Invalid forwarder ordinal")
 
 
 @dataclass
@@ -28,7 +78,9 @@ class PeMetadata:
     machine: int
     magic: int
     resources: list[ResourceEntry] = field(default_factory=list)
-    string_table: dict[int, str] = field(default_factory=dict)  # For LoadString
+    dll_characteristics: int = 0
+    #: RT_STRING table (absolute string ID -> text) for user32.LoadString.
+    string_table: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -48,8 +100,6 @@ class SectionEntry:
 
 
 def perms_from_section_chars(chars: int) -> int:
-    from speakeasy.windows.common import ImageSectionCharacteristics
-
     perms = common.PERM_MEM_NONE
     if chars & ImageSectionCharacteristics.IMAGE_SCN_MEM_READ:
         perms |= common.PERM_MEM_READ
@@ -57,7 +107,7 @@ def perms_from_section_chars(chars: int) -> int:
         perms |= common.PERM_MEM_WRITE
     if chars & ImageSectionCharacteristics.IMAGE_SCN_MEM_EXECUTE:
         perms |= common.PERM_MEM_EXEC
-    return perms
+    return int(perms)
 
 
 def get_prot_string(perms: int) -> str:
@@ -72,6 +122,7 @@ class ImportEntry:
     iat_address: int
     dll_name: str
     func_name: str
+    source: str = "static"
 
 
 @dataclass
@@ -79,11 +130,50 @@ class ExportEntry:
     name: str | None
     address: int
     ordinal: int
-    execution_mode: str
+    kind: str = "function"
+    forwarder: str | None = None
+    #: Local dispatch mode for handler/decoy exports (``"intercepted"``).
+    execution_mode: str = "intercepted"
+
+
+IMAGE_REL_BASED_ABSOLUTE = 0
+IMAGE_REL_BASED_HIGHLOW = 3
+IMAGE_REL_BASED_DIR64 = 10
+
+
+@dataclass(frozen=True)
+class BaseRelocation:
+    """An entry of the base relocation table of a PE. The loader adds the base delta to the value at ``rva``."""
+
+    rva: int
+    type: int
+
+
+class Loader(Protocol):
+    def make_image(self) -> LoadedImage: ...
 
 
 @dataclass
 class LoadedImage:
+    """
+    An image and its addresses.
+
+    A loader returns the image at its preferred base, ``image_base``. The addresses are RVAs:
+    the bases of the regions, the IAT slots, the exports, the entry points, the TLS callbacks
+    and the TLS and resource directories. ``relocate_image`` returns a copy at a base, with
+    absolute addresses. ``relocations`` is None if the image can load only at its preferred base.
+
+    Local extension fields (kept for the FX-001/FX-013 and child-execution contracts):
+
+    * ``tls_directory`` is the parsed ``IMAGE_TLS_DIRECTORY`` whose address fields
+      are absolute VAs at the preferred base. ``tls_directory_rva`` is the
+      directory RVA (upstream form) and ``tls_directory_va`` is the local
+      absolute preferred-base address.
+    * ``default_export_mode``, ``loader`` and ``dep_policy`` carry local dispatch,
+      provenance and NXCOMPAT-policy metadata. ``source`` keeps the upstream
+      synthetic/guest marking used by ``win32``.
+    """
+
     arch: int
     module_type: str
     name: str
@@ -93,46 +183,164 @@ class LoadedImage:
     regions: list[MemoryRegion]
     imports: list[ImportEntry]
     exports: list[ExportEntry]
-    default_export_mode: str
     entry_points: list[int]
     visible_in_peb: bool = True
     stack_size: int = 0x12000
     tls_callbacks: list[int] = field(default_factory=list)
-    tls_directory_va: int | None = None
     tls_directory: TlsDirectory | None = None
-    loader: Loader | None = None
+    tls_directory_rva: int | None = None
+    tls_directory_va: int | None = None
+    resource_directory: tuple[int, int] | None = None
     sections: list[SectionEntry] = field(default_factory=list)
     pe_metadata: PeMetadata | None = None
+    source: str = "guest_pe"
+    relocations: list[BaseRelocation] | None = None
+    problems: list[str] = field(default_factory=list)
+    #: Local dispatch mode for handler/decoy exports (``"intercepted"``).
+    default_export_mode: str = "intercepted"
+    #: The loader that produced this image, for local loader-identity checks.
+    loader: Loader | None = None
     #: DEP/NXCOMPAT policy from the PE Optional Header; None for non-PE
     #: loaders (shellcode, synthesized API modules, decoys).  ``None`` means
     #: "unknown" and keeps the emulator's DEP-enabled behaviour.
     dep_policy: ImageDepPolicy | None = None
 
 
-class Loader(Protocol):
-    def make_image(self) -> LoadedImage: ...
+IMAGE_DLLCHARACTERISTICS_NX_COMPAT = 0x0100
+
+
+def is_dep_enabled(image: LoadedImage) -> bool:
+    """
+    Get whether a process for ``image`` runs with Data Execution Prevention (DEP).
+
+    The emulator models the OptIn system policy, the default of client versions of Windows: a 32-bit process runs
+    with DEP only if its image has ``IMAGE_DLLCHARACTERISTICS_NX_COMPAT`` (the ``/NXCOMPAT`` linker option). A
+    64-bit process always runs with DEP.
+
+    References:
+        https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getsystemdeppolicy
+        https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#dll-characteristics
+    """
+    if image.arch != _arch.ARCH_X86 or image.pe_metadata is None:
+        return True
+    return bool(image.pe_metadata.dll_characteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT)
+
+
+def _write_image_base(image: LoadedImage, data: bytearray, base: int) -> None:
+    """Write ``base`` in the ImageBase field of the PE header, in the data of the region at RVA 0."""
+    if image.pe_metadata is None or len(data) < 0x40:
+        return
+    size = 8 if image.pe_metadata.magic == 0x20B else 4
+    # The ImageBase field follows the signature, the file header and 24 or 28 bytes of the optional header.
+    offset = int.from_bytes(data[0x3C:0x40], "little") + 4 + 20 + (24 if size == 8 else 28)
+    if offset + size <= len(data):
+        data[offset : offset + size] = base.to_bytes(size, "little")
+
+
+def relocate_image(image: LoadedImage, base: int) -> LoadedImage:
+    """
+    Return a copy of the image at ``base``, with absolute addresses.
+
+    If ``base`` is not the preferred base, add the difference to the value at each base relocation
+    and write ``base`` in the ImageBase field of the PE header, as the Windows loader does.  The
+    local parsed TLS directory (``tls_directory``) and its absolute address (``tls_directory_va``)
+    are shifted with the image; ``tls_directory_rva`` stays relative.
+
+    Raises:
+        ValueError: if the image does not fit at ``base``, the image has no relocation data and
+            ``base`` is not its preferred base, or a base relocation is not valid.
+    """
+    if type(base) is not int or base < 0 or base + image.image_size > 1 << image.arch:
+        raise ValueError(f"Image does not fit in the address space at {base:#x}")
+    delta = base - image.image_base
+    if delta and image.relocations is None:
+        raise ValueError("Cannot rebase a guest PE without valid relocation data")
+    data = [bytearray(region.data) for region in image.regions]
+    if delta:
+        regions = sorted(range(len(image.regions)), key=lambda i: image.regions[i].base)
+        starts = [image.regions[i].base for i in regions]
+        for relocation in image.relocations or ():
+            if relocation.type == IMAGE_REL_BASED_ABSOLUTE:
+                continue
+            if relocation.type not in (IMAGE_REL_BASED_HIGHLOW, IMAGE_REL_BASED_DIR64):
+                raise ValueError(f"Unsupported base relocation type {relocation.type}")
+            size = 4 if relocation.type == IMAGE_REL_BASED_HIGHLOW else 8
+            position = bisect_right(starts, relocation.rva) - 1
+            if position < 0 or relocation.rva + size > image.image_size:
+                raise ValueError("Base relocation lies outside the image")
+            buffer = data[regions[position]]
+            offset = relocation.rva - starts[position]
+            # The part of the image after the data of the file is zeros.
+            buffer.extend(bytes(max(0, offset + size - len(buffer))))
+            value = int.from_bytes(buffer[offset : offset + size], "little") + delta
+            buffer[offset : offset + size] = (value & ((1 << (8 * size)) - 1)).to_bytes(size, "little")
+        if starts and starts[0] == 0:
+            _write_image_base(image, data[regions[0]], base)
+    resource_directory = image.resource_directory
+    if resource_directory is not None:
+        resource_directory = (base + resource_directory[0], resource_directory[1])
+    tls_directory = image.tls_directory
+    tls_directory_va = image.tls_directory_va
+    if delta:
+        if tls_directory is not None:
+            tls_directory = replace(
+                tls_directory,
+                start=tls_directory.start + delta if tls_directory.start else 0,
+                end=tls_directory.end + delta if tls_directory.end else 0,
+                index_va=tls_directory.index_va + delta if tls_directory.index_va else 0,
+                callbacks_va=tls_directory.callbacks_va + delta if tls_directory.callbacks_va else 0,
+            )
+        if tls_directory_va is not None:
+            tls_directory_va += delta
+    return replace(
+        image,
+        image_base=base,
+        regions=[
+            MemoryRegion(base + region.base, bytes(buffer), region.name, region.perms)
+            for region, buffer in zip(image.regions, data)
+        ],
+        imports=[replace(entry, iat_address=base + entry.iat_address) for entry in image.imports],
+        exports=[replace(entry, address=base + entry.address) for entry in image.exports],
+        entry_points=[base + rva for rva in image.entry_points],
+        tls_callbacks=[base + rva for rva in image.tls_callbacks],
+        tls_directory=tls_directory,
+        tls_directory_va=tls_directory_va,
+        resource_directory=resource_directory,
+    )
+
+
+class LoadState(Enum):
+    """The initialization state of a module in one process. The names follow LDR_DDAG_STATE in Windows."""
+
+    INITIALIZING = "initializing"
+    READY_TO_RUN = "ready_to_run"
+    INIT_ERROR = "init_error"
 
 
 class RuntimeModule:
     def __init__(self, image: LoadedImage) -> None:
-        self._image = image
-        self.base = image.image_base
-        self.image_size = image.image_size
-        self.ep = (image.entry_points[0] - image.image_base) if image.entry_points else 0
-        self.arch = image.arch
-        self.emu_path = image.emu_path
-        self.path = image.emu_path
-        self.module_type = image.module_type
-        self.stack_commit = image.stack_size
-        self.visible_in_peb = image.visible_in_peb
+        self.load_states: dict[int, LoadState] = {}
+        self._image: LoadedImage = image
+        self.base: int = image.image_base
+        self.image_size: int = image.image_size
+        self.ep: int = (image.entry_points[0] - image.image_base) if image.entry_points else 0
+        self.arch: int = image.arch
+        self.emu_path: str = image.emu_path
+        self.path: str = image.emu_path
+        self.module_type: str = image.module_type
+        self.stack_commit: int = image.stack_size
+        self.visible_in_peb: bool = image.visible_in_peb
+        self.name: str = image.name
+        self.sections: list[SectionEntry] = image.sections
+        # The bytes of a guest image after the load, only if memory.strings is on.
+        # get_mem_strings compares them with memory to find the strings that the guest writes in its image.
+        self.loaded_data: bytes | None = None
+        # Local loader/identity and NXCOMPAT-policy metadata (FX-001/FX-013).
         self.loader = image.loader
-        self.name = image.name
-        self.sections = image.sections
-        self.dep_policy = image.dep_policy
+        self.dep_policy: ImageDepPolicy | None = image.dep_policy
 
     def __repr__(self) -> str:
-        loader_type = type(self.loader).__name__ if self.loader is not None else "None"
-        return f"RuntimeModule({self._image.name!r} at {self.base:#x}, via {loader_type})"
+        return f"RuntimeModule({self._image.name!r} at {self.base:#x}, {self._image.source})"
 
     def is_exe(self) -> bool:
         return self._image.module_type == "exe"
@@ -150,7 +358,7 @@ class RuntimeModule:
         return ntpath.basename(self.emu_path)
 
     def get_ep(self) -> int:
-        return self.base + self.ep
+        return (self.base + self.ep) & ((1 << self.arch) - 1)
 
     def get_exports(self) -> list[ExportEntry]:
         return self._image.exports
@@ -176,6 +384,11 @@ class RuntimeModule:
 
         return self._image.tls_directory
 
+    def get_tls_directory_rva(self) -> int | None:
+        """Return the TLS directory RVA (upstream address form) for this image, if any."""
+
+        return self._image.tls_directory_rva
+
     def get_pe_metadata(self) -> PeMetadata | None:
         return self._image.pe_metadata
 
@@ -190,7 +403,99 @@ class RuntimeModule:
         return self._image.dep_policy
 
 
+DLL_PROCESS_ATTACH = 1
+
+
+@dataclass(frozen=True)
+class InitRoutine:
+    """A TLS callback or the DllMain of a module, to run in one process."""
+
+    module: RuntimeModule
+    address: int
+    is_entry_point: bool
+    is_last: bool
+    pid: int
+
+    @property
+    def args(self) -> tuple[int, int, int]:
+        return (self.module.base, DLL_PROCESS_ATTACH, 0)
+
+
+def _delay_import_directory(pe: Any) -> tuple[int, bytes, list[int]]:
+    """
+    Check the raw delay import descriptors, because pefile accepts malformed descriptors.
+
+    Return the RVA and the raw bytes of the directory, and the thunk count of each
+    descriptor. Old x86 descriptors hold VAs, and pefile changes their fields to RVAs.
+    The caller writes the raw bytes back, so that the mapped image has the original table.
+
+    Raises:
+        ValueError: if a descriptor or its tables are outside the image or not terminated,
+            or the attributes of a descriptor are not valid for the architecture.
+    """
+    if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 13:
+        return 0, b"", []
+    directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[13]
+    rva, size = directory.VirtualAddress, directory.Size
+    if not rva and not size:
+        return 0, b"", []
+    if not rva or size < 32 or rva + size > pe.image_size:
+        raise ValueError("Delay import directory lies outside the image or is truncated")
+    raw = pe.get_data(rva, size)
+    if len(raw) != size:
+        raise ValueError("Truncated delay import directory")
+    counts: list[int] = []
+    for offset in range(0, size - 31, 32):
+        fields = struct.unpack_from("<8I", raw, offset)
+        if not any(fields):
+            return rva, raw, counts
+        attrs, name, _handle, iat, names, _bound, _unload, _timestamp = fields
+        if attrs not in (0, 1) or (pe.arch == _arch.ARCH_AMD64 and attrs != 1):
+            raise ValueError("Invalid delay import attributes for PE architecture")
+        if not attrs:
+            name, iat, names = name - pe.base, iat - pe.base, names - pe.base
+        if not 0 < name < pe.image_size:
+            raise ValueError("Delay import DLL name lies outside the image")
+        if not 0 < iat <= pe.image_size - pe.arch // 8:
+            raise ValueError("Delay import IAT slot lies outside the image")
+        if not 0 < names <= pe.image_size - pe.arch // 8:
+            raise ValueError("Delay import name table lies outside the image")
+        width = pe.arch // 8
+        count = 0
+        while True:
+            slot = names + count * width
+            if slot > pe.image_size - width:
+                raise ValueError("Unterminated delay import name table")
+            if iat + count * width > pe.image_size - width:
+                raise ValueError("Delay import IAT slot lies outside the image")
+            thunk = pe.get_data(slot, width)
+            if len(thunk) != width:
+                raise ValueError("Truncated delay import name table")
+            if not int.from_bytes(thunk, "little"):
+                break
+            count += 1
+        counts.append(count)
+    raise ValueError("Unterminated delay import descriptor table")
+
+
 class PeLoader:
+    """
+    Load a guest PE.
+
+    The loader logs a warning and skips malformed import, export and TLS callback data.
+    It rejects a PE with an unsupported machine type, or with headers or sections that do not fit the image.
+
+    Local extensions:
+
+    * ``base_override`` materializes the image at an explicitly selected base
+      (the child-execution materializer contract) instead of relying on a later
+      relocation.
+    * ``PeMetadata.string_table`` keeps the RT_STRING entries used by
+      ``user32.LoadString``.
+    * The DEP policy and parsed TLS directory are attached to the image for the
+      local FX-001 paths.
+    """
+
     def __init__(
         self,
         *,
@@ -199,20 +504,195 @@ class PeLoader:
         base_override: int | None = None,
         emu_path: str = "",
     ) -> None:
-        self._path = path
-        self._data = data
-        self._base_override = base_override
-        self._emu_path = emu_path
-        self._pe_obj: Any = None
+        self._path: str | None = path
+        self._data: bytes | None = data
+        self._base_override: int | None = base_override
+        self._emu_path: str = emu_path
+
+    def _optional_error(self, context: str, error: Exception) -> None:
+        logger.warning("Skipping malformed PE %s: %s", context, error)
+
+    def _get_import_descriptor_problem(self, pe: Any, mapped_image: bytes | bytearray) -> str | None:
+        # The Windows loader reads the descriptors up to the first one without a Name or a
+        # FirstThunk, and fails the load at the first one that points outside the image.
+        rva = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1].VirtualAddress
+        if not rva:
+            return None
+        for index, offset in enumerate(range(rva, len(mapped_image) - 19, 20)):
+            name_table, _, _, name, iat = struct.unpack_from("<5I", mapped_image, offset)
+            if not name or not iat:
+                return None
+            for field_name, value in (("DLL name", name), ("import name table", name_table), ("IAT", iat)):
+                if value >= pe.image_size:
+                    return (
+                        f"{field_name} RVA {value:#x} of import descriptor {index} "
+                        f"is outside the image (size {pe.image_size:#x})"
+                    )
+        return None
+
+    def _get_image_problems(self, pe: Any, mapped_image: bytes | bytearray) -> list[str]:
+        problems = []
+        ep_rva = pe.OPTIONAL_HEADER.AddressOfEntryPoint
+        if ep_rva >= pe.image_size:
+            problems.append(f"entry point RVA {ep_rva:#x} is outside the image (size {pe.image_size:#x})")
+        # The loader maps raw data only up to VirtualSize, and files often end
+        # inside the FileAlignment padding of the last section.
+        alignment = pe.OPTIONAL_HEADER.FileAlignment or 1
+        file_end = -(-pe.file_size // alignment) * alignment
+        truncated = [
+            sect.Name.partition(b"\x00")[0].decode("utf-8", errors="replace")
+            for sect in pe.sections
+            if sect.SizeOfRawData
+            and sect.PointerToRawData + min(sect.SizeOfRawData, sect.Misc_VirtualSize or sect.SizeOfRawData) > file_end
+        ]
+        if truncated:
+            names = ", ".join(truncated)
+            problems.append(f"section raw data is past the end of the file (size {pe.file_size:#x}): {names}")
+        if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) > 1:
+            import_rva = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1].VirtualAddress
+            if import_rva >= pe.image_size:
+                problems.append(f"import directory RVA {import_rva:#x} is outside the image (size {pe.image_size:#x})")
+            elif problem := self._get_import_descriptor_problem(pe, mapped_image):
+                problems.append(problem)
+        for problem in problems:
+            logger.warning("Invalid PE image: %s", problem)
+        return problems
+
+    def _import_dll_name(self, pe: Any, entry: Any, source: str) -> str:
+        # pefile replaces a non-ASCII name with *invalid*. Read the raw string, so that
+        # the Latin-1 decode keeps all bytes of the name.
+        rva = entry.struct.Name if source == "static" else entry.struct.szName
+        if not 0 < rva < pe.image_size:
+            raise ValueError("Import DLL name lies outside the image")
+        try:
+            raw: bytes = pe.get_data(rva, min(pefile.MAX_DLL_LENGTH, pe.image_size - rva))
+        except pefile.PEFormatError as error:
+            raise ValueError("Unreadable imported DLL name") from error
+        terminator = raw.find(b"\0")
+        if terminator < 0:
+            raise ValueError("Unterminated imported DLL name")
+        raw = raw[:terminator]
+        # Apply the file name rules of pefile, but accept bytes above 0x7F. The Latin-1
+        # decode below keeps them.
+        ascii_name = bytes(c if c < 128 else ord("x") for c in raw)
+        if not raw or not pefile.is_valid_dos_filename(ascii_name):
+            raise ValueError("Invalid imported DLL name")
+        try:
+            dll = raw.decode("ascii")
+        except UnicodeDecodeError:
+            dll = raw.decode("latin-1")
+            logger.warning("Non-ASCII imported DLL name decoded as Latin-1: %r", dll)
+        dll = ntpath.splitext(dll)[0]
+        if not dll:
+            raise ValueError("Invalid imported DLL name")
+        return dll
+
+    def _static_import_slots(self, pe: Any, entry: Any, parsed: Any, budget: list[int]):
+        """
+        Yield the IAT slot RVA and the symbol of each import of a static descriptor.
+
+        Read the thunk table directly, so that each import keeps its slot when pefile drops a malformed name.
+        """
+        width = pe.arch // 8
+        table_rva = entry.struct.OriginalFirstThunk or entry.struct.FirstThunk
+        if table_rva != entry.struct.FirstThunk:
+            # pefile reads the IAT if the ILT is empty or cannot be read. If the thunk_rva of a
+            # pefile symbol is its IAT slot, read the IAT too. Check the slot offset first.
+            for symbol in parsed:
+                address = getattr(symbol, "address", None)
+                thunk_rva = getattr(symbol, "thunk_rva", None)
+                if address is None or thunk_rva is None:
+                    continue
+                offset = address - pe.base - entry.struct.FirstThunk
+                if (
+                    offset >= 0
+                    and offset % width == 0
+                    and 0 < entry.struct.FirstThunk <= pe.image_size - width - offset
+                    and thunk_rva == entry.struct.FirstThunk + offset
+                ):
+                    table_rva = entry.struct.FirstThunk
+                    break
+        symbols = {symbol.thunk_rva: symbol for symbol in parsed if getattr(symbol, "thunk_rva", None) is not None}
+        index = 0
+        while True:
+            thunk_rva = table_rva + index * width
+            try:
+                if not table_rva or not 0 <= thunk_rva <= pe.image_size - width:
+                    raise ValueError("Import name table lies outside the image")
+                raw = pe.get_data(thunk_rva, width)
+                if len(raw) != width:
+                    raise ValueError("Truncated import name table")
+                value = int.from_bytes(raw, "little")
+            except (ValueError, pefile.PEFormatError) as error:
+                self._optional_error("static import name table", error)
+                return
+            if not value:
+                return
+            # When the limit is reached, a NUL thunk still ends the table, but the next
+            # nonzero thunk stops the read.
+            if not budget[0]:
+                self._optional_error("static import name table", ValueError("Import symbol limit exceeded"))
+                return
+            budget[0] -= 1
+            slot_rva = entry.struct.FirstThunk + index * width
+            index += 1
+            ordinal_flag = 1 << (pe.arch - 1)
+            ordinal = bool(value & ordinal_flag)
+            if ordinal and value & ~(ordinal_flag | 0xFFFF):
+                self._optional_error("static import entry", ValueError("Invalid ordinal import reserved bits"))
+                continue
+            symbol = symbols.get(thunk_rva)
+            if symbol is None:
+                # pefile dropped this symbol. Read its ordinal or name from the thunk.
+                name = None
+                if not ordinal:
+                    try:
+                        if not 0 < value <= pe.image_size - 3:
+                            raise ValueError("Import function name lies outside the image")
+                        raw = pe.get_data(value + 2, min(pefile.MAX_IMPORT_NAME_LENGTH, pe.image_size - value - 2))
+                        terminator = raw.find(b"\0")
+                        if terminator < 0:
+                            raise ValueError("Unterminated imported function name")
+                        name = raw[:terminator]
+                    except (ValueError, pefile.PEFormatError) as error:
+                        self._optional_error("static import entry", error)
+                        continue
+                symbol = SimpleNamespace(import_by_ordinal=ordinal, ordinal=value & 0xFFFF, name=name)
+            yield slot_rva, symbol
 
     def make_image(self) -> LoadedImage:
-        from speakeasy.windows.common import _PeParser
+        class InventoryParser(_PeParser):
+            # PeLoader reads the imports from the pefile entries. The _PeParser
+            # version decodes names as UTF-8 and fails on other bytes.
+            def _get_pe_imports(self):
+                return {}
 
-        pe = _PeParser(path=self._path, data=self._data, imp_id=0xFEEDF00C, imp_step=4)
-        self._pe_obj = pe
+        pe = InventoryParser(path=self._path, data=self._data)
+        supported = {(0x14C, 0x10B): _arch.ARCH_X86, (0x8664, 0x20B): _arch.ARCH_AMD64}
+        if (pe.FILE_HEADER.Machine, pe.OPTIONAL_HEADER.Magic) not in supported:
+            raise ValueError("Unsupported or inconsistent PE machine and optional-header magic")
 
         if self._base_override is not None and self._base_override != pe.base:
             pe.rebase(self._base_override)
+
+        if pe.base + pe.image_size > 1 << pe.arch:
+            raise ValueError("PE exceeds architecture address space")
+        if pe.OPTIONAL_HEADER.SizeOfHeaders > pe.image_size:
+            raise ValueError("PE headers extend beyond the image")
+        for section in pe.sections:
+            # Check only the virtual size. In malware, the FileAlignment padding of the
+            # raw data can go past SizeOfImage.
+            if section.Misc_VirtualSize and section.VirtualAddress + section.Misc_VirtualSize > pe.image_size:
+                raise ValueError("PE section extends beyond the image")
+
+        relocations = None
+        if getattr(pe, "DIRECTORY_ENTRY_BASERELOC", None):
+            relocations = [
+                BaseRelocation(entry.rva, entry.type)
+                for block in pe.DIRECTORY_ENTRY_BASERELOC
+                for entry in block.entries
+                if entry.type != IMAGE_REL_BASED_ABSOLUTE
+            ]
 
         module_type = "exe"
         if pe.is_driver():
@@ -221,77 +701,200 @@ class PeLoader:
             module_type = "dll"
 
         base = pe.base
-        mapped_image = pe.get_memory_mapped_image(max_virtual_address=0xF0000000)
+        parsed_delay = getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", ())
+        delay_rva, delay_raw = 0, b""
+        try:
+            delay_rva, delay_raw, delay_counts = _delay_import_directory(pe)
+            if delay_counts != [len(entry.imports) for entry in parsed_delay]:
+                raise ValueError("Delay import descriptors could not be parsed completely")
+        except (ValueError, pefile.PEFormatError) as error:
+            self._optional_error("delay import directory", error)
+            parsed_delay = ()
+            # Write back the raw descriptors also when they are not valid, because pefile
+            # can change old VA fields to RVAs.
+            directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[13]
+            delay_rva, size = directory.VirtualAddress, directory.Size
+            delay_raw = b""
+            if delay_rva > 0 and delay_rva + size <= pe.image_size:
+                try:
+                    raw = pe.get_data(delay_rva, size)
+                except pefile.PEFormatError:
+                    raw = b""
+                if len(raw) == size:
+                    delay_raw = raw
+        mapped_image: bytes | bytearray = pe.get_mapped_image()[: pe.image_size]
+        if delay_raw:
+            mapped_image = bytearray(mapped_image)
+            mapped_image[delay_rva : delay_rva + len(delay_raw)] = delay_raw
 
         imports: list[ImportEntry] = []
-        if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
-            for entry in pe.DIRECTORY_ENTRY_IMPORT:
-                dll = entry.dll.decode("utf-8")
-                dll = os.path.splitext(dll)[0]
-                for imp in entry.imports:
-                    if imp.import_by_ordinal:
-                        func_name = f"ordinal_{imp.ordinal}"
-                    else:
-                        func_name = imp.name.decode("utf-8")
-                    imports.append(
-                        ImportEntry(
-                            iat_address=imp.address,
-                            dll_name=dll,
-                            func_name=func_name,
+        ptr_size = pe.arch // 8
+        # The loader binds delay imports at load time, with the same import list as static
+        # imports. pefile changes the VAs of old x86 delay descriptors to RVAs.
+        parsed_static = {
+            entry.struct.get_file_offset(): entry.imports for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", ())
+        }
+        static_entries = ()
+        if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) > 1:
+            directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1]
+            if directory.VirtualAddress:
+                # With dllnames_only, pefile keeps a descriptor also when it drops all of its symbols.
+                try:
+                    static_entries = (
+                        pe.parse_import_directory(directory.VirtualAddress, directory.Size, dllnames_only=True) or ()
+                    )
+                except pefile.PEFormatError as error:
+                    self._optional_error("static import directory", error)
+        # pefile stops after more than MAX_IMPORT_SYMBOLS symbols, so it can keep
+        # MAX_IMPORT_SYMBOLS + 1. Use the same limit for the nonzero thunks of all static
+        # descriptors, also the malformed ones. NUL thunks do not count.
+        static_budget = [pefile.MAX_IMPORT_SYMBOLS + 1]
+        for entries, source in ((static_entries, "static"), (parsed_delay, "delay")):
+            for entry in entries:
+                try:
+                    dll = self._import_dll_name(pe, entry, source)
+                    # _delay_import_directory already validated delay attributes.
+                    iat_rva = entry.struct.pIAT if source == "delay" else entry.struct.FirstThunk
+                except ValueError as error:
+                    self._optional_error(f"{source} import descriptor", error)
+                    continue
+                if source == "static":
+                    slots = self._static_import_slots(
+                        pe, entry, parsed_static.get(entry.struct.get_file_offset(), ()), static_budget
+                    )
+                else:
+                    slots = ((iat_rva + index * ptr_size, imp) for index, imp in enumerate(entry.imports))
+                for slot_rva, imp in slots:
+                    try:
+                        if iat_rva == 0 or not 0 <= slot_rva <= pe.image_size - ptr_size:
+                            raise ValueError("Import IAT slot lies outside the image")
+                        if imp.import_by_ordinal:
+                            func_name = f"ordinal_{imp.ordinal}"
+                        else:
+                            if not imp.name:
+                                raise ValueError("Missing imported function name")
+                            func_name = imp.name.decode("ascii")
+                            if not pefile.is_valid_function_name(imp.name):
+                                raise ValueError("Invalid imported function name")
+                        imports.append(ImportEntry(slot_rva, dll, func_name, source))
+                    except ValueError as error:
+                        self._optional_error(f"{source} import entry", error)
+
+        exports: list[ExportEntry] = []
+        parsed_exports = getattr(getattr(pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", ())
+        if pe.OPTIONAL_HEADER.DATA_DIRECTORY:
+            directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]
+            # Windows uses the full Size of the directory to find forwarders, also when Size
+            # goes past the image. So only the directory header must fit.
+            directory_end = directory.VirtualAddress + directory.Size
+            if (directory.VirtualAddress or directory.Size) and (
+                not directory.VirtualAddress or directory.Size < 40 or directory.VirtualAddress + 40 > pe.image_size
+            ):
+                self._optional_error("export directory", ValueError("Export directory extends beyond the image"))
+                parsed_exports = ()
+            directory_bytes = b""
+            if parsed_exports:
+                directory_bytes = bytes(mapped_image[directory.VirtualAddress : min(directory_end, pe.image_size)])
+            for exp in parsed_exports:
+                try:
+                    if not exp.address:
+                        continue
+                    if not 0 < exp.address < pe.image_size:
+                        raise ValueError("Export target lies outside the image")
+                    forwarder = None
+                    if directory.VirtualAddress <= exp.address < directory_end:
+                        offset = exp.address - directory.VirtualAddress
+                        terminator = directory_bytes.find(b"\0", offset)
+                        if terminator < 0:
+                            raise ValueError("Unterminated forwarder within export directory")
+                        forwarder = directory_bytes[offset:terminator].decode("ascii")
+                        # The image can write the forwarder string at run time, so an empty string is valid.
+                        if forwarder:
+                            validate_forwarder(forwarder)
+                    section = pe.get_section_by_rva(exp.address)
+                    kind = "function"
+                    if forwarder is None and section is not None:
+                        if not section.Characteristics & 0x20000000:  # IMAGE_SCN_MEM_EXECUTE
+                            kind = "data"
+                    name = exp.name.decode("utf-8") if exp.name else None
+                    exports.append(
+                        ExportEntry(
+                            name=name,
+                            address=exp.address,
+                            ordinal=exp.ordinal,
+                            kind=kind,
+                            forwarder=forwarder,
                         )
                     )
 
-        exports: list[ExportEntry] = []
-        if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
-            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
-                name = exp.name.decode("utf-8") if exp.name else None
-                exports.append(
-                    ExportEntry(
-                        name=name,
-                        address=exp.address + base,
-                        ordinal=exp.ordinal,
-                        execution_mode="intercepted",
-                    )
-                )
+                except ValueError as error:
+                    self._optional_error("export entry", error)
+
+        resource_directory = None
+        resources = pe.OPTIONAL_HEADER.DATA_DIRECTORY[2]
+        if resources.VirtualAddress and resources.Size:
+            resource_directory = (resources.VirtualAddress, resources.Size)
 
         tls_callbacks: list[int] = []
-        tls_directory_va: int | None = None
         tls_directory: TlsDirectory | None = None
+        tls_directory_rva: int | None = None
+        tls_directory_va: int | None = None
         ptr_size = 4 if pe.arch == _arch.ARCH_X86 else 8
-        if hasattr(pe, "DIRECTORY_ENTRY_TLS"):
-            tls_directory_va = pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress + base
-            tls_struct = pe.DIRECTORY_ENTRY_TLS.struct
+        tls_rva = 0
+        if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) > 9:
+            tls_rva = pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress
+
+        def read_mapped(rva: int, size: int) -> bytes:
+            return bytes(mapped_image[rva : rva + size]).ljust(size, b"\0")
+
+        # Windows reads the directory from the mapped image, so it can extend
+        # into the zero-filled tail of a section that pefile does not parse.
+        if tls_rva and tls_rva + 4 * ptr_size + 8 <= pe.image_size:
+            tls_directory_rva = tls_rva
+            # The local TLS manager works with absolute VAs at the preferred base.
+            tls_directory_va = base + tls_rva
             tls_directory = TlsDirectory(
-                start=tls_struct.StartAddressOfRawData,
-                end=tls_struct.EndAddressOfRawData,
-                index_va=tls_struct.AddressOfIndex,
-                callbacks_va=tls_struct.AddressOfCallBacks,
-                zero_fill=tls_struct.SizeOfZeroFill,
-                characteristics=tls_struct.Characteristics,
+                start=int.from_bytes(read_mapped(tls_rva, ptr_size), "little"),
+                end=int.from_bytes(read_mapped(tls_rva + ptr_size, ptr_size), "little"),
+                index_va=int.from_bytes(read_mapped(tls_rva + 2 * ptr_size, ptr_size), "little"),
+                callbacks_va=int.from_bytes(read_mapped(tls_rva + 3 * ptr_size, ptr_size), "little"),
+                zero_fill=int.from_bytes(read_mapped(tls_rva + 4 * ptr_size, 4), "little"),
+                characteristics=int.from_bytes(read_mapped(tls_rva + 4 * ptr_size + 4, 4), "little"),
             )
-            if tls_struct.AddressOfCallBacks:
-                rva = tls_struct.AddressOfCallBacks - base
-                for i in range(100):
-                    ptr = pe.get_data(rva + ptr_size * i, ptr_size)
-                    ptr = int.from_bytes(ptr, "little")
-                    if ptr == 0:
-                        break
-                    tls_callbacks.append(ptr)
+            # The TLS directory and the callback array have VAs at the preferred base.
+            callbacks = tls_directory.callbacks_va
+            rva = callbacks - base
+            for i in range(100 if callbacks else 0):
+                slot = rva + ptr_size * i
+                try:
+                    if not 0 <= slot <= pe.image_size - ptr_size:
+                        raise ValueError("TLS callback array lies outside the image")
+                    ptr = int.from_bytes(read_mapped(slot, ptr_size), "little")
+                except ValueError as error:
+                    self._optional_error("TLS callbacks", error)
+                    break
+                if ptr == 0:
+                    break
+                tls_callbacks.append(ptr - base)
 
         sections = []
         for sect in pe.sections:
-            sect_name = sect.Name.decode("utf-8", errors="ignore").rstrip("\x00")
+            available = max(0, pe.image_size - sect.VirtualAddress)
+            extent = min(max(sect.Misc_VirtualSize, sect.SizeOfRawData), available)
+            if not extent:
+                continue
+            sect_name = sect.Name.partition(b"\x00")[0].decode("utf-8", errors="replace")
             sections.append(
                 SectionEntry(
                     name=sect_name,
                     virtual_address=sect.VirtualAddress,
-                    virtual_size=sect.Misc_VirtualSize,
+                    virtual_size=extent,
                     perms=perms_from_section_chars(sect.Characteristics),
                 )
             )
 
         region = MemoryRegion(
-            base=base,
+            base=0,
             data=bytes(mapped_image),
             name="pe_image",
             perms=common.PERM_MEM_RWX,
@@ -300,7 +903,7 @@ class PeLoader:
         entry_points = []
         ep_rva = pe.OPTIONAL_HEADER.AddressOfEntryPoint
         if ep_rva:
-            entry_points.append(base + ep_rva)
+            entry_points.append(ep_rva)
 
         name = ""
         if self._path:
@@ -311,6 +914,7 @@ class PeLoader:
             timestamp=pe.FILE_HEADER.TimeDateStamp,
             machine=pe.FILE_HEADER.Machine,
             magic=pe.OPTIONAL_HEADER.Magic,
+            dll_characteristics=pe.OPTIONAL_HEADER.DllCharacteristics,
         )
         # Explicit DEP policy from the image header.  The NXCOMPAT bit is the
         # only field that controls executable-page permission; a zero value is
@@ -347,16 +951,13 @@ class PeLoader:
                             for s_id, s_val in strings.items():
                                 pe_metadata.string_table[s_id] = s_val
 
-                    # Regular resource entry
                     if hasattr(resource_id, "directory"):
                         for resource_lang in resource_id.directory.entries:
                             if hasattr(resource_lang, "data"):
                                 data_rva = resource_lang.data.struct.OffsetToData
                                 size = resource_lang.data.struct.Size
-                                lang_id = 0
-                                if hasattr(resource_lang.data.struct, "Id"):
-                                    lang_id = resource_lang.data.struct.Id
-                                # Calculate RVA of the entry structure for HRSRC compatibility
+                                lang_id = resource_lang.id or 0
+                                # FindResource returns the address of the IMAGE_RESOURCE_DATA_ENTRY as the HRSRC
                                 entry_offset = resource_lang.data.struct.get_file_offset()
                                 entry_rva = pe.get_rva_from_offset(entry_offset)
 
@@ -381,24 +982,29 @@ class PeLoader:
             regions=[region],
             imports=imports,
             exports=exports,
-            default_export_mode="intercepted",
             entry_points=entry_points,
             visible_in_peb=True,
             stack_size=max(pe.OPTIONAL_HEADER.SizeOfStackReserve or 0, 0x12000),
             tls_callbacks=tls_callbacks,
-            tls_directory_va=tls_directory_va,
             tls_directory=tls_directory,
-            loader=self,
+            tls_directory_rva=tls_directory_rva,
+            tls_directory_va=tls_directory_va,
+            resource_directory=resource_directory,
             sections=sections,
             pe_metadata=pe_metadata,
+            source="guest_pe",
+            relocations=relocations,
+            problems=self._get_image_problems(pe, mapped_image),
+            default_export_mode="intercepted",
+            loader=self,
             dep_policy=dep_policy,
         )
 
 
 class ShellcodeLoader:
     def __init__(self, *, data: bytes, arch: int) -> None:
-        self._data = data
-        self._arch = arch
+        self._data: bytes = data
+        self._arch: int = arch
 
     def make_image(self) -> LoadedImage:
         region = MemoryRegion(
@@ -411,6 +1017,7 @@ class ShellcodeLoader:
         return LoadedImage(
             arch=self._arch,
             module_type="shellcode",
+            source="guest_shellcode",
             name="shellcode",
             emu_path="",
             image_base=0,
@@ -418,9 +1025,9 @@ class ShellcodeLoader:
             regions=[region],
             imports=[],
             exports=[],
-            default_export_mode="intercepted",
             entry_points=[],
             visible_in_peb=False,
+            relocations=[],
             loader=self,
             sections=[
                 SectionEntry(
@@ -430,156 +1037,4 @@ class ShellcodeLoader:
                     perms=common.PERM_MEM_RWX,
                 )
             ],
-        )
-
-
-class ApiModuleLoader:
-    def __init__(self, *, name: str, api: Any, arch: int, base: int, emu_path: str) -> None:
-        self._name = name
-        self._api = api
-        self._arch = arch
-        self._base = base
-        self._emu_path = emu_path
-
-    def make_image(self) -> LoadedImage:
-        from speakeasy.windows.common import EXPORTED_FUNCTION, JitPeFile
-
-        funcs = [(f[4], f[0]) for k, f in self._api.funcs.items() if isinstance(k, str)]
-        data_exports = [k for k, d in self._api.data.items() if isinstance(k, str)]
-
-        new = funcs.copy()
-
-        if self._name == "ntdll":
-            nt_handler = getattr(self._api, "_nt_handler", None)
-            if nt_handler:
-                nt_funcs = [(f[4], f[0]) for k, f in nt_handler.funcs.items() if isinstance(k, str)]
-                new = funcs + nt_funcs
-
-        if self._name in ("ntdll", "ntoskrnl"):
-            extra = []
-            for _o, fn in new:
-                if fn.startswith("Nt"):
-                    extra.append((None, "Zw" + fn[2:]))
-                elif fn.startswith("Zw"):
-                    extra.append((None, "Nt" + fn[2:]))
-            new = new + extra
-        else:
-            extra = []
-            for _o, fn in new:
-                extra.append((None, fn + "A"))
-                extra.append((None, fn + "W"))
-            new = new + extra
-
-        func_names = [fn for _o, fn in new]
-        func_names.sort()
-
-        all_exports: list[str] = []
-        ords = [o for o, _fn in funcs if o is not None]
-        if ords:
-            num_exports = max(max(ords) + 1, len(all_exports) + 1)
-            all_exports = [f"ordinal_{i}" for i in range(num_exports)]
-            for o, fn in funcs:
-                if o is not None:
-                    all_exports[o - 1] = fn
-            for fn in func_names:
-                if fn not in all_exports:
-                    all_exports.append(fn)
-        if not all_exports:
-            all_exports = func_names
-        all_exports += data_exports
-
-        jit = JitPeFile(self._arch, base=self._base, mod_name=self._name, exports=all_exports)
-        img_data = jit.basepe.get_memory_mapped_image(max_virtual_address=0xF0000000)
-        image_size = jit.basepe.OPTIONAL_HEADER.SizeOfImage
-
-        text_sect = jit.get_section_by_name(jit.basepe, ".text")
-        text_va = text_sect.VirtualAddress
-        stub_size = len(EXPORTED_FUNCTION[self._arch])
-
-        pe_exports: list[ExportEntry] = []
-        for i, name in enumerate(all_exports):
-            pe_exports.append(
-                ExportEntry(
-                    name=name,
-                    address=self._base + text_va + i * stub_size,
-                    ordinal=i + 1,
-                    execution_mode="intercepted",
-                )
-            )
-
-        sections = []
-        for sect in jit.basepe.sections:
-            sect_name = sect.Name.decode("utf-8", errors="ignore").rstrip("\x00")
-            vs = sect.Misc_VirtualSize
-            sections.append(
-                SectionEntry(
-                    name=sect_name,
-                    virtual_address=sect.VirtualAddress,
-                    virtual_size=vs,
-                    perms=perms_from_section_chars(sect.Characteristics),
-                )
-            )
-
-        region = MemoryRegion(
-            base=self._base,
-            data=bytes(img_data),
-            name="api_module",
-            perms=common.PERM_MEM_RWX,
-        )
-
-        pe_metadata = PeMetadata(
-            subsystem=jit.basepe.OPTIONAL_HEADER.Subsystem,
-            timestamp=jit.basepe.FILE_HEADER.TimeDateStamp,
-            machine=jit.basepe.FILE_HEADER.Machine,
-            magic=jit.basepe.OPTIONAL_HEADER.Magic,
-        )
-
-        return LoadedImage(
-            arch=self._arch,
-            module_type="dll",
-            name=self._name,
-            emu_path=self._emu_path,
-            image_base=self._base,
-            image_size=image_size,
-            regions=[region],
-            imports=[],
-            exports=pe_exports,
-            default_export_mode="intercepted",
-            entry_points=[],
-            visible_in_peb=True,
-            loader=self,
-            sections=sections,
-            pe_metadata=pe_metadata,
-        )
-
-
-class DecoyLoader:
-    def __init__(self, *, name: str, base: int, emu_path: str, image_size: int) -> None:
-        self._name = name
-        self._base = base
-        self._emu_path = emu_path
-        self._image_size = image_size
-
-    def make_image(self) -> LoadedImage:
-        pe_metadata = PeMetadata(
-            subsystem=2,  # IMAGE_SUBSYSTEM_WINDOWS_GUI
-            timestamp=0,
-            machine=0,
-            magic=0,
-        )
-        return LoadedImage(
-            arch=0,
-            module_type="decoy",
-            name=self._name,
-            emu_path=self._emu_path,
-            image_base=self._base,
-            image_size=self._image_size,
-            regions=[],
-            imports=[],
-            exports=[],
-            default_export_mode="intercepted",
-            entry_points=[],
-            visible_in_peb=True,
-            loader=self,
-            pe_metadata=pe_metadata,
         )

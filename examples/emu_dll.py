@@ -8,17 +8,20 @@ logger = logging.getLogger(__name__)
 
 def hook_messagebox(emu, api_name, func, params):
     """
-    API hook that is installed to intercept MessageBox calls as an example
+    API hook that intercepts MessageBox calls as an example.
+
     Args:
-        api_name: The full name including module of the hooked API
-        func: the real emulated function provided by the framework
-              Users can call this by passing in "params" whenever they choose
-        params: the argments passed to the function
+        emu: The emulator instance.
+        api_name: The full name including module of the hooked API.
+        func: The real emulated function provided by the framework. Users can call this by passing in
+            ``params`` whenever they choose.
+        params: The arguments passed to the function.
     """
     # Call the MessageBox function and print its text string data
     rv = func(params)
 
-    hWnd, lpText, lpCaption, uType = params
+    # params holds the raw arguments; the handler's decoded values are in get_api_args()
+    lpText = emu.get_api_args()[1].display
 
     msg = f"{api_name} text: {lpText}"
     logger.info(msg)
@@ -31,14 +34,15 @@ def hook_messagebox(emu, api_name, func, params):
 
 def hook_mem_write(emu, access, address, size, value):
     """
-    Hook that is called whenever memory is written to
-    Args:
-        access: memory access requested
-        address: Memory address that is being written to
-        size: Size of the data being written
-        value: data that is being written to "address"
-    """
+    Hook that is called whenever memory is written to.
 
+    Args:
+        emu: The emulator instance.
+        access: Memory access requested.
+        address: Memory address that is being written to.
+        size: Size of the data being written.
+        value: Data that is being written to ``address``.
+    """
     # For a quick example, lets just log writes that occur to the stack
     for mm in emu.get_mem_maps():
         if mm.tag and mm.tag.startswith("emu.stack"):
@@ -46,22 +50,20 @@ def hook_mem_write(emu, access, address, size, value):
             end = start + mm.size
             if start < address < end:
                 # Get the assembly instruction that did the write
-                mnem, op, instr = emu.disasm(emu.reg_read("eip"), 0x20)
+                mnem, op, instr = emu.get_disasm(emu.reg_read("eip"), 0x20)
 
                 msg = f"Stack written to: instr: {instr} addr:0x{address:x}"
                 logger.info(msg)
-    return
 
 
 def main(args):
-    # Init the speakeasy object
-    se = speakeasy.Speakeasy()
+    # Init the speakeasy object. If runs.exports is true, all exports will be emulated sequentially.
+    # In this example, lets just run the main entry point and call exports manually.
+    se = speakeasy.Speakeasy(config={"runs": {"exports": False}})
     module = se.load_module(args.file)
 
     # Begin emulating the DLL at its defined entry point.
-    # If all_entrypoints is set to True, all exports will be emulated sequentially.
-    # In this example, lets just run the main entry point and call exports manually.
-    se.run_module(module, all_entrypoints=False)
+    se.run_module(module)
 
     # Hook user32!MessageBoxA/W and call our function; wild cards are supported here so we can
     # hook both versions with a single hook

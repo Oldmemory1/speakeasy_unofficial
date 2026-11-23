@@ -1,19 +1,21 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
 import ctypes as ct
+from typing import TYPE_CHECKING, Annotated
 
 import speakeasy.winenv.arch as _arch
 from speakeasy.struct import EmuStruct, Ptr
 
 from .. import api
 
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
+
 
 class WTS_SESSION_INFO(EmuStruct):
-    def __init__(self, ptr_size):
-        super().__init__(ptr_size)
-        self.SessionId = ct.c_uint32
-        self.pWinStationName = Ptr
-        self.State = ct.c_uint32
+    SessionId: Annotated[int, ct.c_uint32]
+    pWinStationName: Annotated[int, Ptr]
+    State: Annotated[int, ct.c_uint32]
 
 
 class WtsApi32(api.ApiHandler):
@@ -28,29 +30,23 @@ class WtsApi32(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("WTSEnumerateSessions", argc=5, conv=_arch.CALL_CONV_STDCALL)
-    def WTSEnumerateSessions(self, emu, argv, ctx: api.ApiContext = None):
+    def WTSEnumerateSessions(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
         BOOL WTSEnumerateSessions(
-          IN HANDLE          hServer,
-          IN DWORD           Reserved,
-          IN DWORD           Version,
-          PWTS_SESSION_INFO *ppSessionInfo,
-          DWORD              *pCount
+            HANDLE hServer,
+            DWORD Reserved,
+            DWORD Version,
+            PWTS_SESSION_INFO *ppSessionInfo,
+            DWORD *pCount
         );
         """
-        ctx = ctx or {}
-
-        hServer, res, ver, ppSessionInfo, pCount = argv
+        hServer, Reserved, Version, ppSessionInfo, pCount = argv
         rv = 0
 
-        fn = ctx["func_name"]
+        fn = ctx.func_name
         cw = self.get_char_width(ctx)
 
-        winstatname = "RDP-Tcp#1" + "\x00"
-        if cw == 2:
-            sn = winstatname.encode("utf-16le")
-        elif cw == 1:
-            sn = winstatname.encode("utf-8")
+        sn = self.encode_string("RDP-Tcp#1\x00", cw)
 
         wsi = WTS_SESSION_INFO(emu.get_ptr_size())
 
@@ -69,19 +65,19 @@ class WtsApi32(api.ApiHandler):
 
         # Write the total session count
         if ppSessionInfo and pCount:
-            self.mem_write(pCount, (1).to_bytes(4, "little"))
+            self.write_dword(pCount, 1)
             # Write the session buffer
-            self.mem_write(ppSessionInfo, (buf).to_bytes(self.get_ptr_size(), "little"))
+            self.write_ptr(ppSessionInfo, buf)
 
             rv = 1
 
         return rv
 
     @apihook("WTSFreeMemory", argc=1, conv=_arch.CALL_CONV_STDCALL)
-    def WTSFreeMemory(self, emu, argv, ctx: api.ApiContext = None):
+    def WTSFreeMemory(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        void WTSFreeMemory(
-          IN PVOID pMemory
+        VOID WTSFreeMemory(
+            PVOID pMemory
         );
         """
         (pMemory,) = argv

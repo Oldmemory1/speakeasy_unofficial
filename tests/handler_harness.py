@@ -1,0 +1,128 @@
+"""Call API handlers directly, with the context that dispatch builds."""
+
+import struct
+from collections.abc import Generator, Iterator
+from typing import Any
+
+import pytest
+
+from speakeasy import Speakeasy
+from speakeasy.profiler import GuestCallbackFrame, Run
+from speakeasy.windows import guest_callbacks, objman
+from speakeasy.windows.kernel import WinKernelEmulator
+from speakeasy.windows.win32 import Win32Emulator
+from speakeasy.winenv import arch as e_arch
+from speakeasy.winenv.api import sigdb
+from speakeasy.winenv.api.api import ApiContext, HandlerArgs
+from speakeasy.winenv.defs.windows import windows as windefs
+
+
+def load_emu(config: dict[str, Any], data: bytes) -> Iterator[Speakeasy]:
+    if not sigdb.get_default_database().available:
+        pytest.skip("bundled signature database not generated")
+    se = Speakeasy(config=config)
+    try:
+        se.load_module(data=data)
+        se.emu.curr_run = Run()
+        yield se
+    finally:
+        se.shutdown()
+
+
+def get_win32_emu(se: Speakeasy) -> Win32Emulator:
+    emu = se.emu
+    assert isinstance(emu, Win32Emulator)
+    return emu
+
+
+def get_kernel_emu(se: Speakeasy) -> WinKernelEmulator:
+    emu = se.emu
+    assert isinstance(emu, WinKernelEmulator)
+    return emu
+
+
+def alloc(se: Speakeasy, data: bytes) -> int:
+    addr = se.mem_alloc(len(data), base=0x20000000)
+    se.mem_write(addr, data)
+    return addr
+
+
+def invalid_handle(se: Speakeasy) -> int:
+    """INVALID_HANDLE_VALUE as a guest register or argument holds it."""
+    return windefs.INVALID_HANDLE_VALUE & ((1 << 8 * se.get_ptr_size()) - 1)
+
+
+def unicode_string(se: Speakeasy, text: str) -> int:
+    """Build an x86 UNICODE_STRING for ``text`` and return its address."""
+    buf = text.encode("utf-16le")
+    buf_addr = alloc(se, buf + b"\x00\x00")
+    return alloc(se, struct.pack("<HHI", len(buf), len(buf) + 2, buf_addr))
+
+
+def ansi_string(se: Speakeasy, text: bytes) -> int:
+    """Build an x86 STRING for ``text`` and return its address."""
+    return alloc(se, struct.pack("<HHI", len(text), len(text) + 1, alloc(se, text + b"\x00")))
+
+
+def object_attributes(se: Speakeasy, name: str) -> int:
+    """Build an x86 OBJECT_ATTRIBUTES for ``name`` and return its address."""
+    return alloc(se, struct.pack("<IIIIII", 24, 0, unicode_string(se, name), 0, 0, 0))
+
+
+def call(se: Speakeasy, dll: str, name: str, argv: list[int]) -> tuple[int, dict[str | int, str]]:
+    """
+    Call a handler with the context and frame that dispatch builds.
+
+    A variadic handler reads ``argv`` from the stack. Return the handler result and the displays, by
+    parameter name, or by slot index for a call without a signature. A handler that calls guest code
+    starts its first guest call, and its result is None.
+    """
+    emu = se.emu
+    mod, func_attrs = emu.get_api_handler(dll, name)
+    _, func, argc, conv, _ = func_attrs
+    if argc == e_arch.VAR_ARGS:
+        emu.set_func_args(emu.stack_base, 0, *argv, conv=conv)
+        argv = []
+    assert argc in (e_arch.VAR_ARGS, len(argv))
+    sig = emu.get_handler_signature(dll, name, argc)
+    if sig is None:
+        args = HandlerArgs.from_slots(argv)
+    else:
+        args = HandlerArgs.from_signature(sig, emu.get_ptr_size(), emu._render_signature_args(sig, argv), argv)
+    ctx = ApiContext(func_name=f"{dll}.{name}", args=args)
+    previous = emu._active_api_frame
+    frame = GuestCallbackFrame(emu.get_stack_ptr(), return_address=0)
+    emu._active_api_frame = frame
+    try:
+        rv = func(mod, emu, list(argv), ctx)
+        if isinstance(rv, Generator):
+            rv = guest_callbacks.start_api_handler(emu, frame, rv)
+    finally:
+        emu._active_api_frame = previous
+    return rv, {i if a.name is None else a.name: a.display for i, a in enumerate(args.get_report_args())}
+
+
+def start_process(se: Speakeasy) -> None:
+    """
+    Create the process and thread that ``run_module`` creates.
+
+    Handlers that use the current process, thread, or module need them.
+    """
+    emu = se.emu
+    assert isinstance(emu, Win32Emulator)
+    assert emu.om is not None
+    module = emu.modules[0]
+    emu.prepare_module_for_emulation(module, False)
+    if emu.curr_process is None:
+        p = objman.Process(
+            emu, path=module.emu_path, base=module.base, pe=module, cmdline=emu.get_main_command_line(module.emu_path)
+        )
+        emu.processes.append(p)
+        emu.curr_process = p
+        emu.om.add_object(p)
+    t = objman.Thread(emu, stack_base=emu.stack_base, stack_commit=module.stack_commit)
+    emu.om.add_object(t)
+    assert emu.curr_process is not None
+    emu.curr_process.threads.append(t)
+    emu.curr_thread = t
+    emu.curr_mod = module

@@ -1,16 +1,21 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
-import speakeasy.winenv.defs.windows.kernel32 as k32defs
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from speakeasy.winenv.defs.enums import DRIVE_TYPE
+
+if TYPE_CHECKING:
+    from speakeasy.config import DriveConfig
 
 
 class DriveManager:
-    """
-    Manages the emulation of Windows drives. Currently assumes one volume per drive.
-    """
+    """Keep the drives of the config. Each drive has one volume."""
 
-    def __init__(self, config: list | None = None):
+    def __init__(self, config: list[DriveConfig] | None = None):
         super().__init__()
-        self.drives: list = config or []
+        self.drives: list[DriveConfig] = config or []
         self.drive_letters: list[str] = []
 
         for drive in self.drives:
@@ -33,6 +38,6 @@ class DriveManager:
         drive = self.get_drive(root_path=root_path)
         if drive:
             if drive.root_path == root_path:
-                return k32defs.get_define_value(drive.drive_type)
+                return DRIVE_TYPE[drive.drive_type] if drive.drive_type else DRIVE_TYPE.DRIVE_UNKNOWN
 
-        return k32defs.DRIVE_NO_ROOT_DIR
+        return DRIVE_TYPE.DRIVE_NO_ROOT_DIR

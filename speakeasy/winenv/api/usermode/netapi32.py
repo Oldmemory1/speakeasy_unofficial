@@ -1,9 +1,16 @@
 # Copyright (C) 2021 FireEye, Inc. All Rights Reserved.
 
+from typing import TYPE_CHECKING
+
 import speakeasy.winenv.defs.windows.netapi32 as netapi32defs
 import speakeasy.winenv.defs.windows.windows as windefs
+from speakeasy.windows.common import FILETIME_UNIX_EPOCH
+from speakeasy.winenv.api.compare import Fold, get_string_order
 
 from .. import api
+
+if TYPE_CHECKING:
+    from speakeasy.windows.win32 import Win32Emulator
 
 
 class NetApi32(api.ApiHandler):
@@ -20,39 +27,39 @@ class NetApi32(api.ApiHandler):
         super().__get_hook_attrs__(self)
 
     @apihook("NetGetJoinInformation", argc=3)
-    def NetGetJoinInformation(self, emu, argv, ctx: api.ApiContext = None):
+    def NetGetJoinInformation(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        NET_API_STATUS NET_API_FUNCTION NetGetJoinInformation(
-          LPCWSTR lpServer,
-          LPWSTR *lpNameBuffer,
-          PNETSETUP_JOIN_STATUS BufferType
+        NET_API_STATUS NetGetJoinInformation(
+            LPCWSTR lpServer,
+            LPWSTR *lpNameBuffer,
+            PNETSETUP_JOIN_STATUS BufferType
         );
         """
         lpServer, lpNameBuffer, BufferType = argv
 
         if lpServer:
             server = self.read_wide_string(lpServer)
-            argv[0] = server
+            ctx.args["lpServer"].display = server
 
         # Assumes the server being queried is the local computer
-        domain = emu.config.domain
-        argv[1] = domain
-        namebuf = self.mem_alloc(emu.get_ptr_size())
+        domain = emu.config.system.domain or ""
+        ctx.args["lpNameBuffer"].display = domain
+        namebuf = self.mem_alloc((len(domain) + 1) * 2)
         self.write_wide_string(domain, namebuf)
-        self.mem_write(lpNameBuffer, namebuf.to_bytes(emu.get_ptr_size(), "little"))
+        self.write_ptr(lpNameBuffer, namebuf)
 
-        argv[2] = netapi32defs.NetSetupDomainName
-        self.mem_write(BufferType, netapi32defs.NetSetupDomainName.to_bytes(4, "little"))
+        ctx.args["BufferType"].display = "NetSetupDomainName"
+        self.write_dword(BufferType, netapi32defs.NetSetupDomainName)
 
         return netapi32defs.NERR_Success
 
     @apihook("NetWkstaGetInfo", argc=3)
-    def NetWkstaGetInfo(self, emu, argv, ctx: api.ApiContext = None):
+    def NetWkstaGetInfo(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        NET_API_STATUS NET_API_FUNCTION NetWkstaGetInfo(
-          LMSTR  servername,
-          DWORD  level,
-          LPBYTE *bufptr
+        NET_API_STATUS NetWkstaGetInfo(
+            LMSTR servername,
+            DWORD level,
+            LPBYTE *bufptr
         );
         """
         servername, level, bufptr = argv
@@ -60,6 +67,7 @@ class NetApi32(api.ApiHandler):
         if level not in [100, 101, 102]:
             return windefs.ERROR_INVALID_LEVEL
 
+        wki: netapi32defs.WKSTA_INFO_100 | netapi32defs.WKSTA_INFO_101 | netapi32defs.WKSTA_INFO_102
         if level == 100:
             wki = netapi32defs.WKSTA_INFO_100(emu.get_ptr_size())
         elif level == 101:
@@ -80,55 +88,107 @@ class NetApi32(api.ApiHandler):
             wki.wki_logged_on_users = 2
 
         wki_addr = self.mem_alloc(wki.sizeof())
-        self.mem_cast(wki, wki_addr)
 
         platform_id = 500  # PLATFORM_ID_NT
         wki.wki_platform_id = platform_id
 
-        hostname = emu.config.hostname
+        hostname = emu.config.system.hostname
         computername_ptr = self.mem_alloc(2 + (len(hostname) * 2))
         # Assuming Unicode; "This string is Unicode if _WIN32_WINNT or
         # FORCE_UNICODE are defined."
         self.write_mem_string(hostname, computername_ptr, width=2)
         wki.wki_computername = computername_ptr
 
-        domain = emu.config.domain
+        domain = emu.config.system.domain or ""
         langroup_ptr = self.mem_alloc(2 + (len(domain) * 2))
         self.write_mem_string(domain, langroup_ptr, width=2)
         wki.wki_langroup = langroup_ptr
 
-        osver = emu.config.os_ver
-        wki.wki_ver_major = osver.major
-        wki.wki_ver_minor = osver.minor
+        osver = emu.config.system.os_ver
+        wki.wki_ver_major = osver.major or 0
+        wki.wki_ver_minor = osver.minor or 0
 
         self.mem_write(wki_addr, wki.get_bytes())
-        self.mem_write(bufptr, wki_addr.to_bytes(emu.get_ptr_size(), "little"))
+        self.write_ptr(bufptr, wki_addr)
+
+        return netapi32defs.NERR_Success
+
+    @apihook("NetStatisticsGet", argc=5)
+    def NetStatisticsGet(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        NET_API_STATUS NetStatisticsGet(
+            LMSTR ServerName,
+            LMSTR Service,
+            DWORD Level,
+            DWORD Options,
+            LPBYTE *Buffer
+        );
+
+        The statistics start when the system starts. All counters are zero.
+        """
+        ServerName, Service, Level, Options, Buffer = argv
+
+        if ServerName:
+            ctx.args["ServerName"].display = self.read_wide_string(ServerName)
+        service = ""
+        if Service:
+            service = self.read_wide_string(Service)
+            ctx.args["Service"].display = service
+
+        self.write_ptr(Buffer, 0)
+
+        boot_time = emu.api.load_api_handler("kernel32").boot_time
+        start = (boot_time - FILETIME_UNIX_EPOCH) // 10_000_000
+
+        stats: netapi32defs.STAT_WORKSTATION_0 | netapi32defs.STAT_SERVER_0
+        if get_string_order(service, netapi32defs.SERVICE_WORKSTATION, Fold.ASCII_LOWER) == 0:
+            stats = netapi32defs.STAT_WORKSTATION_0(emu.get_ptr_size())
+            stats.StatisticsStartTime = start
+        elif get_string_order(service, netapi32defs.SERVICE_SERVER, Fold.ASCII_LOWER) == 0:
+            stats = netapi32defs.STAT_SERVER_0(emu.get_ptr_size())
+            stats.sts0_start = start
+        else:
+            return windefs.ERROR_NOT_SUPPORTED
+
+        if Level != 0:
+            return windefs.ERROR_INVALID_LEVEL
+        if Options != 0:
+            return windefs.ERROR_INVALID_PARAMETER
+
+        buf = self.heap_alloc(stats.sizeof(), heap="NetApiBufferAllocate")
+        if not buf:
+            return windefs.ERROR_NOT_ENOUGH_MEMORY
+        self.mem_write(buf, stats.get_bytes())
+        self.write_ptr(Buffer, buf)
 
         return netapi32defs.NERR_Success
 
     @apihook("NetUserAdd", argc=4)
-    def NetUserAdd(self, emu, argv, ctx={}):
+    def NetUserAdd(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        NET_API_STATUS NET_API_FUNCTION NetUserAdd(
-          LPCWSTR servername,
-          DWORD   level,
-          LPBYTE  buf,
-          LPDWORD parm_err
+        NET_API_STATUS NetUserAdd(
+            LPCWSTR servername,
+            DWORD level,
+            LPBYTE buf,
+            LPDWORD parm_err
         );
         """
         servername, level, buf, parm_err = argv
 
         if servername:
             server = self.read_wide_string(servername)
-            argv[0] = server
+            ctx.args["servername"].display = server
 
         return netapi32defs.NERR_Success
 
     @apihook("NetApiBufferFree", argc=1)
-    def NetApiBufferFree(self, emu, argv, ctx: api.ApiContext = None):
+    def NetApiBufferFree(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
         """
-        NET_API_STATUS NET_API_FUNCTION NetApiBufferFree(
-          _Frees_ptr_opt_ LPVOID Buffer
+        NET_API_STATUS NetApiBufferFree(
+            LPVOID Buffer
         );
         """
+        (Buffer,) = argv
+        if Buffer:
+            self.heap_free(Buffer)
         return netapi32defs.NERR_Success

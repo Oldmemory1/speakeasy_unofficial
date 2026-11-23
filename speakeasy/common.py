@@ -1,6 +1,16 @@
 # Copyright (C) 2020 FireEye, Inc. All Rights Reserved.
 
+from __future__ import annotations
+
 import os
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
+from unicorn.x86_const import UC_X86_INS_IN, UC_X86_INS_OUT, UC_X86_INS_SYSCALL, UC_X86_INS_SYSENTER
+
+if TYPE_CHECKING:
+    from speakeasy.binemu import BinaryEmulator
+    from speakeasy.engines.unicorn_eng import EmuEngine
 
 # Emulation hook types
 HOOK_CODE = 1000
@@ -16,6 +26,7 @@ HOOK_DYN_CODE = 1009
 HOOK_INSN = 1010
 HOOK_MEM_MAP = 1011
 HOOK_INSN_INVALID = 1012
+HOOK_BLOCK = 1013
 
 # Emulation memory protection types
 PERM_MEM_NONE = 0
@@ -36,9 +47,7 @@ INVAL_PERM_MEM_READ = 2005
 
 
 def normalize_package_path(path):
-    """
-    Get the supplied path in relation to the package root
-    """
+    """Get the supplied path in relation to the package root."""
 
     def _get_speakeasy_root():
         return os.path.join(os.path.dirname(__file__))
@@ -52,130 +61,162 @@ def normalize_package_path(path):
 
 class Hook:
     """
-    Base class for all emulator hooks
+    Base class for all emulator hooks.
+
+    A hook has no emulator until ``bind`` gives it one. ``Speakeasy`` keeps the hooks
+    that a caller adds before the load, and binds them when it creates the machine.
     """
 
-    def __init__(self, se_obj, emu_eng, cb, native_hook=False):
+    htype: int
+    emu: BinaryEmulator
+    emu_eng: EmuEngine
+
+    def __init__(self, cb, *, native_hook=False):
         """
-        Arguments:
-            se_obj: speakeasy emulator object
-            emu_eng: emulation engine object
-            cb: Python callback function
-            native_hook: When set to True, a new, raw callback will be registered with
-                         with the underlying emulation engine that is called directly by the DLL.
-                         Otherwise, this hook will be dispatched via a wrapper hook
-                         (e.g. see _wrap_code_cb below)
+        Create a hook.
+
+        Args:
+            cb: Python callback function. Its first argument is the emulator.
+            native_hook: If true, ``add`` adds an engine hook that calls the callback through
+                a wrapper such as ``_wrap_code_cb``. If false, a dispatch hook of the emulator
+                calls the callback, for example ``_hook_mem_invalid_dispatch``.
         """
-        self.cb = cb
-        self.handle = 0
-        self.enabled = False
-        self.added = False
-        self.native_hook = native_hook
-        self.emu_eng = emu_eng
-        self.se_obj = se_obj
+        self.cb: Callable[..., Any] = cb
+        self.handle: int = 0
+        self.enabled: bool = True
+        self.added: bool = False
+        self.native_hook: bool = native_hook
+
+    def bind(self, emu: BinaryEmulator) -> None:
+        """Give the hook the emulator that calls it."""
+        self.emu = emu
+        self.emu_eng = emu.emu_eng
+
+    def add(self):
+        self.added = True
 
     def enable(self):
         self.enabled = True
-        self.emu_eng.hook_enable(self.handle)
 
     def disable(self):
+        # The code that calls the callback checks the flag, so a disabled hook does not run.
+        # add() does not change the flag.
         self.enabled = False
-        self.emu_eng.hook_disable(self.handle)
+
+    def detach(self):
+        """
+        Remove the hook from the engine, so that the engine does not call it again.
+
+        The hook stays in the hook lists of the emulator, and ``set_hooks`` can add it to the engine again. To remove a
+        hook, use ``BinaryEmulator.remove_hook``.
+        """
+        if self.added and self.native_hook:
+            self.emu_eng.hook_remove(self.handle)
+        self.handle = 0
+        self.added = False
+        self.enabled = False
 
     def _wrap_code_cb(self, emu, addr, size, ctx=None):
         try:
             if self.enabled:
-                if self.se_obj.exit_event and self.se_obj.exit_event.is_set():
-                    self.se_obj.stop()
+                if self.emu.exit_event and self.emu.exit_event.is_set():
+                    self.emu.stop()
                     return False
-                return self.cb(self.se_obj, addr, size)
+                return self.cb(self.emu, addr, size)
             return True
         except KeyboardInterrupt:
-            self.se_obj.stop()
+            self.emu.stop()
             return False
 
     def _wrap_intr_cb(self, emu, num, ctx=None):
         if self.enabled:
-            return self.cb(self.se_obj, num)
-        return True
-
-    def _wrap_in_insn_cb(self, emu, port, size, ctx=None):
-        if self.enabled:
-            return self.cb(self.se_obj, port, size)
-        return True
-
-    def _wrap_syscall_insn_cb(self, emu, ctx=None):
-        if self.enabled:
-            return self.cb(self.se_obj)
+            return self.cb(self.emu, num)
         return True
 
     def _wrap_memory_access_cb(self, emu, access, addr, size, value, ctx=None):
         try:
             if self.enabled:
-                if self.se_obj.exit_event and self.se_obj.exit_event.is_set():
-                    self.se_obj.stop()
+                if self.emu.exit_event and self.emu.exit_event.is_set():
+                    self.emu.stop()
                     return False
-                return self.cb(self.se_obj, access, addr, size, value)
+                return self.cb(self.emu, access, addr, size, value)
             return True
         except KeyboardInterrupt:
-            self.se_obj.stop()
+            self.emu.stop()
             return False
 
     def _wrap_invalid_insn_cb(self, emu, ctx=None):
         if self.enabled:
-            return self.cb(self.se_obj)
-        return True
+            return self.cb(self.emu)
+        # Unicorn reads True as "handled", so a disabled hook must not claim the instruction.
+        return False
 
 
 class ApiHook(Hook):
-    """
-    This hook type is used when using a specific API (e.g. kernel32.CreateFile)
-    """
+    """Hook that fires when the guest calls an API, for example ``kernel32.CreateFile``."""
 
-    def __init__(self, se_obj, emu_eng, cb, module="", api_name="", argc=0, call_conv=None):
-        super().__init__(se_obj, emu_eng, cb)
-        self.module = module
-        self.api_name = api_name
-        self.argc = argc
-        self.call_conv = call_conv
+    htype = HOOK_API
+
+    def __init__(self, cb, module="", api_name="", argc=0, call_conv=None):
+        super().__init__(cb)
+        self.module: str = module.lower()
+        self.api_name: str = api_name.lower()
+        self.argc: int = argc
+        self.call_conv: int | None = call_conv
 
 
 class DynCodeHook(Hook):
     """
-    This hook type is used to get a callback when dynamically created/copied code is executed
-    Currently, this will only fire once per dynamic code mapping. Could be useful for unpacking.
+    Hook that fires when the guest runs code in memory that ``VirtualAlloc`` or a similar API allocated.
+
+    It fires the first time that the start of the region runs, and each time that code in the
+    region calls an API. Use it to find unpacked code.
     """
 
-    def __init__(self, se_obj, emu_eng, cb):
-        super().__init__(se_obj, emu_eng, cb)
+    htype = HOOK_DYN_CODE
 
 
 class CodeHook(Hook):
-    """
-    This hook callback will fire for every CPU instruction
-    """
+    """Hook that fires for each instruction in its address range."""
 
-    def __init__(self, se_obj, emu_eng, cb, begin=1, end=0, native_hook=True):
-        super().__init__(se_obj, emu_eng, cb, native_hook=native_hook)
-        self.begin = begin
-        self.end = end
+    htype = HOOK_CODE
+
+    def __init__(self, cb, begin=1, end=0, *, native_hook=True):
+        super().__init__(cb, native_hook=native_hook)
+        self.begin: int = begin
+        self.end: int = end
 
     def add(self):
         if not self.added and self.native_hook:
             self.handle = self.emu_eng.hook_add(htype=HOOK_CODE, cb=self._wrap_code_cb, begin=self.begin, end=self.end)
         self.added = True
-        self.enabled = True
+
+
+class BlockHook(Hook):
+    """Hook that fires at the start of each translation block in its address range."""
+
+    htype = HOOK_BLOCK
+
+    def __init__(self, cb, begin=1, end=0):
+        super().__init__(cb, native_hook=True)
+        self.begin: int = begin
+        self.end: int = end
+
+    def add(self):
+        if not self.added:
+            self.handle = self.emu_eng.hook_add(htype=HOOK_BLOCK, cb=self._wrap_code_cb, begin=self.begin, end=self.end)
+        self.added = True
 
 
 class ReadMemHook(Hook):
-    """
-    This hook will fire each time a valid chunk of memory is read from
-    """
+    """Hook that fires when the guest reads mapped memory in its address range."""
 
-    def __init__(self, se_obj, emu_eng, cb, begin=1, end=0, native_hook=True):
-        super().__init__(se_obj, emu_eng, cb, native_hook=native_hook)
-        self.begin = begin
-        self.end = end
+    htype = HOOK_MEM_READ
+
+    def __init__(self, cb, begin=1, end=0, *, native_hook=True):
+        super().__init__(cb, native_hook=native_hook)
+        self.begin: int = begin
+        self.end: int = end
 
     def add(self):
         if not self.added and self.native_hook:
@@ -183,18 +224,17 @@ class ReadMemHook(Hook):
                 htype=HOOK_MEM_READ, cb=self._wrap_memory_access_cb, begin=self.begin, end=self.end
             )
         self.added = True
-        self.enabled = True
 
 
 class WriteMemHook(Hook):
-    """
-    This hook will fire each time a valid chunk of memory is written to
-    """
+    """Hook that fires when the guest writes mapped memory in its address range."""
 
-    def __init__(self, se_obj, emu_eng, cb, begin=1, end=0, native_hook=True):
-        super().__init__(se_obj, emu_eng, cb, native_hook=native_hook)
-        self.begin = begin
-        self.end = end
+    htype = HOOK_MEM_WRITE
+
+    def __init__(self, cb, begin=1, end=0, *, native_hook=True):
+        super().__init__(cb, native_hook=native_hook)
+        self.begin: int = begin
+        self.end: int = end
 
     def add(self):
         if not self.added and self.native_hook:
@@ -202,83 +242,106 @@ class WriteMemHook(Hook):
                 htype=HOOK_MEM_WRITE, cb=self._wrap_memory_access_cb, begin=self.begin, end=self.end
             )
         self.added = True
-        self.enabled = True
 
 
 class MapMemHook(Hook):
-    """
-    This hook will fire each time a chunk of memory is mapped
-    """
+    """Hook that fires when the emulator maps memory with a base in the address range of the hook."""
 
-    def __init__(self, se_obj, emu_eng, cb, begin=1, end=0):
-        super().__init__(se_obj, emu_eng, cb)
-        self.begin = begin
-        self.end = end
+    htype = HOOK_MEM_MAP
 
-    def add(self):
-        self.added = True
-        self.enabled = True
+    def __init__(self, cb, begin=1, end=0):
+        super().__init__(cb)
+        self.begin: int = begin
+        self.end: int = end
 
 
 class InvalidMemHook(Hook):
-    """
-    This hook will fire each time a invalid chunk of memory is accessed
-    """
+    """Hook that fires when the guest accesses unmapped or protected memory."""
 
-    def __init__(self, se_obj, emu_eng, cb, native_hook=False):
-        super().__init__(se_obj, emu_eng, cb, native_hook=native_hook)
+    htype = HOOK_MEM_INVALID
 
     def add(self):
         if not self.added and self.native_hook:
             self.handle = self.emu_eng.hook_add(htype=HOOK_MEM_INVALID, cb=self._wrap_memory_access_cb)
         self.added = True
-        self.enabled = True
 
 
 class InterruptHook(Hook):
-    """
-    This hook will fire each time a a software interrupt is triggered
-    """
+    """Hook that fires for an interrupt or a CPU exception."""
 
-    def __init__(self, se_obj, emu_eng, cb, native_hook=True):
-        super().__init__(se_obj, emu_eng, cb, native_hook=native_hook)
+    htype = HOOK_INTERRUPT
+
+    def __init__(self, cb, *, native_hook=True):
+        super().__init__(cb, native_hook=native_hook)
 
     def add(self):
         if not self.added and self.native_hook:
             self.handle = self.emu_eng.hook_add(htype=HOOK_INTERRUPT, cb=self._wrap_intr_cb)
         self.added = True
-        self.enabled = True
 
 
 class InstructionHook(Hook):
     """
-    This hook will fire each time a instruction hook is triggered,
-    Only the instructions: IN, OUT, SYSCALL, and SYSENTER are supported by unicorn.
+    Hook that fires when a selected instruction executes.
+
+    The hook supports only the instructions IN, OUT, SYSCALL, and SYSENTER. The emulator
+    calls the IN hooks through one dispatch hook (see ``BinaryEmulator._hook_in_dispatch``).
     """
 
-    def __init__(self, se_obj, emu_eng, cb, native_hook=True, insn=None):
-        super().__init__(se_obj, emu_eng, cb, native_hook=native_hook)
-        self.insn = insn
+    htype = HOOK_INSN
+
+    def __init__(self, cb, begin=1, end=0, insns=(), *, native_hook=True):
+        super().__init__(cb, native_hook=native_hook)
+        self.begin: int = begin
+        self.end: int = end
+        self.insns: tuple[int, ...] = tuple(insns)
+        self.handles: list[int] = []
+
+    def covers_pc(self) -> bool:
+        """Get whether the pc is in the range of the hook. ``begin > end`` means all addresses."""
+        # Unicorn does not check the range of an IN or OUT hook, and checks a SYSENTER hook
+        # against a pc that is not up to date, so the wrappers check the range here.
+        # A hook with no range does not read the pc, because a register read is slow in a hot hook.
+        return self.begin > self.end or self.begin <= self.emu.get_pc() <= self.end
 
     def add(self):
         if not self.added and self.native_hook:
-            self.handle = self.emu_eng.hook_add(htype=HOOK_INSN, cb=self._wrap_syscall_insn_cb, arg1=self.insn)
+            for insn in self.insns:
+                if insn == UC_X86_INS_IN:
+                    continue
+                # The engine also accepts CPUID, but a CPUID callback must return whether Unicorn skips
+                # the instruction, and these wrappers return nothing.
+                if insn not in (UC_X86_INS_OUT, UC_X86_INS_SYSCALL, UC_X86_INS_SYSENTER):
+                    raise ValueError(f"unsupported instruction for an instruction hook: {insn}")
+                cb = self._wrap_out_insn_cb if insn == UC_X86_INS_OUT else self._wrap_syscall_insn_cb
+                self.handles.append(self.emu_eng.hook_add(htype=HOOK_INSN, cb=cb, arg1=insn))
         self.added = True
-        self.enabled = True
+
+    def detach(self):
+        for handle in self.handles:
+            self.emu_eng.hook_remove(handle)
+        self.handles.clear()
+        self.added = False
+        self.enabled = False
+
+    def _wrap_out_insn_cb(self, emu, port, size, value, ctx=None):
+        if self.enabled and self.covers_pc():
+            self.cb(self.emu, port, size, value)
+
+    def _wrap_syscall_insn_cb(self, emu, ctx=None):
+        if self.enabled and self.covers_pc():
+            self.cb(self.emu)
 
 
 class InvalidInstructionHook(Hook):
-    """
-    This hook will fire every time an invalid instruction is attempted
-    to be executed
-    """
+    """Hook that fires when the emulator hits an invalid instruction."""
 
-    def __init__(self, se_obj, emu_eng, cb, native_hook=True):
-        super().__init__(se_obj, emu_eng, cb, native_hook=native_hook)
+    htype = HOOK_INSN_INVALID
+
+    def __init__(self, cb, *, native_hook=True):
+        super().__init__(cb, native_hook=native_hook)
 
     def add(self):
         if not self.added and self.native_hook:
             self.handle = self.emu_eng.hook_add(htype=HOOK_INSN_INVALID, cb=self._wrap_invalid_insn_cb)
-
         self.added = True
-        self.enabled = True
