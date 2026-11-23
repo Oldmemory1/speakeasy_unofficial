@@ -15,6 +15,7 @@ import speakeasy.winenv.defs.registry.reg as regdefs
 import speakeasy.winenv.defs.windows.windows as windefs
 from speakeasy.errors import ApiEmuError
 from speakeasy.profiler_events import FILE_OPEN, FILE_READ, FILE_WRITE, MEM_WRITE
+from speakeasy.windows import page_trace_diagnostics
 from speakeasy.windows.page_protection import ERROR_INVALID_ADDRESS, apply_page_protection
 from speakeasy.winenv.api import api
 
@@ -1455,13 +1456,27 @@ class Ntoskrnl(api.ApiHandler):
         """
         hnd, base_ptr, size_ptr, new_prot, old_ptr = argv
 
+        # FX-003 diagnostics: read-only snapshot of the IN/OUT pointers,
+        # requested protection and pre-call guest registers. Attached before
+        # any validation/return so failure paths are traced too.
+        observation = page_trace_diagnostics.start_nt_protect(emu, ctx, argv)
+
         if not old_ptr:
+            page_trace_diagnostics.finish_nt_protect(
+                emu, ctx, observation, status=ddk.STATUS_ACCESS_VIOLATION
+            )
             return ddk.STATUS_ACCESS_VIOLATION
 
         if self._resolve_process_handle(emu, hnd) is None:
+            page_trace_diagnostics.finish_nt_protect(
+                emu, ctx, observation, status=ddk.STATUS_INVALID_HANDLE
+            )
             return ddk.STATUS_INVALID_HANDLE
 
         if not base_ptr or not size_ptr:
+            page_trace_diagnostics.finish_nt_protect(
+                emu, ctx, observation, status=ddk.STATUS_INVALID_PARAMETER
+            )
             return ddk.STATUS_INVALID_PARAMETER
 
         ptr_size = emu.get_ptr_size()
@@ -1473,8 +1488,11 @@ class Ntoskrnl(api.ApiHandler):
         result = apply_page_protection(emu, addr, size, new_prot)
         if not result.success:
             if result.error == ERROR_INVALID_ADDRESS:
-                return ddk.STATUS_ACCESS_VIOLATION
-            return ddk.STATUS_INVALID_PARAMETER
+                status = ddk.STATUS_ACCESS_VIOLATION
+            else:
+                status = ddk.STATUS_INVALID_PARAMETER
+            page_trace_diagnostics.finish_nt_protect(emu, ctx, observation, status=status)
+            return status
 
         rounded_size = result.end - result.start
         self.mem_write(base_ptr, result.start.to_bytes(ptr_size, "little"))
@@ -1482,6 +1500,15 @@ class Ntoskrnl(api.ApiHandler):
         self.mem_write(old_ptr, result.old_protect.to_bytes(4, "little"))
         argv[1] = result.start
         argv[2] = rounded_size
+        page_trace_diagnostics.finish_nt_protect(
+            emu,
+            ctx,
+            observation,
+            status=ddk.STATUS_SUCCESS,
+            base_address_written=result.start,
+            region_size_written=rounded_size,
+            old_protect_written=result.old_protect,
+        )
         return ddk.STATUS_SUCCESS
 
     @apihook("ZwWriteVirtualMemory", argc=5)
@@ -1535,6 +1562,11 @@ class Ntoskrnl(api.ApiHandler):
         ProcessHandle, BaseAddress, ZeroBits, RegionSize, Type, Protect = argv
         rv = ddk.STATUS_SUCCESS
 
+        # FX-003 diagnostics: record ProcessHandle/BaseAddress/RegionSize/
+        # AllocationType/Protect plus the returned mapping. Read-only evidence;
+        # the allocation semantics are not changed here.
+        observation = page_trace_diagnostics.start_nt_allocate(emu, ctx, argv)
+
         if ProcessHandle == self.get_max_int():
             obj = emu.get_current_process()
         else:
@@ -1549,6 +1581,10 @@ class Ntoskrnl(api.ApiHandler):
         emu._set_dyn_code_hook(base, size)
 
         self.mem_write(BaseAddress, base.to_bytes(self.get_ptr_size(), "little"))
+
+        page_trace_diagnostics.finish_nt_allocate(
+            emu, ctx, observation, status=rv, base_out=base, region_size=size
+        )
 
         return rv
 

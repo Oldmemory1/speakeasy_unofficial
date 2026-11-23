@@ -238,6 +238,32 @@ def _complete_pending_api_callback(emu: Any) -> None:
     emu.do_call_return(frame.cleanup_argc, frame.ret_addr, api_return)
 
 
+def attach_handler_observation(error: ErrorInfo, ctx: Any) -> None:
+    """Fold a handler's read-only observation into an API error report.
+
+    FX-003 handlers attach page-protection evidence to
+    ``ctx["_api_observation"]`` before a risky operation.  If the handler then
+    raises (for example ``lstrcpyA`` writing to an unmapped destination), the
+    exception path never reaches ``log_api``, so the evidence would otherwise
+    be dropped.  This merge keeps it in ``ErrorInfo.diagnostics``.
+
+    Reporting-only: the exception type/message, run termination and any other
+    behaviour are unchanged.  Missing or non-dict observations are ignored.
+    """
+    if error is None or not isinstance(ctx, dict):
+        return
+    observation = ctx.get("_api_observation")
+    if not isinstance(observation, dict):
+        return
+    try:
+        diagnostics = error.diagnostics if isinstance(error.diagnostics, dict) else {}
+        merged = dict(diagnostics)
+        merged["api_observation"] = observation
+        error.diagnostics = merged
+    except Exception:
+        logger.debug("fx-003 diagnostic: handler observation merge failed", exc_info=True)
+
+
 class WindowsEmulator(BinaryEmulator):
     """
     Base class providing emulation of all Windows modules and shellcode.
@@ -3153,6 +3179,7 @@ class WindowsEmulator(BinaryEmulator):
                 except Exception as e:
                     logger.exception("0x%x: Error while calling API handler for %s:", oret, imp_api)
                     error = self.get_error_info(str(e), self.get_pc(), traceback=traceback.format_exc())
+                    attach_handler_observation(error, default_ctx)
                     self.curr_run.error = error  # type: ignore[union-attr]
                     self.on_run_complete()
                     return

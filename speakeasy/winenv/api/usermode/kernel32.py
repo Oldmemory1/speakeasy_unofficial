@@ -29,7 +29,7 @@ from speakeasy.profiler_events import (
     THREAD_CREATE,
     THREAD_INJECT,
 )
-from speakeasy.windows import api_diagnostics, api_trace_diagnostics
+from speakeasy.windows import api_diagnostics, api_trace_diagnostics, page_trace_diagnostics
 from speakeasy.windows.child_execution import ChildTargetResolver
 from speakeasy.windows.objman import Process
 from speakeasy.windows.os_capabilities import (
@@ -1690,17 +1690,31 @@ class Kernel32(api.ApiHandler):
         );"""
         lpAddress, dwSize, flNewProtect, lpflOldProtect = argv
 
+        # FX-003 diagnostics: per-page protection state before/after the call
+        # plus the outcome. Read-only; the protection change itself is
+        # unchanged (it still goes through apply_page_protection).
+        observation = page_trace_diagnostics.start_virtual_protect(emu, ctx, argv)
+
         if not lpflOldProtect:
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            page_trace_diagnostics.finish_virtual_protect(
+                emu, ctx, observation, success=False, error=windefs.ERROR_INVALID_PARAMETER
+            )
             return 0
 
         result = apply_page_protection(emu, lpAddress, dwSize, flNewProtect)
         if not result.success:
             if result.error is not None:
                 emu.set_last_error(result.error)
+            page_trace_diagnostics.finish_virtual_protect(
+                emu, ctx, observation, success=False, error=result.error
+            )
             return 0
 
         self.mem_write(lpflOldProtect, result.old_protect.to_bytes(4, "little"))
+        page_trace_diagnostics.finish_virtual_protect(
+            emu, ctx, observation, success=True, old_protect_written=result.old_protect
+        )
         return 1
 
     @apihook("VirtualProtectEx", argc=5)
@@ -2659,9 +2673,16 @@ class Kernel32(api.ApiHandler):
 
         cw = self.get_char_width(ctx)
 
+        # FX-003 diagnostics: pointers, destination page state and a bounded
+        # source preview are attached before decoding; the patch bytes are
+        # recorded before the guest write so evidence survives a fault.
+        observation = page_trace_diagnostics.start_lstrcpy(emu, ctx, argv, cw)
+
         s = self.read_mem_string(src, cw)
         argv[1] = s
         s += "\x00"
+
+        page_trace_diagnostics.finish_lstrcpy(emu, ctx, observation, text=s, char_width=cw)
 
         self.write_mem_string(s, dest, cw)
         return dest
