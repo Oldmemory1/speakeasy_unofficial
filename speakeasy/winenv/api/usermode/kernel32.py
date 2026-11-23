@@ -29,7 +29,12 @@ from speakeasy.profiler_events import (
     THREAD_CREATE,
     THREAD_INJECT,
 )
-from speakeasy.windows import api_diagnostics, api_trace_diagnostics, page_trace_diagnostics
+from speakeasy.windows import (
+    api_diagnostics,
+    api_trace_diagnostics,
+    module_trace_diagnostics,
+    page_trace_diagnostics,
+)
 from speakeasy.windows.child_execution import ChildTargetResolver
 from speakeasy.windows.objman import Process
 from speakeasy.windows.os_capabilities import (
@@ -512,8 +517,12 @@ class Kernel32(api.ApiHandler):
         hmod = windefs.NULL
 
         cw = self.get_char_width(ctx)
+        # FX-004 diagnostics: record the request and pre-call module table
+        # before the loader may map a new (possibly synthetic) module.
+        observation = module_trace_diagnostics.start_load_library(emu, ctx, argv, cw)
         if not lib_name or not emu.is_address_valid(lib_name):
             emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            module_trace_diagnostics.finish_load_library(emu, ctx, observation, return_value=hmod)
             return hmod
         req_lib = self.read_mem_string(lib_name, cw)
         lib = winemu.normalize_dll_name(req_lib)
@@ -528,6 +537,7 @@ class Kernel32(api.ApiHandler):
                 req_lib,
             )
 
+        module_trace_diagnostics.finish_load_library(emu, ctx, observation, return_value=hmod)
         return hmod
 
     @apihook("CreateToolhelp32Snapshot", argc=2)
@@ -2319,10 +2329,28 @@ class Kernel32(api.ApiHandler):
         ctx = ctx or {}
         dwFlags, lpModuleName, phModule = argv
 
+        try:
+            cw = self.get_char_width(ctx)
+        except Exception:
+            cw = 1
+        # FX-004 diagnostics: flags (including FROM_ADDRESS), the name argument,
+        # the module table and the phModule write-back are the provenance a
+        # NULL result needs.  Handler behaviour is unchanged.
+        observation = module_trace_diagnostics.start_get_module_handle_ex(emu, ctx, argv, cw)
+
         hmod = self.GetModuleHandle(emu, [lpModuleName], ctx)
+        written = None
         if phModule:
             _mod = (hmod).to_bytes(emu.get_ptr_size(), "little")
             self.mem_write(phModule, _mod)
+            written = hmod
+        module_trace_diagnostics.finish_get_module_handle_ex(
+            emu,
+            ctx,
+            observation,
+            return_value=hmod,
+            ph_module_written=written,
+        )
         return hmod
 
     @apihook("GetModuleHandle", argc=1)
@@ -2375,6 +2403,11 @@ class Kernel32(api.ApiHandler):
         hmod, proc_name = argv
         rv = 0
 
+        ctx = ctx or {}
+        # FX-004 diagnostics: hmod/name, the module table, export-table
+        # membership and the resolved target's page provenance.  Read-only.
+        observation = module_trace_diagnostics.start_get_proc_address(emu, ctx, argv, 1)
+
         proc = ""
         if proc_name:
             if isinstance(proc_name, int) and proc_name < 0x10000:
@@ -2426,6 +2459,7 @@ class Kernel32(api.ApiHandler):
                 [(m.get_base_name(), hex(m.base)) for m in emu.modules],
             )
 
+        module_trace_diagnostics.finish_get_proc_address(emu, ctx, observation, return_value=rv)
         return rv
 
     @apihook("AllocConsole", argc=0)
@@ -5257,6 +5291,17 @@ class Kernel32(api.ApiHandler):
                 api_name=ctx.get("func_name"),
             ),
         )
+        # FX-004 diagnostics: keep the FX-015 scatter observation and add the
+        # unload-specific evidence (handle, matched module, module table and
+        # whether anything was actually removed) under a nested key.
+        observation = module_trace_diagnostics.start_unload(
+            emu,
+            ctx,
+            argv,
+            handler="kernel32.FreeLibrary",
+            argument_name="h_lib_module",
+        )
+        module_trace_diagnostics.finish_unload(emu, ctx, observation, return_value=True)
         return True
 
     @apihook("WaitForSingleObject", argc=2)

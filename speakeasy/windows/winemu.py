@@ -27,7 +27,12 @@ from speakeasy.profiler import ApiCallbackFrame, MemAccess, ProcessEntryContext,
 from speakeasy.profiler_events import TracePosition
 from speakeasy.report import ErrorInfo, RegionInfo
 from speakeasy.struct import EmuStruct
-from speakeasy.windows import api_trace_diagnostics, bool_semantics, handle_semantics
+from speakeasy.windows import (
+    api_trace_diagnostics,
+    bool_semantics,
+    handle_semantics,
+    module_trace_diagnostics,
+)
 from speakeasy.windows.child_execution import (
     ChildExecutionDispatcher,
     ChildExecutionRegistry,
@@ -3133,7 +3138,25 @@ class WindowsEmulator(BinaryEmulator):
         self._apply_signature_last_error(sig, rv)
 
         ret = self.get_ret_address()
-        self.log_api(call_pc, imp_api, rv, argv, display=display)
+        # FX-004 diagnostics: a signature-emulated unload API (LdrUnloadDll)
+        # gets an explicit observation (arguments, return value, module table).
+        # Other signature-emulated APIs return None and report as before.
+        observation = module_trace_diagnostics.signature_call_observation(
+            self, dll, name, sig, argv, rv, call_pc
+        )
+        event_context = (
+            {"func_name": imp_api, "_api_observation": observation}
+            if observation is not None
+            else None
+        )
+        self.log_api(
+            call_pc,
+            imp_api,
+            rv,
+            argv,
+            display=display,
+            event_context=event_context,
+        )
         self.do_call_return(argc, ret, rv, conv=conv)
         self._dispatch_control_return()
         if not self.run_complete:
@@ -3279,7 +3302,18 @@ class WindowsEmulator(BinaryEmulator):
 
                 rv = hook.cb(self, imp_api, orig, argv)
                 ret = self.get_ret_address()
-                self.log_api(call_pc, imp_api, rv, argv)
+                # FX-004 diagnostics: the wildcard-hook path is how the sample
+                # pipeline dispatches handler-less APIs, so the unload
+                # observation must be attached here too (None for other APIs).
+                observation = module_trace_diagnostics.signature_call_observation(
+                    self, dll, name, sig, argv, rv, call_pc
+                )
+                event_context = (
+                    {"func_name": imp_api, "_api_observation": observation}
+                    if observation is not None
+                    else None
+                )
+                self.log_api(call_pc, imp_api, rv, argv, event_context=event_context)
                 self.do_call_return(argc, ret, rv, conv=conv)
                 self._dispatch_control_return()
                 if not self.run_complete:
