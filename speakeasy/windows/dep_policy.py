@@ -18,8 +18,9 @@ mapped executable (``virtual.c:4940-4966``).  The guest therefore may execute
 pages that the Win32 ``PAGE_*`` value alone would keep non-executable.
 
 This module only describes the policy.  The Windows emulator decides where to
-apply it; the emulator deliberately relaxes execution only for writable pages,
-so read-only image sections (``.rdata``/resources) keep their protections.
+apply it; the emulator deliberately relaxes execution only for writable pages
+(``VirtualAlloc`` views and writable image sections), so read-only image
+sections (``.rdata``/resources) keep their protections.
 
 The policy is architecture independent: the field sits at the same Optional
 Header offset (0x46) in PE32 and PE32+.
@@ -89,3 +90,40 @@ def dep_opt_out(policy: ImageDepPolicy | None) -> bool:
         semantics.
     """
     return policy is not None and policy.dep_disabled
+
+
+def image_page_exec_allowed(
+    policy: ImageDepPolicy | None,
+    *,
+    is_image_page: bool,
+    page_readable: bool,
+    page_writable: bool,
+) -> bool:
+    """Return True when the image DEP opt-out relaxes an image-page fetch.
+
+    Wine disables no-exec enforcement for a process whose image lacks
+    NXCOMPAT (``dlls/ntdll/loader.c:1585-1591``) and ``mprotect_exec`` then
+    adds ``PROT_EXEC`` to readable views
+    (``dlls/ntdll/unix/virtual.c:1647-1659``).  The emulator applies that
+    relaxation only to writable image pages, the class packed samples decrypt
+    code into: a ``PAGE_WRITECOPY`` image page that carries read and write
+    permission may be executed.  Read-only image sections (``.rdata``,
+    resources), no-access pages and non-image mappings keep their protections.
+
+    Args:
+        policy: DEP policy of the process image, or ``None`` when unknown.
+        is_image_page: True when the faulting page belongs to a PE image view.
+        page_readable: True when the page's effective permissions carry read.
+        page_writable: True when the page's effective permissions carry write.
+
+    Returns:
+        True only for an explicit DEP opt-out (NXCOMPAT clear) on a readable,
+        writable image page.  A ``None`` policy (unknown header) and every
+        other page class return False, so DEP-enabled semantics are preserved.
+
+    Architecture: independent of PE32/PE32+; the NXCOMPAT bit sits at the same
+    Optional Header offset in both formats.
+    """
+    if not dep_opt_out(policy):
+        return False
+    return bool(is_image_page and page_readable and page_writable)

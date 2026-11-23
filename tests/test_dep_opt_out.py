@@ -306,11 +306,11 @@ def _run_pe(config, arch: int, *, dll_characteristics: int, protect: int, write_
         se.shutdown()
 
 
-def _run_image_data_pe(config, arch: int):
+def _run_image_data_pe(config, arch: int, *, dll_characteristics: int = OPT_OUT_DLL_CHARACTERISTICS):
     """Execute a ret written into the image's own writable .data page."""
     is_64 = arch == e_arch.ARCH_AMD64
     code, patches = (_emit_image_data_x64 if is_64 else _emit_image_data_x86)()
-    pe = _build_pe(arch, dll_characteristics=OPT_OUT_DLL_CHARACTERISTICS, code=code)
+    pe = _build_pe(arch, dll_characteristics=dll_characteristics, code=code)
 
     se = Speakeasy(config=config, argv=[])
     try:
@@ -446,13 +446,17 @@ def test_opt_out_readonly_allocation_still_faults(config, arch):
 
 
 # ---------------------------------------------------------------------------
-# Negative: opt-out never promotes image-section pages (.data/.rdata/resources)
+# Negative: NXCOMPAT=1 never promotes image-section pages (.data/.rdata/resources)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("arch", [e_arch.ARCH_X86, e_arch.ARCH_AMD64], ids=["x86", "x64"])
-def test_opt_out_image_data_page_still_faults(config, arch):
-    result = _run_image_data_pe(config, arch)
+def test_nx_compat_image_data_page_still_faults(config, arch):
+    result = _run_image_data_pe(
+        config,
+        arch,
+        dll_characteristics=NXCOMPAT_DLL_CHARACTERISTICS,
+    )
 
     error = result["error"]
     assert error is not None
