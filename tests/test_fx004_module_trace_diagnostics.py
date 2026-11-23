@@ -589,6 +589,22 @@ def test_get_proc_address_handler_export_reports_sentinel_dispatch(engine):
     assert observation["target"]["address"] == hex(rv)
 
 
+def test_get_proc_address_missing_export_of_primary_exe_returns_null(engine):
+    emu = engine.emu
+    exe = next(mod for mod in emu.modules if mod.is_exe())
+
+    rv, ctx = _get_proc_address(emu, exe.base, "Fx004NotAnExport")
+
+    # Behaviour baseline: the primary image keeps strict Windows NULL
+    # semantics for a genuinely missing export.
+    assert rv == 0
+    observation = _module_observation(ctx)
+    assert observation["export_found"] is False
+    assert observation["resolved_is_sentinel"] is False
+    assert observation["return_value"] == "0x0"
+    assert observation["miss_reason"] == "export_not_in_module"
+
+
 def test_get_proc_address_missing_export_reports_null_handle_and_miss(engine):
     emu = engine.emu
     emu.fileman.add_existing_file(DROP_PATH, _bin(TEST_DLL))
