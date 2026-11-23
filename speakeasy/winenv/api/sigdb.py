@@ -813,6 +813,44 @@ _default_db: SignatureDatabase | None = None
 _default_lock = threading.Lock()
 
 
+def name_variants(func: str) -> tuple[str, ...]:
+    """Return the exact spelling plus the related A/W spellings.
+
+    ``GetModuleFileName`` -> ``(GetModuleFileName, GetModuleFileNameA,
+    GetModuleFileNameW)``; ``GetModuleFileNameA`` -> ``(GetModuleFileNameA,
+    GetModuleFileName)``.  This mirrors how the loader folds A/W names onto
+    undecorated handlers; it does not imply the database knows every spelling.
+    """
+    if func.endswith(("A", "W")) and len(func) > 1:
+        return (func, func[:-1])
+    return (func, func + "A", func + "W")
+
+
+def lookup_name_variants(
+    database: SignatureDatabase,
+    dll: str,
+    func: str,
+    arch: str,
+) -> dict[str, FuncSig | None]:
+    """Look up *func* and its A/W spellings without changing matching semantics.
+
+    Returns a mapping keyed by spelling (in :func:`name_variants` order); each
+    value is exactly what :meth:`SignatureDatabase.lookup` returns for that
+    spelling (``None`` when unknown).  Lookup failures are logged and reported
+    as ``None`` for that spelling.
+    """
+    result: dict[str, FuncSig | None] = {}
+    for spelling in name_variants(func):
+        try:
+            result[spelling] = database.lookup(dll, spelling, arch)
+        except Exception:
+            logger.debug(
+                "signature variant lookup failed for %s!%s", dll, spelling, exc_info=True
+            )
+            result[spelling] = None
+    return result
+
+
 def get_default_database() -> SignatureDatabase:
     """Process-wide database backed by the bundled win32metadata and phnt signatures."""
     global _default_db

@@ -11,6 +11,7 @@ from speakeasy.errors import ApiEmuError
 from speakeasy.profiler import ApiCallbackFrame, Run
 from speakeasy.profiler_events import TracePosition
 from speakeasy.struct import EmuStruct
+from speakeasy.windows import api_name_resolution_diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -363,9 +364,17 @@ class ApiHandler:
         """
         name = ctx.get("func_name", "")
         if name.endswith("A"):
+            # FX-005 diagnostics: evidence only; the width itself is unchanged.
+            api_name_resolution_diagnostics.observe_char_width(self, ctx, name, char_width=1)
             return 1
         elif name.endswith("W"):
+            api_name_resolution_diagnostics.observe_char_width(self, ctx, name, char_width=2)
             return 2
+        # Undecorated name: record which lookup matched it to a handler before
+        # preserving the existing ApiEmuError and its message.
+        api_name_resolution_diagnostics.observe_char_width(
+            self, ctx, name, failure="undecorated_api_name"
+        )
         raise ApiEmuError(f"Failed to get character width from function: {name}")
 
     def get_va_arg_count(self, fmt):
