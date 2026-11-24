@@ -2943,3 +2943,45 @@ class User32(api.ApiHandler):
 
         # Otherwise return start
         return lpszStart
+
+    @apihook("SystemParametersInfoW", argc=4)
+    def SystemParametersInfoW(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL SystemParametersInfoW(
+            UINT uiAction,
+            UINT uiParam,
+            PVOID pvParam,
+            UINT fWinIni
+        );
+
+        Only the queries the emulated desktop can answer are implemented. A NULL
+        pvParam or an action the emulator does not model returns FALSE and sets
+        LastError to ERROR_INVALID_PARAMETER; success is never reported for a
+        setting that was not applied. SPI_GETWORKAREA (0x0030) fills the RECT at
+        pvParam with the configured screen size; the work area equals the full
+        screen because no taskbar is modeled. SPI_GETSCREENSAVEACTIVE (0x0010)
+        and SPI_GETSCREENSAVERRUNNING (0x0072) store FALSE because the emulated
+        desktop has no screen saver.
+        """
+        uiAction, uiParam, pvParam, fWinIni = argv
+
+        if pvParam == 0:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+
+        if uiAction == 0x0030:  # SPI_GETWORKAREA
+            # RECT: left, top, right, bottom as four 32-bit LONGs.
+            ui = getattr(getattr(emu, "config", None), "ui", None)
+            width = resolve_system_metric(SM_CXSCREEN, ui)[0]
+            height = resolve_system_metric(SM_CYSCREEN, ui)[0]
+            for offset, value in enumerate((0, 0, width, height)):
+                self.write_dword(pvParam + offset * 4, value)
+            return 1
+
+        if uiAction in (0x0010, 0x0072):  # SPI_GETSCREENSAVEACTIVE, SPI_GETSCREENSAVERRUNNING
+            self.write_dword(pvParam, 0)
+            return 1
+
+        # A setting or query the emulator does not model is not reported as applied.
+        emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+        return 0

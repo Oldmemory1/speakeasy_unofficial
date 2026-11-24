@@ -9507,3 +9507,81 @@ class Kernel32(ExceptionApis, api.ApiHandler):
         """
         # Return a fake ATOM value. ATOMs are 16-bit identifiers.
         return 0x1234
+
+    @apihook("TryAcquireSRWLockExclusive", argc=1)
+    def TryAcquireSRWLockExclusive(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOLEAN TryAcquireSRWLockExclusive(
+            PSRWLOCK SRWLock
+        );
+
+        The emulator does not model SRW lock ownership, so every lock is free and an
+        uncontended try succeeds. No ownership state is recorded.
+        """
+        return 1
+
+    @apihook("WriteConsoleA", argc=5)
+    def WriteConsoleA(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL WriteConsoleA(
+            HANDLE hConsoleOutput,
+            const VOID *lpBuffer,
+            DWORD nNumberOfCharsToWrite,
+            LPDWORD lpNumberOfCharsWritten,
+            LPVOID lpReserved
+        );
+
+        Delegates to WriteConsole; the A suffix selects ANSI width.
+        """
+        return self.WriteConsole(emu, argv, ctx)
+
+    @apihook("WriteConsoleW", argc=5)
+    def WriteConsoleW(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL WriteConsoleW(
+            HANDLE hConsoleOutput,
+            const VOID *lpBuffer,
+            DWORD nNumberOfCharsToWrite,
+            LPDWORD lpNumberOfCharsWritten,
+            LPVOID lpReserved
+        );
+
+        Delegates to WriteConsole; the W suffix selects Unicode width.
+        """
+        return self.WriteConsole(emu, argv, ctx)
+
+    @apihook("WritePrivateProfileStringA", argc=4)
+    def WritePrivateProfileStringA(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL WritePrivateProfileStringA(
+            LPCSTR lpAppName,
+            LPCSTR lpKeyName,
+            LPCSTR lpString,
+            LPCSTR lpFileName
+        );
+
+        No profile store is modeled and nothing is written to disk or the registry;
+        this is a deliberate approximation. A NULL lpFileName fails.
+        """
+        if not argv[3]:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        return 1
+
+    @apihook("WritePrivateProfileStringW", argc=4)
+    def WritePrivateProfileStringW(self, emu: "Win32Emulator", argv: list[int], ctx: api.ApiContext = api.NO_CONTEXT):
+        """
+        BOOL WritePrivateProfileStringW(
+            LPCWSTR lpAppName,
+            LPCWSTR lpKeyName,
+            LPCWSTR lpString,
+            LPCWSTR lpFileName
+        );
+
+        No profile store is modeled and nothing is written to disk or the registry;
+        this is a deliberate approximation. A NULL lpFileName fails.
+        """
+        if not argv[3]:
+            emu.set_last_error(windefs.ERROR_INVALID_PARAMETER)
+            return 0
+        return 1
